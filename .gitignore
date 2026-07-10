@@ -1,0 +1,15 @@
+# Go
+*.exe
+*.test
+*.out
+/bin/
+
+# Local SQLite (tests/dev)
+*.db
+*.db-wal
+*.db-shm
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
