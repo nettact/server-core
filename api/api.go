@@ -25,6 +25,7 @@ import (
 	"github.com/nettact/server-core/config"
 	"github.com/nettact/server-core/identity"
 	"github.com/nettact/server-core/ingest"
+	"github.com/nettact/server-core/inventory"
 	"github.com/nettact/server-core/registry"
 	"github.com/nettact/server-core/site"
 )
@@ -38,6 +39,7 @@ type Deps struct {
 	Ingest       *ingest.Service
 	Config       *config.Service
 	Site         *site.Service
+	Inventory    *inventory.Service
 	Audit        *audit.Service
 	Dev          bool // relax CORS for the Vite origin
 	SecureCookie bool // set Secure on the session cookie (production/HTTPS)
@@ -72,6 +74,7 @@ func Router(d Deps) http.Handler {
 			r.Post("/enrollment-tokens", d.handleCreateToken)
 			r.Get("/sites/{id}/targets", d.handleListTargets)
 			r.Put("/sites/{id}/targets", d.handleSetTargets)
+			r.Get("/sites/{id}/devices", d.handleListDevices)
 		})
 	})
 	return r
@@ -337,6 +340,18 @@ func (d Deps) handleSetTargets(w http.ResponseWriter, r *http.Request) {
 	}
 	d.Audit.Log(r.Context(), "admin", "monitoring.set_targets", siteID, strconv.Itoa(len(body.Targets))+" targets")
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (d Deps) handleListDevices(w http.ResponseWriter, r *http.Request) {
+	devices, err := d.Inventory.ListDevices(r.Context(), chi.URLParam(r, "id"))
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if devices == nil {
+		devices = []inventory.Device{}
+	}
+	writeJSON(w, http.StatusOK, devices)
 }
 
 func (d Deps) handleHealthz(w http.ResponseWriter, r *http.Request) {
