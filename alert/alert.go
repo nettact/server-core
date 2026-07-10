@@ -17,11 +17,12 @@ import (
 
 // RuleView is the rule context the alert service needs (avoids importing rules).
 type RuleView struct {
-	ID         string
-	Name       string
-	Layer      string
-	Severity   string
-	ForSeconds int
+	ID            string
+	Name          string
+	Layer         string
+	Severity      string
+	ForSeconds    int
+	FailThreshold int // fire after this many CONSECUTIVE breaching evaluations (min 1)
 }
 
 // Raised is the payload published on TopicAlertRaised / TopicAlertResolved.
@@ -61,16 +62,25 @@ type Service struct {
 
 func New(db *store.DB, bus *eventbus.Bus) *Service { return &Service{db: db, bus: bus} }
 
-// Update transitions the (rule, agent, target) alert given the latest breach state.
+// Update transitions the (rule, agent, target) alert given the latest breach
+// state. Triggering is count-based: the alert fires after FailThreshold
+// CONSECUTIVE breaching evaluations; a single non-breach resets the counter and
+// resolves any open alert. (ForSeconds is retained as an additional gate: a
+// pending alert only promotes once both the count and the duration are met.)
 func (s *Service) Update(ctx context.Context, rule RuleView, agentID, siteID, target string, breach bool, value float64) error {
 	now := time.Now().UTC()
+	threshold := rule.FailThreshold
+	if threshold < 1 {
+		threshold = 1
+	}
 
 	var id, state string
 	var startedAt time.Time
+	var failCount int
 	err := s.db.QueryRowContext(ctx,
-		`SELECT id, state, started_at FROM alerts
+		`SELECT id, state, started_at, fail_count FROM alerts
 		 WHERE rule_id=? AND agent_id=? AND target=? AND state IN ('pending','firing')
-		 ORDER BY started_at DESC LIMIT 1`, rule.ID, agentID, target).Scan(&id, &state, &startedAt)
+		 ORDER BY started_at DESC LIMIT 1`, rule.ID, agentID, target).Scan(&id, &state, &startedAt, &failCount)
 	open := err == nil
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return err
@@ -79,13 +89,14 @@ func (s *Service) Update(ctx context.Context, rule RuleView, agentID, siteID, ta
 	switch {
 	case breach && !open:
 		id = "alert_" + uuid.NewString()
-		st := "firing"
-		if rule.ForSeconds > 0 {
-			st = "pending"
+		count := 1
+		st := "pending"
+		if count >= threshold && durationMet(rule, now, now) {
+			st = "firing"
 		}
 		if _, err := s.db.ExecContext(ctx,
-			`INSERT INTO alerts(id, rule_id, agent_id, site_id, target, state, value, started_at, last_eval_at)
-			 VALUES(?,?,?,?,?,?,?,?,?)`, id, rule.ID, agentID, siteID, target, st, value, now, now); err != nil {
+			`INSERT INTO alerts(id, rule_id, agent_id, site_id, target, state, value, fail_count, started_at, last_eval_at)
+			 VALUES(?,?,?,?,?,?,?,?,?,?)`, id, rule.ID, agentID, siteID, target, st, value, count, now, now); err != nil {
 			return err
 		}
 		if st == "firing" {
@@ -93,14 +104,15 @@ func (s *Service) Update(ctx context.Context, rule RuleView, agentID, siteID, ta
 		}
 
 	case breach && open:
-		if state == "pending" && now.Sub(startedAt) >= time.Duration(rule.ForSeconds)*time.Second {
+		failCount++
+		if state == "pending" && failCount >= threshold && durationMet(rule, startedAt, now) {
 			if _, err := s.db.ExecContext(ctx,
-				`UPDATE alerts SET state='firing', value=?, last_eval_at=? WHERE id=?`, value, now, id); err != nil {
+				`UPDATE alerts SET state='firing', value=?, fail_count=?, last_eval_at=? WHERE id=?`, value, failCount, now, id); err != nil {
 				return err
 			}
 			s.publish(eventbus.TopicAlertRaised, rule, id, agentID, siteID, target, value, now)
 		} else {
-			if _, err := s.db.ExecContext(ctx, `UPDATE alerts SET value=?, last_eval_at=? WHERE id=?`, value, now, id); err != nil {
+			if _, err := s.db.ExecContext(ctx, `UPDATE alerts SET value=?, fail_count=?, last_eval_at=? WHERE id=?`, value, failCount, now, id); err != nil {
 				return err
 			}
 		}
@@ -108,7 +120,7 @@ func (s *Service) Update(ctx context.Context, rule RuleView, agentID, siteID, ta
 	case !breach && open:
 		wasFiring := state == "firing"
 		if _, err := s.db.ExecContext(ctx,
-			`UPDATE alerts SET state='resolved', resolved_at=?, last_eval_at=? WHERE id=?`, now, now, id); err != nil {
+			`UPDATE alerts SET state='resolved', resolved_at=?, last_eval_at=?, fail_count=0 WHERE id=?`, now, now, id); err != nil {
 			return err
 		}
 		if wasFiring {
@@ -116,6 +128,15 @@ func (s *Service) Update(ctx context.Context, rule RuleView, agentID, siteID, ta
 		}
 	}
 	return nil
+}
+
+// durationMet reports whether the rule's optional ForSeconds dwell has elapsed
+// between the alert's start and now (always true when ForSeconds is 0).
+func durationMet(rule RuleView, startedAt, now time.Time) bool {
+	if rule.ForSeconds <= 0 {
+		return true
+	}
+	return now.Sub(startedAt) >= time.Duration(rule.ForSeconds)*time.Second
 }
 
 func (s *Service) publish(topic string, rule RuleView, id, agentID, siteID, target string, value float64, at time.Time) {

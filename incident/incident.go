@@ -7,6 +7,7 @@ package incident
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -219,10 +220,48 @@ func (s *Service) notify(ctx context.Context, incID, event string) {
 	if err != nil {
 		return
 	}
-	s.notif.Notify(ctx, notification.Payload{
+	// Route to the union of channels selected on the rules of this site's firing
+	// alerts. When none specify channels, Notify falls back to all enabled.
+	channelIDs := s.firingChannels(ctx, inc.SiteID)
+	s.notif.Notify(ctx, channelIDs, notification.Payload{
 		Event: event, IncidentID: inc.ID, SiteID: inc.SiteID, SuspectedLayer: inc.SuspectedLayer,
 		Severity: inc.Severity, State: inc.State, Summary: inc.Summary, At: time.Now().UTC(),
 	})
+}
+
+// firingChannels returns the distinct channel IDs configured on the rules of a
+// site's currently-firing alerts.
+func (s *Service) firingChannels(ctx context.Context, siteID string) []string {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT DISTINCT COALESCE(r.channel_ids,'')
+		FROM alerts a JOIN alert_rules r ON r.id = a.rule_id
+		WHERE a.site_id=? AND a.state='firing'`, siteID)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	seen := map[string]bool{}
+	var out []string
+	for rows.Next() {
+		var chans string
+		if err := rows.Scan(&chans); err != nil {
+			continue
+		}
+		if chans == "" {
+			continue
+		}
+		var ids []string
+		if json.Unmarshal([]byte(chans), &ids) != nil {
+			continue
+		}
+		for _, id := range ids {
+			if id != "" && !seen[id] {
+				seen[id] = true
+				out = append(out, id)
+			}
+		}
+	}
+	return out
 }
 
 // --- UI reads ---

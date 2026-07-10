@@ -6,6 +6,7 @@ package config
 
 import (
 	"context"
+	"encoding/json"
 
 	"github.com/google/uuid"
 
@@ -31,11 +32,12 @@ func New(db *store.DB, reg *registry.Service) *Service {
 
 // ProbeTarget is a site-scoped monitoring target managed via the UI.
 type ProbeTarget struct {
-	ID      string `json:"id"`
-	Kind    string `json:"kind"`   // "icmp" (M2)
-	Target  string `json:"target"` // "1.1.1.1", "example.com", …
-	Tier    string `json:"tier"`   // "base" | "regular"
-	Enabled bool   `json:"enabled"`
+	ID      string           `json:"id"`
+	Kind    string           `json:"kind"`   // "icmp" (M2)
+	Target  string           `json:"target"` // "1.1.1.1", "example.com", …
+	Tier    string           `json:"tier"`   // "base" | "regular"
+	Params  pcfg.ProbeParams `json:"params"` // per-protocol probe settings
+	Enabled bool             `json:"enabled"`
 }
 
 // SeedDefaults inserts a few public ICMP targets for a site if it has none, so
@@ -60,7 +62,7 @@ func (s *Service) SeedDefaults(ctx context.Context, siteID string) error {
 // ListSiteTargets returns the site-scoped monitoring targets.
 func (s *Service) ListSiteTargets(ctx context.Context, siteID string) ([]ProbeTarget, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, kind, COALESCE(target,''), tier, enabled
+		`SELECT id, kind, COALESCE(target,''), tier, COALESCE(params,''), enabled
 		 FROM probe_tasks WHERE site_id=? AND agent_id IS NULL ORDER BY kind, target`, siteID)
 	if err != nil {
 		return nil, err
@@ -69,9 +71,13 @@ func (s *Service) ListSiteTargets(ctx context.Context, siteID string) ([]ProbeTa
 	var out []ProbeTarget
 	for rows.Next() {
 		var t ProbeTarget
+		var params string
 		var enabled int
-		if err := rows.Scan(&t.ID, &t.Kind, &t.Target, &t.Tier, &enabled); err != nil {
+		if err := rows.Scan(&t.ID, &t.Kind, &t.Target, &t.Tier, &params, &enabled); err != nil {
 			return nil, err
+		}
+		if params != "" {
+			_ = json.Unmarshal([]byte(params), &t.Params)
 		}
 		t.Enabled = enabled == 1
 		out = append(out, t)
@@ -79,8 +85,11 @@ func (s *Service) ListSiteTargets(ctx context.Context, siteID string) ([]ProbeTa
 	return out, rows.Err()
 }
 
-// SetSiteTargets replaces all site-scoped targets and bumps config_version for
-// every agent in the site so they pick up the change on next telemetry.
+// SetSiteTargets reconciles the site-scoped targets to the given set and bumps
+// config_version for every agent in the site so they pick up the change on next
+// telemetry. Existing target IDs are PRESERVED (upsert) so per-target alarm
+// rules bound via probe_task_id survive edits; targets no longer present are
+// deleted along with their bound rules.
 func (s *Service) SetSiteTargets(ctx context.Context, siteID string, targets []ProbeTarget) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -93,10 +102,48 @@ func (s *Service) SetSiteTargets(ctx context.Context, siteID string, targets []P
 		}
 	}()
 
-	if _, err := tx.ExecContext(ctx,
-		`DELETE FROM probe_tasks WHERE site_id=? AND agent_id IS NULL`, siteID); err != nil {
+	// Assign IDs to new targets, then delete any existing target (and its bound
+	// rules) that is not in the incoming set.
+	keep := make(map[string]bool, len(targets))
+	for i := range targets {
+		if targets[i].ID == "" {
+			targets[i].ID = "probe_" + uuid.NewString()
+		}
+		keep[targets[i].ID] = true
+	}
+	rows, err := tx.QueryContext(ctx,
+		`SELECT id FROM probe_tasks WHERE site_id=? AND agent_id IS NULL`, siteID)
+	if err != nil {
 		return err
 	}
+	var existing []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return err
+		}
+		existing = append(existing, id)
+	}
+	rows.Close()
+	for _, id := range existing {
+		if keep[id] {
+			continue
+		}
+		// Clear alerts before their rules (FKs ON: alerts.rule_id → alert_rules.id),
+		// then the rules, then the target itself.
+		if _, err := tx.ExecContext(ctx,
+			`DELETE FROM alerts WHERE rule_id IN (SELECT id FROM alert_rules WHERE probe_task_id=?)`, id); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM alert_rules WHERE probe_task_id=?`, id); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM probe_tasks WHERE id=?`, id); err != nil {
+			return err
+		}
+	}
+
 	for _, t := range targets {
 		if t.Tier == "" {
 			t.Tier = "base"
@@ -105,10 +152,13 @@ func (s *Service) SetSiteTargets(ctx context.Context, siteID string, targets []P
 		if t.Enabled {
 			enabled = 1
 		}
+		params, _ := json.Marshal(t.Params)
 		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO probe_tasks(id, site_id, agent_id, kind, target, tier, enabled)
-			 VALUES(?,?,NULL,?,?,?,?)`,
-			"probe_"+uuid.NewString(), siteID, t.Kind, t.Target, t.Tier, enabled); err != nil {
+			`INSERT INTO probe_tasks(id, site_id, agent_id, kind, target, tier, params, enabled)
+			 VALUES(?,?,NULL,?,?,?,?,?)
+			 ON CONFLICT(id) DO UPDATE SET kind=excluded.kind, target=excluded.target,
+			   tier=excluded.tier, params=excluded.params, enabled=excluded.enabled`,
+			t.ID, siteID, t.Kind, t.Target, t.Tier, string(params), enabled); err != nil {
 			return err
 		}
 	}
@@ -117,6 +167,19 @@ func (s *Service) SetSiteTargets(ctx context.Context, siteID string, targets []P
 	}
 	committed = true
 	return s.reg.BumpConfigVersionForSite(ctx, siteID)
+}
+
+// TargetByName returns the probe_task ID for a site target by its target string
+// (e.g. "1.1.1.1"). Used by the rule engine to bind a metric series back to the
+// target that produced it. Returns "" if no such target.
+func (s *Service) TargetIDByTarget(ctx context.Context, siteID, target string) (string, error) {
+	var id string
+	err := s.db.QueryRowContext(ctx,
+		`SELECT id FROM probe_tasks WHERE site_id=? AND agent_id IS NULL AND target=? LIMIT 1`, siteID, target).Scan(&id)
+	if err != nil {
+		return "", err
+	}
+	return id, nil
 }
 
 // DesiredStateFor builds the config to push to a specific agent.
@@ -137,7 +200,7 @@ func (s *Service) DesiredStateFor(ctx context.Context, agentID string) (pcfg.Des
 		if !t.Enabled {
 			continue
 		}
-		ds.ProbeTargets = append(ds.ProbeTargets, pcfg.ProbeTarget{Kind: t.Kind, Target: t.Target, Tier: t.Tier})
+		ds.ProbeTargets = append(ds.ProbeTargets, pcfg.ProbeTarget{Kind: t.Kind, Target: t.Target, Tier: t.Tier, Params: t.Params})
 	}
 	return ds, nil
 }

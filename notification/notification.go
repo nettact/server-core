@@ -33,6 +33,7 @@ type Payload struct {
 // Channel is a notification destination.
 type Channel struct {
 	ID      string            `json:"id"`
+	Name    string            `json:"name"` // human label to tell multiple channels apart
 	Type    string            `json:"type"` // "webhook" | "email"
 	Config  map[string]string `json:"config"`
 	Enabled bool              `json:"enabled"`
@@ -48,7 +49,7 @@ func New(db *store.DB) *Service {
 }
 
 func (s *Service) List(ctx context.Context) ([]Channel, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, type, config, enabled FROM notification_channels ORDER BY type`)
+	rows, err := s.db.QueryContext(ctx, `SELECT id, COALESCE(name,''), type, config, enabled FROM notification_channels ORDER BY type, name`)
 	if err != nil {
 		return nil, err
 	}
@@ -58,7 +59,7 @@ func (s *Service) List(ctx context.Context) ([]Channel, error) {
 		var c Channel
 		var cfg string
 		var enabled int
-		if err := rows.Scan(&c.ID, &c.Type, &cfg, &enabled); err != nil {
+		if err := rows.Scan(&c.ID, &c.Name, &c.Type, &cfg, &enabled); err != nil {
 			return nil, err
 		}
 		_ = json.Unmarshal([]byte(cfg), &c.Config)
@@ -69,12 +70,29 @@ func (s *Service) List(ctx context.Context) ([]Channel, error) {
 }
 
 // Create adds a channel. config is stored as JSON.
-func (s *Service) Create(ctx context.Context, typ string, config map[string]string) (string, error) {
+func (s *Service) Create(ctx context.Context, name, typ string, config map[string]string) (string, error) {
 	id := "chan_" + uuid.NewString()
 	b, _ := json.Marshal(config)
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO notification_channels(id, type, config, enabled) VALUES(?,?,?,1)`, id, typ, string(b))
+		`INSERT INTO notification_channels(id, name, type, config, enabled) VALUES(?,?,?,?,1)`, id, name, typ, string(b))
 	return id, err
+}
+
+// Update edits a channel's name/enabled and, when config is non-nil, its config.
+func (s *Service) Update(ctx context.Context, id, name string, enabled bool, config map[string]string) error {
+	en := 0
+	if enabled {
+		en = 1
+	}
+	if config != nil {
+		b, _ := json.Marshal(config)
+		_, err := s.db.ExecContext(ctx,
+			`UPDATE notification_channels SET name=?, enabled=?, config=? WHERE id=?`, name, en, string(b), id)
+		return err
+	}
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE notification_channels SET name=?, enabled=? WHERE id=?`, name, en, id)
+	return err
 }
 
 func (s *Service) Delete(ctx context.Context, id string) error {
@@ -82,9 +100,24 @@ func (s *Service) Delete(ctx context.Context, id string) error {
 	return err
 }
 
-// Notify delivers p to all enabled channels (best-effort, logged on failure).
-func (s *Service) Notify(ctx context.Context, p Payload) {
-	rows, err := s.db.QueryContext(ctx, `SELECT type, config FROM notification_channels WHERE enabled=1`)
+// Notify delivers p to the given enabled channels (best-effort, logged on
+// failure). When channelIDs is empty it falls back to ALL enabled channels, so
+// callers with no routing configured keep the original global fan-out behavior.
+func (s *Service) Notify(ctx context.Context, channelIDs []string, p Payload) {
+	q := `SELECT type, config FROM notification_channels WHERE enabled=1`
+	var args []any
+	if len(channelIDs) > 0 {
+		placeholders := make([]byte, 0, len(channelIDs)*2)
+		for i, id := range channelIDs {
+			if i > 0 {
+				placeholders = append(placeholders, ',')
+			}
+			placeholders = append(placeholders, '?')
+			args = append(args, id)
+		}
+		q += " AND id IN (" + string(placeholders) + ")"
+	}
+	rows, err := s.db.QueryContext(ctx, q, args...)
 	if err != nil {
 		log.Printf("notify: list channels: %v", err)
 		return

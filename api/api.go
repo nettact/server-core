@@ -84,6 +84,7 @@ func Router(d Deps) http.Handler {
 			r.Get("/agents/{id}/metrics", d.handleAgentMetrics)
 			r.Get("/agents/{id}/latest", d.handleAgentLatest)
 			r.Get("/agents/{id}/series", d.handleAgentSeries)
+			r.Get("/agents/{id}/status-history", d.handleAgentStatusHistory)
 			r.Get("/enrollment-tokens", d.handleListTokens)
 			r.Post("/enrollment-tokens", d.handleCreateToken)
 			r.Get("/sites/{id}/targets", d.handleListTargets)
@@ -93,10 +94,19 @@ func Router(d Deps) http.Handler {
 			r.Get("/incidents", d.handleListIncidents)
 			r.Get("/incidents/{id}/timeline", d.handleTimeline)
 			r.Get("/alerts", d.handleListAlerts)
-			r.Get("/rules", d.handleListRules)
+			// Alarm rules are bound to a target; templates are reusable presets.
+			r.Get("/rule-templates", d.handleListTemplates)
+			r.Post("/rule-templates", d.handleCreateTemplate)
+			r.Put("/rule-templates/{id}", d.handleUpdateRule)
+			r.Delete("/rule-templates/{id}", d.handleDeleteRule)
+			r.Get("/targets/{id}/rules", d.handleListTargetRules)
+			r.Post("/targets/{id}/rules", d.handleCreateTargetRule)
+			r.Post("/targets/{id}/apply-template", d.handleApplyTemplate)
 			r.Put("/rules/{id}", d.handleUpdateRule)
+			r.Delete("/rules/{id}", d.handleDeleteRule)
 			r.Get("/channels", d.handleListChannels)
 			r.Post("/channels", d.handleCreateChannel)
+			r.Put("/channels/{id}", d.handleUpdateChannel)
 			r.Delete("/channels/{id}", d.handleDeleteChannel)
 		})
 	})
@@ -487,8 +497,22 @@ func (d Deps) handleListAlerts(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, alerts)
 }
 
-func (d Deps) handleListRules(w http.ResponseWriter, r *http.Request) {
-	rs, err := d.Rules.List(r.Context(), siteParam(r))
+// ---- alarm rules & templates ----
+
+func (d Deps) handleListTemplates(w http.ResponseWriter, r *http.Request) {
+	ts, err := d.Rules.ListTemplates(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if ts == nil {
+		ts = []rules.Rule{}
+	}
+	writeJSON(w, http.StatusOK, ts)
+}
+
+func (d Deps) handleListTargetRules(w http.ResponseWriter, r *http.Request) {
+	rs, err := d.Rules.ListForTarget(r.Context(), chi.URLParam(r, "id"))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -499,38 +523,95 @@ func (d Deps) handleListRules(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, rs)
 }
 
-func (d Deps) handleUpdateRule(w http.ResponseWriter, r *http.Request) {
-	var body struct {
-		Enabled    *bool    `json:"enabled"`
-		Comparator string   `json:"comparator"`
-		Threshold  *float64 `json:"threshold"`
-		ForSeconds *int     `json:"for_seconds"`
-	}
-	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&body); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid body")
+func (d Deps) handleCreateTemplate(w http.ResponseWriter, r *http.Request) {
+	rule, ok := decodeRule(w, r)
+	if !ok {
 		return
 	}
-	id := chi.URLParam(r, "id")
-	ctx := r.Context()
-	if body.Enabled != nil {
-		if err := d.Rules.SetEnabled(ctx, id, *body.Enabled); err != nil {
-			writeError(w, http.StatusInternalServerError, err.Error())
-			return
-		}
+	id, err := d.Rules.CreateTemplate(r.Context(), siteParam(r), rule)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
 	}
-	if body.Comparator != "" && body.Threshold != nil {
-		fs := 0
-		if body.ForSeconds != nil {
-			fs = *body.ForSeconds
-		}
-		if err := d.Rules.UpdateThreshold(ctx, id, body.Comparator, *body.Threshold, fs); err != nil {
-			writeError(w, http.StatusInternalServerError, err.Error())
-			return
-		}
+	d.Audit.Log(r.Context(), "admin", "rule_template.create", id, rule.Name)
+	writeJSON(w, http.StatusOK, map[string]string{"id": id})
+}
+
+func (d Deps) handleCreateTargetRule(w http.ResponseWriter, r *http.Request) {
+	rule, ok := decodeRule(w, r)
+	if !ok {
+		return
 	}
-	d.Audit.Log(ctx, "admin", "rule.update", id, "")
+	probeTaskID := chi.URLParam(r, "id")
+	id, err := d.Rules.CreateForTarget(r.Context(), siteParam(r), probeTaskID, rule)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	d.Audit.Log(r.Context(), "admin", "rule.create", id, probeTaskID)
+	writeJSON(w, http.StatusOK, map[string]string{"id": id})
+}
+
+func (d Deps) handleApplyTemplate(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		TemplateID string `json:"template_id"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&body); err != nil || body.TemplateID == "" {
+		writeError(w, http.StatusBadRequest, "template_id required")
+		return
+	}
+	probeTaskID := chi.URLParam(r, "id")
+	id, err := d.Rules.ApplyTemplate(r.Context(), body.TemplateID, probeTaskID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	d.Audit.Log(r.Context(), "admin", "rule.apply_template", id, probeTaskID)
+	writeJSON(w, http.StatusOK, map[string]string{"id": id})
+}
+
+func (d Deps) handleUpdateRule(w http.ResponseWriter, r *http.Request) {
+	rule, ok := decodeRule(w, r)
+	if !ok {
+		return
+	}
+	rule.ID = chi.URLParam(r, "id")
+	if err := d.Rules.Update(r.Context(), rule); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	d.Audit.Log(r.Context(), "admin", "rule.update", rule.ID, "")
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
+
+func (d Deps) handleDeleteRule(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	if err := d.Rules.Delete(r.Context(), id); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	d.Audit.Log(r.Context(), "admin", "rule.delete", id, "")
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+// decodeRule parses a rules.Rule from the request body, applying light defaults.
+func decodeRule(w http.ResponseWriter, r *http.Request) (rules.Rule, bool) {
+	var rule rules.Rule
+	if err := json.NewDecoder(io.LimitReader(r.Body, 8192)).Decode(&rule); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid rule body")
+		return rules.Rule{}, false
+	}
+	if rule.Name == "" || rule.MetricKind == "" || rule.Comparator == "" {
+		writeError(w, http.StatusBadRequest, "name, metric_kind and comparator are required")
+		return rules.Rule{}, false
+	}
+	if rule.Severity == "" {
+		rule.Severity = "warn"
+	}
+	return rule, true
+}
+
+// ---- notification channels ----
 
 func (d Deps) handleListChannels(w http.ResponseWriter, r *http.Request) {
 	chans, err := d.Notification.List(r.Context())
@@ -546,6 +627,7 @@ func (d Deps) handleListChannels(w http.ResponseWriter, r *http.Request) {
 
 func (d Deps) handleCreateChannel(w http.ResponseWriter, r *http.Request) {
 	var body struct {
+		Name   string            `json:"name"`
 		Type   string            `json:"type"`
 		Config map[string]string `json:"config"`
 	}
@@ -553,13 +635,32 @@ func (d Deps) handleCreateChannel(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "type must be webhook or email")
 		return
 	}
-	id, err := d.Notification.Create(r.Context(), body.Type, body.Config)
+	id, err := d.Notification.Create(r.Context(), body.Name, body.Type, body.Config)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	d.Audit.Log(r.Context(), "admin", "channel.create", body.Type, "")
+	d.Audit.Log(r.Context(), "admin", "channel.create", body.Type, body.Name)
 	writeJSON(w, http.StatusOK, map[string]string{"id": id})
+}
+
+func (d Deps) handleUpdateChannel(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Name    string            `json:"name"`
+		Enabled bool              `json:"enabled"`
+		Config  map[string]string `json:"config"` // nil/omitted = keep existing
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 8192)).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid body")
+		return
+	}
+	id := chi.URLParam(r, "id")
+	if err := d.Notification.Update(r.Context(), id, body.Name, body.Enabled, body.Config); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	d.Audit.Log(r.Context(), "admin", "channel.update", id, body.Name)
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
 func (d Deps) handleDeleteChannel(w http.ResponseWriter, r *http.Request) {
@@ -568,6 +669,18 @@ func (d Deps) handleDeleteChannel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (d Deps) handleAgentStatusHistory(w http.ResponseWriter, r *http.Request) {
+	hist, err := d.Registry.StatusHistory(r.Context(), chi.URLParam(r, "id"))
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if hist == nil {
+		hist = []registry.StatusEvent{}
+	}
+	writeJSON(w, http.StatusOK, hist)
 }
 
 func (d Deps) handleHealthz(w http.ResponseWriter, r *http.Request) {

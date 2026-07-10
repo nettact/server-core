@@ -141,6 +141,11 @@ func (s *Service) Enroll(ctx context.Context, req enroll.EnrollRequest) (enroll.
 		`UPDATE enrollment_tokens SET used_at=? WHERE token_hash=?`, now, sha256hex(req.EnrollmentToken)); err != nil {
 		return enroll.EnrollResponse{}, err
 	}
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO agent_status_history(id, agent_id, status, changed_at) VALUES(?,?,'online',?)`,
+		"ash_"+uuid.NewString(), agentID, now); err != nil {
+		return enroll.EnrollResponse{}, err
+	}
 	if err := tx.Commit(); err != nil {
 		return enroll.EnrollResponse{}, err
 	}
