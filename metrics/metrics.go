@@ -219,6 +219,65 @@ func (s *Store) Stats(ctx context.Context) (Stats, error) {
 	return st, nil
 }
 
+// SeriesInfo describes one stored series (agent + kind + target), used to
+// populate the history browser's selectors independently of recent activity.
+type SeriesInfo struct {
+	Kind   string `json:"kind"`
+	Target string `json:"target"`
+	Layer  string `json:"layer"`
+	Unit   string `json:"unit"`
+}
+
+// ListSeries returns every series recorded for an agent (from the dictionary,
+// regardless of how recently it reported) ordered by kind then target.
+func (s *Store) ListSeries(ctx context.Context, agentID string) ([]SeriesInfo, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT kind, COALESCE(target,''), COALESCE(layer,''), COALESCE(unit,'')
+		FROM series WHERE agent_id=? ORDER BY kind, target`, agentID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []SeriesInfo
+	for rows.Next() {
+		var si SeriesInfo
+		if err := rows.Scan(&si.Kind, &si.Target, &si.Layer, &si.Unit); err != nil {
+			return nil, err
+		}
+		out = append(out, si)
+	}
+	return out, rows.Err()
+}
+
+// LatestSnapshot returns the newest sample per series for an agent (all kinds)
+// within the sinceUnix lower bound — one point per target instead of a full
+// range. This backs the dashboard's "current status" view, replacing several
+// wide range queries with a single cheap read. Relies on SQLite's documented
+// bare-column-follows-MAX behaviour over the clustered (series_id, ts) key.
+func (s *Store) LatestSnapshot(ctx context.Context, agentID string, sinceUnix int64) ([]Point, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT s.kind, COALESCE(s.target,''), COALESCE(s.layer,''), COALESCE(s.unit,''), sm.value, MAX(sm.ts)
+		FROM series s JOIN samples sm ON sm.series_id = s.id
+		WHERE s.agent_id=? AND sm.ts >= ?
+		GROUP BY s.id
+		ORDER BY s.kind, s.target`, agentID, sinceUnix)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Point
+	for rows.Next() {
+		var p Point
+		var tsUnix int64
+		if err := rows.Scan(&p.Kind, &p.Target, &p.Layer, &p.Unit, &p.Value, &tsUnix); err != nil {
+			return nil, err
+		}
+		p.TS = time.Unix(tsUnix, 0).UTC()
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
 // TargetValue is the latest value of a series (for the rule engine).
 type TargetValue struct {
 	Target string

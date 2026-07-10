@@ -82,6 +82,8 @@ func Router(d Deps) http.Handler {
 			r.Get("/agents", d.handleListAgents)
 			r.Get("/agents/{id}", d.handleGetAgent)
 			r.Get("/agents/{id}/metrics", d.handleAgentMetrics)
+			r.Get("/agents/{id}/latest", d.handleAgentLatest)
+			r.Get("/agents/{id}/series", d.handleAgentSeries)
 			r.Get("/enrollment-tokens", d.handleListTokens)
 			r.Post("/enrollment-tokens", d.handleCreateToken)
 			r.Get("/sites/{id}/targets", d.handleListTargets)
@@ -306,6 +308,41 @@ func (d Deps) handleAgentMetrics(w http.ResponseWriter, r *http.Request) {
 		points = []metrics.Point{}
 	}
 	writeJSON(w, http.StatusOK, points)
+}
+
+// handleAgentLatest returns the newest value per series (one point per target)
+// so the dashboard can render current status without pulling full ranges.
+// The lookback window defaults to 2h and is overridable via ?since_seconds.
+func (d Deps) handleAgentLatest(w http.ResponseWriter, r *http.Request) {
+	since := time.Now().Unix() - 2*3600
+	if s := r.URL.Query().Get("since_seconds"); s != "" {
+		if n, err := strconv.Atoi(s); err == nil && n > 0 {
+			since = time.Now().Unix() - int64(n)
+		}
+	}
+	points, err := d.Metrics.LatestSnapshot(r.Context(), chi.URLParam(r, "id"), since)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if points == nil {
+		points = []metrics.Point{}
+	}
+	writeJSON(w, http.StatusOK, points)
+}
+
+// handleAgentSeries lists every series recorded for an agent, so the history
+// browser can offer a target selector regardless of recent activity.
+func (d Deps) handleAgentSeries(w http.ResponseWriter, r *http.Request) {
+	series, err := d.Metrics.ListSeries(r.Context(), chi.URLParam(r, "id"))
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if series == nil {
+		series = []metrics.SeriesInfo{}
+	}
+	writeJSON(w, http.StatusOK, series)
 }
 
 func (d Deps) handleListSites(w http.ResponseWriter, r *http.Request) {
