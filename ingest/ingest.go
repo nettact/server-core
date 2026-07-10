@@ -1,6 +1,8 @@
 // Package ingest receives, validates, dedups and persists telemetry packets —
 // the heart of the ingest loop (architecture §3.3 / §5.1). Dedup is on
 // (agent_id, sequence): a replayed batch is acknowledged but not re-stored.
+// Metric samples go to the time-series store (package metrics); events and
+// inventory are written here.
 package ingest
 
 import (
@@ -12,6 +14,7 @@ import (
 	"github.com/nettact/protocol"
 	"github.com/nettact/protocol/telemetry"
 	"github.com/nettact/server-core/eventbus"
+	"github.com/nettact/server-core/metrics"
 	"github.com/nettact/server-core/store"
 )
 
@@ -23,12 +26,13 @@ type Ack struct {
 }
 
 type Service struct {
-	db  *store.DB
-	bus *eventbus.Bus
+	db      *store.DB
+	bus     *eventbus.Bus
+	metrics *metrics.Store
 }
 
-func New(db *store.DB, bus *eventbus.Bus) *Service {
-	return &Service{db: db, bus: bus}
+func New(db *store.DB, bus *eventbus.Bus, m *metrics.Store) *Service {
+	return &Service{db: db, bus: bus, metrics: m}
 }
 
 // Ingest stores one telemetry packet idempotently and returns the ack watermark.
@@ -37,6 +41,15 @@ func (s *Service) Ingest(ctx context.Context, agentID, siteID string, pkt teleme
 		return Ack{}, err
 	}
 	now := time.Now().UTC()
+
+	// Resolve series ids before opening the tx (SQLite is single-connection).
+	var seriesIDs map[string]int64
+	if len(pkt.Metrics) > 0 {
+		var err error
+		if seriesIDs, err = s.metrics.EnsureSeries(ctx, agentID, siteID, pkt.Metrics); err != nil {
+			return Ack{}, err
+		}
+	}
 
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -59,13 +72,8 @@ func (s *Service) Ingest(ctx context.Context, agentID, siteID string, pkt teleme
 	affected, _ := res.RowsAffected()
 
 	if affected > 0 {
-		for _, m := range pkt.Metrics {
-			if _, err := tx.ExecContext(ctx,
-				`INSERT INTO metrics(agent_id, site_id, ts, kind, target, layer, value, unit, labels)
-				 VALUES(?,?,?,?,?,?,?,?,?)`,
-				agentID, siteID, m.TS.UTC(), string(m.Kind), m.Target, string(m.Layer), m.Value, m.Unit, encodeMap(m.Labels)); err != nil {
-				return Ack{}, err
-			}
+		if err := s.metrics.InsertSamples(ctx, tx, agentID, seriesIDs, pkt.Metrics); err != nil {
+			return Ack{}, err
 		}
 		for _, e := range pkt.Events {
 			if _, err := tx.ExecContext(ctx,

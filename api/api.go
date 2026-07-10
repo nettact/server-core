@@ -28,6 +28,7 @@ import (
 	"github.com/nettact/server-core/incident"
 	"github.com/nettact/server-core/ingest"
 	"github.com/nettact/server-core/inventory"
+	"github.com/nettact/server-core/metrics"
 	"github.com/nettact/server-core/notification"
 	"github.com/nettact/server-core/registry"
 	"github.com/nettact/server-core/rules"
@@ -41,6 +42,7 @@ type Deps struct {
 	Identity     *identity.Service
 	Registry     *registry.Service
 	Ingest       *ingest.Service
+	Metrics      *metrics.Store
 	Config       *config.Service
 	Site         *site.Service
 	Inventory    *inventory.Service
@@ -75,6 +77,7 @@ func Router(d Deps) http.Handler {
 			r.Post("/auth/logout", d.handleLogout)
 			r.Get("/auth/me", d.handleMe)
 			r.Get("/quota", d.handleQuota)
+			r.Get("/stats", d.handleStats)
 			r.Get("/sites", d.handleListSites)
 			r.Get("/agents", d.handleListAgents)
 			r.Get("/agents/{id}", d.handleGetAgent)
@@ -83,6 +86,7 @@ func Router(d Deps) http.Handler {
 			r.Post("/enrollment-tokens", d.handleCreateToken)
 			r.Get("/sites/{id}/targets", d.handleListTargets)
 			r.Put("/sites/{id}/targets", d.handleSetTargets)
+			r.Post("/sites/{id}/purge-target", d.handlePurgeTarget)
 			r.Get("/sites/{id}/devices", d.handleListDevices)
 			r.Get("/incidents", d.handleListIncidents)
 			r.Get("/incidents/{id}/timeline", d.handleTimeline)
@@ -247,6 +251,15 @@ func (d Deps) handleQuota(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]int{"used": used, "max": d.Registry.MaxAgents()})
 }
 
+func (d Deps) handleStats(w http.ResponseWriter, r *http.Request) {
+	st, err := d.Metrics.Stats(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, st)
+}
+
 func (d Deps) handleListAgents(w http.ResponseWriter, r *http.Request) {
 	agents, err := d.Registry.List(r.Context())
 	if err != nil {
@@ -269,7 +282,7 @@ func (d Deps) handleGetAgent(w http.ResponseWriter, r *http.Request) {
 }
 
 func (d Deps) handleAgentMetrics(w http.ResponseWriter, r *http.Request) {
-	q := ingest.MetricQuery{
+	q := metrics.Query{
 		AgentID: chi.URLParam(r, "id"),
 		Kind:    r.URL.Query().Get("kind"),
 		Target:  r.URL.Query().Get("target"),
@@ -281,18 +294,18 @@ func (d Deps) handleAgentMetrics(w http.ResponseWriter, r *http.Request) {
 	}
 	if s := r.URL.Query().Get("since_seconds"); s != "" {
 		if n, err := strconv.Atoi(s); err == nil && n > 0 {
-			q.Since = time.Now().UTC().Add(-time.Duration(n) * time.Second)
+			q.SinceUnix = time.Now().Unix() - int64(n)
 		}
 	}
-	samples, err := d.Ingest.QueryMetrics(r.Context(), q)
+	points, err := d.Metrics.Query(r.Context(), q)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	if samples == nil {
-		samples = []ingest.Sample{}
+	if points == nil {
+		points = []metrics.Point{}
 	}
-	writeJSON(w, http.StatusOK, samples)
+	writeJSON(w, http.StatusOK, points)
 }
 
 func (d Deps) handleListSites(w http.ResponseWriter, r *http.Request) {
@@ -369,6 +382,24 @@ func (d Deps) handleSetTargets(w http.ResponseWriter, r *http.Request) {
 	}
 	d.Audit.Log(r.Context(), "admin", "monitoring.set_targets", siteID, strconv.Itoa(len(body.Targets))+" targets")
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (d Deps) handlePurgeTarget(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Target string `json:"target"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&body); err != nil || body.Target == "" {
+		writeError(w, http.StatusBadRequest, "target required")
+		return
+	}
+	siteID := chi.URLParam(r, "id")
+	n, err := d.Metrics.PurgeTarget(r.Context(), siteID, body.Target)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	d.Audit.Log(r.Context(), "admin", "metrics.purge_target", body.Target, strconv.Itoa(n)+" series")
+	writeJSON(w, http.StatusOK, map[string]int{"purged_series": n})
 }
 
 func (d Deps) handleListDevices(w http.ResponseWriter, r *http.Request) {

@@ -12,6 +12,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/nettact/server-core/alert"
+	"github.com/nettact/server-core/metrics"
 	"github.com/nettact/server-core/store"
 )
 
@@ -30,12 +31,13 @@ type Rule struct {
 }
 
 type Service struct {
-	db     *store.DB
-	alerts *alert.Service
+	db      *store.DB
+	alerts  *alert.Service
+	metrics *metrics.Store
 }
 
-func New(db *store.DB, alerts *alert.Service) *Service {
-	return &Service{db: db, alerts: alerts}
+func New(db *store.DB, alerts *alert.Service, m *metrics.Store) *Service {
+	return &Service{db: db, alerts: alerts, metrics: m}
 }
 
 // SeedDefaults installs the standard §4 layered rules for a site if it has none.
@@ -105,45 +107,25 @@ func (s *Service) UpdateThreshold(ctx context.Context, id, comparator string, th
 }
 
 // EvaluateAgent runs all of the site's enabled rules against this agent's latest
-// metrics and updates alert state. Called on each telemetry.ingested event.
+// metric per matching series and updates alert state. Called on each
+// telemetry.ingested event.
 func (s *Service) EvaluateAgent(ctx context.Context, agentID, siteID string) error {
 	rs, err := s.List(ctx, siteID)
 	if err != nil {
 		return err
 	}
-	since := time.Now().UTC().Add(-5 * time.Minute)
+	sinceUnix := time.Now().Add(-5 * time.Minute).Unix()
 	for _, r := range rs {
 		if !r.Enabled {
 			continue
 		}
-		// latest value per matching target (SQLite: bare columns follow MAX(ts))
-		rows, err := s.db.QueryContext(ctx, `
-			SELECT target, value, MAX(ts) FROM metrics
-			WHERE agent_id=? AND kind=? AND target GLOB ? AND ts > ?
-			GROUP BY target`, agentID, r.MetricKind, r.TargetGlob, since)
+		found, err := s.metrics.LatestPerSeries(ctx, agentID, r.MetricKind, r.TargetGlob, sinceUnix)
 		if err != nil {
 			return err
 		}
-		type tv struct {
-			target string
-			value  float64
-		}
-		var found []tv
-		for rows.Next() {
-			var target string
-			var value float64
-			var maxTS string // MAX(ts) returns a string from the driver; unused
-			if err := rows.Scan(&target, &value, &maxTS); err != nil {
-				rows.Close()
-				return err
-			}
-			found = append(found, tv{target, value})
-		}
-		rows.Close()
-
 		rv := alert.RuleView{ID: r.ID, Name: r.Name, Layer: r.Layer, Severity: r.Severity, ForSeconds: r.ForSeconds}
 		for _, f := range found {
-			if err := s.alerts.Update(ctx, rv, agentID, siteID, f.target, compare(f.value, r.Comparator, r.Threshold), f.value); err != nil {
+			if err := s.alerts.Update(ctx, rv, agentID, siteID, f.Target, compare(f.Value, r.Comparator, r.Threshold), f.Value); err != nil {
 				return err
 			}
 		}

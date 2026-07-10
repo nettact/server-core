@@ -19,7 +19,7 @@ type DB struct {
 // pooled connection gets them.
 func Open(path string) (*DB, error) {
 	dsn := path + "?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)" +
-		"&_pragma=foreign_keys(ON)&_pragma=synchronous(NORMAL)"
+		"&_pragma=foreign_keys(ON)&_pragma=synchronous(NORMAL)&_pragma=auto_vacuum(INCREMENTAL)"
 	sqldb, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
