@@ -1,0 +1,163 @@
+// Package notification delivers incident events to configured channels
+// (webhook + SMTP). Delivery is best-effort and must never block or fail the
+// incident pipeline.
+package notification
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+	"net/http"
+	"net/smtp"
+	"time"
+
+	"github.com/google/uuid"
+
+	"github.com/nettact/server-core/store"
+)
+
+// Payload is the incident event delivered to channels.
+type Payload struct {
+	Event          string    `json:"event"` // incident.opened | incident.updated | incident.resolved
+	IncidentID     string    `json:"incident_id"`
+	SiteID         string    `json:"site_id"`
+	SuspectedLayer string    `json:"suspected_layer"`
+	Severity       string    `json:"severity"`
+	State          string    `json:"state"`
+	Summary        string    `json:"summary"`
+	At             time.Time `json:"at"`
+}
+
+// Channel is a notification destination.
+type Channel struct {
+	ID      string            `json:"id"`
+	Type    string            `json:"type"` // "webhook" | "email"
+	Config  map[string]string `json:"config"`
+	Enabled bool              `json:"enabled"`
+}
+
+type Service struct {
+	db     *store.DB
+	client *http.Client
+}
+
+func New(db *store.DB) *Service {
+	return &Service{db: db, client: &http.Client{Timeout: 10 * time.Second}}
+}
+
+func (s *Service) List(ctx context.Context) ([]Channel, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id, type, config, enabled FROM notification_channels ORDER BY type`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Channel
+	for rows.Next() {
+		var c Channel
+		var cfg string
+		var enabled int
+		if err := rows.Scan(&c.ID, &c.Type, &cfg, &enabled); err != nil {
+			return nil, err
+		}
+		_ = json.Unmarshal([]byte(cfg), &c.Config)
+		c.Enabled = enabled == 1
+		out = append(out, redact(c))
+	}
+	return out, rows.Err()
+}
+
+// Create adds a channel. config is stored as JSON.
+func (s *Service) Create(ctx context.Context, typ string, config map[string]string) (string, error) {
+	id := "chan_" + uuid.NewString()
+	b, _ := json.Marshal(config)
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO notification_channels(id, type, config, enabled) VALUES(?,?,?,1)`, id, typ, string(b))
+	return id, err
+}
+
+func (s *Service) Delete(ctx context.Context, id string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM notification_channels WHERE id=?`, id)
+	return err
+}
+
+// Notify delivers p to all enabled channels (best-effort, logged on failure).
+func (s *Service) Notify(ctx context.Context, p Payload) {
+	rows, err := s.db.QueryContext(ctx, `SELECT type, config FROM notification_channels WHERE enabled=1`)
+	if err != nil {
+		log.Printf("notify: list channels: %v", err)
+		return
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var typ, cfg string
+		if err := rows.Scan(&typ, &cfg); err != nil {
+			continue
+		}
+		var config map[string]string
+		_ = json.Unmarshal([]byte(cfg), &config)
+		switch typ {
+		case "webhook":
+			s.sendWebhook(ctx, config["url"], p)
+		case "email":
+			s.sendEmail(config, p)
+		}
+	}
+}
+
+func (s *Service) sendWebhook(ctx context.Context, url string, p Payload) {
+	if url == "" {
+		return
+	}
+	body, _ := json.Marshal(p)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := s.client.Do(req)
+	if err != nil {
+		log.Printf("notify webhook %s: %v", url, err)
+		return
+	}
+	resp.Body.Close()
+}
+
+func (s *Service) sendEmail(cfg map[string]string, p Payload) {
+	host, from, to := cfg["host"], cfg["from"], cfg["to"]
+	if host == "" || from == "" || to == "" {
+		return
+	}
+	port := cfg["port"]
+	if port == "" {
+		port = "587"
+	}
+	subject := fmt.Sprintf("[NetTact] %s: %s", p.Event, p.Summary)
+	msg := fmt.Sprintf("From: %s\r\nTo: %s\r\nSubject: %s\r\n\r\n%s\r\nSite: %s\r\nLayer: %s\r\nSeverity: %s\r\nAt: %s\r\n",
+		from, to, subject, p.Summary, p.SiteID, p.SuspectedLayer, p.Severity, p.At.Format(time.RFC3339))
+	var auth smtp.Auth
+	if cfg["username"] != "" {
+		auth = smtp.PlainAuth("", cfg["username"], cfg["password"], host)
+	}
+	if err := smtp.SendMail(host+":"+port, auth, from, []string{to}, []byte(msg)); err != nil {
+		log.Printf("notify email: %v", err)
+	}
+}
+
+// redact hides secrets when listing channels for the UI.
+func redact(c Channel) Channel {
+	if c.Config == nil {
+		return c
+	}
+	out := make(map[string]string, len(c.Config))
+	for k, v := range c.Config {
+		if k == "password" && v != "" {
+			out[k] = "••••••"
+		} else {
+			out[k] = v
+		}
+	}
+	c.Config = out
+	return c
+}

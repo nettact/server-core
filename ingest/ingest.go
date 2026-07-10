@@ -88,7 +88,7 @@ func (s *Service) Ingest(ctx context.Context, agentID, siteID string, pkt teleme
 	committed = true
 
 	if affected > 0 && s.bus != nil {
-		s.bus.Publish(eventbus.TopicTelemetryIngested, agentID)
+		s.bus.Publish(eventbus.TopicTelemetryIngested, eventbus.TelemetryIngested{AgentID: agentID, SiteID: siteID})
 	}
 
 	var high sql.NullInt64

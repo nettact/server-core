@@ -21,12 +21,16 @@ import (
 	pcfg "github.com/nettact/protocol/config"
 	"github.com/nettact/protocol/enroll"
 	"github.com/nettact/protocol/telemetry"
+	"github.com/nettact/server-core/alert"
 	"github.com/nettact/server-core/audit"
 	"github.com/nettact/server-core/config"
 	"github.com/nettact/server-core/identity"
+	"github.com/nettact/server-core/incident"
 	"github.com/nettact/server-core/ingest"
 	"github.com/nettact/server-core/inventory"
+	"github.com/nettact/server-core/notification"
 	"github.com/nettact/server-core/registry"
+	"github.com/nettact/server-core/rules"
 	"github.com/nettact/server-core/site"
 )
 
@@ -40,9 +44,14 @@ type Deps struct {
 	Config       *config.Service
 	Site         *site.Service
 	Inventory    *inventory.Service
+	Rules        *rules.Service
+	Alert        *alert.Service
+	Incident     *incident.Service
+	Notification *notification.Service
 	Audit        *audit.Service
-	Dev          bool // relax CORS for the Vite origin
-	SecureCookie bool // set Secure on the session cookie (production/HTTPS)
+	SPA          http.Handler // optional embedded web UI (served for non-/api routes)
+	Dev          bool         // relax CORS for the Vite origin
+	SecureCookie bool         // set Secure on the session cookie (production/HTTPS)
 }
 
 func Router(d Deps) http.Handler {
@@ -75,9 +84,29 @@ func Router(d Deps) http.Handler {
 			r.Get("/sites/{id}/targets", d.handleListTargets)
 			r.Put("/sites/{id}/targets", d.handleSetTargets)
 			r.Get("/sites/{id}/devices", d.handleListDevices)
+			r.Get("/incidents", d.handleListIncidents)
+			r.Get("/incidents/{id}/timeline", d.handleTimeline)
+			r.Get("/alerts", d.handleListAlerts)
+			r.Get("/rules", d.handleListRules)
+			r.Put("/rules/{id}", d.handleUpdateRule)
+			r.Get("/channels", d.handleListChannels)
+			r.Post("/channels", d.handleCreateChannel)
+			r.Delete("/channels/{id}", d.handleDeleteChannel)
 		})
 	})
+
+	// Embedded SPA (served for any non-/api path) when provided.
+	if d.SPA != nil {
+		r.Handle("/*", d.SPA)
+	}
 	return r
+}
+
+func siteParam(r *http.Request) string {
+	if s := r.URL.Query().Get("site"); s != "" {
+		return s
+	}
+	return site.DefaultSiteID
 }
 
 // ---- auth (UI session) ----
@@ -352,6 +381,125 @@ func (d Deps) handleListDevices(w http.ResponseWriter, r *http.Request) {
 		devices = []inventory.Device{}
 	}
 	writeJSON(w, http.StatusOK, devices)
+}
+
+func (d Deps) handleListIncidents(w http.ResponseWriter, r *http.Request) {
+	incs, err := d.Incident.List(r.Context(), siteParam(r))
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if incs == nil {
+		incs = []incident.Incident{}
+	}
+	writeJSON(w, http.StatusOK, incs)
+}
+
+func (d Deps) handleTimeline(w http.ResponseWriter, r *http.Request) {
+	tl, err := d.Incident.Timeline(r.Context(), chi.URLParam(r, "id"))
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if tl == nil {
+		tl = []incident.TimelineEntry{}
+	}
+	writeJSON(w, http.StatusOK, tl)
+}
+
+func (d Deps) handleListAlerts(w http.ResponseWriter, r *http.Request) {
+	alerts, err := d.Alert.ListActive(r.Context(), siteParam(r))
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if alerts == nil {
+		alerts = []alert.Alert{}
+	}
+	writeJSON(w, http.StatusOK, alerts)
+}
+
+func (d Deps) handleListRules(w http.ResponseWriter, r *http.Request) {
+	rs, err := d.Rules.List(r.Context(), siteParam(r))
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if rs == nil {
+		rs = []rules.Rule{}
+	}
+	writeJSON(w, http.StatusOK, rs)
+}
+
+func (d Deps) handleUpdateRule(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Enabled    *bool    `json:"enabled"`
+		Comparator string   `json:"comparator"`
+		Threshold  *float64 `json:"threshold"`
+		ForSeconds *int     `json:"for_seconds"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid body")
+		return
+	}
+	id := chi.URLParam(r, "id")
+	ctx := r.Context()
+	if body.Enabled != nil {
+		if err := d.Rules.SetEnabled(ctx, id, *body.Enabled); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	}
+	if body.Comparator != "" && body.Threshold != nil {
+		fs := 0
+		if body.ForSeconds != nil {
+			fs = *body.ForSeconds
+		}
+		if err := d.Rules.UpdateThreshold(ctx, id, body.Comparator, *body.Threshold, fs); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	}
+	d.Audit.Log(ctx, "admin", "rule.update", id, "")
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (d Deps) handleListChannels(w http.ResponseWriter, r *http.Request) {
+	chans, err := d.Notification.List(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if chans == nil {
+		chans = []notification.Channel{}
+	}
+	writeJSON(w, http.StatusOK, chans)
+}
+
+func (d Deps) handleCreateChannel(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Type   string            `json:"type"`
+		Config map[string]string `json:"config"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 8192)).Decode(&body); err != nil || (body.Type != "webhook" && body.Type != "email") {
+		writeError(w, http.StatusBadRequest, "type must be webhook or email")
+		return
+	}
+	id, err := d.Notification.Create(r.Context(), body.Type, body.Config)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	d.Audit.Log(r.Context(), "admin", "channel.create", body.Type, "")
+	writeJSON(w, http.StatusOK, map[string]string{"id": id})
+}
+
+func (d Deps) handleDeleteChannel(w http.ResponseWriter, r *http.Request) {
+	if err := d.Notification.Delete(r.Context(), chi.URLParam(r, "id")); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
 func (d Deps) handleHealthz(w http.ResponseWriter, r *http.Request) {

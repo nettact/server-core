@@ -16,6 +16,12 @@ const (
 	TopicIncidentUpdated   = "incident.updated"
 )
 
+// TelemetryIngested is the payload for TopicTelemetryIngested.
+type TelemetryIngested struct {
+	AgentID string
+	SiteID  string
+}
+
 // Message is one published event.
 type Message struct {
 	Topic   string
