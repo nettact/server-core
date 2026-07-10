@@ -1,8 +1,8 @@
 // Package rules is the deterministic threshold engine (architecture §9 layer 1:
-// rule-based diagnosis before any AI). Rules are now bound to a specific
-// monitoring target (probe_task) rather than matched by glob, and trigger after
-// a configurable number of CONSECUTIVE failures. A rule with is_template=1 is a
-// reusable preset (not evaluated) that can be applied onto a target.
+// rule-based diagnosis before any AI). Rules are bound to a specific monitoring
+// target (probe_task) rather than matched by glob, and trigger after a
+// configurable number of CONSECUTIVE failures. Each rule is configured directly
+// on its target.
 package rules
 
 import (
@@ -31,7 +31,6 @@ type Rule struct {
 	Layer         string   `json:"layer"`
 	Severity      string   `json:"severity"`
 	ChannelIDs    []string `json:"channel_ids"`
-	IsTemplate    bool     `json:"is_template"`
 	Enabled       bool     `json:"enabled"`
 }
 
@@ -45,85 +44,46 @@ func New(db *store.DB, alerts *alert.Service, m *metrics.Store) *Service {
 	return &Service{db: db, alerts: alerts, metrics: m}
 }
 
-// SeedDefaults installs the standard §4 layered rules as reusable TEMPLATES for
-// a site if it has none, so operators can quickly apply them onto targets.
-func (s *Service) SeedDefaults(ctx context.Context, siteID string) error {
-	var n int
-	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM alert_rules WHERE is_template=1`).Scan(&n); err != nil {
-		return err
-	}
-	if n > 0 {
-		return nil
-	}
-	defaults := []Rule{
-		{Name: "网关不可达", MetricKind: "probe.icmp.loss_pct", Comparator: "gte", Threshold: 50, FailThreshold: 3, Layer: "lan", Severity: "error"},
-		{Name: "公网目标不可达", MetricKind: "probe.icmp.loss_pct", Comparator: "gte", Threshold: 50, FailThreshold: 3, Layer: "internet", Severity: "error"},
-		{Name: "DNS 解析失败", MetricKind: "probe.dns.ok", Comparator: "lt", Threshold: 1, FailThreshold: 2, Layer: "dns", Severity: "warn"},
-		{Name: "HTTP 检测失败", MetricKind: "probe.http.ok", Comparator: "lt", Threshold: 1, FailThreshold: 2, Layer: "service", Severity: "warn"},
-	}
-	for _, r := range defaults {
-		if _, err := s.insert(ctx, siteID, r, "", true); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// insert writes a rule row (template or live). probeTaskID is "" for templates.
-func (s *Service) insert(ctx context.Context, siteID string, r Rule, probeTaskID string, isTemplate bool) (string, error) {
+// insert writes a live rule row bound to a probe_task. The legacy is_template
+// column is always written as 0 (templates were removed; rules are configured
+// per target).
+func (s *Service) insert(ctx context.Context, siteID string, r Rule, probeTaskID string) (string, error) {
 	id := "rule_" + uuid.NewString()
 	if r.FailThreshold < 1 {
 		r.FailThreshold = 1
 	}
 	chans, _ := json.Marshal(r.ChannelIDs)
-	tmpl, pt := 0, any(nil)
-	if isTemplate {
-		tmpl = 1
-	} else {
-		pt = probeTaskID
-	}
 	en := 1
-	if !r.Enabled && !isTemplate {
+	if !r.Enabled {
 		en = 0
 	}
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO alert_rules(id, site_id, probe_task_id, name, metric_kind, comparator, threshold,
 		                        fail_threshold, for_seconds, layer, severity, channel_ids, is_template, enabled)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		id, siteID, pt, r.Name, r.MetricKind, r.Comparator, r.Threshold,
-		r.FailThreshold, r.ForSeconds, r.Layer, r.Severity, string(chans), tmpl, en)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,0,?)`,
+		id, siteID, probeTaskID, r.Name, r.MetricKind, r.Comparator, r.Threshold,
+		r.FailThreshold, r.ForSeconds, r.Layer, r.Severity, string(chans), en)
 	return id, err
 }
 
 func scanRule(rows *sql.Rows) (Rule, error) {
 	var r Rule
 	var probeTask, chans string
-	var isTemplate, enabled int
+	var enabled int
 	if err := rows.Scan(&r.ID, &probeTask, &r.Name, &r.MetricKind, &r.Comparator, &r.Threshold,
-		&r.FailThreshold, &r.ForSeconds, &r.Layer, &r.Severity, &chans, &isTemplate, &enabled); err != nil {
+		&r.FailThreshold, &r.ForSeconds, &r.Layer, &r.Severity, &chans, &enabled); err != nil {
 		return Rule{}, err
 	}
 	r.ProbeTaskID = probeTask
 	if chans != "" {
 		_ = json.Unmarshal([]byte(chans), &r.ChannelIDs)
 	}
-	r.IsTemplate = isTemplate == 1
 	r.Enabled = enabled == 1
 	return r, nil
 }
 
 const ruleCols = `id, COALESCE(probe_task_id,''), name, metric_kind, comparator, threshold,
-	fail_threshold, for_seconds, COALESCE(layer,''), severity, COALESCE(channel_ids,''), is_template, enabled`
-
-// ListTemplates returns the reusable rule presets.
-func (s *Service) ListTemplates(ctx context.Context) ([]Rule, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT `+ruleCols+` FROM alert_rules WHERE is_template=1 ORDER BY name`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	return collectRules(rows)
-}
+	fail_threshold, for_seconds, COALESCE(layer,''), severity, COALESCE(channel_ids,''), enabled`
 
 // ListForTarget returns the live alarm rules bound to a probe_task.
 func (s *Service) ListForTarget(ctx context.Context, probeTaskID string) ([]Rule, error) {
@@ -148,37 +108,14 @@ func collectRules(rows *sql.Rows) ([]Rule, error) {
 	return out, rows.Err()
 }
 
-// CreateTemplate stores a new reusable preset.
-func (s *Service) CreateTemplate(ctx context.Context, siteID string, r Rule) (string, error) {
-	return s.insert(ctx, siteID, r, "", true)
-}
-
 // CreateForTarget stores a new live rule bound to a probe_task. New rules are
 // enabled by default so they start evaluating immediately.
 func (s *Service) CreateForTarget(ctx context.Context, siteID, probeTaskID string, r Rule) (string, error) {
 	r.Enabled = true
-	return s.insert(ctx, siteID, r, probeTaskID, false)
+	return s.insert(ctx, siteID, r, probeTaskID)
 }
 
-// ApplyTemplate copies a template's fields into a new live rule on a target.
-func (s *Service) ApplyTemplate(ctx context.Context, templateID, probeTaskID string) (string, error) {
-	var siteID string
-	row := s.db.QueryRowContext(ctx, `SELECT COALESCE(site_id,''), `+ruleCols+` FROM alert_rules WHERE id=? AND is_template=1`, templateID)
-	var r Rule
-	var probeTask, chans string
-	var isTemplate, enabled int
-	if err := row.Scan(&siteID, &r.ID, &probeTask, &r.Name, &r.MetricKind, &r.Comparator, &r.Threshold,
-		&r.FailThreshold, &r.ForSeconds, &r.Layer, &r.Severity, &chans, &isTemplate, &enabled); err != nil {
-		return "", err
-	}
-	if chans != "" {
-		_ = json.Unmarshal([]byte(chans), &r.ChannelIDs)
-	}
-	r.Enabled = true
-	return s.insert(ctx, siteID, r, probeTaskID, false)
-}
-
-// Update edits a rule's fields (works for both templates and live rules).
+// Update edits a live rule's fields.
 func (s *Service) Update(ctx context.Context, r Rule) error {
 	if r.FailThreshold < 1 {
 		r.FailThreshold = 1
@@ -206,7 +143,7 @@ func (s *Service) SetEnabled(ctx context.Context, id string, enabled bool) error
 	return err
 }
 
-// Delete removes a rule (template or live). Any alerts it produced are cleared
+// Delete removes a rule. Any alerts it produced are cleared
 // first — alerts.rule_id references alert_rules(id) with foreign keys ON, so a
 // bare rule delete would fail once the rule has ever fired.
 func (s *Service) Delete(ctx context.Context, id string) error {

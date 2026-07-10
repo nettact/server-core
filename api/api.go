@@ -94,14 +94,9 @@ func Router(d Deps) http.Handler {
 			r.Get("/incidents", d.handleListIncidents)
 			r.Get("/incidents/{id}/timeline", d.handleTimeline)
 			r.Get("/alerts", d.handleListAlerts)
-			// Alarm rules are bound to a target; templates are reusable presets.
-			r.Get("/rule-templates", d.handleListTemplates)
-			r.Post("/rule-templates", d.handleCreateTemplate)
-			r.Put("/rule-templates/{id}", d.handleUpdateRule)
-			r.Delete("/rule-templates/{id}", d.handleDeleteRule)
+			// Alarm rules are configured per monitoring target.
 			r.Get("/targets/{id}/rules", d.handleListTargetRules)
 			r.Post("/targets/{id}/rules", d.handleCreateTargetRule)
-			r.Post("/targets/{id}/apply-template", d.handleApplyTemplate)
 			r.Put("/rules/{id}", d.handleUpdateRule)
 			r.Delete("/rules/{id}", d.handleDeleteRule)
 			r.Get("/channels", d.handleListChannels)
@@ -497,19 +492,7 @@ func (d Deps) handleListAlerts(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, alerts)
 }
 
-// ---- alarm rules & templates ----
-
-func (d Deps) handleListTemplates(w http.ResponseWriter, r *http.Request) {
-	ts, err := d.Rules.ListTemplates(r.Context())
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	if ts == nil {
-		ts = []rules.Rule{}
-	}
-	writeJSON(w, http.StatusOK, ts)
-}
+// ---- alarm rules (per monitoring target) ----
 
 func (d Deps) handleListTargetRules(w http.ResponseWriter, r *http.Request) {
 	rs, err := d.Rules.ListForTarget(r.Context(), chi.URLParam(r, "id"))
@@ -521,20 +504,6 @@ func (d Deps) handleListTargetRules(w http.ResponseWriter, r *http.Request) {
 		rs = []rules.Rule{}
 	}
 	writeJSON(w, http.StatusOK, rs)
-}
-
-func (d Deps) handleCreateTemplate(w http.ResponseWriter, r *http.Request) {
-	rule, ok := decodeRule(w, r)
-	if !ok {
-		return
-	}
-	id, err := d.Rules.CreateTemplate(r.Context(), siteParam(r), rule)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	d.Audit.Log(r.Context(), "admin", "rule_template.create", id, rule.Name)
-	writeJSON(w, http.StatusOK, map[string]string{"id": id})
 }
 
 func (d Deps) handleCreateTargetRule(w http.ResponseWriter, r *http.Request) {
@@ -549,24 +518,6 @@ func (d Deps) handleCreateTargetRule(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	d.Audit.Log(r.Context(), "admin", "rule.create", id, probeTaskID)
-	writeJSON(w, http.StatusOK, map[string]string{"id": id})
-}
-
-func (d Deps) handleApplyTemplate(w http.ResponseWriter, r *http.Request) {
-	var body struct {
-		TemplateID string `json:"template_id"`
-	}
-	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&body); err != nil || body.TemplateID == "" {
-		writeError(w, http.StatusBadRequest, "template_id required")
-		return
-	}
-	probeTaskID := chi.URLParam(r, "id")
-	id, err := d.Rules.ApplyTemplate(r.Context(), body.TemplateID, probeTaskID)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	d.Audit.Log(r.Context(), "admin", "rule.apply_template", id, probeTaskID)
 	writeJSON(w, http.StatusOK, map[string]string{"id": id})
 }
 
