@@ -1,12 +1,14 @@
-// Package api exposes the HTTP surface (chi router + handlers). It lives in
-// server-core so the future cloud server can reuse the same handlers. Auth is
-// dev-open in M1 (any Bearer token accepted, agents auto-register); real
-// bearer-token verification and session login land in M2.
+// Package api exposes the HTTP surface (chi router + handlers), reusable by the
+// future cloud server. M2 adds real auth: a single-user session (HttpOnly
+// cookie) for the UI, ed25519 enrollment for agents, and bearer-token auth on
+// telemetry. Monitoring targets are edited here and pushed to agents via the
+// telemetry ack (config downlink).
 package api
 
 import (
 	"compress/gzip"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"strconv"
@@ -16,21 +18,31 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 
+	pcfg "github.com/nettact/protocol/config"
+	"github.com/nettact/protocol/enroll"
 	"github.com/nettact/protocol/telemetry"
+	"github.com/nettact/server-core/audit"
+	"github.com/nettact/server-core/config"
+	"github.com/nettact/server-core/identity"
 	"github.com/nettact/server-core/ingest"
 	"github.com/nettact/server-core/registry"
 	"github.com/nettact/server-core/site"
 )
 
+const sessionCookie = "nettact_session"
+
 // Deps are the services the HTTP layer needs.
 type Deps struct {
-	Ingest   *ingest.Service
-	Registry *registry.Service
-	Site     *site.Service
-	Dev      bool
+	Identity     *identity.Service
+	Registry     *registry.Service
+	Ingest       *ingest.Service
+	Config       *config.Service
+	Site         *site.Service
+	Audit        *audit.Service
+	Dev          bool // relax CORS for the Vite origin
+	SecureCookie bool // set Secure on the session cookie (production/HTTPS)
 }
 
-// Router builds the HTTP handler.
 func Router(d Deps) http.Handler {
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
@@ -40,19 +52,125 @@ func Router(d Deps) http.Handler {
 	}
 
 	r.Route("/api/v1", func(r chi.Router) {
+		// public / agent-facing
 		r.Get("/healthz", d.handleHealthz)
+		r.Post("/auth/login", d.handleLogin)
+		r.Post("/enroll", d.handleEnroll)
 		r.Post("/telemetry", d.handleTelemetry)
-		r.Get("/sites", d.handleListSites)
-		r.Get("/agents", d.handleListAgents)
-		r.Get("/agents/{id}", d.handleGetAgent)
-		r.Get("/agents/{id}/metrics", d.handleAgentMetrics)
+
+		// session-protected UI
+		r.Group(func(r chi.Router) {
+			r.Use(d.requireSession)
+			r.Post("/auth/logout", d.handleLogout)
+			r.Get("/auth/me", d.handleMe)
+			r.Get("/quota", d.handleQuota)
+			r.Get("/sites", d.handleListSites)
+			r.Get("/agents", d.handleListAgents)
+			r.Get("/agents/{id}", d.handleGetAgent)
+			r.Get("/agents/{id}/metrics", d.handleAgentMetrics)
+			r.Get("/enrollment-tokens", d.handleListTokens)
+			r.Post("/enrollment-tokens", d.handleCreateToken)
+			r.Get("/sites/{id}/targets", d.handleListTargets)
+			r.Put("/sites/{id}/targets", d.handleSetTargets)
+		})
 	})
 	return r
 }
 
-const maxPacketBytes = 8 << 20 // 8 MiB decompressed cap
+// ---- auth (UI session) ----
+
+func (d Deps) handleLogin(w http.ResponseWriter, r *http.Request) {
+	var body struct{ Username, Password string }
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid body")
+		return
+	}
+	u, err := d.Identity.Authenticate(r.Context(), body.Username, body.Password)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, "invalid credentials")
+		return
+	}
+	sid, exp, err := d.Identity.CreateSession(r.Context(), u.ID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name: sessionCookie, Value: sid, Path: "/",
+		HttpOnly: true, SameSite: http.SameSiteLaxMode, Secure: d.SecureCookie, Expires: exp,
+	})
+	d.Audit.Log(r.Context(), u.Username, "auth.login", "", "")
+	writeJSON(w, http.StatusOK, u)
+}
+
+func (d Deps) handleLogout(w http.ResponseWriter, r *http.Request) {
+	if c, err := r.Cookie(sessionCookie); err == nil {
+		_ = d.Identity.DeleteSession(r.Context(), c.Value)
+	}
+	http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: "", Path: "/", HttpOnly: true, MaxAge: -1})
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (d Deps) handleMe(w http.ResponseWriter, r *http.Request) {
+	u, _ := d.Identity.ValidateSession(r.Context(), cookieVal(r, sessionCookie))
+	writeJSON(w, http.StatusOK, u)
+}
+
+func (d Deps) requireSession(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, err := d.Identity.ValidateSession(r.Context(), cookieVal(r, sessionCookie)); err != nil {
+			writeError(w, http.StatusUnauthorized, "login required")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// ---- enrollment (agent-facing) ----
+
+func (d Deps) handleEnroll(w http.ResponseWriter, r *http.Request) {
+	var req enroll.EnrollRequest
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid enroll request")
+		return
+	}
+	resp, err := d.Registry.Enroll(r.Context(), req)
+	switch {
+	case errors.Is(err, registry.ErrQuota):
+		writeError(w, http.StatusForbidden, "agent quota reached (max_agents)")
+		return
+	case errors.Is(err, registry.ErrEnrollToken):
+		writeError(w, http.StatusUnauthorized, "invalid or expired enrollment token")
+		return
+	case errors.Is(err, registry.ErrSignature):
+		writeError(w, http.StatusBadRequest, "invalid signature")
+		return
+	case err != nil:
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	d.Audit.Log(r.Context(), resp.AgentID, "agent.enroll", resp.SiteID, req.Hostname)
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// ---- telemetry (agent-facing, bearer auth) ----
+
+const maxPacketBytes = 8 << 20
+
+type telemetryResponse struct {
+	HighestSequence uint64             `json:"highest_sequence"`
+	ServerTime      time.Time          `json:"server_time"`
+	ConfigVersion   int                `json:"config_version"`
+	DesiredState    *pcfg.DesiredState `json:"desired_state,omitempty"`
+}
 
 func (d Deps) handleTelemetry(w http.ResponseWriter, r *http.Request) {
+	agentID, siteID, err := d.Registry.AuthenticateAgent(r.Context(), bearer(r))
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, "invalid agent token")
+		return
+	}
+
 	var body io.Reader = http.MaxBytesReader(w, r.Body, maxPacketBytes)
 	if strings.EqualFold(r.Header.Get("Content-Encoding"), "gzip") {
 		gz, err := gzip.NewReader(body)
@@ -63,41 +181,38 @@ func (d Deps) handleTelemetry(w http.ResponseWriter, r *http.Request) {
 		defer gz.Close()
 		body = gz
 	}
-
 	var pkt telemetry.Packet
 	if err := json.NewDecoder(body).Decode(&pkt); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid packet json: "+err.Error())
 		return
 	}
-	if pkt.AgentID == "" {
-		writeError(w, http.StatusBadRequest, "missing agent_id")
-		return
-	}
 
 	ctx := r.Context()
-	siteID := pkt.SiteID
-	if siteID == "" {
-		siteID = site.DefaultSiteID
-	}
-	if ok, _ := d.Site.Exists(ctx, siteID); !ok {
-		siteID = site.DefaultSiteID
-	}
-
-	// Dev auto-registration; hostname/platform/version passed via headers.
-	if err := d.Registry.EnsureDevAgent(ctx, pkt.AgentID, siteID,
-		r.Header.Get("X-Agent-Hostname"),
-		r.Header.Get("X-Agent-Platform"),
-		r.Header.Get("X-Agent-Version")); err != nil {
-		writeError(w, http.StatusInternalServerError, "register: "+err.Error())
-		return
-	}
-
-	ack, err := d.Ingest.Ingest(ctx, pkt.AgentID, siteID, pkt)
+	ack, err := d.Ingest.Ingest(ctx, agentID, siteID, pkt)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "ingest: "+err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, ack)
+	_ = d.Registry.TouchLastSeen(ctx, agentID)
+	_ = d.Registry.SetReportedConfigVersion(ctx, agentID, pkt.ReportedConfigVersion)
+
+	resp := telemetryResponse{HighestSequence: ack.HighestSequence, ServerTime: ack.ServerTime}
+	if st, err := d.Registry.ConfigStatus(ctx, agentID); err == nil {
+		resp.ConfigVersion = st.ConfigVersion
+		if pkt.ReportedConfigVersion < st.ConfigVersion {
+			if ds, err := d.Config.DesiredStateFor(ctx, agentID); err == nil {
+				resp.DesiredState = &ds
+			}
+		}
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// ---- UI resources ----
+
+func (d Deps) handleQuota(w http.ResponseWriter, r *http.Request) {
+	used, _ := d.Registry.AgentCount(r.Context())
+	writeJSON(w, http.StatusOK, map[string]int{"used": used, "max": d.Registry.MaxAgents()})
 }
 
 func (d Deps) handleListAgents(w http.ResponseWriter, r *http.Request) {
@@ -160,11 +275,90 @@ func (d Deps) handleListSites(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, sites)
 }
 
+func (d Deps) handleListTokens(w http.ResponseWriter, r *http.Request) {
+	toks, err := d.Registry.ListEnrollmentTokens(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if toks == nil {
+		toks = []registry.EnrollmentToken{}
+	}
+	writeJSON(w, http.StatusOK, toks)
+}
+
+func (d Deps) handleCreateToken(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		SiteID     string `json:"site_id"`
+		Note       string `json:"note"`
+		TTLMinutes int    `json:"ttl_minutes"`
+	}
+	_ = json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&body)
+	if body.SiteID == "" {
+		body.SiteID = site.DefaultSiteID
+	}
+	ttl := time.Duration(body.TTLMinutes) * time.Minute
+	if ttl <= 0 {
+		ttl = 60 * time.Minute
+	}
+	token, err := d.Registry.CreateEnrollmentToken(r.Context(), body.SiteID, body.Note, ttl)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	d.Audit.Log(r.Context(), "admin", "enroll_token.create", body.SiteID, body.Note)
+	writeJSON(w, http.StatusOK, map[string]any{"token": token, "expires_in_minutes": int(ttl.Minutes())})
+}
+
+func (d Deps) handleListTargets(w http.ResponseWriter, r *http.Request) {
+	targets, err := d.Config.ListSiteTargets(r.Context(), chi.URLParam(r, "id"))
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if targets == nil {
+		targets = []config.ProbeTarget{}
+	}
+	writeJSON(w, http.StatusOK, targets)
+}
+
+func (d Deps) handleSetTargets(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Targets []config.ProbeTarget `json:"targets"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid body")
+		return
+	}
+	siteID := chi.URLParam(r, "id")
+	if err := d.Config.SetSiteTargets(r.Context(), siteID, body.Targets); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	d.Audit.Log(r.Context(), "admin", "monitoring.set_targets", siteID, strconv.Itoa(len(body.Targets))+" targets")
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
 func (d Deps) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
-// --- helpers ---
+// ---- helpers ----
+
+func bearer(r *http.Request) string {
+	h := r.Header.Get("Authorization")
+	if strings.HasPrefix(h, "Bearer ") {
+		return strings.TrimSpace(strings.TrimPrefix(h, "Bearer "))
+	}
+	return ""
+}
+
+func cookieVal(r *http.Request, name string) string {
+	if c, err := r.Cookie(name); err == nil {
+		return c.Value
+	}
+	return ""
+}
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
@@ -176,7 +370,6 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]string{"error": msg})
 }
 
-// devCORS allows the Vite dev origin to call the API during development.
 func devCORS(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		origin := r.Header.Get("Origin")

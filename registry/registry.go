@@ -6,7 +6,6 @@ package registry
 import (
 	"context"
 	"database/sql"
-	"errors"
 	"time"
 
 	"github.com/nettact/server-core/store"
@@ -24,30 +23,15 @@ type Agent struct {
 }
 
 type Service struct {
-	db *store.DB
+	db        *store.DB
+	maxAgents int // 0 = unlimited
 }
 
-func New(db *store.DB) *Service { return &Service{db: db} }
-
-// EnsureDevAgent auto-registers (or refreshes) an agent seen via telemetry in
-// dev mode. It stores an empty key/token — a placeholder replaced by real
-// enrollment in M2.
-func (s *Service) EnsureDevAgent(ctx context.Context, id, siteID, hostname, platform, version string) error {
-	if id == "" {
-		return errors.New("empty agent id")
-	}
-	now := time.Now().UTC()
-	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO agents(id, site_id, public_key, token_hash, hostname, platform, agent_version, status, last_seen_at, created_at)
-		VALUES(?, ?, X'', '', ?, ?, ?, 'online', ?, ?)
-		ON CONFLICT(id) DO UPDATE SET
-			hostname=COALESCE(NULLIF(excluded.hostname,''), agents.hostname),
-			platform=COALESCE(NULLIF(excluded.platform,''), agents.platform),
-			agent_version=COALESCE(NULLIF(excluded.agent_version,''), agents.agent_version),
-			status='online',
-			last_seen_at=excluded.last_seen_at`,
-		id, siteID, hostname, platform, version, now, now)
-	return err
+// New constructs the registry. maxAgents caps enrollment (0 = unlimited). The
+// quota is a product requirement (default 3); note architecture §7/§15 advise
+// against hard-limiting Lite — it is intentionally configurable.
+func New(db *store.DB, maxAgents int) *Service {
+	return &Service{db: db, maxAgents: maxAgents}
 }
 
 // TouchLastSeen bumps an agent's last-seen timestamp.
