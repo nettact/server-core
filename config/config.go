@@ -33,10 +33,10 @@ func New(db *store.DB, reg *registry.Service) *Service {
 // ProbeTarget is a site-scoped monitoring target managed via the UI.
 type ProbeTarget struct {
 	ID      string           `json:"id"`
-	Kind    string           `json:"kind"`   // "icmp" (M2)
-	Target  string           `json:"target"` // "1.1.1.1", "example.com", …
-	Tier    string           `json:"tier"`   // "base" | "regular"
-	Params  pcfg.ProbeParams `json:"params"` // per-protocol probe settings
+	Kind    string           `json:"kind"`           // "icmp" | "dns" | "http" | "tcp" | "host"
+	Name    string           `json:"name,omitempty"` // human-friendly display name; optional
+	Target  string           `json:"target"`         // "1.1.1.1", "example.com", …
+	Params  pcfg.ProbeParams `json:"params"`         // per-protocol probe settings
 	Enabled bool             `json:"enabled"`
 }
 
@@ -52,9 +52,9 @@ func (s *Service) SeedDefaults(ctx context.Context, siteID string) error {
 		return nil
 	}
 	defaults := []ProbeTarget{
-		{Kind: "icmp", Target: "1.1.1.1", Tier: "base", Enabled: true},
-		{Kind: "icmp", Target: "8.8.8.8", Tier: "base", Enabled: true},
-		{Kind: "icmp", Target: "223.5.5.5", Tier: "base", Enabled: true},
+		{Kind: "icmp", Target: "1.1.1.1", Enabled: true},
+		{Kind: "icmp", Target: "8.8.8.8", Enabled: true},
+		{Kind: "icmp", Target: "223.5.5.5", Enabled: true},
 	}
 	return s.SetSiteTargets(ctx, siteID, defaults)
 }
@@ -62,7 +62,7 @@ func (s *Service) SeedDefaults(ctx context.Context, siteID string) error {
 // ListSiteTargets returns the site-scoped monitoring targets.
 func (s *Service) ListSiteTargets(ctx context.Context, siteID string) ([]ProbeTarget, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, kind, COALESCE(target,''), tier, COALESCE(params,''), enabled
+		`SELECT id, kind, COALESCE(name,''), COALESCE(target,''), COALESCE(params,''), enabled
 		 FROM probe_tasks WHERE site_id=? AND agent_id IS NULL ORDER BY kind, target`, siteID)
 	if err != nil {
 		return nil, err
@@ -73,7 +73,7 @@ func (s *Service) ListSiteTargets(ctx context.Context, siteID string) ([]ProbeTa
 		var t ProbeTarget
 		var params string
 		var enabled int
-		if err := rows.Scan(&t.ID, &t.Kind, &t.Target, &t.Tier, &params, &enabled); err != nil {
+		if err := rows.Scan(&t.ID, &t.Kind, &t.Name, &t.Target, &params, &enabled); err != nil {
 			return nil, err
 		}
 		if params != "" {
@@ -145,20 +145,17 @@ func (s *Service) SetSiteTargets(ctx context.Context, siteID string, targets []P
 	}
 
 	for _, t := range targets {
-		if t.Tier == "" {
-			t.Tier = "base"
-		}
 		enabled := 0
 		if t.Enabled {
 			enabled = 1
 		}
 		params, _ := json.Marshal(t.Params)
 		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO probe_tasks(id, site_id, agent_id, kind, target, tier, params, enabled)
+			`INSERT INTO probe_tasks(id, site_id, agent_id, kind, name, target, params, enabled)
 			 VALUES(?,?,NULL,?,?,?,?,?)
-			 ON CONFLICT(id) DO UPDATE SET kind=excluded.kind, target=excluded.target,
-			   tier=excluded.tier, params=excluded.params, enabled=excluded.enabled`,
-			t.ID, siteID, t.Kind, t.Target, t.Tier, string(params), enabled); err != nil {
+			 ON CONFLICT(id) DO UPDATE SET kind=excluded.kind, name=excluded.name, target=excluded.target,
+			   params=excluded.params, enabled=excluded.enabled`,
+			t.ID, siteID, t.Kind, t.Name, t.Target, string(params), enabled); err != nil {
 			return err
 		}
 	}
@@ -206,7 +203,7 @@ func (s *Service) DesiredStateFor(ctx context.Context, agentID string) (pcfg.Des
 		if t.Kind == "host" {
 			continue
 		}
-		ds.ProbeTargets = append(ds.ProbeTargets, pcfg.ProbeTarget{Kind: t.Kind, Target: t.Target, Tier: t.Tier, Params: t.Params})
+		ds.ProbeTargets = append(ds.ProbeTargets, pcfg.ProbeTarget{Kind: t.Kind, Name: t.Name, Target: t.Target, Params: t.Params})
 	}
 	return ds, nil
 }

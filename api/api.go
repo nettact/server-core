@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
@@ -499,6 +500,12 @@ func (d Deps) handleSetTargets(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid body")
 		return
 	}
+	for i := range body.Targets {
+		if err := validateTarget(&body.Targets[i]); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
 	siteID := chi.URLParam(r, "id")
 	if err := d.Config.SetSiteTargets(r.Context(), siteID, body.Targets); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -506,6 +513,88 @@ func (d Deps) handleSetTargets(w http.ResponseWriter, r *http.Request) {
 	}
 	d.Audit.Log(r.Context(), "admin", "monitoring.set_targets", siteID, strconv.Itoa(len(body.Targets))+" targets")
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+// validKinds is the whitelist of monitoring-target kinds the server accepts.
+var validKinds = map[string]bool{"icmp": true, "dns": true, "http": true, "tcp": true, "host": true}
+
+// validateTarget checks a single monitoring target before it is persisted and
+// pushed to agents. It normalizes trivial fields and rejects malformed configs
+// with a user-facing message (mirrors the decodeRule validation style).
+func validateTarget(t *config.ProbeTarget) error {
+	t.Kind = strings.TrimSpace(t.Kind)
+	t.Name = strings.TrimSpace(t.Name)
+	t.Target = strings.TrimSpace(t.Target)
+	if !validKinds[t.Kind] {
+		return errors.New("invalid monitor kind: " + t.Kind)
+	}
+	if utf8.RuneCountInString(t.Name) > 128 {
+		return errors.New("name too long (max 128)")
+	}
+	// Every kind needs a target: probes need something to hit, and a host anchor
+	// needs its metric-series target (e.g. "host", "core0", a mount) or the rule
+	// engine — which skips rules bound to an empty target — can never match it.
+	if t.Target == "" {
+		return errors.New("target is required")
+	}
+	if t.Kind == "tcp" {
+		if t.Params.Port < 1 || t.Params.Port > 65535 {
+			return errors.New("tcp monitor requires a port in 1-65535")
+		}
+	}
+	if t.Params.IntervalSeconds < 0 || t.Params.IntervalSeconds > 86400 {
+		return errors.New("interval_seconds out of range (0-86400)")
+	}
+	if t.Params.TimeoutMs < 0 || t.Params.TimeoutMs > 300000 {
+		return errors.New("timeout_ms out of range (0-300000)")
+	}
+	if t.Params.ResolverPort < 0 || t.Params.ResolverPort > 65535 {
+		return errors.New("resolver_port out of range (0-65535)")
+	}
+	switch t.Params.ResolverProtocol {
+	case "", "udp", "tcp":
+	case "dot", "doh":
+		// DoT/DoH have no system default, so a resolver server/URL is required.
+		if t.Params.ResolverServer == "" {
+			return errors.New(t.Params.ResolverProtocol + " requires a resolver server")
+		}
+	default:
+		return errors.New("invalid resolver_protocol: " + t.Params.ResolverProtocol)
+	}
+	if t.Params.AcceptedStatuses != "" {
+		if err := validateAcceptedStatuses(t.Params.AcceptedStatuses); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validateAcceptedStatuses parses a CSV of HTTP status codes / ranges
+// (e.g. "200-299,301,404") and ensures every code sits in 100-599. A non-empty
+// expression that yields no codes (e.g. "," or "  ") is rejected, since it would
+// otherwise persist and make an HTTP probe reject every response.
+func validateAcceptedStatuses(s string) error {
+	n := 0
+	for _, part := range strings.Split(s, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		lo, hi, ok := strings.Cut(part, "-")
+		if !ok {
+			hi = lo
+		}
+		a, err1 := strconv.Atoi(strings.TrimSpace(lo))
+		b, err2 := strconv.Atoi(strings.TrimSpace(hi))
+		if err1 != nil || err2 != nil || a < 100 || b > 599 || a > b {
+			return errors.New("invalid accepted_statuses: " + s)
+		}
+		n++
+	}
+	if n == 0 {
+		return errors.New("invalid accepted_statuses: " + s)
+	}
+	return nil
 }
 
 func (d Deps) handlePurgeTarget(w http.ResponseWriter, r *http.Request) {
