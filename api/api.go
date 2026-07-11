@@ -7,6 +7,7 @@ package api
 
 import (
 	"compress/gzip"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"io"
@@ -85,6 +86,8 @@ func Router(d Deps) http.Handler {
 			r.Get("/sites", d.handleListSites)
 			r.Get("/agents", d.handleListAgents)
 			r.Get("/agents/{id}", d.handleGetAgent)
+			r.Put("/agents/{id}", d.handleUpdateAgent)
+			r.Delete("/agents/{id}", d.handleDeleteAgent)
 			r.Get("/agents/{id}/metrics", d.handleAgentMetrics)
 			r.Get("/agents/{id}/latest", d.handleAgentLatest)
 			r.Get("/agents/{id}/series", d.handleAgentSeries)
@@ -369,6 +372,56 @@ func (d Deps) handleGetAgent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, a)
+}
+
+func (d Deps) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	var body struct {
+		DisplayName string `json:"display_name"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid body")
+		return
+	}
+	if err := d.Registry.UpdateAgent(r.Context(), id, body.DisplayName); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(w, http.StatusNotFound, "agent not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	d.Audit.Log(r.Context(), "admin", "agent.update", id, body.DisplayName)
+	a, err := d.Registry.Get(r.Context(), id)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, a)
+}
+
+func (d Deps) handleDeleteAgent(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	// Purge the agent's time-series (series/samples/rollups + metrics-store cache)
+	// BEFORE removing the agent row. If the purge fails we return 500 with the
+	// agent still present, so a retry re-purges and then deletes — otherwise the
+	// agent row would be gone, the retry would 404, and the series would be
+	// orphaned forever, contrary to the endpoint's hard-delete semantics. Purging
+	// a non-existent agent is a harmless no-op, so ordering it first is safe.
+	if _, err := d.Metrics.PurgeAgent(r.Context(), id); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if err := d.Registry.DeleteAgent(r.Context(), id); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(w, http.StatusNotFound, "agent not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	d.Audit.Log(r.Context(), "admin", "agent.delete", id, "")
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (d Deps) handleAgentMetrics(w http.ResponseWriter, r *http.Request) {

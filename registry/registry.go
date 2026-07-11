@@ -17,6 +17,7 @@ import (
 type Agent struct {
 	ID           string     `json:"id"`
 	SiteID       string     `json:"site_id"`
+	DisplayName  string     `json:"display_name"` // operator-set friendly label, editable from the UI
 	Hostname     string     `json:"hostname"`
 	Platform     string     `json:"platform"`
 	AgentVersion string     `json:"agent_version"`
@@ -145,7 +146,7 @@ func (s *Service) StatusHistory(ctx context.Context, agentID string) ([]StatusEv
 
 func (s *Service) List(ctx context.Context) ([]Agent, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, site_id, COALESCE(hostname,''), COALESCE(platform,''), COALESCE(agent_version,''),
+		SELECT id, site_id, COALESCE(display_name,''), COALESCE(hostname,''), COALESCE(platform,''), COALESCE(agent_version,''),
 		       status, COALESCE(capabilities,'[]'), last_seen_at, created_at
 		FROM agents WHERE revoked=0 ORDER BY created_at`)
 	if err != nil {
@@ -157,7 +158,7 @@ func (s *Service) List(ctx context.Context) ([]Agent, error) {
 		var a Agent
 		var caps string
 		var lastSeen sql.NullTime
-		if err := rows.Scan(&a.ID, &a.SiteID, &a.Hostname, &a.Platform, &a.AgentVersion,
+		if err := rows.Scan(&a.ID, &a.SiteID, &a.DisplayName, &a.Hostname, &a.Platform, &a.AgentVersion,
 			&a.Status, &caps, &lastSeen, &a.CreatedAt); err != nil {
 			return nil, err
 		}
@@ -178,10 +179,10 @@ func (s *Service) Get(ctx context.Context, id string) (Agent, error) {
 	var lastSeen sql.NullTime
 	var caps string
 	err := s.db.QueryRowContext(ctx, `
-		SELECT id, site_id, COALESCE(hostname,''), COALESCE(platform,''), COALESCE(agent_version,''),
+		SELECT id, site_id, COALESCE(display_name,''), COALESCE(hostname,''), COALESCE(platform,''), COALESCE(agent_version,''),
 		       status, COALESCE(capabilities,'[]'), last_seen_at, created_at
 		FROM agents WHERE id=? AND revoked=0`, id).
-		Scan(&a.ID, &a.SiteID, &a.Hostname, &a.Platform, &a.AgentVersion, &a.Status, &caps, &lastSeen, &a.CreatedAt)
+		Scan(&a.ID, &a.SiteID, &a.DisplayName, &a.Hostname, &a.Platform, &a.AgentVersion, &a.Status, &caps, &lastSeen, &a.CreatedAt)
 	if err != nil {
 		return Agent{}, err
 	}
@@ -193,4 +194,58 @@ func (s *Service) Get(ctx context.Context, id string) (Agent, error) {
 		a.LastSeenAt = &t
 	}
 	return a, nil
+}
+
+// UpdateAgent sets an agent's operator-editable display name. Reported fields
+// (hostname/platform/version/capabilities) are owned by the agent and not
+// touched here. Returns sql.ErrNoRows if no live agent has that id.
+func (s *Service) UpdateAgent(ctx context.Context, id, displayName string) error {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE agents SET display_name=? WHERE id=? AND revoked=0`, displayName, id)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+// DeleteAgent hard-deletes an agent and the rows that belong to it. Foreign keys
+// are enforced (store.Open sets foreign_keys=ON), so FK-constrained child rows
+// (interfaces, config_versions, agent_status_history, per-agent probe_tasks) must
+// go before the agent row; the non-FK per-agent tables (agent_packets, events,
+// alerts) are cleared too so no orphaned rows survive. All in one transaction.
+// Time-series data (series/samples/rollups, plus the metrics store's in-memory
+// cache) is NOT handled here — callers purge it via metrics.Store.PurgeAgent so
+// the cache stays consistent. Returns sql.ErrNoRows if no agent has that id.
+func (s *Service) DeleteAgent(ctx context.Context, id string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	for _, stmt := range []string{
+		`DELETE FROM interfaces WHERE agent_id=?`,
+		`DELETE FROM config_versions WHERE agent_id=?`,
+		`DELETE FROM agent_status_history WHERE agent_id=?`,
+		`DELETE FROM probe_tasks WHERE agent_id=?`,
+		`DELETE FROM agent_packets WHERE agent_id=?`,
+		`DELETE FROM events WHERE agent_id=?`,
+		`DELETE FROM alerts WHERE agent_id=?`,
+	} {
+		if _, err := tx.ExecContext(ctx, stmt, id); err != nil {
+			return err
+		}
+	}
+
+	res, err := tx.ExecContext(ctx, `DELETE FROM agents WHERE id=?`, id)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return sql.ErrNoRows
+	}
+	return tx.Commit()
 }
