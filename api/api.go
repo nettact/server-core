@@ -85,6 +85,7 @@ func Router(d Deps) http.Handler {
 			r.Get("/agents/{id}/latest", d.handleAgentLatest)
 			r.Get("/agents/{id}/series", d.handleAgentSeries)
 			r.Get("/agents/{id}/status-history", d.handleAgentStatusHistory)
+			r.Get("/agents/{id}/alerts", d.handleAgentAlerts)
 			r.Get("/enrollment-tokens", d.handleListTokens)
 			r.Post("/enrollment-tokens", d.handleCreateToken)
 			r.Get("/sites/{id}/targets", d.handleListTargets)
@@ -482,6 +483,26 @@ func (d Deps) handleTimeline(w http.ResponseWriter, r *http.Request) {
 
 func (d Deps) handleListAlerts(w http.ResponseWriter, r *http.Request) {
 	alerts, err := d.Alert.ListActive(r.Context(), siteParam(r))
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if alerts == nil {
+		alerts = []alert.Alert{}
+	}
+	writeJSON(w, http.StatusOK, alerts)
+}
+
+// handleAgentAlerts returns the alarm history (firing + resolved) for one
+// agent+target, newest first, for the history page's 报警记录 panel.
+func (d Deps) handleAgentAlerts(w http.ResponseWriter, r *http.Request) {
+	limit := 10
+	if s := r.URL.Query().Get("limit"); s != "" {
+		if n, err := strconv.Atoi(s); err == nil && n > 0 {
+			limit = n
+		}
+	}
+	alerts, err := d.Alert.ListForTarget(r.Context(), chi.URLParam(r, "id"), r.URL.Query().Get("target"), limit)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return

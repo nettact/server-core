@@ -94,9 +94,15 @@ func (s *Service) Update(ctx context.Context, rule RuleView, agentID, siteID, ta
 		if count >= threshold && durationMet(rule, now, now) {
 			st = "firing"
 		}
+		// fired_at is stamped only once the alert actually fires, so the history
+		// view can tell real alarms from pending attempts that never fired.
+		var firedAt any
+		if st == "firing" {
+			firedAt = now
+		}
 		if _, err := s.db.ExecContext(ctx,
-			`INSERT INTO alerts(id, rule_id, agent_id, site_id, target, state, value, fail_count, started_at, last_eval_at)
-			 VALUES(?,?,?,?,?,?,?,?,?,?)`, id, rule.ID, agentID, siteID, target, st, value, count, now, now); err != nil {
+			`INSERT INTO alerts(id, rule_id, agent_id, site_id, target, state, value, fail_count, started_at, last_eval_at, fired_at)
+			 VALUES(?,?,?,?,?,?,?,?,?,?,?)`, id, rule.ID, agentID, siteID, target, st, value, count, now, now, firedAt); err != nil {
 			return err
 		}
 		if st == "firing" {
@@ -107,7 +113,7 @@ func (s *Service) Update(ctx context.Context, rule RuleView, agentID, siteID, ta
 		failCount++
 		if state == "pending" && failCount >= threshold && durationMet(rule, startedAt, now) {
 			if _, err := s.db.ExecContext(ctx,
-				`UPDATE alerts SET state='firing', value=?, fail_count=?, last_eval_at=? WHERE id=?`, value, failCount, now, id); err != nil {
+				`UPDATE alerts SET state='firing', value=?, fail_count=?, last_eval_at=?, fired_at=? WHERE id=?`, value, failCount, now, now, id); err != nil {
 				return err
 			}
 			s.publish(eventbus.TopicAlertRaised, rule, id, agentID, siteID, target, value, now)
@@ -151,11 +157,33 @@ func (s *Service) publish(topic string, rule RuleView, id, agentID, siteID, targ
 
 // ListActive returns firing alerts for a site, joined with rule metadata.
 func (s *Service) ListActive(ctx context.Context, siteID string) ([]Alert, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	return s.query(ctx, `
 		SELECT a.id, a.rule_id, COALESCE(r.name,''), a.agent_id, a.site_id, a.target,
 		       COALESCE(r.layer,''), COALESCE(r.severity,''), a.state, a.value, a.started_at, a.resolved_at
 		FROM alerts a LEFT JOIN alert_rules r ON r.id=a.rule_id
 		WHERE a.site_id=? AND a.state='firing' ORDER BY a.started_at DESC`, siteID)
+}
+
+// ListForTarget returns the alarm history for a single agent+target, newest
+// first and capped to limit — powers the history page's per-target 报警记录
+// panel. Only alerts that actually fired are included (fired_at set), so pending
+// attempts that resolved without firing are excluded. agent_id is a global
+// primary key, so no site scoping is needed (and adding it would wrongly exclude
+// agents outside the default site).
+func (s *Service) ListForTarget(ctx context.Context, agentID, target string, limit int) ([]Alert, error) {
+	if limit <= 0 || limit > 500 {
+		limit = 50
+	}
+	return s.query(ctx, `
+		SELECT a.id, a.rule_id, COALESCE(r.name,''), a.agent_id, a.site_id, a.target,
+		       COALESCE(r.layer,''), COALESCE(r.severity,''), a.state, a.value, a.started_at, a.resolved_at
+		FROM alerts a LEFT JOIN alert_rules r ON r.id=a.rule_id
+		WHERE a.agent_id=? AND a.target=? AND a.fired_at IS NOT NULL
+		ORDER BY a.started_at DESC LIMIT ?`, agentID, target, limit)
+}
+
+func (s *Service) query(ctx context.Context, sqlStr string, args ...any) ([]Alert, error) {
+	rows, err := s.db.QueryContext(ctx, sqlStr, args...)
 	if err != nil {
 		return nil, err
 	}
