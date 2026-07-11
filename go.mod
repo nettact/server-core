@@ -7,6 +7,7 @@ require (
 	github.com/google/uuid v1.6.0
 	github.com/nettact/protocol v0.0.0-00010101000000-000000000000
 	golang.org/x/crypto v0.34.0
+	google.golang.org/protobuf v1.36.11
 	modernc.org/sqlite v1.34.5
 )
 

@@ -21,6 +21,7 @@ import (
 	pcfg "github.com/nettact/protocol/config"
 	"github.com/nettact/protocol/enroll"
 	"github.com/nettact/protocol/telemetry"
+	"github.com/nettact/protocol/wire"
 	"github.com/nettact/server-core/alert"
 	"github.com/nettact/server-core/audit"
 	"github.com/nettact/server-core/config"
@@ -231,9 +232,23 @@ func (d Deps) handleTelemetry(w http.ResponseWriter, r *http.Request) {
 		defer gz.Close()
 		body = gz
 	}
-	var pkt telemetry.Packet
-	if err := json.NewDecoder(body).Decode(&pkt); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid packet json: "+err.Error())
+	// Decode by Content-Type: protobuf when advertised, JSON otherwise (default),
+	// so pre-protobuf agents keep working. Protobuf needs the whole buffer.
+	// MaxBytesReader bounds only the compressed bytes, so bound the decompressed
+	// read as well (one extra byte detects overflow) — otherwise a small gzip
+	// bomb from an authenticated agent could allocate unbounded memory.
+	raw, err := io.ReadAll(io.LimitReader(body, maxPacketBytes+1))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "read body: "+err.Error())
+		return
+	}
+	if len(raw) > maxPacketBytes {
+		writeError(w, http.StatusRequestEntityTooLarge, "telemetry packet exceeds size limit")
+		return
+	}
+	pkt, err := wire.UnmarshalPacket(raw, r.Header.Get("Content-Type"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid packet: "+err.Error())
 		return
 	}
 
@@ -273,7 +288,9 @@ func (d Deps) handleTelemetry(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	writeJSON(w, http.StatusOK, resp)
+	// Reply in the format the agent accepts (protobuf preferred), falling back to
+	// JSON. telemetryResponse and wire.Ack are field-identical, so convert directly.
+	writeAck(w, r, wire.Ack(resp))
 }
 
 // ---- live host snapshot (ephemeral, never stored) ----
@@ -762,6 +779,21 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]string{"error": msg})
 }
 
+// writeAck encodes the telemetry ack in the format the agent advertised via
+// Accept (protobuf preferred; JSON when absent/unknown), matching the request's
+// negotiated format so old JSON agents receive JSON acks.
+func writeAck(w http.ResponseWriter, r *http.Request, ack wire.Ack) {
+	ct := wire.Negotiate(r.Header.Get("Accept"))
+	data, err := wire.MarshalAck(ack, ct)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "encode ack: "+err.Error())
+		return
+	}
+	w.Header().Set("Content-Type", ct)
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(data)
+}
+
 func devCORS(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		origin := r.Header.Get("Origin")
@@ -772,7 +804,7 @@ func devCORS(next http.Handler) http.Handler {
 		}
 		if r.Method == http.MethodOptions {
 			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, Content-Encoding, X-Agent-Hostname, X-Agent-Platform, X-Agent-Version")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Accept, Authorization, Content-Encoding, X-Agent-Hostname, X-Agent-Platform, X-Agent-Version")
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
