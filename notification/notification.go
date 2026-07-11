@@ -1,6 +1,6 @@
 // Package notification delivers incident events to configured channels
-// (webhook + SMTP). Delivery is best-effort and must never block or fail the
-// incident pipeline.
+// (webhook + SMTP + native OS desktop notification). Delivery is best-effort
+// and must never block or fail the incident pipeline.
 package notification
 
 import (
@@ -34,7 +34,7 @@ type Payload struct {
 type Channel struct {
 	ID      string            `json:"id"`
 	Name    string            `json:"name"` // human label to tell multiple channels apart
-	Type    string            `json:"type"` // "webhook" | "email"
+	Type    string            `json:"type"` // "webhook" | "email" | "system"
 	Config  map[string]string `json:"config"`
 	Enabled bool              `json:"enabled"`
 }
@@ -135,6 +135,8 @@ func (s *Service) Notify(ctx context.Context, channelIDs []string, p Payload) {
 			s.sendWebhook(ctx, config["url"], p)
 		case "email":
 			s.sendEmail(config, p)
+		case "system":
+			s.sendNative(ctx, p)
 		}
 	}
 }
@@ -175,6 +177,22 @@ func (s *Service) sendEmail(cfg map[string]string, p Payload) {
 	}
 	if err := smtp.SendMail(host+":"+port, auth, from, []string{to}, []byte(msg)); err != nil {
 		log.Printf("notify email: %v", err)
+	}
+}
+
+// sendNative pops a desktop notification on the host running this process
+// (Windows / macOS). It is a no-op on unsupported platforms. Delivery is
+// best-effort and bounded by a short timeout so it never blocks the pipeline.
+func (s *Service) sendNative(ctx context.Context, p Payload) {
+	ctx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	defer cancel()
+	title := fmt.Sprintf("[NetTact] %s", p.Event)
+	body := p.Summary
+	if p.SuspectedLayer != "" || p.Severity != "" {
+		body = fmt.Sprintf("%s (%s / %s)", p.Summary, p.SuspectedLayer, p.Severity)
+	}
+	if err := nativeNotify(ctx, title, body); err != nil {
+		log.Printf("notify system: %v", err)
 	}
 }
 

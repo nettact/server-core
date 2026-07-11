@@ -12,6 +12,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -81,6 +82,7 @@ func Router(d Deps) http.Handler {
 			r.Use(d.requireSession)
 			r.Post("/auth/logout", d.handleLogout)
 			r.Get("/auth/me", d.handleMe)
+			r.Get("/server-info", d.handleServerInfo)
 			r.Get("/quota", d.handleQuota)
 			r.Get("/stats", d.handleStats)
 			r.Get("/sites", d.handleListSites)
@@ -174,6 +176,16 @@ func (d Deps) handleLogout(w http.ResponseWriter, r *http.Request) {
 func (d Deps) handleMe(w http.ResponseWriter, r *http.Request) {
 	u, _ := d.Identity.ValidateSession(r.Context(), cookieVal(r, sessionCookie))
 	writeJSON(w, http.StatusOK, u)
+}
+
+// handleServerInfo reports the host OS and whether native desktop notifications
+// are available on this build, so the UI can conditionally offer the "system"
+// notification channel.
+func (d Deps) handleServerInfo(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{
+		"os":            runtime.GOOS,
+		"native_notify": notification.NativeSupported(),
+	})
 }
 
 func (d Deps) requireSession(next http.Handler) http.Handler {
@@ -907,8 +919,8 @@ func (d Deps) handleCreateChannel(w http.ResponseWriter, r *http.Request) {
 		Type   string            `json:"type"`
 		Config map[string]string `json:"config"`
 	}
-	if err := json.NewDecoder(io.LimitReader(r.Body, 8192)).Decode(&body); err != nil || (body.Type != "webhook" && body.Type != "email") {
-		writeError(w, http.StatusBadRequest, "type must be webhook or email")
+	if err := json.NewDecoder(io.LimitReader(r.Body, 8192)).Decode(&body); err != nil || (body.Type != "webhook" && body.Type != "email" && body.Type != "system") {
+		writeError(w, http.StatusBadRequest, "type must be webhook, email or system")
 		return
 	}
 	id, err := d.Notification.Create(r.Context(), body.Name, body.Type, body.Config)
