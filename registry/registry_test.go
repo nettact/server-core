@@ -36,7 +36,8 @@ func TestUpdateAndDeleteAgent(t *testing.T) {
 	mustExec(t, db, `INSERT INTO interfaces(id,agent_id,name) VALUES('if1','agent_x','eth0')`)
 	mustExec(t, db, `INSERT INTO config_versions(id,agent_id,version,desired_state,created_at) VALUES('cv1','agent_x',1,'{}',?)`, now)
 	mustExec(t, db, `INSERT INTO agent_status_history(id,agent_id,status,changed_at) VALUES('ash1','agent_x','online',?)`, now)
-	mustExec(t, db, `INSERT INTO probe_tasks(id,site_id,agent_id,kind) VALUES('pt1','site_default','agent_x','icmp')`)
+	mustExec(t, db, `INSERT INTO agent_groups(id,site_id,name) VALUES('grp1','site_default','g')`)
+	mustExec(t, db, `INSERT INTO agent_group_members(group_id,agent_id) VALUES('grp1','agent_x')`)
 	mustExec(t, db, `INSERT INTO agent_packets(agent_id,sequence,received_at) VALUES('agent_x',1,?)`, now)
 	mustExec(t, db, `INSERT INTO events(id,agent_id,site_id,ts,type) VALUES('e1','agent_x','site_default',?,'t')`, now)
 	mustExec(t, db, `INSERT INTO alerts(id,agent_id,site_id,state,started_at) VALUES('al1','agent_x','site_default','firing',?)`, now)
@@ -60,7 +61,7 @@ func TestUpdateAndDeleteAgent(t *testing.T) {
 		t.Fatalf("DeleteAgent: %v", err)
 	}
 	for _, tbl := range []string{
-		"interfaces", "config_versions", "agent_status_history", "probe_tasks",
+		"interfaces", "config_versions", "agent_status_history", "agent_group_members",
 		"agent_packets", "events", "alerts",
 	} {
 		var n int

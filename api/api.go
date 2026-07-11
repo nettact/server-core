@@ -103,6 +103,11 @@ func Router(d Deps) http.Handler {
 			r.Put("/sites/{id}/targets", d.handleSetTargets)
 			r.Post("/sites/{id}/purge-target", d.handlePurgeTarget)
 			r.Get("/sites/{id}/devices", d.handleListDevices)
+			// Agent groups: named sets of agents that scope monitoring targets.
+			r.Get("/sites/{id}/agent-groups", d.handleListAgentGroups)
+			r.Post("/sites/{id}/agent-groups", d.handleCreateAgentGroup)
+			r.Put("/agent-groups/{id}", d.handleUpdateAgentGroup)
+			r.Delete("/agent-groups/{id}", d.handleDeleteAgentGroup)
 			r.Get("/incidents", d.handleListIncidents)
 			r.Get("/incidents/{id}/timeline", d.handleTimeline)
 			r.Get("/alerts", d.handleListAlerts)
@@ -566,6 +571,82 @@ func (d Deps) handleSetTargets(w http.ResponseWriter, r *http.Request) {
 	}
 	d.Audit.Log(r.Context(), "admin", "monitoring.set_targets", siteID, strconv.Itoa(len(body.Targets))+" targets")
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (d Deps) handleListAgentGroups(w http.ResponseWriter, r *http.Request) {
+	groups, err := d.Registry.ListGroups(r.Context(), chi.URLParam(r, "id"))
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if groups == nil {
+		groups = []registry.AgentGroup{}
+	}
+	writeJSON(w, http.StatusOK, groups)
+}
+
+func (d Deps) handleCreateAgentGroup(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid body")
+		return
+	}
+	name := strings.TrimSpace(body.Name)
+	if name == "" || utf8.RuneCountInString(name) > 128 {
+		writeError(w, http.StatusBadRequest, "group name is required (max 128)")
+		return
+	}
+	siteID := chi.URLParam(r, "id")
+	id, err := d.Registry.CreateGroup(r.Context(), siteID, name)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	d.Audit.Log(r.Context(), "admin", "agent_group.create", siteID, name)
+	writeJSON(w, http.StatusOK, map[string]string{"id": id})
+}
+
+func (d Deps) handleUpdateAgentGroup(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	var body struct {
+		Name     string   `json:"name"`
+		AgentIDs []string `json:"agent_ids"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid body")
+		return
+	}
+	name := strings.TrimSpace(body.Name)
+	if name == "" || utf8.RuneCountInString(name) > 128 {
+		writeError(w, http.StatusBadRequest, "group name is required (max 128)")
+		return
+	}
+	if err := d.Registry.UpdateGroup(r.Context(), id, name, body.AgentIDs); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(w, http.StatusNotFound, "group not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	d.Audit.Log(r.Context(), "admin", "agent_group.update", id, name)
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (d Deps) handleDeleteAgentGroup(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	if err := d.Registry.DeleteGroup(r.Context(), id); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(w, http.StatusNotFound, "group not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	d.Audit.Log(r.Context(), "admin", "agent_group.delete", id, "")
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // validKinds is the whitelist of monitoring-target kinds the server accepts.

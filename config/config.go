@@ -7,6 +7,7 @@ package config
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 
 	"github.com/google/uuid"
 
@@ -38,6 +39,12 @@ type ProbeTarget struct {
 	Target  string           `json:"target"`         // "1.1.1.1", "example.com", …
 	Params  pcfg.ProbeParams `json:"params"`         // per-protocol probe settings
 	Enabled bool             `json:"enabled"`
+	// Scope: AllAgents=true pushes this target to every agent in the site
+	// (the default). When false, it is pushed only to agents that belong to one
+	// of GroupIDs. These fields drive server-side per-agent resolution and are
+	// not part of the wire DesiredState the agent receives.
+	AllAgents bool     `json:"all_agents"`
+	GroupIDs  []string `json:"group_ids"`
 }
 
 // SeedDefaults inserts a few public ICMP targets for a site if it has none, so
@@ -45,44 +52,71 @@ type ProbeTarget struct {
 func (s *Service) SeedDefaults(ctx context.Context, siteID string) error {
 	var n int
 	if err := s.db.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM probe_tasks WHERE site_id=? AND agent_id IS NULL`, siteID).Scan(&n); err != nil {
+		`SELECT COUNT(*) FROM probe_tasks WHERE site_id=?`, siteID).Scan(&n); err != nil {
 		return err
 	}
 	if n > 0 {
 		return nil
 	}
 	defaults := []ProbeTarget{
-		{Kind: "icmp", Target: "1.1.1.1", Enabled: true},
-		{Kind: "icmp", Target: "8.8.8.8", Enabled: true},
-		{Kind: "icmp", Target: "223.5.5.5", Enabled: true},
+		{Kind: "icmp", Target: "1.1.1.1", Enabled: true, AllAgents: true},
+		{Kind: "icmp", Target: "8.8.8.8", Enabled: true, AllAgents: true},
+		{Kind: "icmp", Target: "223.5.5.5", Enabled: true, AllAgents: true},
 	}
 	return s.SetSiteTargets(ctx, siteID, defaults)
 }
 
-// ListSiteTargets returns the site-scoped monitoring targets.
+// ListSiteTargets returns the site-scoped monitoring targets, each with its scope
+// (AllAgents flag + the agent-group IDs it is bound to) for the management UI.
 func (s *Service) ListSiteTargets(ctx context.Context, siteID string) ([]ProbeTarget, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, kind, COALESCE(name,''), COALESCE(target,''), COALESCE(params,''), enabled
-		 FROM probe_tasks WHERE site_id=? AND agent_id IS NULL ORDER BY kind, target`, siteID)
+		`SELECT id, kind, COALESCE(name,''), COALESCE(target,''), COALESCE(params,''), enabled, all_agents
+		 FROM probe_tasks WHERE site_id=? ORDER BY kind, target`, siteID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	var out []ProbeTarget
+	byID := make(map[string]*ProbeTarget)
 	for rows.Next() {
 		var t ProbeTarget
 		var params string
-		var enabled int
-		if err := rows.Scan(&t.ID, &t.Kind, &t.Name, &t.Target, &params, &enabled); err != nil {
+		var enabled, allAgents int
+		if err := rows.Scan(&t.ID, &t.Kind, &t.Name, &t.Target, &params, &enabled, &allAgents); err != nil {
 			return nil, err
 		}
 		if params != "" {
 			_ = json.Unmarshal([]byte(params), &t.Params)
 		}
 		t.Enabled = enabled == 1
+		t.AllAgents = allAgents == 1
 		out = append(out, t)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	for i := range out {
+		byID[out[i].ID] = &out[i]
+	}
+	// Backfill each target's group bindings in one pass.
+	grows, err := s.db.QueryContext(ctx,
+		`SELECT ptg.task_id, ptg.group_id FROM probe_task_groups ptg
+		 JOIN probe_tasks pt ON pt.id = ptg.task_id
+		 WHERE pt.site_id=?`, siteID)
+	if err != nil {
+		return nil, err
+	}
+	defer grows.Close()
+	for grows.Next() {
+		var taskID, groupID string
+		if err := grows.Scan(&taskID, &groupID); err != nil {
+			return nil, err
+		}
+		if t := byID[taskID]; t != nil {
+			t.GroupIDs = append(t.GroupIDs, groupID)
+		}
+	}
+	return out, grows.Err()
 }
 
 // SetSiteTargets reconciles the site-scoped targets to the given set and bumps
@@ -112,7 +146,7 @@ func (s *Service) SetSiteTargets(ctx context.Context, siteID string, targets []P
 		keep[targets[i].ID] = true
 	}
 	rows, err := tx.QueryContext(ctx,
-		`SELECT id FROM probe_tasks WHERE site_id=? AND agent_id IS NULL`, siteID)
+		`SELECT id FROM probe_tasks WHERE site_id=?`, siteID)
 	if err != nil {
 		return err
 	}
@@ -131,12 +165,15 @@ func (s *Service) SetSiteTargets(ctx context.Context, siteID string, targets []P
 			continue
 		}
 		// Clear alerts before their rules (FKs ON: alerts.rule_id → alert_rules.id),
-		// then the rules, then the target itself.
+		// then the rules, its group bindings, then the target itself.
 		if _, err := tx.ExecContext(ctx,
 			`DELETE FROM alerts WHERE rule_id IN (SELECT id FROM alert_rules WHERE probe_task_id=?)`, id); err != nil {
 			return err
 		}
 		if _, err := tx.ExecContext(ctx, `DELETE FROM alert_rules WHERE probe_task_id=?`, id); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM probe_task_groups WHERE task_id=?`, id); err != nil {
 			return err
 		}
 		if _, err := tx.ExecContext(ctx, `DELETE FROM probe_tasks WHERE id=?`, id); err != nil {
@@ -149,14 +186,44 @@ func (s *Service) SetSiteTargets(ctx context.Context, siteID string, targets []P
 		if t.Enabled {
 			enabled = 1
 		}
+		allAgents := 0
+		if t.AllAgents {
+			allAgents = 1
+		}
 		params, _ := json.Marshal(t.Params)
 		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO probe_tasks(id, site_id, agent_id, kind, name, target, params, enabled)
-			 VALUES(?,?,NULL,?,?,?,?,?)
+			`INSERT INTO probe_tasks(id, site_id, kind, name, target, params, enabled, all_agents)
+			 VALUES(?,?,?,?,?,?,?,?)
 			 ON CONFLICT(id) DO UPDATE SET kind=excluded.kind, name=excluded.name, target=excluded.target,
-			   params=excluded.params, enabled=excluded.enabled`,
-			t.ID, siteID, t.Kind, t.Name, t.Target, string(params), enabled); err != nil {
+			   params=excluded.params, enabled=excluded.enabled, all_agents=excluded.all_agents`,
+			t.ID, siteID, t.Kind, t.Name, t.Target, string(params), enabled, allAgents); err != nil {
 			return err
+		}
+		// Reconcile the target's group bindings (rebuild: clear then insert).
+		if _, err := tx.ExecContext(ctx, `DELETE FROM probe_task_groups WHERE task_id=?`, t.ID); err != nil {
+			return err
+		}
+		if !t.AllAgents {
+			// A target may only be scoped to groups in its own site: the INSERT..SELECT
+			// filters by site_id so a cross-site (or unknown) group id inserts no row
+			// and is rejected, preventing one site's config from reaching another
+			// site's agents.
+			seen := make(map[string]bool, len(t.GroupIDs))
+			for _, gid := range t.GroupIDs {
+				if seen[gid] {
+					continue
+				}
+				seen[gid] = true
+				res, err := tx.ExecContext(ctx,
+					`INSERT INTO probe_task_groups(task_id, group_id)
+					 SELECT ?, id FROM agent_groups WHERE id=? AND site_id=?`, t.ID, gid, siteID)
+				if err != nil {
+					return err
+				}
+				if n, _ := res.RowsAffected(); n == 0 {
+					return fmt.Errorf("agent group %q does not belong to site %s", gid, siteID)
+				}
+			}
 		}
 	}
 	if err := tx.Commit(); err != nil {
@@ -172,20 +239,21 @@ func (s *Service) SetSiteTargets(ctx context.Context, siteID string, targets []P
 func (s *Service) TargetIDByTarget(ctx context.Context, siteID, target string) (string, error) {
 	var id string
 	err := s.db.QueryRowContext(ctx,
-		`SELECT id FROM probe_tasks WHERE site_id=? AND agent_id IS NULL AND target=? LIMIT 1`, siteID, target).Scan(&id)
+		`SELECT id FROM probe_tasks WHERE site_id=? AND target=? LIMIT 1`, siteID, target).Scan(&id)
 	if err != nil {
 		return "", err
 	}
 	return id, nil
 }
 
-// DesiredStateFor builds the config to push to a specific agent.
+// DesiredStateFor builds the config to push to a specific agent. Targets are
+// resolved per agent: a target reaches this agent when it is broadcast to the
+// whole site (all_agents=1) or when this agent belongs to one of the target's
+// bound groups. "host" targets are server-side alerting anchors (the agent emits
+// host.* metrics on its own) and are never pushed down; disabled targets are
+// skipped in the query.
 func (s *Service) DesiredStateFor(ctx context.Context, agentID string) (pcfg.DesiredState, error) {
 	st, err := s.reg.ConfigStatus(ctx, agentID)
-	if err != nil {
-		return pcfg.DesiredState{}, err
-	}
-	targets, err := s.ListSiteTargets(ctx, st.SiteID)
 	if err != nil {
 		return pcfg.DesiredState{}, err
 	}
@@ -193,17 +261,29 @@ func (s *Service) DesiredStateFor(ctx context.Context, agentID string) (pcfg.Des
 		ConfigVersion: st.ConfigVersion,
 		Intervals:     pcfg.Intervals{BaseSeconds: defaultBaseSeconds, RegularSeconds: defaultRegularSeconds},
 	}
-	for _, t := range targets {
-		if !t.Enabled {
-			continue
-		}
-		// "host" targets are server-side alerting anchors for host.* metrics (which
-		// the agent emits on its own when --report-host is set); they carry no probe
-		// for the agent to run, so they are not pushed down.
-		if t.Kind == "host" {
-			continue
-		}
-		ds.ProbeTargets = append(ds.ProbeTargets, pcfg.ProbeTarget{Kind: t.Kind, Name: t.Name, Target: t.Target, Params: t.Params})
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT kind, COALESCE(name,''), COALESCE(target,''), COALESCE(params,'')
+		 FROM probe_tasks pt
+		 WHERE pt.site_id=? AND pt.enabled=1 AND pt.kind<>'host'
+		   AND (pt.all_agents=1 OR EXISTS(
+		     SELECT 1 FROM probe_task_groups ptg
+		     JOIN agent_group_members agm ON agm.group_id = ptg.group_id
+		     WHERE ptg.task_id = pt.id AND agm.agent_id = ?))
+		 ORDER BY kind, target`, st.SiteID, agentID)
+	if err != nil {
+		return pcfg.DesiredState{}, err
 	}
-	return ds, nil
+	defer rows.Close()
+	for rows.Next() {
+		var t pcfg.ProbeTarget
+		var params string
+		if err := rows.Scan(&t.Kind, &t.Name, &t.Target, &params); err != nil {
+			return pcfg.DesiredState{}, err
+		}
+		if params != "" {
+			_ = json.Unmarshal([]byte(params), &t.Params)
+		}
+		ds.ProbeTargets = append(ds.ProbeTargets, t)
+	}
+	return ds, rows.Err()
 }

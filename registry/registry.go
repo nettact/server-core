@@ -213,7 +213,7 @@ func (s *Service) UpdateAgent(ctx context.Context, id, displayName string) error
 
 // DeleteAgent hard-deletes an agent and the rows that belong to it. Foreign keys
 // are enforced (store.Open sets foreign_keys=ON), so FK-constrained child rows
-// (interfaces, config_versions, agent_status_history, per-agent probe_tasks) must
+// (interfaces, config_versions, agent_status_history, agent_group_members) must
 // go before the agent row; the non-FK per-agent tables (agent_packets, events,
 // alerts) are cleared too so no orphaned rows survive. All in one transaction.
 // Time-series data (series/samples/rollups, plus the metrics store's in-memory
@@ -230,7 +230,7 @@ func (s *Service) DeleteAgent(ctx context.Context, id string) error {
 		`DELETE FROM interfaces WHERE agent_id=?`,
 		`DELETE FROM config_versions WHERE agent_id=?`,
 		`DELETE FROM agent_status_history WHERE agent_id=?`,
-		`DELETE FROM probe_tasks WHERE agent_id=?`,
+		`DELETE FROM agent_group_members WHERE agent_id=?`,
 		`DELETE FROM agent_packets WHERE agent_id=?`,
 		`DELETE FROM events WHERE agent_id=?`,
 		`DELETE FROM alerts WHERE agent_id=?`,
