@@ -6,6 +6,7 @@ package registry
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"time"
 
 	"github.com/google/uuid"
@@ -20,6 +21,7 @@ type Agent struct {
 	Platform     string     `json:"platform"`
 	AgentVersion string     `json:"agent_version"`
 	Status       string     `json:"status"`
+	Capabilities []string   `json:"capabilities"` // advertised at enroll; gates host/process/connection views
 	LastSeenAt   *time.Time `json:"last_seen_at"`
 	CreatedAt    time.Time  `json:"created_at"`
 }
@@ -57,6 +59,23 @@ func (s *Service) TouchLastSeen(ctx context.Context, id string) error {
 		s.recordStatus(ctx, id, "online", now)
 	}
 	return nil
+}
+
+// UpdateCapabilities refreshes an agent's advertised capabilities from an
+// authenticated telemetry upload, so restarting an agent with different
+// --report-* flags is reflected server-side (enrollment happens only once). The
+// conditional WHERE makes it a no-op write when nothing changed.
+func (s *Service) UpdateCapabilities(ctx context.Context, id string, caps []string) error {
+	if caps == nil {
+		caps = []string{}
+	}
+	b, err := json.Marshal(caps)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx,
+		`UPDATE agents SET capabilities=? WHERE id=? AND capabilities<>?`, string(b), id, string(b))
+	return err
 }
 
 // SweepStale marks any online agent whose last_seen_at is older than threshold
@@ -127,7 +146,7 @@ func (s *Service) StatusHistory(ctx context.Context, agentID string) ([]StatusEv
 func (s *Service) List(ctx context.Context) ([]Agent, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, site_id, COALESCE(hostname,''), COALESCE(platform,''), COALESCE(agent_version,''),
-		       status, last_seen_at, created_at
+		       status, COALESCE(capabilities,'[]'), last_seen_at, created_at
 		FROM agents WHERE revoked=0 ORDER BY created_at`)
 	if err != nil {
 		return nil, err
@@ -136,10 +155,14 @@ func (s *Service) List(ctx context.Context) ([]Agent, error) {
 	var out []Agent
 	for rows.Next() {
 		var a Agent
+		var caps string
 		var lastSeen sql.NullTime
 		if err := rows.Scan(&a.ID, &a.SiteID, &a.Hostname, &a.Platform, &a.AgentVersion,
-			&a.Status, &lastSeen, &a.CreatedAt); err != nil {
+			&a.Status, &caps, &lastSeen, &a.CreatedAt); err != nil {
 			return nil, err
+		}
+		if caps != "" {
+			_ = json.Unmarshal([]byte(caps), &a.Capabilities)
 		}
 		if lastSeen.Valid {
 			t := lastSeen.Time
@@ -153,13 +176,17 @@ func (s *Service) List(ctx context.Context) ([]Agent, error) {
 func (s *Service) Get(ctx context.Context, id string) (Agent, error) {
 	var a Agent
 	var lastSeen sql.NullTime
+	var caps string
 	err := s.db.QueryRowContext(ctx, `
 		SELECT id, site_id, COALESCE(hostname,''), COALESCE(platform,''), COALESCE(agent_version,''),
-		       status, last_seen_at, created_at
+		       status, COALESCE(capabilities,'[]'), last_seen_at, created_at
 		FROM agents WHERE id=? AND revoked=0`, id).
-		Scan(&a.ID, &a.SiteID, &a.Hostname, &a.Platform, &a.AgentVersion, &a.Status, &lastSeen, &a.CreatedAt)
+		Scan(&a.ID, &a.SiteID, &a.Hostname, &a.Platform, &a.AgentVersion, &a.Status, &caps, &lastSeen, &a.CreatedAt)
 	if err != nil {
 		return Agent{}, err
+	}
+	if caps != "" {
+		_ = json.Unmarshal([]byte(caps), &a.Capabilities)
 	}
 	if lastSeen.Valid {
 		t := lastSeen.Time

@@ -200,6 +200,12 @@ func (s *Service) DesiredStateFor(ctx context.Context, agentID string) (pcfg.Des
 		if !t.Enabled {
 			continue
 		}
+		// "host" targets are server-side alerting anchors for host.* metrics (which
+		// the agent emits on its own when --report-host is set); they carry no probe
+		// for the agent to run, so they are not pushed down.
+		if t.Kind == "host" {
+			continue
+		}
 		ds.ProbeTargets = append(ds.ProbeTargets, pcfg.ProbeTarget{Kind: t.Kind, Target: t.Target, Tier: t.Tier, Params: t.Params})
 	}
 	return ds, nil

@@ -24,6 +24,7 @@ import (
 	"github.com/nettact/server-core/alert"
 	"github.com/nettact/server-core/audit"
 	"github.com/nettact/server-core/config"
+	"github.com/nettact/server-core/hostlive"
 	"github.com/nettact/server-core/identity"
 	"github.com/nettact/server-core/incident"
 	"github.com/nettact/server-core/ingest"
@@ -51,9 +52,10 @@ type Deps struct {
 	Incident     *incident.Service
 	Notification *notification.Service
 	Audit        *audit.Service
-	SPA          http.Handler // optional embedded web UI (served for non-/api routes)
-	Dev          bool         // relax CORS for the Vite origin
-	SecureCookie bool         // set Secure on the session cookie (production/HTTPS)
+	HostLive     *hostlive.Store // in-memory live process/connection snapshots (never persisted)
+	SPA          http.Handler    // optional embedded web UI (served for non-/api routes)
+	Dev          bool            // relax CORS for the Vite origin
+	SecureCookie bool            // set Secure on the session cookie (production/HTTPS)
 }
 
 func Router(d Deps) http.Handler {
@@ -86,6 +88,10 @@ func Router(d Deps) http.Handler {
 			r.Get("/agents/{id}/series", d.handleAgentSeries)
 			r.Get("/agents/{id}/status-history", d.handleAgentStatusHistory)
 			r.Get("/agents/{id}/alerts", d.handleAgentAlerts)
+			// Live host snapshot (ephemeral process/connection lists): POST asks the
+			// agent, GET polls for the result. Never stored.
+			r.Post("/agents/{id}/snapshot", d.handleRequestSnapshot)
+			r.Get("/agents/{id}/snapshot", d.handleGetSnapshot)
 			r.Get("/enrollment-tokens", d.handleListTokens)
 			r.Post("/enrollment-tokens", d.handleCreateToken)
 			r.Get("/sites/{id}/targets", d.handleListTargets)
@@ -237,17 +243,75 @@ func (d Deps) handleTelemetry(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "ingest: "+err.Error())
 		return
 	}
+	// A live host snapshot is stored in memory only and handled outside ingest's
+	// sequence dedup (it is idempotent, latest-wins), so a snapshot-only packet
+	// with a reused sequence is still processed.
+	if pkt.HostSnapshot != nil && d.HostLive != nil {
+		d.HostLive.Store(agentID, *pkt.HostSnapshot)
+	}
 	_ = d.Registry.TouchLastSeen(ctx, agentID)
 	_ = d.Registry.SetReportedConfigVersion(ctx, agentID, pkt.ReportedConfigVersion)
+	// Refresh advertised capabilities from the header so a restart with changed
+	// --report-* flags is reflected (enrollment runs only once). No-op when equal.
+	if h := r.Header.Get("X-Agent-Capabilities"); h != "" {
+		_ = d.Registry.UpdateCapabilities(ctx, agentID, splitCaps(h))
+	}
 
 	resp := telemetryResponse{HighestSequence: ack.HighestSequence, ServerTime: ack.ServerTime}
 	if st, err := d.Registry.ConfigStatus(ctx, agentID); err == nil {
 		resp.ConfigVersion = st.ConfigVersion
-		if pkt.ReportedConfigVersion < st.ConfigVersion {
+		// A pending live-snapshot request must reach the agent even when its config
+		// version is current, so attach DesiredState if config lags OR one is pending.
+		var pendingSnap *pcfg.SnapshotRequest
+		if d.HostLive != nil {
+			pendingSnap = d.HostLive.PendingFor(agentID)
+		}
+		if pkt.ReportedConfigVersion < st.ConfigVersion || pendingSnap != nil {
 			if ds, err := d.Config.DesiredStateFor(ctx, agentID); err == nil {
+				ds.SnapshotRequest = pendingSnap
 				resp.DesiredState = &ds
 			}
 		}
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// ---- live host snapshot (ephemeral, never stored) ----
+
+// handleRequestSnapshot registers a pending live-snapshot request for an agent.
+// The agent honors it only for the caps it was started with, so a request for a
+// non-opted-in agent simply comes back with empty lists.
+func (d Deps) handleRequestSnapshot(w http.ResponseWriter, r *http.Request) {
+	if d.HostLive == nil {
+		writeError(w, http.StatusServiceUnavailable, "live snapshots not available")
+		return
+	}
+	var body struct {
+		WantProcesses   *bool `json:"want_processes"`
+		WantConnections *bool `json:"want_connections"`
+	}
+	_ = json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&body)
+	// Default to requesting both lists when the client omits the fields.
+	wantProcs := body.WantProcesses == nil || *body.WantProcesses
+	wantConns := body.WantConnections == nil || *body.WantConnections
+	id := d.HostLive.Request(chi.URLParam(r, "id"), wantProcs, wantConns)
+	writeJSON(w, http.StatusOK, map[string]string{"request_id": id})
+}
+
+// handleGetSnapshot returns the latest in-memory snapshot for an agent (if fresh)
+// and whether a request is still pending, so the console can poll after asking.
+func (d Deps) handleGetSnapshot(w http.ResponseWriter, r *http.Request) {
+	if d.HostLive == nil {
+		writeError(w, http.StatusServiceUnavailable, "live snapshots not available")
+		return
+	}
+	snap, ok, pending := d.HostLive.Latest(chi.URLParam(r, "id"))
+	resp := struct {
+		Snapshot *telemetry.HostSnapshot `json:"snapshot"`
+		Pending  bool                    `json:"pending"`
+	}{Pending: pending}
+	if ok {
+		resp.Snapshot = &snap
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
@@ -660,6 +724,18 @@ func (d Deps) handleHealthz(w http.ResponseWriter, r *http.Request) {
 }
 
 // ---- helpers ----
+
+// splitCaps parses the comma-separated X-Agent-Capabilities header, trimming
+// blanks so an empty or padded value yields a clean slice.
+func splitCaps(h string) []string {
+	var out []string
+	for _, p := range strings.Split(h, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
 
 func bearer(r *http.Request) string {
 	h := r.Header.Get("Authorization")
