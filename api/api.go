@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"runtime"
 	"strconv"
@@ -689,7 +690,7 @@ func (d Deps) handleDeleteAgentGroup(w http.ResponseWriter, r *http.Request) {
 }
 
 // validKinds is the whitelist of monitoring-target kinds the server accepts.
-var validKinds = map[string]bool{"icmp": true, "dns": true, "http": true, "tcp": true, "host": true}
+var validKinds = map[string]bool{"icmp": true, "dns": true, "http": true, "tcp": true, "nat": true, "host": true}
 
 // validateTarget checks a single monitoring target before it is persisted and
 // pushed to agents. It normalizes trivial fields and rejects malformed configs
@@ -713,6 +714,30 @@ func validateTarget(t *config.ProbeTarget) error {
 	if t.Kind == "tcp" {
 		if t.Params.Port < 1 || t.Params.Port > 65535 {
 			return errors.New("tcp monitor requires a port in 1-65535")
+		}
+	}
+	if t.Kind == "nat" {
+		switch t.Params.NATTransport {
+		case "", "udp", "tcp", "tls", "dtls":
+		default:
+			return errors.New("invalid nat_transport: " + t.Params.NATTransport)
+		}
+		if t.Params.Port < 0 || t.Params.Port > 65535 {
+			return errors.New("nat monitor port out of range (0-65535)")
+		}
+		// stun_server2 is host[:port] (the agent applies the default STUN port when
+		// none is given, like the primary target), so a bare host is valid. A value
+		// containing a colon must parse cleanly as host:port with an in-range port —
+		// this rejects malformed forms like "host:3478:extra" or "host:abc" rather than
+		// silently accepting them as a bare host.
+		if s := t.Params.STUNServer2; s != "" && strings.ContainsRune(s, ':') {
+			host, port, err := net.SplitHostPort(s)
+			if err != nil || host == "" {
+				return errors.New("stun_server2 must be host or host:port")
+			}
+			if p, perr := strconv.Atoi(port); perr != nil || p < 1 || p > 65535 {
+				return errors.New("stun_server2 port out of range (1-65535)")
+			}
 		}
 	}
 	if t.Params.IntervalSeconds < 0 || t.Params.IntervalSeconds > 86400 {

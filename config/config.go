@@ -46,7 +46,7 @@ func New(db *store.DB, reg *registry.Service) *Service {
 // ProbeTarget is a site-scoped monitoring target managed via the UI.
 type ProbeTarget struct {
 	ID      string           `json:"id"`
-	Kind    string           `json:"kind"`           // "icmp" | "dns" | "http" | "tcp" | "host"
+	Kind    string           `json:"kind"`           // "icmp" | "dns" | "http" | "tcp" | "nat" | "host"
 	Name    string           `json:"name,omitempty"` // human-friendly display name; optional
 	Target  string           `json:"target"`         // "1.1.1.1", "example.com", …
 	Params  pcfg.ProbeParams `json:"params"`         // per-protocol probe settings
