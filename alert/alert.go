@@ -39,20 +39,31 @@ type Raised struct {
 	At       time.Time
 }
 
-// Alert is a stored alert row joined with its rule (for the UI).
+// Alert is a stored alert row joined with its rule (for the UI). It carries the
+// human-facing identifiers (agent hostname, target name) and the rule's metric
+// condition (kind/comparator/threshold) so the API can render a description that
+// says who fired and why.
 type Alert struct {
 	ID         string     `json:"id"`
 	RuleID     string     `json:"rule_id"`
 	RuleName   string     `json:"rule_name"`
 	AgentID    string     `json:"agent_id"`
+	AgentHost  string     `json:"agent_host"` // display name or hostname of the detecting agent
 	SiteID     string     `json:"site_id"`
 	Target     string     `json:"target"`
+	TargetName string     `json:"target_name,omitempty"` // operator-set friendly name
 	Layer      string     `json:"layer"`
 	Severity   string     `json:"severity"`
 	State      string     `json:"state"`
 	Value      float64    `json:"value"`
 	StartedAt  time.Time  `json:"started_at"`
 	ResolvedAt *time.Time `json:"resolved_at"`
+
+	// Rule condition + probe kind, used server-side to render a description.
+	ProbeKind  string  `json:"-"`
+	MetricKind string  `json:"-"`
+	Comparator string  `json:"-"`
+	Threshold  float64 `json:"-"`
 }
 
 type Service struct {
@@ -155,12 +166,23 @@ func (s *Service) publish(topic string, rule RuleView, id, agentID, siteID, targ
 	})
 }
 
+// alertCols / alertFrom are shared by ListActive and ListForTarget so both carry
+// the same descriptive fields: the rule (name/layer/severity/metric condition),
+// the bound probe task (kind + friendly name), and the detecting agent
+// (display name / hostname). Column order must match query()'s scan.
+const alertCols = `a.id, a.rule_id, COALESCE(r.name,''), a.agent_id,
+	COALESCE(NULLIF(ag.display_name,''), ag.hostname, ''), a.site_id, a.target, COALESCE(p.name,''),
+	COALESCE(r.layer,''), COALESCE(r.severity,''), a.state, a.value, a.started_at, a.resolved_at,
+	COALESCE(p.kind,''), COALESCE(r.metric_kind,''), COALESCE(r.comparator,''), COALESCE(r.threshold,0)`
+
+const alertFrom = `FROM alerts a
+	LEFT JOIN alert_rules r ON r.id=a.rule_id
+	LEFT JOIN probe_tasks p ON p.id=r.probe_task_id
+	LEFT JOIN agents ag ON ag.id=a.agent_id`
+
 // ListActive returns firing alerts for a site, joined with rule metadata.
 func (s *Service) ListActive(ctx context.Context, siteID string) ([]Alert, error) {
-	return s.query(ctx, `
-		SELECT a.id, a.rule_id, COALESCE(r.name,''), a.agent_id, a.site_id, a.target,
-		       COALESCE(r.layer,''), COALESCE(r.severity,''), a.state, a.value, a.started_at, a.resolved_at
-		FROM alerts a LEFT JOIN alert_rules r ON r.id=a.rule_id
+	return s.query(ctx, `SELECT `+alertCols+` `+alertFrom+`
 		WHERE a.site_id=? AND a.state='firing' ORDER BY a.started_at DESC`, siteID)
 }
 
@@ -174,10 +196,7 @@ func (s *Service) ListForTarget(ctx context.Context, agentID, target string, lim
 	if limit <= 0 || limit > 500 {
 		limit = 50
 	}
-	return s.query(ctx, `
-		SELECT a.id, a.rule_id, COALESCE(r.name,''), a.agent_id, a.site_id, a.target,
-		       COALESCE(r.layer,''), COALESCE(r.severity,''), a.state, a.value, a.started_at, a.resolved_at
-		FROM alerts a LEFT JOIN alert_rules r ON r.id=a.rule_id
+	return s.query(ctx, `SELECT `+alertCols+` `+alertFrom+`
 		WHERE a.agent_id=? AND a.target=? AND a.fired_at IS NOT NULL
 		ORDER BY a.started_at DESC LIMIT ?`, agentID, target, limit)
 }
@@ -192,8 +211,10 @@ func (s *Service) query(ctx context.Context, sqlStr string, args ...any) ([]Aler
 	for rows.Next() {
 		var a Alert
 		var resolved sql.NullTime
-		if err := rows.Scan(&a.ID, &a.RuleID, &a.RuleName, &a.AgentID, &a.SiteID, &a.Target,
-			&a.Layer, &a.Severity, &a.State, &a.Value, &a.StartedAt, &resolved); err != nil {
+		if err := rows.Scan(&a.ID, &a.RuleID, &a.RuleName, &a.AgentID, &a.AgentHost,
+			&a.SiteID, &a.Target, &a.TargetName, &a.Layer, &a.Severity, &a.State, &a.Value,
+			&a.StartedAt, &resolved,
+			&a.ProbeKind, &a.MetricKind, &a.Comparator, &a.Threshold); err != nil {
 			return nil, err
 		}
 		if resolved.Valid {

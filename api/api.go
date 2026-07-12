@@ -781,7 +781,15 @@ func (d Deps) handleListDevices(w http.ResponseWriter, r *http.Request) {
 }
 
 func (d Deps) handleListIncidents(w http.ResponseWriter, r *http.Request) {
-	incs, err := d.Incident.List(r.Context(), siteParam(r))
+	ctx := r.Context()
+	siteID := siteParam(r)
+	page, pageSize := pageParams(r, 15, 100)
+	total, err := d.Incident.Count(ctx, siteID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	incs, err := d.Incident.List(ctx, siteID, pageSize, (page-1)*pageSize)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -789,7 +797,25 @@ func (d Deps) handleListIncidents(w http.ResponseWriter, r *http.Request) {
 	if incs == nil {
 		incs = []incident.Incident{}
 	}
-	writeJSON(w, http.StatusOK, incs)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"items": incs, "total": total, "page": page, "page_size": pageSize,
+	})
+}
+
+// pageParams parses ?page and ?page_size, applying a default size and a hard cap.
+func pageParams(r *http.Request, defSize, maxSize int) (page, size int) {
+	page = 1
+	if v, err := strconv.Atoi(r.URL.Query().Get("page")); err == nil && v > 1 {
+		page = v
+	}
+	size = defSize
+	if v, err := strconv.Atoi(r.URL.Query().Get("page_size")); err == nil && v > 0 {
+		size = v
+	}
+	if size > maxSize {
+		size = maxSize
+	}
+	return page, size
 }
 
 func (d Deps) handleTimeline(w http.ResponseWriter, r *http.Request) {
@@ -804,16 +830,37 @@ func (d Deps) handleTimeline(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, tl)
 }
 
+// alertView is an active alert plus a human description of the fault, rendered
+// in both languages so the console can show "who fired and why" without
+// re-implementing the wording client-side.
+type alertView struct {
+	alert.Alert
+	DescZh string `json:"desc_zh"`
+	DescEn string `json:"desc_en"`
+}
+
 func (d Deps) handleListAlerts(w http.ResponseWriter, r *http.Request) {
 	alerts, err := d.Alert.ListActive(r.Context(), siteParam(r))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	if alerts == nil {
-		alerts = []alert.Alert{}
+	views := make([]alertView, 0, len(alerts))
+	for _, a := range alerts {
+		// AgentHost is left off the detail so the description doesn't repeat the
+		// host — the console shows it in its own column.
+		det := notification.AlertDetail{
+			ProbeKind: a.ProbeKind, MetricKind: a.MetricKind, Comparator: a.Comparator,
+			Threshold: a.Threshold, Value: a.Value, TargetName: a.TargetName, Target: a.Target,
+			Layer: a.Layer, Severity: a.Severity,
+		}
+		views = append(views, alertView{
+			Alert:  a,
+			DescZh: notification.DescribeDetail(det, "zh"),
+			DescEn: notification.DescribeDetail(det, "en"),
+		})
 	}
-	writeJSON(w, http.StatusOK, alerts)
+	writeJSON(w, http.StatusOK, views)
 }
 
 // handleAgentAlerts returns the alarm history (firing + resolved) for one

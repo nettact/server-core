@@ -347,11 +347,19 @@ func (s *Service) firingChannels(ctx context.Context, siteID string) []string {
 
 // --- UI reads ---
 
-func (s *Service) List(ctx context.Context, siteID string) ([]Incident, error) {
+// Count returns the total number of incidents for a site (for pagination).
+func (s *Service) Count(ctx context.Context, siteID string) (int, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM incidents WHERE site_id=?`, siteID).Scan(&n)
+	return n, err
+}
+
+// List returns one page of incidents for a site, newest first.
+func (s *Service) List(ctx context.Context, siteID string, limit, offset int) ([]Incident, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, site_id, COALESCE(title,''), COALESCE(suspected_layer,''), state,
 		       COALESCE(severity,''), COALESCE(summary,''), opened_at, resolved_at
-		FROM incidents WHERE site_id=? ORDER BY opened_at DESC LIMIT 200`, siteID)
+		FROM incidents WHERE site_id=? ORDER BY opened_at DESC LIMIT ? OFFSET ?`, siteID, limit, offset)
 	if err != nil {
 		return nil, err
 	}
