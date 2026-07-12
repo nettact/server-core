@@ -88,3 +88,49 @@ func TestUpdateAndDeleteAgent(t *testing.T) {
 		t.Errorf("UpdateAgent(missing) = %v, want sql.ErrNoRows", err)
 	}
 }
+
+// TestSweepStaleExcludesConnected verifies the sweep's exclusion list: an agent
+// with a stale last_seen_at but a live WebSocket session (its ID is in exclude)
+// must stay online, while an equally stale, non-excluded agent flips offline
+// with a history row.
+func TestSweepStaleExcludesConnected(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	ctx := context.Background()
+	stale := time.Now().UTC().Add(-time.Hour)
+
+	mustExec(t, db, `INSERT INTO sites(id,name,created_at) VALUES('site_default','def',?)`, stale)
+	for _, id := range []string{"agent_connected", "agent_gone"} {
+		mustExec(t, db,
+			`INSERT INTO agents(id,site_id,public_key,token_hash,status,last_seen_at) VALUES(?,'site_default',x'00','h','online',?)`,
+			id, stale)
+	}
+
+	reg := New(db, 0)
+	n, err := reg.SweepStale(ctx, 10*time.Second, []string{"agent_connected"})
+	if err != nil {
+		t.Fatalf("SweepStale: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("SweepStale flipped %d agents, want 1", n)
+	}
+	for id, want := range map[string]string{"agent_connected": "online", "agent_gone": "offline"} {
+		a, err := reg.Get(ctx, id)
+		if err != nil {
+			t.Fatalf("Get(%s): %v", id, err)
+		}
+		if a.Status != want {
+			t.Errorf("%s status = %q, want %q", id, a.Status, want)
+		}
+	}
+	// Only the flipped agent gets an offline history row.
+	if hist, _ := reg.StatusHistory(ctx, "agent_gone"); len(hist) != 1 || hist[0].Status != "offline" {
+		t.Errorf("agent_gone history = %+v, want one offline event", hist)
+	}
+	if hist, _ := reg.StatusHistory(ctx, "agent_connected"); len(hist) != 0 {
+		t.Errorf("agent_connected history = %+v, want none", hist)
+	}
+}

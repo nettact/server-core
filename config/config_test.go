@@ -37,7 +37,7 @@ func TestDesiredStateForScoping(t *testing.T) {
 	seedAgent(t, db, "agent_b", siteID)
 
 	reg := registry.New(db, 0)
-	svc := New(db, reg)
+	svc := New(db, reg, nil)
 
 	// Group "g1" contains only agent_a.
 	gid, err := reg.CreateGroup(ctx, siteID, "g1")
@@ -121,7 +121,7 @@ func TestGroupSiteConsistency(t *testing.T) {
 	seedAgent(t, db, "agent_b", "site_b") // lives in the OTHER site
 
 	reg := registry.New(db, 0)
-	svc := New(db, reg)
+	svc := New(db, reg, nil)
 
 	gid, err := reg.CreateGroup(ctx, "site_a", "g")
 	if err != nil {

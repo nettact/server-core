@@ -62,10 +62,10 @@ func (s *Service) TouchLastSeen(ctx context.Context, id string) error {
 	return nil
 }
 
-// UpdateCapabilities refreshes an agent's advertised capabilities from an
-// authenticated telemetry upload, so restarting an agent with different
-// --report-* flags is reflected server-side (enrollment happens only once). The
-// conditional WHERE makes it a no-op write when nothing changed.
+// UpdateCapabilities refreshes an agent's advertised capabilities from its
+// WebSocket Hello, so restarting an agent with different --report-* flags is
+// reflected server-side (enrollment happens only once). The conditional WHERE
+// makes it a no-op write when nothing changed.
 func (s *Service) UpdateCapabilities(ctx context.Context, id string, caps []string) error {
 	if caps == nil {
 		caps = []string{}
@@ -79,16 +79,34 @@ func (s *Service) UpdateCapabilities(ctx context.Context, id string, caps []stri
 	return err
 }
 
+// UpdateReportedInfo refreshes the agent-reported identity fields (hostname,
+// platform, agent version) from a WebSocket Hello, so a rename or agent upgrade
+// is reflected server-side (enrollment happens only once). Empty values are
+// written as-is: the agent owns these fields and reports them on every connect.
+func (s *Service) UpdateReportedInfo(ctx context.Context, id, hostname, platform, agentVersion string) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE agents SET hostname=?, platform=?, agent_version=? WHERE id=?`,
+		hostname, platform, agentVersion, id)
+	return err
+}
+
 // SweepStale marks any online agent whose last_seen_at is older than threshold
 // as offline and records the transition. Runs on a periodic ticker; returns the
-// number of agents flipped offline.
-func (s *Service) SweepStale(ctx context.Context, threshold time.Duration) (int, error) {
+// number of agents flipped offline. exclude lists agent IDs that must never be
+// swept regardless of last_seen_at — the caller passes the currently connected
+// WebSocket sessions, so a live agent can't be flipped offline by a race
+// between its keepalive touch and the sweep threshold.
+func (s *Service) SweepStale(ctx context.Context, threshold time.Duration, exclude []string) (int, error) {
 	now := time.Now().UTC()
 	cutoff := now.Add(-threshold)
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT id FROM agents WHERE revoked=0 AND status='online' AND last_seen_at IS NOT NULL AND last_seen_at < ?`, cutoff)
 	if err != nil {
 		return 0, err
+	}
+	excluded := make(map[string]bool, len(exclude))
+	for _, id := range exclude {
+		excluded[id] = true
 	}
 	var stale []string
 	for rows.Next() {
@@ -97,13 +115,16 @@ func (s *Service) SweepStale(ctx context.Context, threshold time.Duration) (int,
 			rows.Close()
 			return 0, err
 		}
+		if excluded[id] {
+			continue
+		}
 		stale = append(stale, id)
 	}
 	rows.Close()
 	changed := 0
 	for _, id := range stale {
-		// Re-check the stale condition atomically in the UPDATE: if a telemetry
-		// upload marked the agent online (bumping last_seen_at) between the SELECT
+		// Re-check the stale condition atomically in the UPDATE: if a keepalive
+		// touch marked the agent online (bumping last_seen_at) between the SELECT
 		// above and here, the WHERE fails and we neither flip it offline nor write
 		// a bogus history row.
 		res, err := s.db.ExecContext(ctx,

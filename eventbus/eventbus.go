@@ -14,12 +14,20 @@ const (
 	TopicAlertResolved     = "alert.resolved"
 	TopicIncidentOpened    = "incident.opened"
 	TopicIncidentUpdated   = "incident.updated"
+	TopicConfigChanged     = "config.changed"
 )
 
 // TelemetryIngested is the payload for TopicTelemetryIngested.
 type TelemetryIngested struct {
 	AgentID string
 	SiteID  string
+}
+
+// ConfigChanged is the payload for TopicConfigChanged, published after a site's
+// monitoring targets change (and config_version is bumped) so the WebSocket hub
+// can push fresh DesiredState to the site's connected agents immediately.
+type ConfigChanged struct {
+	SiteID string
 }
 
 // Message is one published event.

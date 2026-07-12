@@ -1,7 +1,8 @@
 // Package config manages monitoring targets (probe_tasks) and builds the
 // DesiredState the server pushes down to agents. Targets are configured
 // centrally in Lite so agents stay near-zero-config; changing them bumps the
-// per-agent config_version so the next telemetry ack carries the new state.
+// per-agent config_version and publishes TopicConfigChanged so the WebSocket
+// hub pushes the new state to connected agents immediately.
 package config
 
 import (
@@ -12,6 +13,7 @@ import (
 	"github.com/google/uuid"
 
 	pcfg "github.com/nettact/protocol/config"
+	"github.com/nettact/server-core/eventbus"
 	"github.com/nettact/server-core/registry"
 	"github.com/nettact/server-core/store"
 )
@@ -37,10 +39,11 @@ const AgentScopePredicate = `(pt.all_agents=1 OR EXISTS(
 type Service struct {
 	db  *store.DB
 	reg *registry.Service
+	bus *eventbus.Bus
 }
 
-func New(db *store.DB, reg *registry.Service) *Service {
-	return &Service{db: db, reg: reg}
+func New(db *store.DB, reg *registry.Service, bus *eventbus.Bus) *Service {
+	return &Service{db: db, reg: reg, bus: bus}
 }
 
 // ProbeTarget is a site-scoped monitoring target managed via the UI.
@@ -131,9 +134,10 @@ func (s *Service) ListSiteTargets(ctx context.Context, siteID string) ([]ProbeTa
 	return out, grows.Err()
 }
 
-// SetSiteTargets reconciles the site-scoped targets to the given set and bumps
-// config_version for every agent in the site so they pick up the change on next
-// telemetry. Existing target IDs are PRESERVED (upsert) so per-target alarm
+// SetSiteTargets reconciles the site-scoped targets to the given set, bumps
+// config_version for every agent in the site, and publishes TopicConfigChanged
+// so connected agents get the new state pushed over their WebSocket right
+// away. Existing target IDs are PRESERVED (upsert) so per-target alarm
 // rules bound via probe_task_id survive edits; targets no longer present are
 // deleted along with their bound rules.
 func (s *Service) SetSiteTargets(ctx context.Context, siteID string, targets []ProbeTarget) error {
@@ -242,7 +246,16 @@ func (s *Service) SetSiteTargets(ctx context.Context, siteID string, targets []P
 		return err
 	}
 	committed = true
-	return s.reg.BumpConfigVersionForSite(ctx, siteID)
+	if err := s.reg.BumpConfigVersionForSite(ctx, siteID); err != nil {
+		return err
+	}
+	// Announce the change so the WebSocket hub pushes the new DesiredState to
+	// the site's connected agents right away, instead of waiting for them to
+	// notice the version bump on their own.
+	if s.bus != nil {
+		s.bus.Publish(eventbus.TopicConfigChanged, eventbus.ConfigChanged{SiteID: siteID})
+	}
+	return nil
 }
 
 // DesiredStateFor builds the config to push to a specific agent. Targets are

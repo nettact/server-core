@@ -62,7 +62,7 @@ func TestEvaluateAgentHostScope(t *testing.T) {
 	}
 
 	reg := registry.New(db, 0)
-	cfg := config.New(db, reg)
+	cfg := config.New(db, reg, nil)
 
 	// Group "servers" contains only agent_in.
 	gid, err := reg.CreateGroup(ctx, siteID, "servers")
@@ -139,7 +139,7 @@ func TestEvaluateAgentPerMonitor(t *testing.T) {
 	mustExec(t, db, `INSERT INTO agents(id,site_id,public_key,token_hash,status) VALUES('agent_x',?,x'00','h','online')`, siteID)
 
 	reg := registry.New(db, 0)
-	cfg := config.New(db, reg)
+	cfg := config.New(db, reg, nil)
 
 	// Two ICMP monitors on the same target string.
 	const monA = "probe_dup_a"
@@ -204,7 +204,7 @@ func TestResolveOutOfScopeOnGroupChange(t *testing.T) {
 	mustExec(t, db, `INSERT INTO agents(id,site_id,public_key,token_hash,status) VALUES('agent_x',?,x'00','h','online')`, siteID)
 
 	reg := registry.New(db, 0)
-	cfg := config.New(db, reg)
+	cfg := config.New(db, reg, nil)
 	gid, err := reg.CreateGroup(ctx, siteID, "servers")
 	if err != nil {
 		t.Fatalf("CreateGroup: %v", err)

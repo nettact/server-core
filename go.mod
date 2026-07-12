@@ -3,6 +3,7 @@ module github.com/nettact/server-core
 go 1.25
 
 require (
+	github.com/coder/websocket v1.8.14
 	github.com/go-chi/chi/v5 v5.2.1
 	github.com/google/uuid v1.6.0
 	github.com/nettact/protocol v0.0.0-00010101000000-000000000000

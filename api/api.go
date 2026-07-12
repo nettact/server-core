@@ -1,12 +1,11 @@
 // Package api exposes the HTTP surface (chi router + handlers), reusable by the
 // future cloud server. M2 adds real auth: a single-user session (HttpOnly
-// cookie) for the UI, ed25519 enrollment for agents, and bearer-token auth on
-// telemetry. Monitoring targets are edited here and pushed to agents via the
-// telemetry ack (config downlink).
+// cookie) for the UI and ed25519 enrollment for agents. Telemetry and the
+// config downlink ride the persistent agent WebSocket (package agentws),
+// mounted here at /agent/ws.
 package api
 
 import (
-	"compress/gzip"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -22,17 +21,16 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 
-	pcfg "github.com/nettact/protocol/config"
 	"github.com/nettact/protocol/enroll"
 	"github.com/nettact/protocol/telemetry"
-	"github.com/nettact/protocol/wire"
+	"github.com/nettact/server-core/agentws"
 	"github.com/nettact/server-core/alert"
 	"github.com/nettact/server-core/audit"
 	"github.com/nettact/server-core/config"
+	"github.com/nettact/server-core/eventbus"
 	"github.com/nettact/server-core/hostlive"
 	"github.com/nettact/server-core/identity"
 	"github.com/nettact/server-core/incident"
-	"github.com/nettact/server-core/ingest"
 	"github.com/nettact/server-core/inventory"
 	"github.com/nettact/server-core/metrics"
 	"github.com/nettact/server-core/notification"
@@ -50,7 +48,6 @@ const sessionCookie = "nettact_session"
 type Deps struct {
 	Identity     *identity.Service
 	Registry     *registry.Service
-	Ingest       *ingest.Service
 	Metrics      *metrics.Store
 	Config       *config.Service
 	Site         *site.Service
@@ -62,6 +59,8 @@ type Deps struct {
 	Settings     *settings.Service
 	Audit        *audit.Service
 	HostLive     *hostlive.Store // in-memory live process/connection snapshots (never persisted)
+	AgentWS      *agentws.Hub    // persistent agent WebSocket channel (telemetry + config downlink)
+	Bus          *eventbus.Bus   // TopicConfigChanged for config mutations outside config.Service (group scope edits)
 	SPA          http.Handler    // optional embedded web UI (served for non-/api routes)
 	Dev          bool            // relax CORS for the Vite origin
 	SecureCookie bool            // set Secure on the session cookie (production/HTTPS)
@@ -80,7 +79,7 @@ func Router(d Deps) http.Handler {
 		r.Get("/healthz", d.handleHealthz)
 		r.Post("/auth/login", d.handleLogin)
 		r.Post("/enroll", d.handleEnroll)
-		r.Post("/telemetry", d.handleTelemetry)
+		r.Get("/agent/ws", d.AgentWS.HandleUpgrade)
 
 		// session-protected UI
 		r.Group(func(r chi.Router) {
@@ -233,103 +232,22 @@ func (d Deps) handleEnroll(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
-// ---- telemetry (agent-facing, bearer auth) ----
-
-const maxPacketBytes = 8 << 20
-
-type telemetryResponse struct {
-	HighestSequence uint64             `json:"highest_sequence"`
-	ServerTime      time.Time          `json:"server_time"`
-	ConfigVersion   int                `json:"config_version"`
-	DesiredState    *pcfg.DesiredState `json:"desired_state,omitempty"`
-}
-
-func (d Deps) handleTelemetry(w http.ResponseWriter, r *http.Request) {
-	agentID, siteID, err := d.Registry.AuthenticateAgent(r.Context(), bearer(r))
-	if err != nil {
-		writeError(w, http.StatusUnauthorized, "invalid agent token")
-		return
-	}
-
-	var body io.Reader = http.MaxBytesReader(w, r.Body, maxPacketBytes)
-	if strings.EqualFold(r.Header.Get("Content-Encoding"), "gzip") {
-		gz, err := gzip.NewReader(body)
-		if err != nil {
-			writeError(w, http.StatusBadRequest, "invalid gzip body")
-			return
-		}
-		defer gz.Close()
-		body = gz
-	}
-	// Decode by Content-Type: protobuf when advertised, JSON otherwise (default),
-	// so pre-protobuf agents keep working. Protobuf needs the whole buffer.
-	// MaxBytesReader bounds only the compressed bytes, so bound the decompressed
-	// read as well (one extra byte detects overflow) — otherwise a small gzip
-	// bomb from an authenticated agent could allocate unbounded memory.
-	raw, err := io.ReadAll(io.LimitReader(body, maxPacketBytes+1))
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "read body: "+err.Error())
-		return
-	}
-	if len(raw) > maxPacketBytes {
-		writeError(w, http.StatusRequestEntityTooLarge, "telemetry packet exceeds size limit")
-		return
-	}
-	pkt, err := wire.UnmarshalPacket(raw, r.Header.Get("Content-Type"))
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid packet: "+err.Error())
-		return
-	}
-
-	ctx := r.Context()
-	ack, err := d.Ingest.Ingest(ctx, agentID, siteID, pkt)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "ingest: "+err.Error())
-		return
-	}
-	// A live host snapshot is stored in memory only and handled outside ingest's
-	// sequence dedup (it is idempotent, latest-wins), so a snapshot-only packet
-	// with a reused sequence is still processed.
-	if pkt.HostSnapshot != nil && d.HostLive != nil {
-		d.HostLive.Store(agentID, *pkt.HostSnapshot)
-	}
-	_ = d.Registry.TouchLastSeen(ctx, agentID)
-	_ = d.Registry.SetReportedConfigVersion(ctx, agentID, pkt.ReportedConfigVersion)
-	// Refresh advertised capabilities from the header so a restart with changed
-	// --report-* flags is reflected (enrollment runs only once). No-op when equal.
-	if h := r.Header.Get("X-Agent-Capabilities"); h != "" {
-		_ = d.Registry.UpdateCapabilities(ctx, agentID, splitCaps(h))
-	}
-
-	resp := telemetryResponse{HighestSequence: ack.HighestSequence, ServerTime: ack.ServerTime}
-	if st, err := d.Registry.ConfigStatus(ctx, agentID); err == nil {
-		resp.ConfigVersion = st.ConfigVersion
-		// A pending live-snapshot request must reach the agent even when its config
-		// version is current, so attach DesiredState if config lags OR one is pending.
-		var pendingSnap *pcfg.SnapshotRequest
-		if d.HostLive != nil {
-			pendingSnap = d.HostLive.PendingFor(agentID)
-		}
-		if pkt.ReportedConfigVersion < st.ConfigVersion || pendingSnap != nil {
-			if ds, err := d.Config.DesiredStateFor(ctx, agentID); err == nil {
-				ds.SnapshotRequest = pendingSnap
-				resp.DesiredState = &ds
-			}
-		}
-	}
-	// Reply in the format the agent accepts (protobuf preferred), falling back to
-	// JSON. telemetryResponse and wire.Ack are field-identical, so convert directly.
-	writeAck(w, r, wire.Ack(resp))
-}
-
 // ---- live host snapshot (ephemeral, never stored) ----
 
-// handleRequestSnapshot registers a pending live-snapshot request for an agent.
-// The agent honors it only for the caps it was started with, so a request for a
+// handleRequestSnapshot registers a pending live-snapshot request for an agent
+// and pushes it down the agent's WebSocket immediately. A disconnected agent is
+// a 409 up front — no pending request is registered, so the console gets an
+// honest "agent offline" instead of a spinner that can never resolve. The agent
+// honors the request only for the caps it was started with, so a request for a
 // non-opted-in agent simply comes back with empty lists.
 func (d Deps) handleRequestSnapshot(w http.ResponseWriter, r *http.Request) {
 	if d.HostLive == nil {
 		writeError(w, http.StatusServiceUnavailable, "live snapshots not available")
+		return
+	}
+	id := chi.URLParam(r, "id")
+	if !d.AgentWS.IsConnected(id) {
+		writeError(w, http.StatusConflict, "agent offline")
 		return
 	}
 	var body struct {
@@ -340,8 +258,12 @@ func (d Deps) handleRequestSnapshot(w http.ResponseWriter, r *http.Request) {
 	// Default to requesting both lists when the client omits the fields.
 	wantProcs := body.WantProcesses == nil || *body.WantProcesses
 	wantConns := body.WantConnections == nil || *body.WantConnections
-	id := d.HostLive.Request(chi.URLParam(r, "id"), wantProcs, wantConns)
-	writeJSON(w, http.StatusOK, map[string]string{"request_id": id})
+	req := d.HostLive.Request(id, wantProcs, wantConns)
+	// Push directly; a race where the agent dropped between the check above and
+	// here is fine — the request is re-pushed if it reconnects while pending,
+	// and expires via TTL otherwise.
+	d.AgentWS.PushSnapshotRequest(id, req)
+	writeJSON(w, http.StatusOK, map[string]string{"request_id": req.RequestID})
 }
 
 // handleGetSnapshot returns the latest in-memory snapshot for an agent (if fresh)
@@ -427,6 +349,13 @@ func (d Deps) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 
 func (d Deps) handleDeleteAgent(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
+	// Evict any live WebSocket session FIRST: it authenticated at upgrade time,
+	// so left open it would keep ingesting under the captured identity and could
+	// recreate series after the purge below. Disconnect completes the close
+	// handshake before returning, so no further packet from this agent lands.
+	if d.AgentWS != nil {
+		d.AgentWS.Disconnect(id, agentws.StatusRevoked, "agent deleted")
+	}
 	// Purge the agent's time-series (series/samples/rollups + metrics-store cache)
 	// BEFORE removing the agent row. If the purge fails we return 500 with the
 	// agent still present, so a retry re-purges and then deletes — otherwise the
@@ -665,6 +594,12 @@ func (d Deps) handleUpdateAgentGroup(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	// UpdateGroup bumped config_version (membership changes which targets reach
+	// which agents); publish so the WS hub pushes the recomputed DesiredState to
+	// connected agents now instead of on their next reconnect.
+	if d.Bus != nil {
+		d.Bus.Publish(eventbus.TopicConfigChanged, eventbus.ConfigChanged{SiteID: siteID})
+	}
 	d.Audit.Log(r.Context(), "admin", "agent_group.update", id, name)
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
@@ -685,6 +620,11 @@ func (d Deps) handleDeleteAgentGroup(w http.ResponseWriter, r *http.Request) {
 	if err := d.Alert.ResolveOutOfScope(r.Context(), siteID); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
+	}
+	// DeleteGroup bumped config_version (its target bindings are gone); publish
+	// so connected agents drop the now-unscoped targets immediately.
+	if d.Bus != nil {
+		d.Bus.Publish(eventbus.TopicConfigChanged, eventbus.ConfigChanged{SiteID: siteID})
 	}
 	d.Audit.Log(r.Context(), "admin", "agent_group.delete", id, "")
 	w.WriteHeader(http.StatusNoContent)
@@ -1151,18 +1091,6 @@ func (d Deps) handleHealthz(w http.ResponseWriter, r *http.Request) {
 
 // ---- helpers ----
 
-// splitCaps parses the comma-separated X-Agent-Capabilities header, trimming
-// blanks so an empty or padded value yields a clean slice.
-func splitCaps(h string) []string {
-	var out []string
-	for _, p := range strings.Split(h, ",") {
-		if p = strings.TrimSpace(p); p != "" {
-			out = append(out, p)
-		}
-	}
-	return out
-}
-
 func bearer(r *http.Request) string {
 	h := r.Header.Get("Authorization")
 	if strings.HasPrefix(h, "Bearer ") {
@@ -1188,21 +1116,6 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]string{"error": msg})
 }
 
-// writeAck encodes the telemetry ack in the format the agent advertised via
-// Accept (protobuf preferred; JSON when absent/unknown), matching the request's
-// negotiated format so old JSON agents receive JSON acks.
-func writeAck(w http.ResponseWriter, r *http.Request, ack wire.Ack) {
-	ct := wire.Negotiate(r.Header.Get("Accept"))
-	data, err := wire.MarshalAck(ack, ct)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "encode ack: "+err.Error())
-		return
-	}
-	w.Header().Set("Content-Type", ct)
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(data)
-}
-
 func devCORS(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		origin := r.Header.Get("Origin")
@@ -1213,7 +1126,7 @@ func devCORS(next http.Handler) http.Handler {
 		}
 		if r.Method == http.MethodOptions {
 			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Accept, Authorization, Content-Encoding, X-Agent-Hostname, X-Agent-Platform, X-Agent-Version")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Accept, Authorization")
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}

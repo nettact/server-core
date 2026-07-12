@@ -2,9 +2,11 @@
 // process and network-connection lists) that agents return in response to a
 // console user opening the live page. Nothing here is persisted: the store keeps
 // only the latest snapshot per agent in memory, plus a short-lived pending
-// request that is attached to the agent's next DesiredState downlink. This is
-// how a request reaches the outbound-only agent, and why process/connection data
-// is never written to the database or alerted on.
+// request. Dispatch is a direct WebSocket push — once when the console asks,
+// and again if the agent reconnects while the request is still live (covering a
+// blip between ask and delivery) — so no re-dispatch throttle is needed. This
+// is also why process/connection data is never written to the database or
+// alerted on.
 package hostlive
 
 import (
@@ -20,17 +22,13 @@ import (
 const (
 	// pendingTTL bounds how long an unanswered request stays live (agent offline).
 	pendingTTL = 60 * time.Second
-	// dispatchThrottle keeps the server from re-asking on every telemetry upload
-	// while a request is in flight; it re-dispatches only after this interval.
-	dispatchThrottle = 12 * time.Second
 	// snapshotTTL is how long a delivered snapshot is served before it is stale.
 	snapshotTTL = 60 * time.Second
 )
 
 type pending struct {
-	req          pcfg.SnapshotRequest
-	requestedAt  time.Time
-	dispatchedAt time.Time
+	req         pcfg.SnapshotRequest
+	requestedAt time.Time
 }
 
 type stored struct {
@@ -55,38 +53,36 @@ func New() *Store {
 }
 
 // Request registers (or replaces) a pending live-snapshot request for an agent
-// and returns the new request id. wantProcs/wantConns come from the console; the
-// agent still re-checks its own opt-in flags before collecting anything.
-func (s *Store) Request(agentID string, wantProcs, wantConns bool) string {
+// and returns the built request so the caller can push it to the agent's
+// WebSocket session. wantProcs/wantConns come from the console; the agent still
+// re-checks its own opt-in flags before collecting anything.
+func (s *Store) Request(agentID string, wantProcs, wantConns bool) pcfg.SnapshotRequest {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	id := "snap_" + uuid.NewString()
-	s.pending[agentID] = &pending{
-		req:         pcfg.SnapshotRequest{RequestID: id, WantProcesses: wantProcs, WantConnections: wantConns},
-		requestedAt: s.nowFn(),
+	req := pcfg.SnapshotRequest{
+		RequestID:       "snap_" + uuid.NewString(),
+		WantProcesses:   wantProcs,
+		WantConnections: wantConns,
 	}
-	return id
+	s.pending[agentID] = &pending{req: req, requestedAt: s.nowFn()}
+	return req
 }
 
-// PendingFor returns the request to attach to an agent's DesiredState, or nil.
-// It expires stale requests and throttles re-dispatch so a request in flight is
-// not re-sent on every telemetry upload.
-func (s *Store) PendingFor(agentID string) *pcfg.SnapshotRequest {
+// Pending returns the agent's live pending request, or nil. Its only remaining
+// caller is the WebSocket hub's on-connect re-push (the initial dispatch pushes
+// the request directly), so a non-nil result means "still waiting for the
+// snapshot" and is safe to re-send: the agent answers idempotently.
+func (s *Store) Pending(agentID string) *pcfg.SnapshotRequest {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	p, ok := s.pending[agentID]
 	if !ok {
 		return nil
 	}
-	now := s.nowFn()
-	if now.Sub(p.requestedAt) > pendingTTL {
+	if s.nowFn().Sub(p.requestedAt) > pendingTTL {
 		delete(s.pending, agentID)
 		return nil
 	}
-	if !p.dispatchedAt.IsZero() && now.Sub(p.dispatchedAt) < dispatchThrottle {
-		return nil
-	}
-	p.dispatchedAt = now
 	req := p.req
 	return &req
 }
@@ -105,9 +101,9 @@ func (s *Store) Store(agentID string, snap telemetry.HostSnapshot) {
 
 // Latest returns the most recent snapshot for an agent if it is still fresh, and
 // whether a request is currently pending (so the console can show a spinner).
-// It also enforces pendingTTL here: an offline agent never calls PendingFor, so
-// without this the console would poll a "pending" request forever and the entry
-// would leak.
+// It also enforces pendingTTL here: an offline agent never answers, so without
+// this the console would poll a "pending" request forever and the entry would
+// leak.
 func (s *Store) Latest(agentID string) (telemetry.HostSnapshot, bool, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
