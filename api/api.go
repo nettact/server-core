@@ -451,9 +451,10 @@ func (d Deps) handleDeleteAgent(w http.ResponseWriter, r *http.Request) {
 
 func (d Deps) handleAgentMetrics(w http.ResponseWriter, r *http.Request) {
 	q := metrics.Query{
-		AgentID: chi.URLParam(r, "id"),
-		Kind:    r.URL.Query().Get("kind"),
-		Target:  r.URL.Query().Get("target"),
+		AgentID:   chi.URLParam(r, "id"),
+		Kind:      r.URL.Query().Get("kind"),
+		Target:    r.URL.Query().Get("target"),
+		MonitorID: r.URL.Query().Get("monitor"),
 	}
 	if s := r.URL.Query().Get("limit"); s != "" {
 		if n, err := strconv.Atoi(s); err == nil {
@@ -795,21 +796,37 @@ func validateAcceptedStatuses(s string) error {
 	return nil
 }
 
+// handlePurgeTarget clears history for exactly one of: a user-created monitor
+// (monitor_id — that monitor's series across all agents), or a system-series
+// target string (target — e.g. a removed interface; monitor data is never
+// touched via the string form, so a shared target can't collateral-damage
+// another monitor).
 func (d Deps) handlePurgeTarget(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Target string `json:"target"`
+		MonitorID string `json:"monitor_id"`
+		Target    string `json:"target"`
 	}
-	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&body); err != nil || body.Target == "" {
-		writeError(w, http.StatusBadRequest, "target required")
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&body); err != nil ||
+		(body.MonitorID == "") == (body.Target == "") {
+		writeError(w, http.StatusBadRequest, "exactly one of monitor_id or target required")
 		return
 	}
 	siteID := chi.URLParam(r, "id")
-	n, err := d.Metrics.PurgeTarget(r.Context(), siteID, body.Target)
+	var n int
+	var err error
+	var subject string
+	if body.MonitorID != "" {
+		subject = body.MonitorID
+		n, err = d.Metrics.PurgeMonitor(r.Context(), siteID, body.MonitorID)
+	} else {
+		subject = body.Target
+		n, err = d.Metrics.PurgeTarget(r.Context(), siteID, body.Target)
+	}
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	d.Audit.Log(r.Context(), "admin", "metrics.purge_target", body.Target, strconv.Itoa(n)+" series")
+	d.Audit.Log(r.Context(), "admin", "metrics.purge_target", subject, strconv.Itoa(n)+" series")
 	writeJSON(w, http.StatusOK, map[string]int{"purged_series": n})
 }
 
@@ -909,7 +926,8 @@ func (d Deps) handleListAlerts(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleAgentAlerts returns the alarm history (firing + resolved) for one
-// agent+target, newest first, for the history page's 报警记录 panel.
+// agent, newest first — scoped to a user-created monitor via ?monitor=, or to
+// a target string via ?target= (host alerts, whose metrics carry no monitor).
 func (d Deps) handleAgentAlerts(w http.ResponseWriter, r *http.Request) {
 	limit := 10
 	if s := r.URL.Query().Get("limit"); s != "" {
@@ -917,7 +935,13 @@ func (d Deps) handleAgentAlerts(w http.ResponseWriter, r *http.Request) {
 			limit = n
 		}
 	}
-	alerts, err := d.Alert.ListForTarget(r.Context(), chi.URLParam(r, "id"), r.URL.Query().Get("target"), limit)
+	var alerts []alert.Alert
+	var err error
+	if mon := r.URL.Query().Get("monitor"); mon != "" {
+		alerts, err = d.Alert.ListForMonitor(r.Context(), chi.URLParam(r, "id"), mon, limit)
+	} else {
+		alerts, err = d.Alert.ListForTarget(r.Context(), chi.URLParam(r, "id"), r.URL.Query().Get("target"), limit)
+	}
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return

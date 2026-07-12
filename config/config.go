@@ -245,19 +245,6 @@ func (s *Service) SetSiteTargets(ctx context.Context, siteID string, targets []P
 	return s.reg.BumpConfigVersionForSite(ctx, siteID)
 }
 
-// TargetByName returns the probe_task ID for a site target by its target string
-// (e.g. "1.1.1.1"). Used by the rule engine to bind a metric series back to the
-// target that produced it. Returns "" if no such target.
-func (s *Service) TargetIDByTarget(ctx context.Context, siteID, target string) (string, error) {
-	var id string
-	err := s.db.QueryRowContext(ctx,
-		`SELECT id FROM probe_tasks WHERE site_id=? AND target=? LIMIT 1`, siteID, target).Scan(&id)
-	if err != nil {
-		return "", err
-	}
-	return id, nil
-}
-
 // DesiredStateFor builds the config to push to a specific agent. Targets are
 // resolved per agent: a target reaches this agent when it is broadcast to the
 // whole site (all_agents=1) or when this agent belongs to one of the target's
@@ -274,7 +261,7 @@ func (s *Service) DesiredStateFor(ctx context.Context, agentID string) (pcfg.Des
 		Intervals:     pcfg.Intervals{BaseSeconds: defaultBaseSeconds, RegularSeconds: defaultRegularSeconds},
 	}
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT kind, COALESCE(name,''), COALESCE(target,''), COALESCE(params,'')
+		`SELECT pt.id, kind, COALESCE(name,''), COALESCE(target,''), COALESCE(params,'')
 		 FROM probe_tasks pt
 		 WHERE pt.site_id=? AND pt.enabled=1 AND pt.kind<>'host'
 		   AND `+AgentScopePredicate+`
@@ -286,7 +273,7 @@ func (s *Service) DesiredStateFor(ctx context.Context, agentID string) (pcfg.Des
 	for rows.Next() {
 		var t pcfg.ProbeTarget
 		var params string
-		if err := rows.Scan(&t.Kind, &t.Name, &t.Target, &params); err != nil {
+		if err := rows.Scan(&t.MonitorID, &t.Kind, &t.Name, &t.Target, &params); err != nil {
 			return pcfg.DesiredState{}, err
 		}
 		if params != "" {

@@ -9,32 +9,74 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// DB wraps *sql.DB so modules can depend on a single type.
+// DB carries two handles over the same SQLite file. The embedded *sql.DB is the
+// WRITE handle — a single connection, since SQLite has one writer — so all
+// existing call sites (ingest, rollup, retention, alert state, config CRUD)
+// keep their serialized-writer safety. Read-only paths (chart queries, latest
+// snapshots, list endpoints) should go through Read() instead: WAL mode lets
+// any number of readers run concurrently with the writer, so putting reads on
+// their own small pool keeps a long dashboard query from stalling ingest.
 type DB struct {
-	*sql.DB
+	*sql.DB         // write handle: MaxOpenConns(1)
+	read    *sql.DB // read-only pool; nil in hand-built test values
 }
 
+// Shared PRAGMAs (DSN form so every pooled connection gets them):
+// cache_size is negative-KiB (64 MiB) and mmap_size 256 MiB — the defaults
+// (~2 MiB cache, no mmap) thrash once the samples table grows to GBs.
+const dsnPragmas = "?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)" +
+	"&_pragma=foreign_keys(ON)&_pragma=synchronous(NORMAL)&_pragma=auto_vacuum(INCREMENTAL)" +
+	"&_pragma=cache_size(-65536)&_pragma=mmap_size(268435456)&_pragma=temp_store(MEMORY)"
+
 // Open opens (creating if needed) the SQLite database at path, applies pending
-// migrations, and returns a ready DB. PRAGMAs are set via the DSN so every
-// pooled connection gets them.
+// migrations, and returns a ready DB with separate write and read handles.
 func Open(path string) (*DB, error) {
-	dsn := path + "?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)" +
-		"&_pragma=foreign_keys(ON)&_pragma=synchronous(NORMAL)&_pragma=auto_vacuum(INCREMENTAL)"
-	sqldb, err := sql.Open("sqlite", dsn)
+	w, err := sql.Open("sqlite", path+dsnPragmas)
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
-	// SQLite has a single writer; cap the pool to avoid SQLITE_BUSY churn.
-	// WAL still allows this connection to read and write; Lite scale is fine.
-	sqldb.SetMaxOpenConns(1)
-	if err := sqldb.Ping(); err != nil {
-		sqldb.Close()
+	// SQLite has a single writer; cap the write pool to avoid SQLITE_BUSY churn.
+	w.SetMaxOpenConns(1)
+	if err := w.Ping(); err != nil {
+		w.Close()
 		return nil, fmt.Errorf("ping sqlite: %w", err)
 	}
-	db := &DB{sqldb}
+	db := &DB{DB: w}
 	if err := db.migrate(); err != nil {
-		sqldb.Close()
+		w.Close()
 		return nil, err
 	}
+
+	// Read pool: query_only guards against accidental writes sneaking onto a
+	// reader connection (which would fight the single writer for the lock).
+	r, err := sql.Open("sqlite", path+dsnPragmas+"&_pragma=query_only(ON)")
+	if err != nil {
+		w.Close()
+		return nil, fmt.Errorf("open sqlite reader: %w", err)
+	}
+	r.SetMaxOpenConns(6)
+	if err := r.Ping(); err != nil {
+		r.Close()
+		w.Close()
+		return nil, fmt.Errorf("ping sqlite reader: %w", err)
+	}
+	db.read = r
 	return db, nil
+}
+
+// Read returns the read-only pool, falling back to the write handle when the
+// DB was constructed without one (tests wrapping a bare *sql.DB).
+func (d *DB) Read() *sql.DB {
+	if d.read != nil {
+		return d.read
+	}
+	return d.DB
+}
+
+// Close closes both handles.
+func (d *DB) Close() error {
+	if d.read != nil {
+		_ = d.read.Close()
+	}
+	return d.DB.Close()
 }

@@ -158,7 +158,8 @@ func (s *Service) Delete(ctx context.Context, id string) error {
 // liveRule is a live rule joined with its bound target string, for evaluation.
 type liveRule struct {
 	Rule
-	Target string
+	Target    string
+	ProbeKind string // probe_tasks.kind: "host" rules read system series by target, others by monitor id
 }
 
 // EvaluateAgent runs the site's live (per-target) rules against this agent's
@@ -173,9 +174,9 @@ type liveRule struct {
 // emits on its own — it is the mechanism that limits a host alert to the selected
 // agent groups.
 func (s *Service) EvaluateAgent(ctx context.Context, agentID, siteID string) error {
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.db.Read().QueryContext(ctx, `
 		SELECT r.id, r.name, r.metric_kind, r.comparator, r.threshold, r.fail_threshold, r.for_seconds,
-		       COALESCE(r.layer,''), r.severity, COALESCE(pt.target,'')
+		       COALESCE(r.layer,''), r.severity, COALESCE(pt.target,''), pt.id, pt.kind
 		FROM alert_rules r JOIN probe_tasks pt ON pt.id = r.probe_task_id
 		WHERE r.is_template=0 AND r.enabled=1 AND pt.site_id=?
 		  AND `+config.AgentScopePredicate, siteID, agentID)
@@ -186,7 +187,7 @@ func (s *Service) EvaluateAgent(ctx context.Context, agentID, siteID string) err
 	for rows.Next() {
 		var lr liveRule
 		if err := rows.Scan(&lr.ID, &lr.Name, &lr.MetricKind, &lr.Comparator, &lr.Threshold,
-			&lr.FailThreshold, &lr.ForSeconds, &lr.Layer, &lr.Severity, &lr.Target); err != nil {
+			&lr.FailThreshold, &lr.ForSeconds, &lr.Layer, &lr.Severity, &lr.Target, &lr.ProbeTaskID, &lr.ProbeKind); err != nil {
 			rows.Close()
 			return err
 		}
@@ -199,7 +200,19 @@ func (s *Service) EvaluateAgent(ctx context.Context, agentID, siteID string) err
 		if r.Target == "" {
 			continue
 		}
-		found, err := s.metrics.LatestPerSeries(ctx, agentID, r.MetricKind, r.Target, sinceUnix)
+		// Host monitors exist only to hang rules on — their host.* metrics come
+		// from the (non-configurable) host collector with no monitor id, so they
+		// resolve by target string among the system series. Probe rules resolve
+		// by the monitor id their metrics were stamped with, keeping two monitors
+		// on the same target string independent. Both paths are in-memory
+		// latest-cache lookups (no SQL) since this runs on every ingest.
+		var found []metrics.TargetValue
+		var err error
+		if r.ProbeKind == "host" {
+			found, err = s.metrics.LatestPerSeries(ctx, agentID, r.MetricKind, r.Target, sinceUnix)
+		} else {
+			found, err = s.metrics.LatestByMonitor(ctx, agentID, r.MetricKind, r.ProbeTaskID, sinceUnix)
+		}
 		if err != nil {
 			return err
 		}

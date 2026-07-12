@@ -9,6 +9,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"sync"
 	"time"
 
 	"github.com/nettact/protocol"
@@ -29,10 +30,16 @@ type Service struct {
 	db      *store.DB
 	bus     *eventbus.Bus
 	metrics *metrics.Store
+
+	// Per-agent highest-sequence watermark, cached so the hot ingest path does
+	// not re-run MAX(sequence) on every packet. Loaded from the DB on first
+	// sight of an agent, then maintained in memory.
+	seqMu   sync.Mutex
+	highSeq map[string]uint64
 }
 
 func New(db *store.DB, bus *eventbus.Bus, m *metrics.Store) *Service {
-	return &Service{db: db, bus: bus, metrics: m}
+	return &Service{db: db, bus: bus, metrics: m, highSeq: make(map[string]uint64)}
 }
 
 // Ingest stores one telemetry packet idempotently and returns the ack watermark.
@@ -95,16 +102,51 @@ func (s *Service) Ingest(ctx context.Context, agentID, siteID string, pkt teleme
 	}
 	committed = true
 
-	if affected > 0 && s.bus != nil {
-		s.bus.Publish(eventbus.TopicTelemetryIngested, eventbus.TelemetryIngested{AgentID: agentID, SiteID: siteID})
+	if affected > 0 {
+		// Fold the committed batch into the in-memory latest cache (only after
+		// commit — a rolled-back batch must not surface as "current").
+		if len(pkt.Metrics) > 0 {
+			s.metrics.UpdateLatest(agentID, seriesIDs, pkt.Metrics)
+		}
+		if s.bus != nil {
+			s.bus.Publish(eventbus.TopicTelemetryIngested, eventbus.TelemetryIngested{AgentID: agentID, SiteID: siteID})
+		}
 	}
 
-	var high sql.NullInt64
-	if err := s.db.QueryRowContext(ctx,
-		`SELECT MAX(sequence) FROM agent_packets WHERE agent_id=?`, agentID).Scan(&high); err != nil {
+	high, err := s.watermark(ctx, agentID, pkt.Sequence)
+	if err != nil {
 		return Ack{}, err
 	}
-	return Ack{HighestSequence: uint64(high.Int64), ServerTime: now}, nil
+	return Ack{HighestSequence: high, ServerTime: now}, nil
+}
+
+// watermark returns the agent's highest confirmed sequence, maintained in
+// memory (seeded from the DB once per agent per process).
+func (s *Service) watermark(ctx context.Context, agentID string, seq uint64) (uint64, error) {
+	s.seqMu.Lock()
+	defer s.seqMu.Unlock()
+	cur, ok := s.highSeq[agentID]
+	if !ok {
+		var high sql.NullInt64
+		if err := s.db.QueryRowContext(ctx,
+			`SELECT MAX(sequence) FROM agent_packets WHERE agent_id=?`, agentID).Scan(&high); err != nil {
+			return 0, err
+		}
+		cur = uint64(high.Int64)
+	}
+	if seq > cur {
+		cur = seq
+	}
+	s.highSeq[agentID] = cur
+	return cur, nil
+}
+
+// PrunePackets deletes dedup rows older than keep. The agent WAL retains at
+// most 72h of unacked samples, so anything older can never legitimately replay;
+// without pruning agent_packets grows by one row per packet forever.
+func (s *Service) PrunePackets(ctx context.Context, keep time.Duration) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM agent_packets WHERE received_at < ?`, time.Now().UTC().Add(-keep))
+	return err
 }
 
 func encodeMap(m map[string]string) string {

@@ -74,14 +74,12 @@ func TestEvaluateAgentHostScope(t *testing.T) {
 	}
 
 	// A host target scoped to the "servers" group, with a CPU>90 rule.
+	// SetSiteTargets preserves a provided id, so the fixture names it directly.
+	const ptid = "probe_host_scope_test"
 	if err := cfg.SetSiteTargets(ctx, siteID, []config.ProbeTarget{
-		{Kind: "host", Target: "host", Enabled: true, AllAgents: false, GroupIDs: []string{gid}},
+		{ID: ptid, Kind: "host", Target: "host", Enabled: true, AllAgents: false, GroupIDs: []string{gid}},
 	}); err != nil {
 		t.Fatalf("SetSiteTargets: %v", err)
-	}
-	ptid, err := cfg.TargetIDByTarget(ctx, siteID, "host")
-	if err != nil {
-		t.Fatalf("TargetIDByTarget: %v", err)
 	}
 
 	svc := New(db, alert.New(db, nil), metrics.New(db))
@@ -112,6 +110,84 @@ func TestEvaluateAgentHostScope(t *testing.T) {
 	}
 }
 
+// seedMonitorSample writes one raw sample for a monitor's series.
+func seedMonitorSample(t *testing.T, db *store.DB, agentID, siteID, monitorID, kind, target string, value float64, ts int64) {
+	t.Helper()
+	res, err := db.ExecContext(context.Background(),
+		`INSERT INTO series(agent_id, site_id, monitor_id, kind, target, layer, unit) VALUES(?,?,?,?,?,'','')`,
+		agentID, siteID, monitorID, kind, target)
+	if err != nil {
+		t.Fatalf("insert series: %v", err)
+	}
+	sid, _ := res.LastInsertId()
+	mustExec(t, db, `INSERT INTO samples(series_id, ts, value) VALUES(?,?,?)`, sid, ts, value)
+}
+
+// TestEvaluateAgentPerMonitor verifies rule isolation between two monitors on
+// the SAME target string: each monitor's rule reads only the series stamped
+// with its own monitor id, so one breaching monitor never fires the other's rule.
+func TestEvaluateAgentPerMonitor(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	ctx := context.Background()
+
+	const siteID = "site_default"
+	mustExec(t, db, `INSERT INTO sites(id,name,created_at) VALUES(?, 'def', CURRENT_TIMESTAMP)`, siteID)
+	mustExec(t, db, `INSERT INTO agents(id,site_id,public_key,token_hash,status) VALUES('agent_x',?,x'00','h','online')`, siteID)
+
+	reg := registry.New(db, 0)
+	cfg := config.New(db, reg)
+
+	// Two ICMP monitors on the same target string.
+	const monA = "probe_dup_a"
+	const monB = "probe_dup_b"
+	if err := cfg.SetSiteTargets(ctx, siteID, []config.ProbeTarget{
+		{ID: monA, Kind: "icmp", Target: "1.1.1.1", Enabled: true, AllAgents: true},
+		{ID: monB, Kind: "icmp", Target: "1.1.1.1", Enabled: true, AllAgents: true},
+	}); err != nil {
+		t.Fatalf("SetSiteTargets: %v", err)
+	}
+
+	svc := New(db, alert.New(db, nil), metrics.New(db))
+	// Identical loss>50 rule on each monitor.
+	for _, ptid := range []string{monA, monB} {
+		if _, err := svc.CreateForTarget(ctx, siteID, ptid, Rule{
+			Name: "loss-" + ptid, MetricKind: "probe.icmp.loss_pct", Comparator: "gt", Threshold: 50,
+			FailThreshold: 1, Severity: "error", Layer: "internet",
+		}); err != nil {
+			t.Fatalf("CreateForTarget(%s): %v", ptid, err)
+		}
+	}
+
+	// Monitor A breaches (100% loss); monitor B is healthy (0%).
+	now := time.Now().Unix()
+	seedMonitorSample(t, db, "agent_x", siteID, monA, "probe.icmp.loss_pct", "1.1.1.1", 100, now)
+	seedMonitorSample(t, db, "agent_x", siteID, monB, "probe.icmp.loss_pct", "1.1.1.1", 0, now)
+
+	if err := svc.EvaluateAgent(ctx, "agent_x", siteID); err != nil {
+		t.Fatalf("EvaluateAgent: %v", err)
+	}
+
+	countFor := func(rulePrefix string) int {
+		var n int
+		if err := db.QueryRowContext(ctx, `
+			SELECT COUNT(*) FROM alerts a JOIN alert_rules r ON r.id=a.rule_id
+			WHERE a.agent_id='agent_x' AND a.state='firing' AND r.name=?`, rulePrefix).Scan(&n); err != nil {
+			t.Fatalf("count alerts: %v", err)
+		}
+		return n
+	}
+	if n := countFor("loss-" + monA); n != 1 {
+		t.Errorf("breaching monitor A firing alerts = %d, want 1", n)
+	}
+	if n := countFor("loss-" + monB); n != 0 {
+		t.Errorf("healthy monitor B firing alerts = %d, want 0 (must not read sibling's series)", n)
+	}
+}
+
 // TestResolveOutOfScopeOnGroupChange verifies the counterpart to the scope
 // filter: an alert already firing for an agent must resolve once that agent
 // leaves the target's scope, otherwise the filter would strand it firing forever.
@@ -136,14 +212,11 @@ func TestResolveOutOfScopeOnGroupChange(t *testing.T) {
 	if _, err := reg.UpdateGroup(ctx, gid, "servers", []string{"agent_x"}); err != nil {
 		t.Fatalf("UpdateGroup: %v", err)
 	}
+	const ptid = "probe_host_resolve_test"
 	if err := cfg.SetSiteTargets(ctx, siteID, []config.ProbeTarget{
-		{Kind: "host", Target: "host", Enabled: true, AllAgents: false, GroupIDs: []string{gid}},
+		{ID: ptid, Kind: "host", Target: "host", Enabled: true, AllAgents: false, GroupIDs: []string{gid}},
 	}); err != nil {
 		t.Fatalf("SetSiteTargets: %v", err)
-	}
-	ptid, err := cfg.TargetIDByTarget(ctx, siteID, "host")
-	if err != nil {
-		t.Fatalf("TargetIDByTarget: %v", err)
 	}
 
 	alertSvc := alert.New(db, nil)

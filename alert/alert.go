@@ -266,8 +266,24 @@ func (s *Service) ListForTarget(ctx context.Context, agentID, target string, lim
 		ORDER BY a.started_at DESC LIMIT ?`, agentID, target, limit)
 }
 
+// ListForMonitor returns the alarm history for one agent + one user-created
+// monitor (probe_task), newest first — the monitor-scoped variant of
+// ListForTarget, so two monitors sharing a target string never see each
+// other's alerts. Rules are bound to their monitor, so filtering on the rule's
+// probe_task_id is exact.
+func (s *Service) ListForMonitor(ctx context.Context, agentID, monitorID string, limit int) ([]Alert, error) {
+	if limit <= 0 || limit > 500 {
+		limit = 50
+	}
+	return s.query(ctx, `SELECT `+alertCols+` `+alertFrom+`
+		WHERE a.agent_id=? AND r.probe_task_id=? AND a.fired_at IS NOT NULL
+		ORDER BY a.started_at DESC LIMIT ?`, agentID, monitorID, limit)
+}
+
+// query serves the read-only list endpoints, so it runs on the read pool —
+// alert-state writes (Update) stay on the single write connection.
 func (s *Service) query(ctx context.Context, sqlStr string, args ...any) ([]Alert, error) {
-	rows, err := s.db.QueryContext(ctx, sqlStr, args...)
+	rows, err := s.db.Read().QueryContext(ctx, sqlStr, args...)
 	if err != nil {
 		return nil, err
 	}
