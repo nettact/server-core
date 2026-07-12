@@ -44,7 +44,7 @@ func TestDesiredStateForScoping(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateGroup: %v", err)
 	}
-	if err := reg.UpdateGroup(ctx, gid, "g1", []string{"agent_a"}); err != nil {
+	if _, err := reg.UpdateGroup(ctx, gid, "g1", []string{"agent_a"}); err != nil {
 		t.Fatalf("UpdateGroup: %v", err)
 	}
 
@@ -129,11 +129,11 @@ func TestGroupSiteConsistency(t *testing.T) {
 	}
 
 	// A site_a group must reject a site_b agent as a member.
-	if err := reg.UpdateGroup(ctx, gid, "g", []string{"agent_b"}); err == nil {
+	if _, err := reg.UpdateGroup(ctx, gid, "g", []string{"agent_b"}); err == nil {
 		t.Errorf("UpdateGroup accepted a cross-site agent; want error")
 	}
 	// Same-site member is fine.
-	if err := reg.UpdateGroup(ctx, gid, "g", []string{"agent_a"}); err != nil {
+	if _, err := reg.UpdateGroup(ctx, gid, "g", []string{"agent_a"}); err != nil {
 		t.Errorf("UpdateGroup rejected a same-site agent: %v", err)
 	}
 

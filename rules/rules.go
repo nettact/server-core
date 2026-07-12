@@ -15,6 +15,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/nettact/server-core/alert"
+	"github.com/nettact/server-core/config"
 	"github.com/nettact/server-core/metrics"
 	"github.com/nettact/server-core/store"
 )
@@ -163,12 +164,21 @@ type liveRule struct {
 // EvaluateAgent runs the site's live (per-target) rules against this agent's
 // latest metric for the bound target and updates alert state. Called on each
 // telemetry.ingested event.
+//
+// Rules are scoped by their target the same way DesiredState is: a rule applies
+// to this agent only when its target is broadcast (all_agents=1) or this agent
+// belongs to one of the target's groups. For probe targets this is naturally
+// redundant (out-of-scope agents never receive the probe, so they have no metric
+// to alert on), but for host targets — whose host.* metrics every reporting agent
+// emits on its own — it is the mechanism that limits a host alert to the selected
+// agent groups.
 func (s *Service) EvaluateAgent(ctx context.Context, agentID, siteID string) error {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT r.id, r.name, r.metric_kind, r.comparator, r.threshold, r.fail_threshold, r.for_seconds,
-		       COALESCE(r.layer,''), r.severity, COALESCE(p.target,'')
-		FROM alert_rules r JOIN probe_tasks p ON p.id = r.probe_task_id
-		WHERE r.is_template=0 AND r.enabled=1 AND p.site_id=?`, siteID)
+		       COALESCE(r.layer,''), r.severity, COALESCE(pt.target,'')
+		FROM alert_rules r JOIN probe_tasks pt ON pt.id = r.probe_task_id
+		WHERE r.is_template=0 AND r.enabled=1 AND pt.site_id=?
+		  AND `+config.AgentScopePredicate, siteID, agentID)
 	if err != nil {
 		return err
 	}

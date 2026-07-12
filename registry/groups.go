@@ -78,23 +78,25 @@ func (s *Service) CreateGroup(ctx context.Context, siteID, name string) (string,
 
 // UpdateGroup renames a group and reconciles its membership to exactly agentIDs,
 // then bumps config_version for the site so affected agents pick up the change on
-// their next telemetry ack. Returns sql.ErrNoRows if no such group.
-func (s *Service) UpdateGroup(ctx context.Context, groupID, name string, agentIDs []string) error {
+// their next telemetry ack. Returns the group's site id (so the caller can resolve
+// alerts stranded by agents leaving the group's scope) and sql.ErrNoRows if no
+// such group.
+func (s *Service) UpdateGroup(ctx context.Context, groupID, name string, agentIDs []string) (string, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer tx.Rollback()
 
 	var siteID string
 	if err := tx.QueryRowContext(ctx, `SELECT site_id FROM agent_groups WHERE id=?`, groupID).Scan(&siteID); err != nil {
-		return err // sql.ErrNoRows when the group is gone
+		return "", err // sql.ErrNoRows when the group is gone
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE agent_groups SET name=? WHERE id=?`, name, groupID); err != nil {
-		return err
+		return "", err
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM agent_group_members WHERE group_id=?`, groupID); err != nil {
-		return err
+		return "", err
 	}
 	// Only agents in this group's own site may be members: the INSERT..SELECT
 	// filters by site_id so a cross-site (or unknown) agent id inserts no row and
@@ -110,33 +112,37 @@ func (s *Service) UpdateGroup(ctx context.Context, groupID, name string, agentID
 			`INSERT INTO agent_group_members(group_id, agent_id)
 			 SELECT ?, id FROM agents WHERE id=? AND site_id=?`, groupID, aid, siteID)
 		if err != nil {
-			return err
+			return "", err
 		}
 		if n, _ := res.RowsAffected(); n == 0 {
-			return fmt.Errorf("agent %q does not belong to site %s", aid, siteID)
+			return "", fmt.Errorf("agent %q does not belong to site %s", aid, siteID)
 		}
 	}
 	if _, err := tx.ExecContext(ctx,
 		`UPDATE agents SET config_version=config_version+1 WHERE site_id=?`, siteID); err != nil {
-		return err
+		return "", err
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return "", err
+	}
+	return siteID, nil
 }
 
 // DeleteGroup removes a group, its membership rows, and its target bindings
 // (probe_task_groups), then bumps config_version for the site. Targets bound only
-// to this group fall back to reaching no agents until re-scoped. Returns
-// sql.ErrNoRows if no such group.
-func (s *Service) DeleteGroup(ctx context.Context, groupID string) error {
+// to this group fall back to reaching no agents until re-scoped. Returns the
+// group's site id (so the caller can resolve alerts stranded by the removed
+// bindings) and sql.ErrNoRows if no such group.
+func (s *Service) DeleteGroup(ctx context.Context, groupID string) (string, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer tx.Rollback()
 
 	var siteID string
 	if err := tx.QueryRowContext(ctx, `SELECT site_id FROM agent_groups WHERE id=?`, groupID).Scan(&siteID); err != nil {
-		return err
+		return "", err
 	}
 	for _, stmt := range []string{
 		`DELETE FROM agent_group_members WHERE group_id=?`,
@@ -144,12 +150,15 @@ func (s *Service) DeleteGroup(ctx context.Context, groupID string) error {
 		`DELETE FROM agent_groups WHERE id=?`,
 	} {
 		if _, err := tx.ExecContext(ctx, stmt, groupID); err != nil {
-			return err
+			return "", err
 		}
 	}
 	if _, err := tx.ExecContext(ctx,
 		`UPDATE agents SET config_version=config_version+1 WHERE site_id=?`, siteID); err != nil {
-		return err
+		return "", err
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return "", err
+	}
+	return siteID, nil
 }

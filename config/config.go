@@ -22,6 +22,18 @@ const (
 	defaultRegularSeconds = 30
 )
 
+// AgentScopePredicate is a SQL boolean fragment for a WHERE clause, true when the
+// probe_tasks row aliased "pt" applies to a given agent: either the target is
+// broadcast to the whole site (all_agents=1) or the agent belongs to one of the
+// target's groups. The agent id must be bound to the single "?" placeholder it
+// contains. It defines target→agent scoping in ONE place, shared by the config
+// downlink (DesiredStateFor) and the alert engine (rules.EvaluateAgent), so the
+// two can never drift. Any query using it must alias probe_tasks as "pt".
+const AgentScopePredicate = `(pt.all_agents=1 OR EXISTS(
+	SELECT 1 FROM probe_task_groups ptg
+	JOIN agent_group_members agm ON agm.group_id = ptg.group_id
+	WHERE ptg.task_id = pt.id AND agm.agent_id = ?))`
+
 type Service struct {
 	db  *store.DB
 	reg *registry.Service
@@ -265,10 +277,7 @@ func (s *Service) DesiredStateFor(ctx context.Context, agentID string) (pcfg.Des
 		`SELECT kind, COALESCE(name,''), COALESCE(target,''), COALESCE(params,'')
 		 FROM probe_tasks pt
 		 WHERE pt.site_id=? AND pt.enabled=1 AND pt.kind<>'host'
-		   AND (pt.all_agents=1 OR EXISTS(
-		     SELECT 1 FROM probe_task_groups ptg
-		     JOIN agent_group_members agm ON agm.group_id = ptg.group_id
-		     WHERE ptg.task_id = pt.id AND agm.agent_id = ?))
+		   AND `+AgentScopePredicate+`
 		 ORDER BY kind, target`, st.SiteID, agentID)
 	if err != nil {
 		return pcfg.DesiredState{}, err

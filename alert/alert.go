@@ -147,6 +147,71 @@ func (s *Service) Update(ctx context.Context, rule RuleView, agentID, siteID, ta
 	return nil
 }
 
+// ResolveOutOfScope resolves any open (pending/firing) alert whose bound target
+// is group-scoped (all_agents=0) and whose detecting agent is no longer in any of
+// the target's groups. It is the counterpart to the scope filter in rule
+// evaluation (config.AgentScopePredicate): once an agent leaves a target's scope
+// its rules stop being evaluated for that agent, so an alert already open for it
+// would otherwise never reach the resolve path and stay firing forever. Call after
+// any scope change — a target's scope edit, group membership change, or group
+// deletion. Firing alerts emit TopicAlertResolved so incidents close through the
+// normal path. Idempotent: a second call resolves nothing.
+//
+// The WHERE clause is the negation of AgentScopePredicate correlated to each
+// alert's own agent (all_agents=0 AND agent NOT in any bound group); keep the two
+// in sync if the scoping model changes.
+func (s *Service) ResolveOutOfScope(ctx context.Context, siteID string) error {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT a.id, a.rule_id, a.agent_id, a.target, a.value, a.state,
+		       COALESCE(r.name,''), COALESCE(r.layer,''), COALESCE(r.severity,'')
+		FROM alerts a
+		JOIN alert_rules r ON r.id = a.rule_id
+		JOIN probe_tasks pt ON pt.id = r.probe_task_id
+		WHERE a.site_id=? AND a.state IN ('pending','firing') AND pt.all_agents=0
+		  AND NOT EXISTS(
+		    SELECT 1 FROM probe_task_groups ptg
+		    JOIN agent_group_members agm ON agm.group_id = ptg.group_id
+		    WHERE ptg.task_id = pt.id AND agm.agent_id = a.agent_id)`, siteID)
+	if err != nil {
+		return err
+	}
+	type stranded struct {
+		id, ruleID, agentID, target, state, name, layer, severity string
+		value                                                     float64
+	}
+	var list []stranded
+	for rows.Next() {
+		var st stranded
+		if err := rows.Scan(&st.id, &st.ruleID, &st.agentID, &st.target, &st.value, &st.state,
+			&st.name, &st.layer, &st.severity); err != nil {
+			rows.Close()
+			return err
+		}
+		list = append(list, st)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	now := time.Now().UTC()
+	for _, st := range list {
+		if _, err := s.db.ExecContext(ctx,
+			`UPDATE alerts SET state='resolved', resolved_at=?, last_eval_at=?, fail_count=0 WHERE id=?`,
+			now, now, st.id); err != nil {
+			return err
+		}
+		// Only firing alerts were correlated into an incident, so only they need a
+		// resolve event to unwind it; pending ones just clear silently.
+		if st.state == "firing" {
+			s.publish(eventbus.TopicAlertResolved,
+				RuleView{ID: st.ruleID, Name: st.name, Layer: st.layer, Severity: st.severity},
+				st.id, st.agentID, siteID, st.target, st.value, now)
+		}
+	}
+	return nil
+}
+
 // durationMet reports whether the rule's optional ForSeconds dwell has elapsed
 // between the alert's start and now (always true when ForSeconds is 0).
 func durationMet(rule RuleView, startedAt, now time.Time) bool {

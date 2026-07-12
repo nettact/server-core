@@ -588,6 +588,12 @@ func (d Deps) handleSetTargets(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	// Narrowing a target's scope can strand alerts already firing for agents that
+	// just left it; resolve them so they don't stay firing forever.
+	if err := d.Alert.ResolveOutOfScope(r.Context(), siteID); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
 	d.Audit.Log(r.Context(), "admin", "monitoring.set_targets", siteID, strconv.Itoa(len(body.Targets))+" targets")
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
@@ -642,11 +648,18 @@ func (d Deps) handleUpdateAgentGroup(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "group name is required (max 128)")
 		return
 	}
-	if err := d.Registry.UpdateGroup(r.Context(), id, name, body.AgentIDs); err != nil {
+	siteID, err := d.Registry.UpdateGroup(r.Context(), id, name, body.AgentIDs)
+	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			writeError(w, http.StatusNotFound, "group not found")
 			return
 		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	// Agents removed from the group may have alerts still firing for targets scoped
+	// to it; resolve any that just went out of scope.
+	if err := d.Alert.ResolveOutOfScope(r.Context(), siteID); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -656,11 +669,18 @@ func (d Deps) handleUpdateAgentGroup(w http.ResponseWriter, r *http.Request) {
 
 func (d Deps) handleDeleteAgentGroup(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
-	if err := d.Registry.DeleteGroup(r.Context(), id); err != nil {
+	siteID, err := d.Registry.DeleteGroup(r.Context(), id)
+	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			writeError(w, http.StatusNotFound, "group not found")
 			return
 		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	// Deleting the group drops its target bindings, so targets scoped only to it now
+	// reach nobody; resolve any alerts left firing for those targets.
+	if err := d.Alert.ResolveOutOfScope(r.Context(), siteID); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
