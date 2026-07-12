@@ -25,15 +25,22 @@ const appUserModelID = "NetTact.ServerLite"
 // its toasts a proper source label — then shows the toast under that AppID.
 //
 // Incident text is untrusted (target names etc. flow into the summary), so it
-// must never touch PowerShell or XML syntax: title/body are base64-encoded
+// must never touch PowerShell or XML syntax: title/body/url are base64-encoded
 // (UTF-8) and decoded at runtime, then inserted into the toast XML as DOM text
-// nodes via CreateTextNode (escaping handled on serialization). Base64 output is
-// [A-Za-z0-9+/=] only, so it cannot break out of the surrounding single-quoted
-// literals or trigger PowerShell expansion. The whole script is then passed via
-// -EncodedCommand (base64 UTF-16LE) to avoid shell quoting entirely.
-func nativeNotify(ctx context.Context, title, body string) error {
+// nodes / attributes via CreateTextNode / SetAttribute (escaping handled on
+// serialization). Base64 output is [A-Za-z0-9+/=] only, so it cannot break out
+// of the surrounding single-quoted literals or trigger PowerShell expansion. The
+// whole script is then passed via -EncodedCommand (base64 UTF-16LE) to avoid
+// shell quoting entirely.
+//
+// When url is non-empty it is set as the toast's launch string with
+// activationType="protocol", so clicking the toast opens the incident page in
+// the default browser. Protocol activation is the one activation type that works
+// for an unpackaged app without a registered COM activator.
+func nativeNotify(ctx context.Context, title, body, url string) error {
 	titleB64 := base64.StdEncoding.EncodeToString([]byte(title))
 	bodyB64 := base64.StdEncoding.EncodeToString([]byte(body))
+	urlB64 := base64.StdEncoding.EncodeToString([]byte(url))
 	script := `[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
 [Windows.UI.Notifications.ToastNotification, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
 [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom, ContentType = WindowsRuntime] | Out-Null
@@ -43,8 +50,13 @@ if (-not (Test-Path $regPath)) { New-Item -Path $regPath -Force | Out-Null }
 Set-ItemProperty -Path $regPath -Name DisplayName -Value 'NetTact'
 $title = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('` + titleB64 + `'))
 $body = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('` + bodyB64 + `'))
+$url = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('` + urlB64 + `'))
 $doc = New-Object Windows.Data.Xml.Dom.XmlDocument
 $doc.LoadXml('<toast><visual><binding template="ToastGeneric"><text></text><text></text></binding></visual></toast>')
+if ($url) {
+  $doc.DocumentElement.SetAttribute('launch', $url)
+  $doc.DocumentElement.SetAttribute('activationType', 'protocol')
+}
 $texts = $doc.GetElementsByTagName('text')
 [void]$texts.Item(0).AppendChild($doc.CreateTextNode($title))
 [void]$texts.Item(1).AppendChild($doc.CreateTextNode($body))

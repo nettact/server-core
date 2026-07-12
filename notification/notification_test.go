@@ -47,9 +47,16 @@ func TestSystemChannelCRUD(t *testing.T) {
 	// Dispatch to the enabled system channel must not panic or return an error.
 	svc.Notify(ctx, nil, Payload{
 		Event:          "incident.opened",
-		Summary:        `站点级故障 "WAN" 中断 <test>`, // exercises escaping paths
-		SuspectedLayer: "WAN",
+		State:          "open",
+		Scope:          "site",
+		AgentCount:     2,
+		SuspectedLayer: "wan",
 		Severity:       "critical",
+		Details: []AlertDetail{{
+			ProbeKind: "http", MetricKind: "probe.http.status", Comparator: "eq",
+			Threshold: 200, Value: 503, Target: `http://x <test>`, Layer: "service",
+			Severity: "critical", AgentHost: "node-1",
+		}},
 	})
 }
 

@@ -37,7 +37,10 @@ import (
 	"github.com/nettact/server-core/notification"
 	"github.com/nettact/server-core/registry"
 	"github.com/nettact/server-core/rules"
+	"github.com/nettact/server-core/settings"
 	"github.com/nettact/server-core/site"
+
+	neturl "net/url"
 )
 
 const sessionCookie = "nettact_session"
@@ -55,6 +58,7 @@ type Deps struct {
 	Alert        *alert.Service
 	Incident     *incident.Service
 	Notification *notification.Service
+	Settings     *settings.Service
 	Audit        *audit.Service
 	HostLive     *hostlive.Store // in-memory live process/connection snapshots (never persisted)
 	SPA          http.Handler    // optional embedded web UI (served for non-/api routes)
@@ -122,6 +126,9 @@ func Router(d Deps) http.Handler {
 			r.Post("/channels", d.handleCreateChannel)
 			r.Put("/channels/{id}", d.handleUpdateChannel)
 			r.Delete("/channels/{id}", d.handleDeleteChannel)
+			// Global server settings (e.g. console_base_url for notification links).
+			r.Get("/settings", d.handleGetSettings)
+			r.Put("/settings", d.handleUpdateSettings)
 		})
 	})
 
@@ -930,6 +937,57 @@ func (d Deps) handleCreateChannel(w http.ResponseWriter, r *http.Request) {
 	}
 	d.Audit.Log(r.Context(), "admin", "channel.create", body.Type, body.Name)
 	writeJSON(w, http.StatusOK, map[string]string{"id": id})
+}
+
+// handleGetSettings returns all global settings as a flat map (e.g.
+// {"console_base_url": "http://localhost:8080"}).
+func (d Deps) handleGetSettings(w http.ResponseWriter, r *http.Request) {
+	all, err := d.Settings.All(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, all)
+}
+
+// knownSettingKeys is the allow-list of settings a client may write, so the kv
+// store can't accumulate arbitrary client-supplied keys.
+var knownSettingKeys = map[string]bool{settings.KeyConsoleBaseURL: true}
+
+// handleUpdateSettings merges the posted keys. Only known keys are accepted;
+// console_base_url is validated to be an absolute http(s) origin without a query
+// or fragment (or empty to clear it), since a deep-link path is appended to it.
+func (d Deps) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
+	var body map[string]string
+	if err := json.NewDecoder(io.LimitReader(r.Body, 8192)).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid body")
+		return
+	}
+	for k := range body {
+		if !knownSettingKeys[k] {
+			writeError(w, http.StatusBadRequest, "unknown setting: "+k)
+			return
+		}
+	}
+	if v, ok := body[settings.KeyConsoleBaseURL]; ok {
+		v = strings.TrimSpace(v)
+		if v != "" {
+			u, err := neturl.Parse(v)
+			if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.RawQuery != "" || u.Fragment != "" {
+				writeError(w, http.StatusBadRequest, "console_base_url must be an http(s) URL without a query or fragment")
+				return
+			}
+		}
+		body[settings.KeyConsoleBaseURL] = v
+	}
+	for k, v := range body {
+		if err := d.Settings.Set(r.Context(), k, v); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	}
+	d.Audit.Log(r.Context(), "admin", "settings.update", "", "")
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
 func (d Deps) handleUpdateChannel(w http.ResponseWriter, r *http.Request) {

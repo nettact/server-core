@@ -13,8 +13,13 @@ func NativeSupported() bool { return true }
 
 // nativeNotify shows a macOS notification via osascript. title/body are escaped
 // for embedding inside an AppleScript double-quoted string literal to avoid
-// injection from arbitrary incident text.
-func nativeNotify(ctx context.Context, title, body string) error {
+// injection from arbitrary incident text. A plain `display notification` has no
+// click action, so url (when set) is appended to the body text rather than made
+// clickable.
+func nativeNotify(ctx context.Context, title, body, url string) error {
+	if url != "" {
+		body = body + " " + url
+	}
 	script := "display notification \"" + escapeAppleScript(body) +
 		"\" with title \"" + escapeAppleScript(title) + "\""
 	return exec.CommandContext(ctx, "osascript", "-e", script).Run()

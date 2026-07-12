@@ -9,4 +9,4 @@ func NativeSupported() bool { return false }
 
 // nativeNotify is a no-op on platforms without a supported desktop-notification
 // mechanism (e.g. Linux servers). The "system" channel simply does nothing.
-func nativeNotify(_ context.Context, _, _ string) error { return nil }
+func nativeNotify(_ context.Context, _, _, _ string) error { return nil }

@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/url"
 	"sync"
 	"time"
 
@@ -19,6 +20,7 @@ import (
 	"github.com/nettact/server-core/alert"
 	"github.com/nettact/server-core/eventbus"
 	"github.com/nettact/server-core/notification"
+	"github.com/nettact/server-core/settings"
 	"github.com/nettact/server-core/store"
 )
 
@@ -41,14 +43,15 @@ type TimelineEntry struct {
 }
 
 type Service struct {
-	db    *store.DB
-	bus   *eventbus.Bus
-	notif *notification.Service
-	mu    sync.Mutex // serialize correlation so we never open duplicate incidents
+	db       *store.DB
+	bus      *eventbus.Bus
+	notif    *notification.Service
+	settings *settings.Service // for the console base URL used in deep links (nil-safe)
+	mu       sync.Mutex        // serialize correlation so we never open duplicate incidents
 }
 
-func New(db *store.DB, bus *eventbus.Bus, notif *notification.Service) *Service {
-	return &Service{db: db, bus: bus, notif: notif}
+func New(db *store.DB, bus *eventbus.Bus, notif *notification.Service, set *settings.Service) *Service {
+	return &Service{db: db, bus: bus, notif: notif, settings: set}
 }
 
 // Wire subscribes to alert lifecycle events.
@@ -75,19 +78,36 @@ func (s *Service) onRaised(a alert.Raised) {
 		log.Printf("incident ensure: %v", err)
 		return
 	}
-	layer, severity, summary := s.diagnose(ctx, a.SiteID)
-	_, _ = s.db.ExecContext(ctx, `UPDATE incidents SET suspected_layer=?, severity=?, summary=? WHERE id=?`, layer, severity, summary, incID)
-	s.addTimeline(ctx, incID, "alert.raised", fmt.Sprintf("%s — %s (%s层) = %.1f", a.RuleName, a.Target, layerLabel(a.Layer), a.Value))
+	event := "incident.opened"
+	if !opened {
+		event = "incident.updated"
+	}
+	p := s.buildPayload(ctx, incID, a.SiteID, event, "open")
+	summary := notification.RenderSummary(p, "zh")
+	_, _ = s.db.ExecContext(ctx, `UPDATE incidents SET suspected_layer=?, severity=?, summary=? WHERE id=?`, p.SuspectedLayer, p.Severity, summary, incID)
+	s.addTimeline(ctx, incID, "alert.raised", s.raisedLine(ctx, a))
 
-	event := "incident.updated"
 	if opened {
 		s.addTimeline(ctx, incID, "incident.opened", summary)
-		event = "incident.opened"
 		s.bus.Publish(eventbus.TopicIncidentOpened, incID)
 	} else {
 		s.bus.Publish(eventbus.TopicIncidentUpdated, incID)
 	}
-	s.notify(ctx, incID, event)
+	// Dispatch off the correlation lock: notification delivery does blocking
+	// network I/O (webhook/SMTP), and holding s.mu across it would stall all
+	// other incident processing when a channel endpoint is slow or unreachable.
+	go s.notify(ctx, a.SiteID, p)
+}
+
+// raisedLine renders the timeline entry for a newly-firing alert. It looks up
+// the alert's full facts so the line states the specific fault ("网站 X 返回状态码
+// 503（来自 host）") rather than a bare rule name and number; on lookup failure it
+// falls back to the rule name + target.
+func (s *Service) raisedLine(ctx context.Context, a alert.Raised) string {
+	if d, ok := s.alertDetail(ctx, a.ID); ok {
+		return notification.DescribeDetail(d, "zh")
+	}
+	return fmt.Sprintf("%s — %s", a.RuleName, a.Target)
 }
 
 func (s *Service) onResolved(a alert.Raised) {
@@ -112,13 +132,15 @@ func (s *Service) onResolved(a alert.Raised) {
 		_, _ = s.db.ExecContext(ctx, `UPDATE incidents SET state='resolved', resolved_at=? WHERE id=?`, now, incID)
 		s.addTimeline(ctx, incID, "incident.resolved", "所有告警已恢复")
 		s.bus.Publish(eventbus.TopicIncidentUpdated, incID)
-		s.notify(ctx, incID, "incident.resolved")
+		resolved := s.buildPayload(ctx, incID, a.SiteID, "incident.resolved", "resolved")
+		go s.notify(ctx, a.SiteID, resolved)
 		return
 	}
-	layer, severity, summary := s.diagnose(ctx, a.SiteID)
-	_, _ = s.db.ExecContext(ctx, `UPDATE incidents SET suspected_layer=?, severity=?, summary=? WHERE id=?`, layer, severity, summary, incID)
+	p := s.buildPayload(ctx, incID, a.SiteID, "incident.updated", "open")
+	summary := notification.RenderSummary(p, "zh")
+	_, _ = s.db.ExecContext(ctx, `UPDATE incidents SET suspected_layer=?, severity=?, summary=? WHERE id=?`, p.SuspectedLayer, p.Severity, summary, incID)
 	s.bus.Publish(eventbus.TopicIncidentUpdated, incID)
-	s.notify(ctx, incID, "incident.updated")
+	go s.notify(ctx, a.SiteID, p)
 }
 
 func (s *Service) openIncidentID(ctx context.Context, siteID string) (string, error) {
@@ -146,14 +168,19 @@ func (s *Service) ensureOpenIncident(ctx context.Context, siteID string) (id str
 var layerPriority = []string{"local", "lan", "wan", "internet", "dns", "service", "wireless"}
 var severityRank = map[string]int{"info": 0, "warn": 1, "error": 2, "critical": 3}
 
-// diagnose applies the §4 layered logic to the site's firing alerts.
-func (s *Service) diagnose(ctx context.Context, siteID string) (layer, severity, summary string) {
+// diagnose applies the §4 layered logic to the site's firing alerts, returning
+// the scope (single host vs site-wide), the number of distinct alerting agents,
+// the suspected root-cause layer, and the worst severity.
+func (s *Service) diagnose(ctx context.Context, siteID string) (scope string, agentCount int, suspected, severity string) {
+	// INNER JOIN (every alert is created from a rule) so the agent count and
+	// suspected layer are computed over exactly the alerts collectDetails renders
+	// — otherwise a rule-less row could be counted here but dropped from details.
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT COALESCE(r.layer,''), COALESCE(r.severity,'warn'), a.agent_id
-		FROM alerts a LEFT JOIN alert_rules r ON r.id=a.rule_id
+		FROM alerts a JOIN alert_rules r ON r.id=a.rule_id
 		WHERE a.site_id=? AND a.state='firing'`, siteID)
 	if err != nil {
-		return "", "warn", "检测到网络告警"
+		return "single", 0, "", "warn"
 	}
 	defer rows.Close()
 
@@ -174,39 +201,99 @@ func (s *Service) diagnose(ctx context.Context, siteID string) (layer, severity,
 		}
 	}
 
-	suspected := ""
+	suspected = ""
 	for _, l := range layerPriority {
 		if layers[l] {
 			suspected = l
 			break
 		}
 	}
-	scope := "单机"
+	scope = "single"
 	if len(agents) > 1 {
-		scope = "站点级"
+		scope = "site"
 	}
-	summary = fmt.Sprintf("%s故障：%d 个 agent 出现告警，疑似 %s层", scope, len(agents), layerLabel(suspected))
-	return suspected, worst, summary
+	return scope, len(agents), suspected, worst
 }
 
-func layerLabel(l string) string {
-	switch l {
-	case "local":
-		return "本机"
-	case "lan":
-		return "局域网"
-	case "wan":
-		return "WAN"
-	case "internet":
-		return "互联网"
-	case "dns":
-		return "DNS"
-	case "service":
-		return "服务"
-	case "wireless":
-		return "无线"
+// detailCols / detailFrom are shared by collectDetails (all firing alerts on a
+// site) and alertDetail (one alert by id): alerts joined with their rule (metric
+// + threshold), the bound probe task (kind + friendly name), and the detecting
+// agent (display name / hostname).
+const detailCols = `r.metric_kind, r.comparator, r.threshold, COALESCE(r.layer,''), COALESCE(r.severity,'warn'),
+	COALESCE(p.kind,''), COALESCE(p.name,''), a.target, a.value,
+	COALESCE(NULLIF(ag.display_name,''), ag.hostname, '')`
+
+const detailFrom = `FROM alerts a
+	JOIN alert_rules r ON r.id = a.rule_id
+	LEFT JOIN probe_tasks p ON p.id = r.probe_task_id
+	LEFT JOIN agents ag ON ag.id = a.agent_id`
+
+func scanDetail(row scanner) (notification.AlertDetail, error) {
+	var d notification.AlertDetail
+	err := row.Scan(&d.MetricKind, &d.Comparator, &d.Threshold, &d.Layer, &d.Severity,
+		&d.ProbeKind, &d.TargetName, &d.Target, &d.Value, &d.AgentHost)
+	return d, err
+}
+
+// collectDetails returns the structured facts for every firing alert on a site,
+// used to render per-target lines in notifications.
+func (s *Service) collectDetails(ctx context.Context, siteID string) []notification.AlertDetail {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT `+detailCols+` `+detailFrom+` WHERE a.site_id=? AND a.state='firing'`, siteID)
+	if err != nil {
+		return nil
 	}
-	return "网络"
+	defer rows.Close()
+	var out []notification.AlertDetail
+	for rows.Next() {
+		d, err := scanDetail(rows)
+		if err != nil {
+			continue
+		}
+		out = append(out, d)
+	}
+	return out
+}
+
+// alertDetail returns the facts for a single alert by id (used for the timeline
+// line of a just-fired alert).
+func (s *Service) alertDetail(ctx context.Context, alertID string) (notification.AlertDetail, bool) {
+	row := s.db.QueryRowContext(ctx, `SELECT `+detailCols+` `+detailFrom+` WHERE a.id=?`, alertID)
+	d, err := scanDetail(row)
+	if err != nil {
+		return notification.AlertDetail{}, false
+	}
+	return d, true
+}
+
+// buildPayload assembles the structured notification payload from the current
+// site diagnosis plus the list of firing-alert facts.
+func (s *Service) buildPayload(ctx context.Context, incID, siteID, event, state string) notification.Payload {
+	scope, count, suspected, severity := s.diagnose(ctx, siteID)
+	return notification.Payload{
+		Event:          event,
+		IncidentID:     incID,
+		SiteID:         siteID,
+		State:          state,
+		Severity:       severity,
+		Scope:          scope,
+		AgentCount:     count,
+		SuspectedLayer: suspected,
+		Details:        s.collectDetails(ctx, siteID),
+		URL:            s.incidentURL(ctx, incID),
+		At:             time.Now().UTC(),
+	}
+}
+
+// incidentURL builds a deep link to this incident in the console, or "" when no
+// console base URL is configured. The frontend reads ?incident=<id> to auto-open
+// the incident's timeline.
+func (s *Service) incidentURL(ctx context.Context, incID string) string {
+	base := s.settings.ConsoleBaseURL(ctx)
+	if base == "" {
+		return ""
+	}
+	return base + "/incidents?incident=" + url.QueryEscape(incID)
 }
 
 func (s *Service) addTimeline(ctx context.Context, incID, kind, message string) {
@@ -215,18 +302,12 @@ func (s *Service) addTimeline(ctx context.Context, incID, kind, message string) 
 		"tl_"+uuid.NewString(), incID, time.Now().UTC(), kind, message)
 }
 
-func (s *Service) notify(ctx context.Context, incID, event string) {
-	inc, err := s.Get(ctx, incID)
-	if err != nil {
-		return
-	}
-	// Route to the union of channels selected on the rules of this site's firing
-	// alerts. When none specify channels, Notify falls back to all enabled.
-	channelIDs := s.firingChannels(ctx, inc.SiteID)
-	s.notif.Notify(ctx, channelIDs, notification.Payload{
-		Event: event, IncidentID: inc.ID, SiteID: inc.SiteID, SuspectedLayer: inc.SuspectedLayer,
-		Severity: inc.Severity, State: inc.State, Summary: inc.Summary, At: time.Now().UTC(),
-	})
+// notify routes the payload to the union of channels selected on the rules of
+// this site's firing alerts. When none specify channels, Notify falls back to
+// all enabled.
+func (s *Service) notify(ctx context.Context, siteID string, p notification.Payload) {
+	channelIDs := s.firingChannels(ctx, siteID)
+	s.notif.Notify(ctx, channelIDs, p)
 }
 
 // firingChannels returns the distinct channel IDs configured on the rules of a

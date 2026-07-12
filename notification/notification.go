@@ -9,8 +9,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"mime"
 	"net/http"
 	"net/smtp"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -18,16 +20,22 @@ import (
 	"github.com/nettact/server-core/store"
 )
 
-// Payload is the incident event delivered to channels.
+// Payload is the incident event delivered to channels. It carries STRUCTURED
+// facts (scope + the list of firing alerts) rather than a pre-rendered string,
+// so each channel can render title/summary/details in its own language at
+// delivery time.
 type Payload struct {
-	Event          string    `json:"event"` // incident.opened | incident.updated | incident.resolved
-	IncidentID     string    `json:"incident_id"`
-	SiteID         string    `json:"site_id"`
-	SuspectedLayer string    `json:"suspected_layer"`
-	Severity       string    `json:"severity"`
-	State          string    `json:"state"`
-	Summary        string    `json:"summary"`
-	At             time.Time `json:"at"`
+	Event          string        `json:"event"` // incident.opened | incident.updated | incident.resolved
+	IncidentID     string        `json:"incident_id"`
+	SiteID         string        `json:"site_id"`
+	State          string        `json:"state"`             // open | resolved
+	Severity       string        `json:"severity"`          // worst firing severity
+	Scope          string        `json:"scope"`             // "single" | "site"
+	AgentCount     int           `json:"agent_count"`       // distinct agents alerting
+	SuspectedLayer string        `json:"suspected_layer"`   // root-cause layer code
+	Details        []AlertDetail `json:"details,omitempty"` // per-target firing facts
+	URL            string        `json:"url,omitempty"`     // deep link to the incident in the console
+	At             time.Time     `json:"at"`
 }
 
 // Channel is a notification destination.
@@ -132,20 +140,38 @@ func (s *Service) Notify(ctx context.Context, channelIDs []string, p Payload) {
 		_ = json.Unmarshal([]byte(cfg), &config)
 		switch typ {
 		case "webhook":
-			s.sendWebhook(ctx, config["url"], p)
+			s.sendWebhook(ctx, config, p)
 		case "email":
 			s.sendEmail(config, p)
 		case "system":
-			s.sendNative(ctx, p)
+			s.sendNative(ctx, config["lang"], p)
 		}
 	}
 }
 
-func (s *Service) sendWebhook(ctx context.Context, url string, p Payload) {
+// webhookBody is the JSON posted to webhook channels: the raw structured
+// Payload (machine consumers localize themselves) plus title/text pre-rendered
+// in the channel's configured language for convenience.
+type webhookBody struct {
+	Payload
+	Title string   `json:"title"`
+	Text  string   `json:"text"`
+	Lines []string `json:"lines"`
+}
+
+func (s *Service) sendWebhook(ctx context.Context, cfg map[string]string, p Payload) {
+	url := cfg["url"]
 	if url == "" {
 		return
 	}
-	body, _ := json.Marshal(p)
+	lang := cfg["lang"]
+	lines := RenderDetails(p.Details, lang)
+	body, _ := json.Marshal(webhookBody{
+		Payload: p,
+		Title:   RenderTitle(p, lang),
+		Text:    RenderScope(p, lang),
+		Lines:   lines,
+	})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return
@@ -168,9 +194,28 @@ func (s *Service) sendEmail(cfg map[string]string, p Payload) {
 	if port == "" {
 		port = "587"
 	}
-	subject := fmt.Sprintf("[NetTact] %s: %s", p.Event, p.Summary)
-	msg := fmt.Sprintf("From: %s\r\nTo: %s\r\nSubject: %s\r\n\r\n%s\r\nSite: %s\r\nLayer: %s\r\nSeverity: %s\r\nAt: %s\r\n",
-		from, to, subject, p.Summary, p.SiteID, p.SuspectedLayer, p.Severity, p.At.Format(time.RFC3339))
+	lang := cfg["lang"]
+	title := RenderTitle(p, lang)
+	// Subject may contain non-ASCII (e.g. "网络告警"); RFC 2047-encode it so the
+	// header stays 7-bit-clean and clients render it correctly.
+	subject := mime.QEncoding.Encode("utf-8", "[NetTact] "+title)
+
+	var b strings.Builder
+	b.WriteString(RenderScope(p, lang))
+	b.WriteString("\r\n")
+	for _, line := range RenderDetails(p.Details, lang) {
+		b.WriteString("\r\n- ")
+		b.WriteString(line)
+	}
+	if link := LinkLine(p.URL, lang); link != "" {
+		b.WriteString("\r\n\r\n")
+		b.WriteString(link)
+	}
+	b.WriteString("\r\n\r\n")
+	b.WriteString(emailFooter(p, lang))
+
+	msg := fmt.Sprintf("From: %s\r\nTo: %s\r\nSubject: %s\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=UTF-8\r\n\r\n%s\r\n",
+		from, to, subject, b.String())
 	var auth smtp.Auth
 	if cfg["username"] != "" {
 		auth = smtp.PlainAuth("", cfg["username"], cfg["password"], host)
@@ -180,18 +225,29 @@ func (s *Service) sendEmail(cfg map[string]string, p Payload) {
 	}
 }
 
+// emailFooter renders the localized "Site / Severity / Time" trailer.
+func emailFooter(p Payload, lang string) string {
+	at := p.At.Format(time.RFC3339)
+	if normLang(lang) == "en" {
+		return fmt.Sprintf("Site: %s\r\nSeverity: %s\r\nTime: %s", p.SiteID, p.Severity, at)
+	}
+	return fmt.Sprintf("站点：%s\r\n级别：%s\r\n时间：%s", p.SiteID, p.Severity, at)
+}
+
 // sendNative pops a desktop notification on the host running this process
 // (Windows / macOS). It is a no-op on unsupported platforms. Delivery is
 // best-effort and bounded by a short timeout so it never blocks the pipeline.
-func (s *Service) sendNative(ctx context.Context, p Payload) {
+func (s *Service) sendNative(ctx context.Context, lang string, p Payload) {
 	ctx, cancel := context.WithTimeout(ctx, 8*time.Second)
 	defer cancel()
-	title := fmt.Sprintf("[NetTact] %s", p.Event)
-	body := p.Summary
-	if p.SuspectedLayer != "" || p.Severity != "" {
-		body = fmt.Sprintf("%s (%s / %s)", p.Summary, p.SuspectedLayer, p.Severity)
+	title := RenderTitle(p, lang)
+	body := RenderScope(p, lang)
+	if lines := RenderDetails(p.Details, lang); len(lines) > 0 {
+		body = body + "\n" + lines[0] // keep the toast short — lead with the top fault
 	}
-	if err := nativeNotify(ctx, title, body); err != nil {
+	// p.URL is attached as the toast's click action (protocol activation) rather
+	// than printed into the body, so clicking the toast opens the incident page.
+	if err := nativeNotify(ctx, title, body, p.URL); err != nil {
 		log.Printf("notify system: %v", err)
 	}
 }
