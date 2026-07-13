@@ -205,6 +205,12 @@ func describeZh(d AlertDetail) string {
 		s = fmt.Sprintf("%s 磁盘使用率 %s%%%s", subj, num(d.Value), thrZh(d, "%"))
 	case telemetry.IfaceUp:
 		s = fmt.Sprintf("网卡 %s 已断开", d.Target)
+	case telemetry.WiFiUp:
+		s = fmt.Sprintf("Wi-Fi 网卡 %s 已断开连接", d.Target)
+	case telemetry.WiFiSignalDBm:
+		s = fmt.Sprintf("Wi-Fi 网卡 %s 信号强度 %s dBm%s", d.Target, num(d.Value), thrZh(d, " dBm"))
+	case telemetry.WiFiQualityPct:
+		s = fmt.Sprintf("Wi-Fi 网卡 %s 链路质量 %s%%%s", d.Target, num(d.Value), thrZh(d, "%"))
 	default:
 		s = fmt.Sprintf("%s：%s = %s%s", subj, d.MetricKind, num(d.Value), thrZh(d, ""))
 	}
@@ -270,6 +276,12 @@ func describeEn(d AlertDetail) string {
 		s = fmt.Sprintf("%s disk usage is %s%%%s", subj, num(d.Value), thrEn(d, "%"))
 	case telemetry.IfaceUp:
 		s = fmt.Sprintf("interface %s is down", d.Target)
+	case telemetry.WiFiUp:
+		s = fmt.Sprintf("Wi-Fi adapter %s is disconnected", d.Target)
+	case telemetry.WiFiSignalDBm:
+		s = fmt.Sprintf("Wi-Fi adapter %s signal strength is %s dBm%s", d.Target, num(d.Value), thrEn(d, " dBm"))
+	case telemetry.WiFiQualityPct:
+		s = fmt.Sprintf("Wi-Fi adapter %s link quality is %s%%%s", d.Target, num(d.Value), thrEn(d, "%"))
 	default:
 		s = fmt.Sprintf("%s: %s = %s%s", subj, d.MetricKind, num(d.Value), thrEn(d, ""))
 	}
