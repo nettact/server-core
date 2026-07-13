@@ -390,6 +390,14 @@ func (s *Store) LatestSnapshot(ctx context.Context, agentID string, sinceUnix in
 	}
 	var out []Point
 	for id, si := range s.byAgent[agentID] {
+		// Wi-Fi current values are served from the authoritative interface
+		// snapshot (/agents/{id}/interfaces), not this per-series latest cache —
+		// a per-series latest could surface an earlier round's value when the
+		// current round omitted a field. wifi.* ingestion + Host Metrics history
+		// are unaffected; only this snapshot output excludes them.
+		if strings.HasPrefix(string(si.kind), "wifi.") {
+			continue
+		}
 		lv, ok := s.latest[id]
 		if !ok || lv.ts < sinceUnix {
 			continue

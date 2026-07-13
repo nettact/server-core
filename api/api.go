@@ -96,6 +96,7 @@ func Router(d Deps) http.Handler {
 			r.Delete("/agents/{id}", d.handleDeleteAgent)
 			r.Get("/agents/{id}/metrics", d.handleAgentMetrics)
 			r.Get("/agents/{id}/latest", d.handleAgentLatest)
+			r.Get("/agents/{id}/interfaces", d.handleAgentInterfaces)
 			r.Get("/agents/{id}/series", d.handleAgentSeries)
 			r.Get("/agents/{id}/status-history", d.handleAgentStatusHistory)
 			r.Get("/agents/{id}/alerts", d.handleAgentAlerts)
@@ -425,6 +426,43 @@ func (d Deps) handleAgentLatest(w http.ResponseWriter, r *http.Request) {
 		points = []metrics.Point{}
 	}
 	writeJSON(w, http.StatusOK, points)
+}
+
+// handleAgentInterfaces returns the agent's current interface set plus its
+// collection-level Wi-Fi verdict and a server-computed freshness flag. Same
+// authorization boundary as /latest (session cookie, agent-scoped). stale =
+// now − sampled_at > max(3 × effective RegularSeconds, 90s), so pre-disconnect
+// SSIDs/numerics can never pose as current.
+func (d Deps) handleAgentInterfaces(w http.ResponseWriter, r *http.Request) {
+	agentID := chi.URLParam(r, "id")
+	col, ifaces, err := d.Inventory.ListInterfaces(r.Context(), agentID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	regular := 30 // default regular tier interval (seconds)
+	if ds, derr := d.Config.DesiredStateFor(r.Context(), agentID); derr == nil && ds.Intervals.RegularSeconds > 0 {
+		regular = ds.Intervals.RegularSeconds
+	}
+	window := time.Duration(3*regular) * time.Second
+	if window < 90*time.Second {
+		window = 90 * time.Second
+	}
+	if col.SampledAt != nil {
+		// age > window ⇒ too old; age < -window ⇒ sampled farther in the future
+		// than the freshness window (clock skew ahead) ⇒ suspect, treat as stale.
+		// Small positive skew within the window stays fresh.
+		age := time.Since(*col.SampledAt)
+		col.Stale = age > window || age < -window
+	} else {
+		col.Stale = true // never reported ⇒ not current
+	}
+
+	if ifaces == nil {
+		ifaces = []inventory.Interface{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"wifi": col, "interfaces": ifaces})
 }
 
 // handleAgentSeries lists every series recorded for an agent, so the history

@@ -249,6 +249,7 @@ func (s *Service) DeleteAgent(ctx context.Context, id string) error {
 
 	for _, stmt := range []string{
 		`DELETE FROM interfaces WHERE agent_id=?`,
+		`DELETE FROM agent_wifi WHERE agent_id=?`,
 		`DELETE FROM config_versions WHERE agent_id=?`,
 		`DELETE FROM agent_status_history WHERE agent_id=?`,
 		`DELETE FROM agent_group_members WHERE agent_id=?`,

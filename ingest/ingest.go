@@ -95,6 +95,17 @@ func (s *Service) Ingest(ctx context.Context, agentID, siteID string, pkt teleme
 				return Ack{}, err
 			}
 		}
+		// Apply only the packet's LAST interface snapshot: the WAL drains in
+		// collection order, so within one packet the last snapshot is the newest
+		// round. This gives each (agent, sequence) a single, unambiguous
+		// last-wins current state, ordered by the monotonic packet sequence. The
+		// packet's metrics are passed so the same round's wifi.* numerics are
+		// projected onto the interface rows (matched by exact Metric.TS).
+		if n := len(pkt.InterfaceSnapshots); n > 0 {
+			if err := applyInterfaceSnapshot(ctx, tx, agentID, pkt.InterfaceSnapshots[n-1], pkt.Metrics, pkt.Sequence, now); err != nil {
+				return Ack{}, err
+			}
+		}
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -162,23 +173,6 @@ func encodeMap(m map[string]string) string {
 
 func applyInventory(ctx context.Context, tx *sql.Tx, agentID, siteID string, it telemetry.InventoryItem, now time.Time) error {
 	switch it.Kind {
-	case telemetry.InventoryInterface:
-		if it.Op == telemetry.OpRemove {
-			_, err := tx.ExecContext(ctx, `DELETE FROM interfaces WHERE agent_id=? AND name=?`, agentID, it.Name)
-			return err
-		}
-		up := 0
-		if it.Up {
-			up = 1
-		}
-		_, err := tx.ExecContext(ctx, `
-			INSERT INTO interfaces(id, agent_id, name, addrs, gateway, dns, up, updated_at)
-			VALUES(?,?,?,?,?,?,?,?)
-			ON CONFLICT(agent_id, name) DO UPDATE SET
-				addrs=excluded.addrs, gateway=excluded.gateway, dns=excluded.dns,
-				up=excluded.up, updated_at=excluded.updated_at`,
-			agentID+"/"+it.Name, agentID, it.Name, encodeSlice(it.Addrs), it.Gateway, encodeSlice(it.DNS), up, now)
-		return err
 	case telemetry.InventoryDevice:
 		if it.Op == telemetry.OpRemove {
 			return nil // keep device history in P0
@@ -192,6 +186,117 @@ func applyInventory(ctx context.Context, tx *sql.Tx, agentID, siteID string, it 
 		return err
 	}
 	return nil
+}
+
+// applyInterfaceSnapshot replaces the agent's interface rows with the snapshot's
+// authoritative full set and upserts the collection-level Wi-Fi verdict. It runs
+// inside the per-packet tx after sequence dedup, so it only ever sees a
+// non-duplicate packet. Replacement is ordered by the monotonic packet sequence
+// (the delivery-order signal), never by SampledAt: only a strictly higher
+// sequence replaces current state, so an agent clock correction/rollback can no
+// longer freeze current state (a later, higher-sequence disconnect/SSID change
+// still wins). SampledAt is stored solely for freshness / WAL-replay age.
+//
+// The current-round numeric readings (signal/quality/rx/tx) are projected onto
+// each interface row from the packet's wifi.* metrics whose Metric.TS exactly
+// equals this snapshot's SampledAt — so the numbers belong to the same
+// authoritative round as the categorical state. A field the driver omitted this
+// round (or a disconnected/unreadable adapter) has no such metric and stores
+// NULL, never an earlier round's value. With several snapshots in one packet
+// only the last snapshot is applied, and only its exact-timestamp metrics match.
+func applyInterfaceSnapshot(ctx context.Context, tx *sql.Tx, agentID string, snap telemetry.InterfaceSnapshot, metrics []telemetry.Metric, seq uint64, now time.Time) error {
+	var storedSeq sql.NullInt64
+	err := tx.QueryRowContext(ctx, `SELECT last_sequence FROM agent_wifi WHERE agent_id=?`, agentID).Scan(&storedSeq)
+	if err != nil && err != sql.ErrNoRows {
+		return err
+	}
+	if storedSeq.Valid && seq <= uint64(storedSeq.Int64) {
+		return nil // not a newer packet; delivery order is the authority
+	}
+
+	nums := wifiNumericsForRound(metrics, snap.SampledAt)
+
+	if _, err := tx.ExecContext(ctx, `DELETE FROM interfaces WHERE agent_id=?`, agentID); err != nil {
+		return err
+	}
+	for _, ifc := range snap.Interfaces {
+		up := 0
+		if ifc.Up {
+			up = 1
+		}
+		isw := 0
+		if ifc.IsWireless {
+			isw = 1
+		}
+		var wState, wReason, wSSID, wBand sql.NullString
+		var wChannel sql.NullInt64
+		if ifc.WiFi != nil {
+			wState = nullStr(string(ifc.WiFi.State))
+			wReason = nullStr(string(ifc.WiFi.Reason))
+			wSSID = nullStr(ifc.WiFi.SSID)
+			wBand = nullStr(string(ifc.WiFi.Band))
+			wChannel = sql.NullInt64{Int64: int64(ifc.WiFi.Channel), Valid: true}
+		}
+		n := nums[ifc.Name] // zero value: all-NULL when the round had no numerics for this iface
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO interfaces(id, agent_id, name, addrs, gateway, dns, up, is_wireless,
+				wifi_state, wifi_reason, wifi_ssid, wifi_band, wifi_channel,
+				wifi_signal_dbm, wifi_quality_pct, wifi_rx_mbps, wifi_tx_mbps, updated_at)
+			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+			agentID+"/"+ifc.Name, agentID, ifc.Name, encodeSlice(ifc.Addrs), ifc.Gateway, encodeSlice(ifc.DNS),
+			up, isw, wState, wReason, wSSID, wBand, wChannel,
+			n.signalDBm, n.qualityPct, n.rxMbps, n.txMbps, now); err != nil {
+			return err
+		}
+	}
+
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO agent_wifi(agent_id, state, reason, sampled_at, last_sequence)
+		VALUES(?,?,?,?,?)
+		ON CONFLICT(agent_id) DO UPDATE SET
+			state=excluded.state, reason=excluded.reason,
+			sampled_at=excluded.sampled_at, last_sequence=excluded.last_sequence`,
+		agentID, string(snap.WiFiState), nullStr(string(snap.WiFiReason)), snap.SampledAt.UTC(), int64(seq))
+	return err
+}
+
+// wifiNumeric holds the projected current-round numeric columns for one
+// interface. All fields default to invalid (SQL NULL).
+type wifiNumeric struct {
+	signalDBm, qualityPct sql.NullInt64
+	rxMbps, txMbps        sql.NullFloat64
+}
+
+// wifiNumericsForRound indexes, by interface (Target), the wifi.* numeric
+// samples that belong to exactly this collection round — Metric.TS equal to the
+// applied snapshot's SampledAt. Metrics from any other round in the same packet
+// are ignored, so no earlier round's value is ever carried forward.
+func wifiNumericsForRound(metrics []telemetry.Metric, sampledAt time.Time) map[string]wifiNumeric {
+	out := map[string]wifiNumeric{}
+	for _, m := range metrics {
+		if !m.TS.Equal(sampledAt) {
+			continue
+		}
+		n := out[m.Target]
+		switch m.Kind {
+		case telemetry.WiFiSignalDBm:
+			n.signalDBm = sql.NullInt64{Int64: int64(m.Value), Valid: true}
+		case telemetry.WiFiQualityPct:
+			n.qualityPct = sql.NullInt64{Int64: int64(m.Value), Valid: true}
+		case telemetry.WiFiLinkRxMbps:
+			n.rxMbps = sql.NullFloat64{Float64: m.Value, Valid: true}
+		case telemetry.WiFiLinkTxMbps:
+			n.txMbps = sql.NullFloat64{Float64: m.Value, Valid: true}
+		default:
+			continue
+		}
+		out[m.Target] = n
+	}
+	return out
+}
+
+func nullStr(s string) sql.NullString {
+	return sql.NullString{String: s, Valid: s != ""}
 }
 
 func encodeSlice(s []string) string {
