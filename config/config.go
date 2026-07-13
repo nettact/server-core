@@ -62,8 +62,9 @@ type ProbeTarget struct {
 	GroupIDs  []string `json:"group_ids"`
 }
 
-// SeedDefaults inserts a few public ICMP targets for a site if it has none, so
-// agents get useful public-reachability monitoring out of the box.
+// SeedDefaults inserts a few public ICMP targets plus a default-NIC gateway
+// monitor for a site if it has none, so agents get useful public-reachability
+// and LAN-gateway monitoring out of the box.
 func (s *Service) SeedDefaults(ctx context.Context, siteID string) error {
 	var n int
 	if err := s.db.QueryRowContext(ctx,
@@ -77,6 +78,8 @@ func (s *Service) SeedDefaults(ctx context.Context, siteID string) error {
 		{Kind: "icmp", Target: "1.1.1.1", Enabled: true, AllAgents: true},
 		{Kind: "icmp", Target: "8.8.8.8", Enabled: true, AllAgents: true},
 		{Kind: "icmp", Target: "223.5.5.5", Enabled: true, AllAgents: true},
+		// Empty Interface = each agent's default NIC gateway.
+		{Kind: "gateway", Target: "gateway", Enabled: true, AllAgents: true},
 	}
 	return s.SetSiteTargets(ctx, siteID, defaults)
 }

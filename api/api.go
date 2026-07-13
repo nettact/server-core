@@ -680,7 +680,7 @@ func (d Deps) handleDeleteAgentGroup(w http.ResponseWriter, r *http.Request) {
 }
 
 // validKinds is the whitelist of monitoring-target kinds the server accepts.
-var validKinds = map[string]bool{"icmp": true, "dns": true, "http": true, "tcp": true, "nat": true, "host": true}
+var validKinds = map[string]bool{"icmp": true, "dns": true, "http": true, "tcp": true, "nat": true, "gateway": true, "host": true}
 
 // validateTarget checks a single monitoring target before it is persisted and
 // pushed to agents. It normalizes trivial fields and rejects malformed configs
@@ -694,6 +694,24 @@ func validateTarget(t *config.ProbeTarget) error {
 	}
 	if utf8.RuneCountInString(t.Name) > 128 {
 		return errors.New("name too long (max 128)")
+	}
+	// Gateway monitors probe the agent's own gateway (resolved from the chosen
+	// NIC, or the default NIC when none is given), so there is no user-entered
+	// target. Normalize the empty target to a stable "gateway" so the
+	// required-target check below passes and the monitor list shows a consistent
+	// value; the NIC selection lives in Params.Interface.
+	if t.Kind == "gateway" {
+		if t.Target == "" {
+			t.Target = "gateway"
+		}
+		// The agent matches Interface exactly against a NIC ID/name, so trim
+		// surrounding whitespace ("Wi-Fi " → "Wi-Fi") before it is stored and
+		// pushed — otherwise the lookup fails and the probe reports a false 100%
+		// loss / gateway-unreachable.
+		t.Params.Interface = strings.TrimSpace(t.Params.Interface)
+		if utf8.RuneCountInString(t.Params.Interface) > 128 {
+			return errors.New("interface name too long (max 128)")
+		}
 	}
 	// Every kind needs a target: probes need something to hit, and a host anchor
 	// needs its metric-series target (e.g. "host", "core0", a mount) or the rule
