@@ -33,6 +33,8 @@ type StatusEvent struct {
 	ChangedAt time.Time `json:"changed_at"`
 }
 
+const statusHistoryLimit = 20
+
 type Service struct {
 	db        *store.DB
 	maxAgents int // 0 = unlimited
@@ -146,10 +148,11 @@ func (s *Service) recordStatus(ctx context.Context, agentID, status string, at t
 		"ash_"+uuid.NewString(), agentID, status, at)
 }
 
-// StatusHistory returns an agent's online/offline transitions, newest first.
+// StatusHistory returns at most 20 online/offline transitions, newest first.
 func (s *Service) StatusHistory(ctx context.Context, agentID string) ([]StatusEvent, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT status, changed_at FROM agent_status_history WHERE agent_id=? ORDER BY changed_at DESC LIMIT 500`, agentID)
+		`SELECT status, changed_at FROM agent_status_history WHERE agent_id=? ORDER BY changed_at DESC LIMIT ?`,
+		agentID, statusHistoryLimit)
 	if err != nil {
 		return nil, err
 	}

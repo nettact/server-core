@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -133,5 +134,38 @@ func TestSweepStaleExcludesConnected(t *testing.T) {
 	}
 	if hist, _ := reg.StatusHistory(ctx, "agent_connected"); len(hist) != 0 {
 		t.Errorf("agent_connected history = %+v, want none", hist)
+	}
+}
+
+func TestStatusHistoryReturnsOnlyNewestTwentyEvents(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	ctx := context.Background()
+	base := time.Now().UTC().Truncate(time.Second).Add(-time.Hour)
+
+	mustExec(t, db, `INSERT INTO sites(id,name,created_at) VALUES('site_default','def',?)`, base)
+	mustExec(t, db,
+		`INSERT INTO agents(id,site_id,public_key,token_hash,status) VALUES('agent_history','site_default',x'00','h','online')`)
+	for i := 0; i < 25; i++ {
+		mustExec(t, db,
+			`INSERT INTO agent_status_history(id,agent_id,status,changed_at) VALUES(?,'agent_history',?,?)`,
+			fmt.Sprintf("ash_%02d", i), []string{"offline", "online"}[i%2], base.Add(time.Duration(i)*time.Minute))
+	}
+
+	history, err := New(db, 0).StatusHistory(ctx, "agent_history")
+	if err != nil {
+		t.Fatalf("StatusHistory: %v", err)
+	}
+	if len(history) != statusHistoryLimit {
+		t.Fatalf("history length = %d, want %d", len(history), statusHistoryLimit)
+	}
+	if want := base.Add(24 * time.Minute); !history[0].ChangedAt.Equal(want) {
+		t.Errorf("newest event = %v, want %v", history[0].ChangedAt, want)
+	}
+	if want := base.Add(5 * time.Minute); !history[len(history)-1].ChangedAt.Equal(want) {
+		t.Errorf("oldest returned event = %v, want %v", history[len(history)-1].ChangedAt, want)
 	}
 }
