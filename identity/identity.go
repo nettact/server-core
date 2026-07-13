@@ -33,27 +33,39 @@ type Service struct {
 
 func New(db *store.DB) *Service { return &Service{db: db} }
 
-// EnsureAdmin creates the single admin user on first run. On later runs it is a
-// no-op (the bootstrap flags only seed the very first user).
-func (s *Service) EnsureAdmin(ctx context.Context, username, password string) error {
+// EnsureAdmin creates the single admin user on first run and returns it. On
+// later runs it does not re-create anything (the bootstrap credentials only seed
+// the very first user) but still queries and returns the existing admin, because
+// callers such as the desktop host need the admin's ID on every launch to mint
+// sessions.
+func (s *Service) EnsureAdmin(ctx context.Context, username, password string) (User, error) {
 	var count int
 	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM users`).Scan(&count); err != nil {
-		return err
+		return User{}, err
 	}
 	if count > 0 {
-		return nil
+		// The single-user model means the one existing row is the admin.
+		var u User
+		if err := s.db.QueryRowContext(ctx,
+			`SELECT id, username FROM users ORDER BY created_at LIMIT 1`).Scan(&u.ID, &u.Username); err != nil {
+			return User{}, err
+		}
+		return u, nil
 	}
 	if username == "" || password == "" {
-		return errors.New("first run requires --admin-user and --admin-pass")
+		return User{}, errors.New("first run requires --admin-user and --admin-pass")
 	}
 	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
 	if err != nil {
-		return err
+		return User{}, err
 	}
-	_, err = s.db.ExecContext(ctx,
+	id := "user_" + uuid.NewString()
+	if _, err := s.db.ExecContext(ctx,
 		`INSERT INTO users(id, username, password_hash, created_at) VALUES(?,?,?,?)`,
-		"user_"+uuid.NewString(), username, string(hash), time.Now().UTC())
-	return err
+		id, username, string(hash), time.Now().UTC()); err != nil {
+		return User{}, err
+	}
+	return User{ID: id, Username: username}, nil
 }
 
 // Authenticate verifies a username/password.
@@ -115,6 +127,19 @@ func (s *Service) ValidateSession(ctx context.Context, sessionID string) (User, 
 func (s *Service) DeleteSession(ctx context.Context, sessionID string) error {
 	_, err := s.db.ExecContext(ctx, `DELETE FROM sessions WHERE id=?`, sessionID)
 	return err
+}
+
+// PruneSessions deletes all expired session rows and returns how many were
+// removed. ValidateSession only deletes an expired row when it happens to be
+// presented again, so a long-lived host that mints a session per launch and per
+// activation would otherwise accumulate dead rows for months. Meant to run on a
+// periodic retention tick.
+func (s *Service) PruneSessions(ctx context.Context) (int64, error) {
+	res, err := s.db.ExecContext(ctx, `DELETE FROM sessions WHERE expires_at < ?`, time.Now().UTC())
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
 }
 
 func randToken() string {

@@ -65,7 +65,10 @@ func wifiPacket(seq uint64, sampled time.Time, state telemetry.WiFiLinkState, ss
 func TestInterfaceSnapshotUsesSequenceAndExactRoundNumerics(t *testing.T) {
 	db, svc, inv, metricStore := openWiFiIngest(t)
 	ctx := context.Background()
-	t1 := time.Date(2026, 7, 13, 1, 0, 0, 123456789, time.UTC)
+	// Keep the samples inside the raw-data query tier. A fixed wall-clock
+	// timestamp eventually makes Query select a rollup table, but this test does
+	// not run the rollup worker and is specifically exercising raw ingest.
+	t1 := time.Now().UTC().Add(-15 * time.Minute).Truncate(time.Second)
 
 	if _, err := svc.Ingest(ctx, "agent_wifi", "site_default", wifiPacket(10, t1, telemetry.WiFiConnected, "home", true)); err != nil {
 		t.Fatalf("ingest connected: %v", err)

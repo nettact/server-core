@@ -165,12 +165,22 @@ func (d Deps) handleLogin(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	http.SetCookie(w, &http.Cookie{
-		Name: sessionCookie, Value: sid, Path: "/",
-		HttpOnly: true, SameSite: http.SameSiteLaxMode, Secure: d.SecureCookie, Expires: exp,
-	})
+	SetSessionCookie(w, sid, exp, d.SecureCookie)
 	d.Audit.Log(r.Context(), u.Username, "auth.login", "", "")
 	writeJSON(w, http.StatusOK, u)
+}
+
+// SetSessionCookie writes the canonical session cookie. It is the single source
+// of truth for the cookie's attributes (name, Path, HttpOnly, SameSite, Secure,
+// Expires): any handler that establishes a session — the password login here or
+// a host-driven one-time-token login — must set it through this helper so the
+// attributes can never drift apart (a Path/SameSite/HttpOnly mismatch silently
+// breaks session reuse).
+func SetSessionCookie(w http.ResponseWriter, sid string, exp time.Time, secure bool) {
+	http.SetCookie(w, &http.Cookie{
+		Name: sessionCookie, Value: sid, Path: "/",
+		HttpOnly: true, SameSite: http.SameSiteLaxMode, Secure: secure, Expires: exp,
+	})
 }
 
 func (d Deps) handleLogout(w http.ResponseWriter, r *http.Request) {
