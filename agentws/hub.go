@@ -10,6 +10,7 @@ package agentws
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"net/http"
 	"strings"
@@ -26,29 +27,6 @@ import (
 	"github.com/nettact/server-core/hostlive"
 	"github.com/nettact/server-core/ingest"
 	"github.com/nettact/server-core/registry"
-)
-
-// Application close codes (4000-4999 range reserved for applications by RFC
-// 6455). The agent switches on these to decide whether reconnecting is useful.
-const (
-	// StatusSuperseded closes an old session when the same agent connects again;
-	// the replaced side must NOT reconnect (it would kick the new one in a loop).
-	StatusSuperseded websocket.StatusCode = 4000
-	// StatusUnsupportedSchema rejects a Hello whose schema version this server
-	// does not understand; reconnecting won't help until one side is upgraded.
-	StatusUnsupportedSchema websocket.StatusCode = 4001
-	// StatusUnsupportedSubprotocol rejects a client that offered neither
-	// nettact.v1 subprotocol, so the Frame encoding was never agreed on.
-	StatusUnsupportedSubprotocol websocket.StatusCode = 4002
-	// StatusProtocolError rejects a frame the protocol does not allow at that
-	// point (non-Hello first frame, duplicate Hello, server->agent frame kinds
-	// sent by the agent, or undecodable bytes).
-	StatusProtocolError websocket.StatusCode = 4003
-	// StatusRevoked evicts the session of an agent being deleted: its credential
-	// is about to stop authenticating, so the agent must not reconnect (it would
-	// re-enroll instead). Sent BEFORE the registry row is removed so no in-flight
-	// packet can recreate purged series.
-	StatusRevoked websocket.StatusCode = 4004
 )
 
 // maxFrameBytes bounds a single inbound frame. It matches the old POST body
@@ -105,8 +83,8 @@ func New(d Deps) *Hub {
 }
 
 // HandleUpgrade is the GET /agent/ws handler: it authenticates the bearer
-// token, upgrades to WebSocket, requires a valid Hello as the first frame, and
-// then serves the session until either side goes away.
+// token, upgrades to WebSocket, checks the negotiated subprotocol, then hands
+// the connection to serve (which owns the Hello handshake and session loop).
 func (h *Hub) HandleUpgrade(w http.ResponseWriter, r *http.Request) {
 	// Authenticate BEFORE upgrading so a bad token gets a plain 401 the agent
 	// can distinguish from transport trouble (and we never hold sockets for
@@ -129,48 +107,55 @@ func (h *Hub) HandleUpgrade(w http.ResponseWriter, r *http.Request) {
 	// An empty negotiated subprotocol means the client offered neither
 	// nettact.v1 variant, so we never agreed on a Frame encoding.
 	if conn.Subprotocol() == "" {
-		_ = conn.Close(StatusUnsupportedSubprotocol, "unsupported subprotocol")
+		_ = conn.Close(websocket.StatusCode(wire.CloseUnsupportedSubprotocol), "unsupported subprotocol")
 		return
 	}
 	conn.SetReadLimit(maxFrameBytes)
-	contentType := wire.SubprotocolContentType(conn.Subprotocol())
 
+	sc := &wsConn{c: conn, contentType: wire.SubprotocolContentType(conn.Subprotocol())}
+	h.serve(r.Context(), agentID, siteID, sc)
+}
+
+// serve runs one authenticated session over an established frame link: it
+// requires a valid Hello as the first frame, refreshes registry state, registers
+// the session (kicking any prior one for the same agent), pushes current
+// DesiredState, and loops until the link dies. It blocks for the session's life.
+// Transport-agnostic: HandleUpgrade wraps a WebSocket, DialLocal wraps a pipe.
+func (h *Hub) serve(ctx context.Context, agentID, siteID string, c wire.Conn) {
 	// The first frame MUST be a Hello, promptly.
-	helloCtx, cancel := context.WithTimeout(r.Context(), helloTimeout)
-	_, data, err := conn.Read(helloCtx)
+	helloCtx, cancel := context.WithTimeout(ctx, helloTimeout)
+	frame, err := c.ReadFrame(helloCtx)
 	cancel()
-	if err != nil {
-		_ = conn.Close(StatusProtocolError, "expected hello")
-		return
-	}
-	frame, err := wire.UnmarshalFrame(data, contentType)
 	if err != nil || frame.Hello == nil {
-		_ = conn.Close(StatusProtocolError, "first frame must be hello")
+		_ = c.Close(wire.CloseProtocolError, "first frame must be hello")
 		return
 	}
 	hello := frame.Hello
 	if err := protocol.ValidateSchema(hello.SchemaVersion); err != nil {
-		_ = conn.Close(StatusUnsupportedSchema, "unsupported schema")
+		_ = c.Close(wire.CloseUnsupportedSchema, "unsupported schema")
 		return
 	}
 
 	// The Hello replaces the per-request X-Agent-* headers of the old POST
 	// transport: refresh the agent-owned fields it carries, then mark the agent
-	// online immediately — a connected socket IS liveness, no packet needed.
-	ctx := r.Context()
+	// online immediately — a connected link IS liveness, no packet needed.
 	_ = h.deps.Registry.UpdateCapabilities(ctx, agentID, hello.Capabilities)
 	_ = h.deps.Registry.UpdateReportedInfo(ctx, agentID, hello.Hostname, hello.Platform, hello.AgentVersion)
 	_ = h.deps.Registry.SetReportedConfigVersion(ctx, agentID, hello.ReportedConfigVersion)
 	_ = h.deps.Registry.TouchLastSeen(ctx, agentID)
 
 	s := &session{
-		conn:        conn,
-		agentID:     agentID,
-		siteID:      siteID,
-		contentType: contentType,
-		sendCh:      make(chan wire.Frame, sendQueueCap),
-		done:        make(chan struct{}),
+		conn:    c,
+		agentID: agentID,
+		siteID:  siteID,
+		sendCh:  make(chan wire.Frame, sendQueueCap),
+		done:    make(chan struct{}),
+		closed:  make(chan struct{}),
 	}
+	// Registered first so it runs LAST (after the teardown defer below): closing
+	// `closed` signals Disconnect/CloseAll that the reader has returned and the
+	// final ingest, if any, has completed.
+	defer close(s.closed)
 
 	// Register, kicking any previous session for this agent: exactly one live
 	// connection per agent keeps ack ordering and push routing unambiguous. The
@@ -182,11 +167,11 @@ func (h *Hub) HandleUpgrade(w http.ResponseWriter, r *http.Request) {
 	h.conns[agentID] = s
 	h.mu.Unlock()
 	if old != nil {
-		go old.shutdown(StatusSuperseded, "superseded")
+		go old.shutdown(wire.CloseSuperseded, "superseded")
 	}
 
 	defer func() {
-		s.shutdown(websocket.StatusNormalClosure, "")
+		s.shutdown(wire.CloseNormalClosure, "")
 		// Unregister by identity: if a newer session already took this agent's
 		// slot (we were kicked), we must not evict the replacement.
 		h.mu.Lock()
@@ -228,6 +213,25 @@ func (h *Hub) HandleUpgrade(w http.ResponseWriter, r *http.Request) {
 	h.readLoop(ctx, s)
 }
 
+// DialLocal authenticates the token and, on success, attaches an in-process
+// agent link: it creates a frame pipe, serves the server end on its own
+// goroutine (same lifecycle as a WebSocket session — registered in the hub,
+// kicked on supersede, closed by CloseAll), and returns the agent end. The
+// desktop's bundled agent connects through this instead of a loopback
+// WebSocket, so telemetry never leaves the process.
+func (h *Hub) DialLocal(ctx context.Context, token string) (wire.Conn, error) {
+	agentID, siteID, err := h.deps.Registry.AuthenticateAgent(ctx, token)
+	if err != nil {
+		return nil, fmt.Errorf("authenticate agent: %w", err)
+	}
+	agentEnd, serverEnd := wire.Pipe()
+	// context.Background(): the session's lifetime is governed by the link itself
+	// plus CloseAll on shutdown, exactly like a hijacked WebSocket that outlives
+	// the request context in practice.
+	go h.serve(context.Background(), agentID, siteID, serverEnd)
+	return agentEnd, nil
+}
+
 // PushDesiredStateSite rebuilds and pushes DesiredState to every connected
 // agent of a site (per-agent, since group scoping resolves per agent).
 func (h *Hub) PushDesiredStateSite(ctx context.Context, siteID string) {
@@ -263,16 +267,18 @@ func (h *Hub) PushSnapshotRequest(agentID string, req pcfg.SnapshotRequest) bool
 }
 
 // Disconnect synchronously evicts an agent's live session (no-op when it has
-// none), performing the close handshake before returning. The agent-delete
-// path calls this BEFORE purging: the session authenticated at upgrade time,
-// so without an explicit evict it would keep ingesting under the captured
-// identity and could recreate series the purge just removed.
-func (h *Hub) Disconnect(agentID string, code websocket.StatusCode, reason string) {
+// none), waiting for the session to fully tear down before returning. The
+// agent-delete path calls this BEFORE purging: the session authenticated at
+// upgrade time, so without an explicit evict it would keep ingesting under the
+// captured identity and could recreate series the purge just removed. Waiting on
+// s.closed guarantees any in-flight ingest has finished before the caller purges.
+func (h *Hub) Disconnect(agentID string, code wire.CloseCode, reason string) {
 	h.mu.Lock()
 	s := h.conns[agentID]
 	h.mu.Unlock()
 	if s != nil {
 		s.shutdown(code, reason)
+		<-s.closed
 	}
 }
 
@@ -295,11 +301,13 @@ func (h *Hub) ConnectedIDs() []string {
 	return ids
 }
 
-// CloseAll closes every session with StatusGoingAway for graceful shutdown.
+// CloseAll closes every session with CloseGoingAway for graceful shutdown.
 // http.Server.Shutdown does NOT wait for (or close) hijacked WebSocket
 // connections, so without this they would stall the shutdown deadline. Each
 // close performs the close handshake (blocking up to its internal timeout on a
-// dead peer), so they run in parallel and CloseAll waits for all of them.
+// dead peer), so they run in parallel and CloseAll waits for every session to
+// fully tear down — including any in-flight ingest — before returning, so the
+// caller's later db.Close cannot race a live writer.
 func (h *Hub) CloseAll(reason string) {
 	h.mu.Lock()
 	sessions := make([]*session, 0, len(h.conns))
@@ -312,7 +320,8 @@ func (h *Hub) CloseAll(reason string) {
 		wg.Add(1)
 		go func(s *session) {
 			defer wg.Done()
-			s.shutdown(websocket.StatusGoingAway, reason)
+			s.shutdown(wire.CloseGoingAway, reason)
+			<-s.closed
 		}(s)
 	}
 	wg.Wait()

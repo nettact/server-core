@@ -167,7 +167,7 @@ func testPacket(seq uint64) wire.Frame {
 }
 
 // expectClose asserts the next read fails with the given close status.
-func expectClose(t *testing.T, conn *websocket.Conn, want websocket.StatusCode) {
+func expectClose(t *testing.T, conn *websocket.Conn, want wire.CloseCode) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -175,7 +175,7 @@ func expectClose(t *testing.T, conn *websocket.Conn, want websocket.StatusCode) 
 	if err == nil {
 		t.Fatalf("expected close %d, got a frame", want)
 	}
-	if got := websocket.CloseStatus(err); got != want {
+	if got := websocket.CloseStatus(err); got != websocket.StatusCode(want) {
 		t.Fatalf("close status = %d (%v), want %d", got, err, want)
 	}
 }
@@ -222,7 +222,7 @@ func TestConnectHelloOnline(t *testing.T) {
 }
 
 // TestDisconnectEvicts covers the agent-delete eviction path: Disconnect must
-// synchronously close the live session with StatusRevoked (telling the agent
+// synchronously close the live session with wire.CloseRevoked (telling the agent
 // not to reconnect) and drop it from the hub's tracking.
 func TestDisconnectEvicts(t *testing.T) {
 	e := newTestEnv(t)
@@ -234,8 +234,8 @@ func TestDisconnectEvicts(t *testing.T) {
 		t.Fatalf("first push = %+v, want DesiredState", f)
 	}
 
-	e.hub.Disconnect("agent_a", StatusRevoked, "agent deleted")
-	expectClose(t, conn, StatusRevoked)
+	e.hub.Disconnect("agent_a", wire.CloseRevoked, "agent deleted")
+	expectClose(t, conn, wire.CloseRevoked)
 	// The session's teardown unregisters asynchronously to Disconnect's close;
 	// poll briefly rather than race it.
 	deadline := time.Now().Add(5 * time.Second)
@@ -246,7 +246,7 @@ func TestDisconnectEvicts(t *testing.T) {
 		t.Error("hub still reports agent connected after Disconnect")
 	}
 	// Idempotent: disconnecting an agent with no session is a no-op.
-	e.hub.Disconnect("agent_a", StatusRevoked, "agent deleted")
+	e.hub.Disconnect("agent_a", wire.CloseRevoked, "agent deleted")
 }
 
 // TestPacketAckRoundTrip streams packets over the protobuf subprotocol and
@@ -315,7 +315,7 @@ func TestConfigChangePush(t *testing.T) {
 }
 
 // TestKickSuperseded connects the same agent twice: the first session must be
-// closed with StatusSuperseded, and its (later) unregister must not evict the
+// closed with wire.CloseSuperseded, and its (later) unregister must not evict the
 // replacement from the hub.
 func TestKickSuperseded(t *testing.T) {
 	e := newTestEnv(t)
@@ -333,7 +333,7 @@ func TestKickSuperseded(t *testing.T) {
 		t.Fatalf("conn2 first push = %+v, want DesiredState", f)
 	}
 
-	expectClose(t, conn1, StatusSuperseded)
+	expectClose(t, conn1, wire.CloseSuperseded)
 
 	// Give the kicked session's deferred unregister time to run, then confirm
 	// the identity compare kept the NEW session registered.
@@ -414,7 +414,7 @@ func TestBadFirstFrame(t *testing.T) {
 
 	conn := e.dial(t, "tok_a", wire.SubprotocolJSON)
 	sendFrame(t, conn, testPacket(1))
-	expectClose(t, conn, StatusProtocolError)
+	expectClose(t, conn, wire.CloseProtocolError)
 }
 
 // TestServerToAgentFrameRejected closes the session when the agent sends a
@@ -429,7 +429,7 @@ func TestServerToAgentFrameRejected(t *testing.T) {
 		t.Fatalf("first push = %+v, want DesiredState", f)
 	}
 	sendFrame(t, conn, wire.Frame{Ack: &wire.Ack{HighestSequence: 1}})
-	expectClose(t, conn, StatusProtocolError)
+	expectClose(t, conn, wire.CloseProtocolError)
 }
 
 // TestMissingSubprotocol closes a client that offered neither nettact.v1
@@ -439,7 +439,28 @@ func TestMissingSubprotocol(t *testing.T) {
 	e.seedAgent(t, "agent_a", "tok_a")
 
 	conn := e.dial(t, "tok_a") // no subprotocols offered
-	expectClose(t, conn, StatusUnsupportedSubprotocol)
+	expectClose(t, conn, wire.CloseUnsupportedSubprotocol)
+}
+
+// TestMalformedFrameAfterHello sends undecodable bytes once the session is live
+// and expects a protocol-error close (4003), not a generic normal closure — the
+// codec error must be classified even though the transport is otherwise healthy.
+func TestMalformedFrameAfterHello(t *testing.T) {
+	e := newTestEnv(t)
+	e.seedAgent(t, "agent_a", "tok_a")
+
+	conn := e.dial(t, "tok_a", wire.SubprotocolJSON)
+	sendFrame(t, conn, testHello())
+	if f := readFrame(t, conn); f.DesiredState == nil {
+		t.Fatalf("first push = %+v, want DesiredState", f)
+	}
+	// Garbage that is neither valid JSON nor a valid Frame.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := conn.Write(ctx, websocket.MessageText, []byte("{not a frame")); err != nil {
+		t.Fatalf("write garbage: %v", err)
+	}
+	expectClose(t, conn, wire.CloseProtocolError)
 }
 
 // TestUnauthorized rejects a bad bearer token with a plain 401 before any
@@ -458,5 +479,85 @@ func TestUnauthorized(t *testing.T) {
 	}
 	if resp == nil || resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("response = %+v, want 401", resp)
+	}
+}
+
+// TestDialLocal covers the in-process desktop path: DialLocal authenticates the
+// token, serves the server end over a pipe (same lifecycle as a WS session), and
+// returns the agent end. It must run the full Hello→DesiredState→Packet→Ack flow
+// with no WebSocket, kick a duplicate dial with CloseSuperseded, close on
+// CloseAll, and reject a bad token.
+func TestDialLocal(t *testing.T) {
+	e := newTestEnv(t)
+	e.seedAgent(t, "agent_a", "tok_a")
+	e.setTargets(t, "1.1.1.1") // config_version 0 -> 1
+
+	ctx := context.Background()
+
+	// Bad token: a dial error, before any session exists.
+	if _, err := e.hub.DialLocal(ctx, "wrong"); err == nil {
+		t.Fatal("DialLocal with a bad token succeeded")
+	}
+
+	c, err := e.hub.DialLocal(ctx, "tok_a")
+	if err != nil {
+		t.Fatalf("DialLocal: %v", err)
+	}
+	// Hello up, DesiredState down.
+	if err := c.WriteFrame(ctx, testHello()); err != nil {
+		t.Fatalf("write hello: %v", err)
+	}
+	f, err := c.ReadFrame(ctx)
+	if err != nil {
+		t.Fatalf("read desired state: %v", err)
+	}
+	if f.DesiredState == nil || f.DesiredState.ConfigVersion != 1 || len(f.DesiredState.ProbeTargets) != 1 {
+		t.Fatalf("first push = %+v, want DesiredState v1 with 1 target", f)
+	}
+
+	// Packet up, Ack down.
+	if err := c.WriteFrame(ctx, testPacket(1)); err != nil {
+		t.Fatalf("write packet: %v", err)
+	}
+	f, err = c.ReadFrame(ctx)
+	if err != nil {
+		t.Fatalf("read ack: %v", err)
+	}
+	if f.Ack == nil || f.Ack.HighestSequence != 1 {
+		t.Fatalf("ack = %+v, want HighestSequence 1", f)
+	}
+
+	// The hub tracks the pipe session like any other.
+	deadline := time.Now().Add(2 * time.Second)
+	for !e.hub.IsConnected("agent_a") && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !e.hub.IsConnected("agent_a") {
+		t.Fatal("hub does not report the local agent connected")
+	}
+
+	// A second dial supersedes the first: the original agent end sees 4000.
+	c2, err := e.hub.DialLocal(ctx, "tok_a")
+	if err != nil {
+		t.Fatalf("second DialLocal: %v", err)
+	}
+	if err := c2.WriteFrame(ctx, testHello()); err != nil {
+		t.Fatalf("write hello 2: %v", err)
+	}
+	if _, err := c2.ReadFrame(ctx); err != nil {
+		t.Fatalf("read desired state 2: %v", err)
+	}
+	rctx, rcancel := context.WithTimeout(ctx, 5*time.Second)
+	defer rcancel()
+	if _, err := c.ReadFrame(rctx); wire.CloseStatus(err) != wire.CloseSuperseded {
+		t.Fatalf("first session close = %v, want CloseSuperseded", err)
+	}
+
+	// CloseAll tears the live session down with CloseGoingAway.
+	e.hub.CloseAll("shutting down")
+	gctx, gcancel := context.WithTimeout(ctx, 5*time.Second)
+	defer gcancel()
+	if _, err := c2.ReadFrame(gctx); wire.CloseStatus(err) != wire.CloseGoingAway {
+		t.Fatalf("CloseAll close = %v, want CloseGoingAway", err)
 	}
 }

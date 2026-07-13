@@ -23,6 +23,7 @@ import (
 
 	"github.com/nettact/protocol/enroll"
 	"github.com/nettact/protocol/telemetry"
+	"github.com/nettact/protocol/wire"
 	"github.com/nettact/server-core/agentws"
 	"github.com/nettact/server-core/alert"
 	"github.com/nettact/server-core/audit"
@@ -365,7 +366,7 @@ func (d Deps) handleDeleteAgent(w http.ResponseWriter, r *http.Request) {
 	// recreate series after the purge below. Disconnect completes the close
 	// handshake before returning, so no further packet from this agent lands.
 	if d.AgentWS != nil {
-		d.AgentWS.Disconnect(id, agentws.StatusRevoked, "agent deleted")
+		d.AgentWS.Disconnect(id, wire.CloseRevoked, "agent deleted")
 	}
 	// Purge the agent's time-series (series/samples/rollups + metrics-store cache)
 	// BEFORE removing the agent row. If the purge fails we return 500 with the

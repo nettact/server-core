@@ -2,11 +2,10 @@ package agentws
 
 import (
 	"context"
+	"errors"
 	"log"
 	"sync"
 	"time"
-
-	"github.com/coder/websocket"
 
 	"github.com/nettact/protocol/wire"
 	"github.com/nettact/server-core/registry"
@@ -30,25 +29,30 @@ const (
 	pingTimeout  = 5 * time.Second
 )
 
-// session is one agent's live WebSocket connection. Reads happen on the
-// goroutine that entered HandleUpgrade; all writes are funneled through sendCh
-// into the single writer goroutine, so frames (in particular acks) leave in
-// exactly the order they were enqueued.
+// session is one agent's live connection (a WebSocket, or the desktop's
+// in-process pipe). Reads happen on the goroutine that entered serve; all
+// writes are funneled through sendCh into the single writer goroutine, so
+// frames (in particular acks) leave in exactly the order they were enqueued.
 type session struct {
-	conn        *websocket.Conn
-	agentID     string
-	siteID      string
-	contentType string // fixed per connection by the negotiated subprotocol
+	conn    wire.Conn
+	agentID string
+	siteID  string
 
 	sendCh chan wire.Frame
 	done   chan struct{} // closed exactly once on shutdown
 	once   sync.Once
+
+	// closed is closed by serve() only after the session has fully torn down
+	// (reader returned, unregistered, last_seen stamped). Disconnect/CloseAll
+	// wait on it so a caller — notably agent deletion — knows no ingest is still
+	// in flight before it purges the agent's series.
+	closed chan struct{}
 }
 
-// shutdown closes the connection with the given status and stops the writer
+// shutdown closes the connection with the given code and stops the writer
 // and ping goroutines. Safe to call from any goroutine, any number of times;
-// only the first status/reason wins.
-func (s *session) shutdown(code websocket.StatusCode, reason string) {
+// only the first code/reason wins.
+func (s *session) shutdown(code wire.CloseCode, reason string) {
 	s.once.Do(func() {
 		close(s.done)
 		_ = s.conn.Close(code, reason)
@@ -68,36 +72,27 @@ func (s *session) enqueue(f wire.Frame) bool {
 	case <-s.done:
 		return false
 	case <-t.C:
-		s.shutdown(websocket.StatusPolicyViolation, "write queue overflow")
+		s.shutdown(wire.ClosePolicyViolation, "write queue overflow")
 		return false
 	}
 }
 
 // writeLoop is the session's single writer: it serializes and sends every
-// outbound frame. Binary messages carry protobuf, text carries JSON, matching
-// what the negotiated subprotocol promises the agent.
+// outbound frame in enqueue order. Encoding (protobuf vs JSON) lives in the
+// transport adapter.
 func (s *session) writeLoop() {
-	msgType := websocket.MessageText
-	if s.contentType == wire.ContentTypeProtobuf {
-		msgType = websocket.MessageBinary
-	}
 	for {
 		select {
 		case f := <-s.sendCh:
-			data, err := wire.MarshalFrame(f, s.contentType)
-			if err != nil {
-				// Server-built frames always carry exactly one payload, so this
-				// is a programming error — surface it instead of hiding it.
-				log.Printf("agentws: marshal frame for %s: %v", s.agentID, err)
-				s.shutdown(websocket.StatusInternalError, "encode frame")
-				return
-			}
 			ctx, cancel := context.WithTimeout(context.Background(), writeTimeout)
-			err = s.conn.Write(ctx, msgType, data)
+			err := s.conn.WriteFrame(ctx, f)
 			cancel()
 			if err != nil {
-				// The connection is broken; the reader will notice and tear down.
-				s.shutdown(websocket.StatusAbnormalClosure, "write failed")
+				// A write error means the peer is gone (a clean agent close races the
+				// writer) or, far more rarely, a server-built frame failed to marshal.
+				// Either way the session cannot continue; the reader's teardown handles
+				// the rest. Kept quiet because peer-gone is the normal disconnect path.
+				s.shutdown(wire.CloseInternalError, "write failed")
 				return
 			}
 		case <-s.done:
@@ -107,11 +102,10 @@ func (s *session) writeLoop() {
 }
 
 // pingLoop keeps the connection verified-alive: a successful ping proves the
-// agent end-to-end (coder/websocket answers incoming pings automatically while
-// a Read is in flight, and Ping is safe concurrently with the writer — writes
-// are serialized internally), so each one bumps last_seen_at even when the
-// agent has nothing to report. A failed ping kills the session promptly
-// instead of waiting for TCP to notice.
+// agent end-to-end, so each one bumps last_seen_at even when the agent has
+// nothing to report. Over the in-memory pipe Ping always succeeds while the
+// link is open, so last_seen stays fresh for the desktop's bundled agent too.
+// A failed ping kills the session promptly instead of waiting for TCP to notice.
 func (s *session) pingLoop(reg *registry.Service) {
 	t := time.NewTicker(pingInterval)
 	defer t.Stop()
@@ -122,7 +116,7 @@ func (s *session) pingLoop(reg *registry.Service) {
 			err := s.conn.Ping(ctx)
 			cancel()
 			if err != nil {
-				s.shutdown(websocket.StatusAbnormalClosure, "ping failed")
+				s.shutdown(wire.CloseInternalError, "ping failed")
 				return
 			}
 			tctx, tcancel := context.WithTimeout(context.Background(), pingTimeout)
@@ -136,18 +130,20 @@ func (s *session) pingLoop(reg *registry.Service) {
 
 // readLoop consumes agent->server frames until the connection dies. Because
 // there is a single reader and a single ordered write queue, acks go back in
-// the same order the packets arrived (WS guarantees message order), which is
-// what the agent's WAL-pruning watermark logic relies on.
+// the same order the packets arrived (the link guarantees message order), which
+// is what the agent's WAL-pruning watermark logic relies on.
 func (h *Hub) readLoop(ctx context.Context, s *session) {
 	for {
-		_, data, err := s.conn.Read(ctx)
+		frame, err := s.conn.ReadFrame(ctx)
 		if err != nil {
+			// A codec error (only the WebSocket transport can produce one) means the
+			// agent sent bytes we cannot decode: close with the protocol-error code
+			// so it learns the frame was rejected, not that the server went away.
+			// Any other error is a normal disconnect handled by the deferred teardown.
+			if errors.Is(err, errBadFrame) {
+				s.shutdown(wire.CloseProtocolError, "bad frame")
+			}
 			return // closed, kicked, or broken — the deferred teardown handles it
-		}
-		frame, err := wire.UnmarshalFrame(data, s.contentType)
-		if err != nil {
-			s.shutdown(StatusProtocolError, "bad frame")
-			return
 		}
 		switch {
 		case frame.Packet != nil:
@@ -156,7 +152,7 @@ func (h *Hub) readLoop(ctx context.Context, s *session) {
 				// No ack means the agent keeps the batch in its WAL; closing makes
 				// it reconnect and retry rather than stream into a failing server.
 				log.Printf("agentws: ingest from %s: %v", s.agentID, err)
-				s.shutdown(websocket.StatusInternalError, "ingest failed")
+				s.shutdown(wire.CloseInternalError, "ingest failed")
 				return
 			}
 			_ = h.deps.Registry.TouchLastSeen(ctx, s.agentID)
@@ -173,7 +169,7 @@ func (h *Hub) readLoop(ctx context.Context, s *session) {
 		default:
 			// A second Hello, or a server->agent frame kind (Ack / DesiredState /
 			// SnapshotRequest) coming FROM the agent: both are protocol violations.
-			s.shutdown(StatusProtocolError, "unexpected frame")
+			s.shutdown(wire.CloseProtocolError, "unexpected frame")
 			return
 		}
 	}
