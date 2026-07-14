@@ -192,8 +192,14 @@ func describeZh(d AlertDetail) string {
 		}
 	case telemetry.ICMPRTTms:
 		s = fmt.Sprintf("%s 延迟 %sms%s", subj, num(d.Value), thrZh(d, "ms"))
+	case telemetry.ICMPRTTMin:
+		s = fmt.Sprintf("%s 最小延迟 %sms%s", subj, num(d.Value), thrZh(d, "ms"))
+	case telemetry.ICMPRTTMax:
+		s = fmt.Sprintf("%s 最大延迟 %sms%s", subj, num(d.Value), thrZh(d, "ms"))
 	case telemetry.ICMPJitter:
 		s = fmt.Sprintf("%s 抖动 %sms%s", subj, num(d.Value), thrZh(d, "ms"))
+	case telemetry.ICMPSamples:
+		s = fmt.Sprintf("%s 有效采样数 %s%s", subj, num(d.Value), thrZh(d, ""))
 	case telemetry.DNSOK:
 		s = subj + " 解析失败"
 	case telemetry.DNSResolve:
@@ -208,6 +214,12 @@ func describeZh(d AlertDetail) string {
 		s = subj + " 端口连接失败"
 	case telemetry.TCPConnectMs:
 		s = fmt.Sprintf("%s 连接耗时 %sms%s", subj, num(d.Value), thrZh(d, "ms"))
+	case telemetry.TCPDNSms:
+		s = fmt.Sprintf("%s DNS 解析耗时 %sms%s", subj, num(d.Value), thrZh(d, "ms"))
+	case telemetry.TCPTLSms:
+		s = fmt.Sprintf("%s TLS 握手耗时 %sms%s", subj, num(d.Value), thrZh(d, "ms"))
+	case telemetry.TCPErrorClass:
+		s = fmt.Sprintf("%s 连接错误：%s", subj, tcpErrorClassZh(int(d.Value)))
 	case telemetry.HostCPUPct:
 		s = fmt.Sprintf("%s CPU 使用率 %s%%%s", subj, num(d.Value), thrZh(d, "%"))
 	case telemetry.HostMemPct:
@@ -263,8 +275,14 @@ func describeEn(d AlertDetail) string {
 		}
 	case telemetry.ICMPRTTms:
 		s = fmt.Sprintf("%s latency is %sms%s", subj, num(d.Value), thrEn(d, "ms"))
+	case telemetry.ICMPRTTMin:
+		s = fmt.Sprintf("%s min latency is %sms%s", subj, num(d.Value), thrEn(d, "ms"))
+	case telemetry.ICMPRTTMax:
+		s = fmt.Sprintf("%s max latency is %sms%s", subj, num(d.Value), thrEn(d, "ms"))
 	case telemetry.ICMPJitter:
 		s = fmt.Sprintf("%s jitter is %sms%s", subj, num(d.Value), thrEn(d, "ms"))
+	case telemetry.ICMPSamples:
+		s = fmt.Sprintf("%s valid samples is %s%s", subj, num(d.Value), thrEn(d, ""))
 	case telemetry.DNSOK:
 		s = subj + " failed to resolve"
 	case telemetry.DNSResolve:
@@ -279,6 +297,12 @@ func describeEn(d AlertDetail) string {
 		s = subj + " port connection failed"
 	case telemetry.TCPConnectMs:
 		s = fmt.Sprintf("%s connected in %sms%s", subj, num(d.Value), thrEn(d, "ms"))
+	case telemetry.TCPDNSms:
+		s = fmt.Sprintf("%s DNS resolved in %sms%s", subj, num(d.Value), thrEn(d, "ms"))
+	case telemetry.TCPTLSms:
+		s = fmt.Sprintf("%s TLS handshake in %sms%s", subj, num(d.Value), thrEn(d, "ms"))
+	case telemetry.TCPErrorClass:
+		s = fmt.Sprintf("%s connection error: %s", subj, tcpErrorClassEn(int(d.Value)))
 	case telemetry.HostCPUPct:
 		s = fmt.Sprintf("%s CPU usage is %s%%%s", subj, num(d.Value), thrEn(d, "%"))
 	case telemetry.HostMemPct:
@@ -316,6 +340,48 @@ func thrEn(d AlertDetail, unit string) string {
 		return ""
 	}
 	return fmt.Sprintf(" (threshold %s %s%s)", sym, num(d.Threshold), unit)
+}
+
+// tcpErrorClassZh/En render a probe.tcp.error_class code (telemetry.TCPErr*) as a
+// short human reason. Unknown codes fall back to the raw number.
+func tcpErrorClassZh(code int) string {
+	switch code {
+	case telemetry.TCPErrNone:
+		return "无"
+	case telemetry.TCPErrTimeout:
+		return "连接超时"
+	case telemetry.TCPErrRefused:
+		return "连接被拒绝"
+	case telemetry.TCPErrUnreachable:
+		return "网络不可达"
+	case telemetry.TCPErrDNS:
+		return "DNS 解析失败"
+	case telemetry.TCPErrTLS:
+		return "TLS 握手失败"
+	case telemetry.TCPErrOther:
+		return "其它错误"
+	}
+	return fmt.Sprintf("未知错误（%d）", code)
+}
+
+func tcpErrorClassEn(code int) string {
+	switch code {
+	case telemetry.TCPErrNone:
+		return "none"
+	case telemetry.TCPErrTimeout:
+		return "connection timed out"
+	case telemetry.TCPErrRefused:
+		return "connection refused"
+	case telemetry.TCPErrUnreachable:
+		return "network unreachable"
+	case telemetry.TCPErrDNS:
+		return "DNS resolution failed"
+	case telemetry.TCPErrTLS:
+		return "TLS handshake failed"
+	case telemetry.TCPErrOther:
+		return "other error"
+	}
+	return fmt.Sprintf("unknown error (%d)", code)
 }
 
 // --- shared label maps ---
