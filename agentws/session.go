@@ -166,6 +166,15 @@ func (h *Hub) readLoop(ctx context.Context, s *session) {
 			if h.deps.HostLive != nil {
 				h.deps.HostLive.Store(s.agentID, *frame.HostSnapshot)
 			}
+		case frame.MonitorStatus != nil:
+			// The agent's full-state view of its probe monitors for a config
+			// version: reconcile monitor_status + operational_issues. Never acked;
+			// the monotonic guard inside drops stale/out-of-order frames.
+			if h.deps.OpIssue != nil {
+				if err := h.deps.OpIssue.ApplyMonitorStatus(ctx, s.agentID, s.siteID, *frame.MonitorStatus); err != nil {
+					log.Printf("agentws: monitor status from %s: %v", s.agentID, err)
+				}
+			}
 		default:
 			// A second Hello, or a server->agent frame kind (Ack / DesiredState /
 			// SnapshotRequest) coming FROM the agent: both are protocol violations.

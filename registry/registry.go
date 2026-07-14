@@ -1,6 +1,7 @@
-// Package registry tracks agents: identity, capabilities, status and last-seen.
-// M1 provides dev auto-registration (agent appears on first telemetry). Real
-// ed25519 enrollment, enrollment tokens and the max_agents quota land in M2.
+// Package registry tracks agents: identity, local permission policy, status and
+// last-seen. M1 provides dev auto-registration (agent appears on first
+// telemetry). Real ed25519 enrollment, enrollment tokens and the max_agents
+// quota land in M2.
 package registry
 
 import (
@@ -11,18 +12,27 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/nettact/protocol/permission"
 	"github.com/nettact/server-core/store"
 )
 
 type Agent struct {
-	ID           string     `json:"id"`
-	SiteID       string     `json:"site_id"`
-	DisplayName  string     `json:"display_name"` // operator-set friendly label, editable from the UI
-	Hostname     string     `json:"hostname"`
-	Platform     string     `json:"platform"`
-	AgentVersion string     `json:"agent_version"`
-	Status       string     `json:"status"`
-	Capabilities []string   `json:"capabilities"` // advertised at enroll; gates host/process/connection views
+	ID           string `json:"id"`
+	SiteID       string `json:"site_id"`
+	DisplayName  string `json:"display_name"` // operator-set friendly label, editable from the UI
+	Hostname     string `json:"hostname"`
+	Platform     string `json:"platform"`
+	AgentVersion string `json:"agent_version"`
+	Status       string `json:"status"`
+	// Local permission policy the agent reports on every (re)connect: supported =
+	// what the build+platform can do, granted = the local policy, effective = the
+	// usable intersection. These gate host/process/connection views and drive the
+	// monitor pre-check + remediation surface.
+	Supported    []string   `json:"supported"`
+	Granted      []string   `json:"granted"`
+	Effective    []string   `json:"effective"`
+	PolicySource string     `json:"policy_source"`
+	PolicyHash   string     `json:"policy_hash"`
 	LastSeenAt   *time.Time `json:"last_seen_at"`
 	CreatedAt    time.Time  `json:"created_at"`
 }
@@ -64,21 +74,31 @@ func (s *Service) TouchLastSeen(ctx context.Context, id string) error {
 	return nil
 }
 
-// UpdateCapabilities refreshes an agent's advertised capabilities from its
-// WebSocket Hello, so restarting an agent with different --report-* flags is
+// UpdatePermissions refreshes an agent's reported local permission policy
+// (supported / granted / effective sets, source, hash) from its WebSocket Hello,
+// so restarting an agent with a different NETTACT_AGENT_PERMISSIONS policy is
 // reflected server-side (enrollment happens only once). The conditional WHERE
 // makes it a no-op write when nothing changed.
-func (s *Service) UpdateCapabilities(ctx context.Context, id string, caps []string) error {
-	if caps == nil {
-		caps = []string{}
-	}
-	b, err := json.Marshal(caps)
-	if err != nil {
-		return err
-	}
-	_, err = s.db.ExecContext(ctx,
-		`UPDATE agents SET capabilities=? WHERE id=? AND capabilities<>?`, string(b), id, string(b))
+func (s *Service) UpdatePermissions(ctx context.Context, id string, report permission.PermissionReport) error {
+	sup := marshalStrings(report.Supported)
+	gr := marshalStrings(report.Granted)
+	eff := marshalStrings(report.Effective)
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE agents SET perm_supported=?, perm_granted=?, perm_effective=?, policy_source=?, policy_hash=?
+		WHERE id=? AND (perm_supported<>? OR perm_granted<>? OR perm_effective<>? OR policy_source<>? OR policy_hash<>?)`,
+		sup, gr, eff, report.Source, report.PolicyHash,
+		id, sup, gr, eff, report.Source, report.PolicyHash)
 	return err
+}
+
+// marshalStrings encodes a string slice as a JSON array, normalizing nil to "[]"
+// so a never-set column and an empty report compare equal (no spurious writes).
+func marshalStrings(ss []string) string {
+	if ss == nil {
+		ss = []string{}
+	}
+	b, _ := json.Marshal(ss)
+	return string(b)
 }
 
 // UpdateReportedInfo refreshes the agent-reported identity fields (hostname,
@@ -171,7 +191,8 @@ func (s *Service) StatusHistory(ctx context.Context, agentID string) ([]StatusEv
 func (s *Service) List(ctx context.Context) ([]Agent, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, site_id, COALESCE(display_name,''), COALESCE(hostname,''), COALESCE(platform,''), COALESCE(agent_version,''),
-		       status, COALESCE(capabilities,'[]'), last_seen_at, created_at
+		       status, COALESCE(perm_supported,'[]'), COALESCE(perm_granted,'[]'), COALESCE(perm_effective,'[]'),
+		       COALESCE(policy_source,''), COALESCE(policy_hash,''), last_seen_at, created_at
 		FROM agents WHERE revoked=0 ORDER BY created_at`)
 	if err != nil {
 		return nil, err
@@ -180,15 +201,15 @@ func (s *Service) List(ctx context.Context) ([]Agent, error) {
 	var out []Agent
 	for rows.Next() {
 		var a Agent
-		var caps string
+		var sup, gr, eff string
 		var lastSeen sql.NullTime
 		if err := rows.Scan(&a.ID, &a.SiteID, &a.DisplayName, &a.Hostname, &a.Platform, &a.AgentVersion,
-			&a.Status, &caps, &lastSeen, &a.CreatedAt); err != nil {
+			&a.Status, &sup, &gr, &eff, &a.PolicySource, &a.PolicyHash, &lastSeen, &a.CreatedAt); err != nil {
 			return nil, err
 		}
-		if caps != "" {
-			_ = json.Unmarshal([]byte(caps), &a.Capabilities)
-		}
+		unmarshalStrings(sup, &a.Supported)
+		unmarshalStrings(gr, &a.Granted)
+		unmarshalStrings(eff, &a.Effective)
 		if lastSeen.Valid {
 			t := lastSeen.Time
 			a.LastSeenAt = &t
@@ -201,18 +222,20 @@ func (s *Service) List(ctx context.Context) ([]Agent, error) {
 func (s *Service) Get(ctx context.Context, id string) (Agent, error) {
 	var a Agent
 	var lastSeen sql.NullTime
-	var caps string
+	var sup, gr, eff string
 	err := s.db.QueryRowContext(ctx, `
 		SELECT id, site_id, COALESCE(display_name,''), COALESCE(hostname,''), COALESCE(platform,''), COALESCE(agent_version,''),
-		       status, COALESCE(capabilities,'[]'), last_seen_at, created_at
+		       status, COALESCE(perm_supported,'[]'), COALESCE(perm_granted,'[]'), COALESCE(perm_effective,'[]'),
+		       COALESCE(policy_source,''), COALESCE(policy_hash,''), last_seen_at, created_at
 		FROM agents WHERE id=? AND revoked=0`, id).
-		Scan(&a.ID, &a.SiteID, &a.DisplayName, &a.Hostname, &a.Platform, &a.AgentVersion, &a.Status, &caps, &lastSeen, &a.CreatedAt)
+		Scan(&a.ID, &a.SiteID, &a.DisplayName, &a.Hostname, &a.Platform, &a.AgentVersion, &a.Status,
+			&sup, &gr, &eff, &a.PolicySource, &a.PolicyHash, &lastSeen, &a.CreatedAt)
 	if err != nil {
 		return Agent{}, err
 	}
-	if caps != "" {
-		_ = json.Unmarshal([]byte(caps), &a.Capabilities)
-	}
+	unmarshalStrings(sup, &a.Supported)
+	unmarshalStrings(gr, &a.Granted)
+	unmarshalStrings(eff, &a.Effective)
 	if lastSeen.Valid {
 		t := lastSeen.Time
 		a.LastSeenAt = &t
@@ -220,9 +243,16 @@ func (s *Service) Get(ctx context.Context, id string) (Agent, error) {
 	return a, nil
 }
 
+// unmarshalStrings decodes a stored JSON array into dst, leaving it nil on empty.
+func unmarshalStrings(s string, dst *[]string) {
+	if s != "" {
+		_ = json.Unmarshal([]byte(s), dst)
+	}
+}
+
 // UpdateAgent sets an agent's operator-editable display name. Reported fields
-// (hostname/platform/version/capabilities) are owned by the agent and not
-// touched here. Returns sql.ErrNoRows if no live agent has that id.
+// (hostname/platform/version/permissions) are owned by the agent and not touched
+// here. Returns sql.ErrNoRows if no live agent has that id.
 func (s *Service) UpdateAgent(ctx context.Context, id, displayName string) error {
 	res, err := s.db.ExecContext(ctx,
 		`UPDATE agents SET display_name=? WHERE id=? AND revoked=0`, displayName, id)
@@ -237,9 +267,10 @@ func (s *Service) UpdateAgent(ctx context.Context, id, displayName string) error
 
 // DeleteAgent hard-deletes an agent and the rows that belong to it. Foreign keys
 // are enforced (store.Open sets foreign_keys=ON), so FK-constrained child rows
-// (interfaces, config_versions, agent_status_history, agent_group_members) must
-// go before the agent row; the non-FK per-agent tables (agent_packets, events,
-// alerts) are cleared too so no orphaned rows survive. All in one transaction.
+// (interfaces, config_versions, agent_status_history, agent_group_members,
+// monitor_status, operational_issues) must go before the agent row; the non-FK
+// per-agent tables (agent_packets, events, alerts) are cleared too so no orphaned
+// rows survive. All in one transaction.
 // Time-series data (series/samples/rollups, plus the metrics store's in-memory
 // cache) is NOT handled here — callers purge it via metrics.Store.PurgeAgent so
 // the cache stays consistent. Returns sql.ErrNoRows if no agent has that id.
@@ -256,6 +287,8 @@ func (s *Service) DeleteAgent(ctx context.Context, id string) error {
 		`DELETE FROM config_versions WHERE agent_id=?`,
 		`DELETE FROM agent_status_history WHERE agent_id=?`,
 		`DELETE FROM agent_group_members WHERE agent_id=?`,
+		`DELETE FROM monitor_status WHERE agent_id=?`,
+		`DELETE FROM operational_issues WHERE agent_id=?`,
 		`DELETE FROM agent_packets WHERE agent_id=?`,
 		`DELETE FROM events WHERE agent_id=?`,
 		`DELETE FROM alerts WHERE agent_id=?`,

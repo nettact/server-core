@@ -40,7 +40,17 @@ CREATE TABLE agents(
   hostname TEXT,
   platform TEXT,
   agent_version TEXT,
-  capabilities TEXT NOT NULL DEFAULT '[]',
+  -- Local permission policy the agent reports on every (re)connect: supported =
+  -- what the build+platform can do, granted = the local policy, effective = the
+  -- usable intersection. All three are JSON string arrays of permission IDs.
+  perm_supported TEXT NOT NULL DEFAULT '[]',
+  perm_granted TEXT NOT NULL DEFAULT '[]',
+  perm_effective TEXT NOT NULL DEFAULT '[]',
+  policy_source TEXT NOT NULL DEFAULT '',
+  policy_hash TEXT NOT NULL DEFAULT '',
+  -- Newest MonitorStatus config_version accepted from this agent; -1 = none yet.
+  -- Feeds the monotonic guard that drops stale monitor-status frames.
+  last_status_config_version INTEGER NOT NULL DEFAULT -1,
   status TEXT NOT NULL DEFAULT 'online',
   config_version INTEGER NOT NULL DEFAULT 0,
   reported_config_version INTEGER NOT NULL DEFAULT 0,
@@ -206,3 +216,48 @@ CREATE TABLE audit_log(
   target TEXT,
   detail TEXT
 );
+
+-- ===== agent local-permission policy: monitor status + operational issues =====
+
+-- monitor_status is the server's per-(agent, monitor) view of how a monitor is
+-- executing: 'active' when the agent runs it, or permission_blocked /
+-- target_blocked / unsupported when it does not. Probe monitors are populated
+-- from the agent's MonitorStatus frames (and predicted on target save); host
+-- monitors are evaluated server-side from their bound alert rules. It is the
+-- complete current state — rows absent from a report are deleted.
+CREATE TABLE monitor_status(
+  agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+  monitor_id TEXT NOT NULL REFERENCES probe_tasks(id) ON DELETE CASCADE,
+  status TEXT NOT NULL,                       -- active | permission_blocked | target_blocked | unsupported
+  missing_permissions TEXT NOT NULL DEFAULT '[]',
+  matched_selector TEXT NOT NULL DEFAULT '',
+  reason TEXT NOT NULL DEFAULT '',            -- agent-reported detail (literal_denied, method_requires_extended, …)
+  policy_hash TEXT NOT NULL DEFAULT '',
+  config_version INTEGER NOT NULL,
+  updated_at TIMESTAMP NOT NULL,
+  PRIMARY KEY(agent_id, monitor_id)
+);
+
+-- operational_issues is the deduplicated, operator-facing list of monitors that
+-- are not running. One row per (agent, category, ref, reason); repeat reports
+-- bump count/last_seen rather than pile up. Resolved when the monitor recovers,
+-- goes out of scope, or is disabled. Never fed into alert/incident evaluation.
+CREATE TABLE operational_issues(
+  id TEXT PRIMARY KEY,
+  site_id TEXT NOT NULL REFERENCES sites(id),
+  agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+  category TEXT NOT NULL DEFAULT 'monitor',
+  ref_id TEXT REFERENCES probe_tasks(id) ON DELETE CASCADE,
+  reason TEXT NOT NULL,                        -- permission_blocked | target_blocked | unsupported
+  dedupe_key TEXT NOT NULL UNIQUE,             -- agent_id|category|ref_id|reason
+  missing_permissions TEXT NOT NULL DEFAULT '[]',
+  matched_selector TEXT NOT NULL DEFAULT '',
+  policy_hash TEXT NOT NULL DEFAULT '',
+  state TEXT NOT NULL DEFAULT 'active',        -- active | resolved
+  read INTEGER NOT NULL DEFAULT 0,
+  count INTEGER NOT NULL DEFAULT 1,
+  first_seen_at TIMESTAMP NOT NULL,
+  last_seen_at TIMESTAMP NOT NULL,
+  resolved_at TIMESTAMP
+);
+CREATE INDEX idx_opissues_active ON operational_issues(site_id, state, read);

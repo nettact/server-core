@@ -22,6 +22,7 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 
 	"github.com/nettact/protocol/enroll"
+	"github.com/nettact/protocol/permission"
 	"github.com/nettact/protocol/telemetry"
 	"github.com/nettact/protocol/wire"
 	"github.com/nettact/server-core/agentws"
@@ -35,10 +36,12 @@ import (
 	"github.com/nettact/server-core/inventory"
 	"github.com/nettact/server-core/metrics"
 	"github.com/nettact/server-core/notification"
+	"github.com/nettact/server-core/opissue"
 	"github.com/nettact/server-core/registry"
 	"github.com/nettact/server-core/rules"
 	"github.com/nettact/server-core/settings"
 	"github.com/nettact/server-core/site"
+	"github.com/nettact/server-core/sse"
 
 	neturl "net/url"
 )
@@ -59,12 +62,14 @@ type Deps struct {
 	Notification *notification.Service
 	Settings     *settings.Service
 	Audit        *audit.Service
-	HostLive     *hostlive.Store // in-memory live process/connection snapshots (never persisted)
-	AgentWS      *agentws.Hub    // persistent agent WebSocket channel (telemetry + config downlink)
-	Bus          *eventbus.Bus   // TopicConfigChanged for config mutations outside config.Service (group scope edits)
-	SPA          http.Handler    // optional embedded web UI (served for non-/api routes)
-	Dev          bool            // relax CORS for the Vite origin
-	SecureCookie bool            // set Secure on the session cookie (production/HTTPS)
+	HostLive     *hostlive.Store  // in-memory live process/connection snapshots (never persisted)
+	OpIssue      *opissue.Service // operational-issue engine (monitor status + issues)
+	SSE          *sse.Broker      // Server-Sent Events fan-out for live issue updates
+	AgentWS      *agentws.Hub     // persistent agent WebSocket channel (telemetry + config downlink)
+	Bus          *eventbus.Bus    // TopicConfigChanged for config mutations outside config.Service (group scope edits)
+	SPA          http.Handler     // optional embedded web UI (served for non-/api routes)
+	Dev          bool             // relax CORS for the Vite origin
+	SecureCookie bool             // set Secure on the session cookie (production/HTTPS)
 }
 
 func Router(d Deps) http.Handler {
@@ -101,6 +106,8 @@ func Router(d Deps) http.Handler {
 			r.Get("/agents/{id}/series", d.handleAgentSeries)
 			r.Get("/agents/{id}/status-history", d.handleAgentStatusHistory)
 			r.Get("/agents/{id}/alerts", d.handleAgentAlerts)
+			r.Get("/agents/{id}/issues", d.handleAgentIssues)
+			r.Get("/agents/{id}/monitor-status", d.handleAgentMonitorStatus)
 			// Live host snapshot (ephemeral process/connection lists): POST asks the
 			// agent, GET polls for the result. Never stored.
 			r.Post("/agents/{id}/snapshot", d.handleRequestSnapshot)
@@ -111,6 +118,14 @@ func Router(d Deps) http.Handler {
 			r.Put("/sites/{id}/targets", d.handleSetTargets)
 			r.Post("/sites/{id}/purge-target", d.handlePurgeTarget)
 			r.Get("/sites/{id}/devices", d.handleListDevices)
+			// Operational issues (monitors not running under the agent's permission
+			// policy). Kept separate from alerts/incidents (never alerted on).
+			r.Get("/issues", d.handleListIssues)
+			r.Post("/issues/mark-read", d.handleMarkIssuesRead)
+			r.Get("/issues/unread-count", d.handleIssuesUnreadCount)
+			r.Get("/targets/{id}/agent-status", d.handleTargetAgentStatus)
+			// Server-Sent Events stream for live issue updates.
+			r.Get("/events", d.handleEvents)
 			// Agent groups: named sets of agents that scope monitoring targets.
 			r.Get("/sites/{id}/agent-groups", d.handleListAgentGroups)
 			r.Post("/sites/{id}/agent-groups", d.handleCreateAgentGroup)
@@ -247,36 +262,104 @@ func (d Deps) handleEnroll(w http.ResponseWriter, r *http.Request) {
 // ---- live host snapshot (ephemeral, never stored) ----
 
 // handleRequestSnapshot registers a pending live-snapshot request for an agent
-// and pushes it down the agent's WebSocket immediately. A disconnected agent is
-// a 409 up front — no pending request is registered, so the console gets an
-// honest "agent offline" instead of a spinner that can never resolve. The agent
-// honors the request only for the caps it was started with, so a request for a
-// non-opted-in agent simply comes back with empty lists.
+// and pushes it down the agent's WebSocket. The scopes are process/connection
+// permission IDs; unknown ones are a 400. A disconnected agent is a 409 up front.
+// A permission pre-check runs before anything is pushed: if NONE of the requested
+// scopes is in the agent's effective policy the request is answered inline (200)
+// with per-scope denials + a remediation object and nothing is pushed; otherwise
+// the full scope list is pushed and the agent evaluates each scope itself.
 func (d Deps) handleRequestSnapshot(w http.ResponseWriter, r *http.Request) {
 	if d.HostLive == nil {
 		writeError(w, http.StatusServiceUnavailable, "live snapshots not available")
 		return
 	}
 	id := chi.URLParam(r, "id")
+	var body struct {
+		Scopes []string `json:"scopes"`
+	}
+	_ = json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&body)
+	if len(body.Scopes) == 0 {
+		writeError(w, http.StatusBadRequest, "scopes required")
+		return
+	}
+	reqSet := permission.FromStrings(body.Scopes)
+	for _, sc := range reqSet.Sorted() {
+		if !snapshotScopes.Has(sc) {
+			writeError(w, http.StatusBadRequest, "unknown snapshot scope: "+string(sc))
+			return
+		}
+	}
 	if !d.AgentWS.IsConnected(id) {
 		writeError(w, http.StatusConflict, "agent offline")
 		return
 	}
-	var body struct {
-		WantProcesses   *bool `json:"want_processes"`
-		WantConnections *bool `json:"want_connections"`
+	a, err := d.Registry.Get(r.Context(), id)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "agent not found")
+		return
 	}
-	_ = json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&body)
-	// Default to requesting both lists when the client omits the fields.
-	wantProcs := body.WantProcesses == nil || *body.WantProcesses
-	wantConns := body.WantConnections == nil || *body.WantConnections
-	req := d.HostLive.Request(id, wantProcs, wantConns)
+	effective := permission.FromStrings(a.Effective)
+	supported := permission.FromStrings(a.Supported)
+
+	scopes := reqSet.Sorted() // deterministic order
+	var precheck []telemetry.SnapshotScopeResult
+	var deniedSupported []string // requested, supported, but not granted → env remediation
+	anyUnsupported := false
+	anyEffective := false
+	for _, sc := range scopes {
+		if effective.Has(sc) {
+			anyEffective = true
+			precheck = append(precheck, telemetry.SnapshotScopeResult{Scope: string(sc), Status: telemetry.ScopeCollected})
+			continue
+		}
+		reason := "permission_denied"
+		status := telemetry.ScopeDenied
+		if supported.Has(sc) {
+			deniedSupported = append(deniedSupported, string(sc))
+		} else {
+			reason = "unsupported"
+			status = telemetry.ScopeUnsupported
+			anyUnsupported = true
+		}
+		precheck = append(precheck, telemetry.SnapshotScopeResult{Scope: string(sc), Status: status, Reason: reason})
+	}
+
+	// No requested scope is usable: answer inline, record via audit only, push nothing.
+	if !anyEffective {
+		reason := wire.MonitorStatusUnsupported
+		var missing []string
+		if len(deniedSupported) > 0 {
+			reason = wire.MonitorStatusPermissionBlocked
+			missing = deniedSupported
+		} else if !anyUnsupported {
+			reason = wire.MonitorStatusPermissionBlocked
+		}
+		rem := opissue.Remediate(reason, missing, a.Granted, "")
+		d.Audit.Log(r.Context(), "admin", "snapshot.denied", id, strings.Join(body.Scopes, ","))
+		writeJSON(w, http.StatusOK, map[string]any{
+			"request_id":  nil,
+			"scopes":      precheck,
+			"remediation": rem,
+		})
+		return
+	}
+
+	req := d.HostLive.Request(id, body.Scopes)
 	// Push directly; a race where the agent dropped between the check above and
 	// here is fine — the request is re-pushed if it reconnects while pending,
 	// and expires via TTL otherwise.
 	d.AgentWS.PushSnapshotRequest(id, req)
-	writeJSON(w, http.StatusOK, map[string]string{"request_id": req.RequestID})
+	writeJSON(w, http.StatusOK, map[string]any{"request_id": req.RequestID, "precheck": precheck})
 }
+
+// snapshotScopes is the allow-list of process/connection permission IDs a live
+// snapshot may request. Anything else is a 400.
+var snapshotScopes = permission.NewSet(
+	permission.HostProcessBasicRead, permission.HostProcessOwnerRead,
+	permission.HostProcessResourceRead, permission.HostProcessIORead,
+	permission.HostConnectionSummaryRead, permission.HostConnectionLocalRead,
+	permission.HostConnectionRemoteRead, permission.HostConnectionOwnerRead,
+)
 
 // handleGetSnapshot returns the latest in-memory snapshot for an agent (if fresh)
 // and whether a request is still pending, so the console can poll after asking.
@@ -285,13 +368,33 @@ func (d Deps) handleGetSnapshot(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "live snapshots not available")
 		return
 	}
-	snap, ok, pending := d.HostLive.Latest(chi.URLParam(r, "id"))
+	id := chi.URLParam(r, "id")
+	snap, ok, pending := d.HostLive.Latest(id)
 	resp := struct {
-		Snapshot *telemetry.HostSnapshot `json:"snapshot"`
-		Pending  bool                    `json:"pending"`
+		Snapshot    *telemetry.HostSnapshot `json:"snapshot"`
+		Pending     bool                    `json:"pending"`
+		Remediation *opissue.Remediation    `json:"remediation,omitempty"`
 	}{Pending: pending}
 	if ok {
 		resp.Snapshot = &snap
+		// Attach a permission remediation for any permission-denied scope in the
+		// delivered snapshot, so the console shows the full replacement
+		// NETTACT_AGENT_PERMISSIONS line at the exact failure point (not only in the
+		// POST all-denied path). Unsupported/failed scopes carry no env line; the
+		// console explains those from their scope status.
+		var deniedPerms []string
+		for _, sr := range snap.Scopes {
+			if sr.Status == telemetry.ScopeDenied {
+				deniedPerms = append(deniedPerms, sr.Scope)
+			}
+		}
+		if len(deniedPerms) > 0 {
+			var granted []string
+			if a, err := d.Registry.Get(r.Context(), id); err == nil {
+				granted = a.Granted
+			}
+			resp.Remediation = opissue.Remediate(wire.MonitorStatusPermissionBlocked, deniedPerms, granted, "")
+		}
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
@@ -574,8 +677,35 @@ func (d Deps) handleSetTargets(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	// Same scope narrowing strands operational issues + monitor_status rows for
+	// disabled/out-of-scope monitors; reconcile them (offline agents included).
+	var warnings []opissue.SaveWarning
+	if d.OpIssue != nil {
+		if err := d.OpIssue.ReconcileScope(r.Context(), siteID); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		// Save-and-warn pre-check: predict which in-scope agents can run each monitor
+		// under their current permission policy, upserting predicted monitor_status
+		// rows and returning warnings for the ones some/all agents cannot run.
+		var perr error
+		warnings, perr = d.OpIssue.PredictProbeMonitors(r.Context(), siteID)
+		if perr != nil {
+			writeError(w, http.StatusInternalServerError, perr.Error())
+			return
+		}
+		// Host monitors are server-authored (never pushed to agents), so a target set
+		// that adds/removes/rescopes a host monitor must be reevaluated here.
+		if err := d.OpIssue.ReevaluateHostMonitorsForSite(r.Context(), siteID); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	}
 	d.Audit.Log(r.Context(), "admin", "monitoring.set_targets", siteID, strconv.Itoa(len(body.Targets))+" targets")
-	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+	if warnings == nil {
+		warnings = []opissue.SaveWarning{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "warnings": warnings})
 }
 
 func (d Deps) handleListAgentGroups(w http.ResponseWriter, r *http.Request) {
@@ -643,6 +773,25 @@ func (d Deps) handleUpdateAgentGroup(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	if d.OpIssue != nil {
+		if err := d.OpIssue.ReconcileScope(r.Context(), siteID); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		// A membership change can bring a newly in-scope agent (including an offline
+		// one) under an existing probe monitor. Predict its status now from the stored
+		// permission report so its monitor_status row exists immediately instead of
+		// only after the agent reconnects or an unrelated target save runs.
+		if _, err := d.OpIssue.PredictProbeMonitors(r.Context(), siteID); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		// Group membership changes which agents fall in a host monitor's scope.
+		if err := d.OpIssue.ReevaluateHostMonitorsForSite(r.Context(), siteID); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	}
 	// UpdateGroup bumped config_version (membership changes which targets reach
 	// which agents); publish so the WS hub pushes the recomputed DesiredState to
 	// connected agents now instead of on their next reconnect.
@@ -669,6 +818,24 @@ func (d Deps) handleDeleteAgentGroup(w http.ResponseWriter, r *http.Request) {
 	if err := d.Alert.ResolveOutOfScope(r.Context(), siteID); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
+	}
+	if d.OpIssue != nil {
+		if err := d.OpIssue.ReconcileScope(r.Context(), siteID); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		// Deleting the group re-scopes its former members; recompute predicted probe
+		// status for every still-in-scope agent (offline included) so rows stay
+		// consistent without waiting on a reconnect.
+		if _, err := d.OpIssue.PredictProbeMonitors(r.Context(), siteID); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		// Deleting the group changes host-monitor scope for its former members.
+		if err := d.OpIssue.ReevaluateHostMonitorsForSite(r.Context(), siteID); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
 	}
 	// DeleteGroup bumped config_version (its target bindings are gone); publish
 	// so connected agents drop the now-unscoped targets immediately.
@@ -984,6 +1151,14 @@ func (d Deps) handleCreateTargetRule(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	// A bound rule defines a host monitor's required host permissions, so its
+	// creation can change a host monitor's status; reevaluate the site.
+	if d.OpIssue != nil {
+		if err := d.OpIssue.ReevaluateHostMonitorsForSite(r.Context(), siteParam(r)); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	}
 	d.Audit.Log(r.Context(), "admin", "rule.create", id, probeTaskID)
 	writeJSON(w, http.StatusOK, map[string]string{"id": id})
 }
@@ -998,6 +1173,12 @@ func (d Deps) handleUpdateRule(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	if d.OpIssue != nil {
+		if err := d.OpIssue.ReevaluateHostMonitorsForSite(r.Context(), siteParam(r)); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	}
 	d.Audit.Log(r.Context(), "admin", "rule.update", rule.ID, "")
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
@@ -1007,6 +1188,12 @@ func (d Deps) handleDeleteRule(w http.ResponseWriter, r *http.Request) {
 	if err := d.Rules.Delete(r.Context(), id); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
+	}
+	if d.OpIssue != nil {
+		if err := d.OpIssue.ReevaluateHostMonitorsForSite(r.Context(), siteParam(r)); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
 	}
 	d.Audit.Log(r.Context(), "admin", "rule.delete", id, "")
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})

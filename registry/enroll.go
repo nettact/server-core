@@ -8,7 +8,6 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"time"
 
@@ -126,15 +125,18 @@ func (s *Service) Enroll(ctx context.Context, req enroll.EnrollRequest) (enroll.
 
 	agentID := "agent_" + uuid.NewString()
 	agentToken := randToken()
-	capsJSON, _ := json.Marshal(req.Capabilities)
 	now := time.Now().UTC()
 
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO agents(id, site_id, public_key, token_hash, hostname, platform, agent_version,
-		                   capabilities, status, config_version, reported_config_version, last_seen_at, created_at)
-		VALUES(?,?,?,?,?,?,?,?, 'online', 0, 0, ?, ?)`,
+		                   perm_supported, perm_granted, perm_effective, policy_source, policy_hash,
+		                   status, config_version, reported_config_version, last_seen_at, created_at)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?, 'online', 0, 0, ?, ?)`,
 		agentID, siteID, []byte(req.PublicKey), sha256hex(agentToken),
-		req.Hostname, req.Platform, req.AgentVersion, string(capsJSON), now, now); err != nil {
+		req.Hostname, req.Platform, req.AgentVersion,
+		marshalStrings(req.Permissions.Supported), marshalStrings(req.Permissions.Granted),
+		marshalStrings(req.Permissions.Effective), req.Permissions.Source, req.Permissions.PolicyHash,
+		now, now); err != nil {
 		return enroll.EnrollResponse{}, err
 	}
 	if _, err := tx.ExecContext(ctx,

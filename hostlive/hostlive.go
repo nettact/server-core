@@ -54,15 +54,15 @@ func New() *Store {
 
 // Request registers (or replaces) a pending live-snapshot request for an agent
 // and returns the built request so the caller can push it to the agent's
-// WebSocket session. wantProcs/wantConns come from the console; the agent still
-// re-checks its own opt-in flags before collecting anything.
-func (s *Store) Request(agentID string, wantProcs, wantConns bool) pcfg.SnapshotRequest {
+// WebSocket session. scopes are the process/connection permission IDs the console
+// asked for; the agent evaluates each against its own effective policy and answers
+// per scope (collected / denied / unsupported / failed).
+func (s *Store) Request(agentID string, scopes []string) pcfg.SnapshotRequest {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	req := pcfg.SnapshotRequest{
-		RequestID:       "snap_" + uuid.NewString(),
-		WantProcesses:   wantProcs,
-		WantConnections: wantConns,
+		RequestID: "snap_" + uuid.NewString(),
+		Scopes:    scopes,
 	}
 	s.pending[agentID] = &pending{req: req, requestedAt: s.nowFn()}
 	return req

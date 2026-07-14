@@ -26,6 +26,7 @@ import (
 	"github.com/nettact/server-core/eventbus"
 	"github.com/nettact/server-core/hostlive"
 	"github.com/nettact/server-core/ingest"
+	"github.com/nettact/server-core/opissue"
 	"github.com/nettact/server-core/registry"
 )
 
@@ -43,8 +44,9 @@ type Deps struct {
 	Registry *registry.Service
 	Ingest   *ingest.Service
 	Config   *config.Service
-	HostLive *hostlive.Store // in-memory live snapshots (never persisted)
-	Bus      *eventbus.Bus   // source of TopicConfigChanged pushes
+	HostLive *hostlive.Store  // in-memory live snapshots (never persisted)
+	OpIssue  *opissue.Service // operational-issue engine (monitor status + host re-eval)
+	Bus      *eventbus.Bus    // source of TopicConfigChanged pushes
 }
 
 // Hub tracks the one live session per agent and fans server-initiated pushes
@@ -139,10 +141,17 @@ func (h *Hub) serve(ctx context.Context, agentID, siteID string, c wire.Conn) {
 	// The Hello replaces the per-request X-Agent-* headers of the old POST
 	// transport: refresh the agent-owned fields it carries, then mark the agent
 	// online immediately — a connected link IS liveness, no packet needed.
-	_ = h.deps.Registry.UpdateCapabilities(ctx, agentID, hello.Capabilities)
+	_ = h.deps.Registry.UpdatePermissions(ctx, agentID, hello.Permissions)
 	_ = h.deps.Registry.UpdateReportedInfo(ctx, agentID, hello.Hostname, hello.Platform, hello.AgentVersion)
 	_ = h.deps.Registry.SetReportedConfigVersion(ctx, agentID, hello.ReportedConfigVersion)
 	_ = h.deps.Registry.TouchLastSeen(ctx, agentID)
+	// The agent's effective policy just refreshed, so recompute which of its host
+	// monitors are permission-blocked (probe monitors arrive via MonitorStatus).
+	if h.deps.OpIssue != nil {
+		if err := h.deps.OpIssue.ReevaluateHostMonitors(ctx, agentID); err != nil {
+			log.Printf("agentws: reevaluate host monitors for %s: %v", agentID, err)
+		}
+	}
 
 	s := &session{
 		conn:    c,

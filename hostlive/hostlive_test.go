@@ -26,9 +26,9 @@ func TestPendingLifecycle(t *testing.T) {
 		t.Fatal("Pending with no request should be nil")
 	}
 
-	req := s.Request("agent_a", true, false)
-	if req.RequestID == "" || !req.WantProcesses || req.WantConnections {
-		t.Fatalf("Request returned %+v, want processes-only with an id", req)
+	req := s.Request("agent_a", []string{"host.process.basic.read"})
+	if req.RequestID == "" || len(req.Scopes) != 1 || req.Scopes[0] != "host.process.basic.read" {
+		t.Fatalf("Request returned %+v, want a single process-basic scope with an id", req)
 	}
 
 	// Unanswered and fresh: returned every time (re-push is idempotent).
@@ -46,7 +46,7 @@ func TestPendingLifecycle(t *testing.T) {
 	}
 
 	// An unanswered request expires after pendingTTL.
-	s.Request("agent_a", true, true)
+	s.Request("agent_a", []string{"host.process.basic.read", "host.connection.summary.read"})
 	advance(pendingTTL + time.Second)
 	if s.Pending("agent_a") != nil {
 		t.Error("Pending past pendingTTL should be nil")
@@ -59,15 +59,16 @@ func TestLatestFreshnessAndPending(t *testing.T) {
 	s := New()
 	advance := fakeNow(s)
 
-	req := s.Request("agent_a", true, true)
+	req := s.Request("agent_a", []string{"host.process.basic.read", "host.connection.summary.read"})
 	if _, ok, pending := s.Latest("agent_a"); ok || !pending {
 		t.Fatalf("before snapshot: ok=%v pending=%v, want false/true", ok, pending)
 	}
 
-	s.Store("agent_a", telemetry.HostSnapshot{RequestID: req.RequestID, ProcessTotal: 7})
+	total := 7
+	s.Store("agent_a", telemetry.HostSnapshot{RequestID: req.RequestID, ProcessTotal: &total})
 	snap, ok, pending := s.Latest("agent_a")
-	if !ok || pending || snap.ProcessTotal != 7 {
-		t.Fatalf("after snapshot: ok=%v pending=%v total=%d, want true/false/7", ok, pending, snap.ProcessTotal)
+	if !ok || pending || snap.ProcessTotal == nil || *snap.ProcessTotal != 7 {
+		t.Fatalf("after snapshot: ok=%v pending=%v total=%v, want true/false/7", ok, pending, snap.ProcessTotal)
 	}
 
 	// The stored snapshot goes stale after snapshotTTL.
@@ -78,7 +79,7 @@ func TestLatestFreshnessAndPending(t *testing.T) {
 
 	// An unanswered pending request stops being reported after pendingTTL, so
 	// the console spinner cannot run forever for an agent that went away.
-	s.Request("agent_b", true, true)
+	s.Request("agent_b", []string{"host.process.basic.read"})
 	advance(pendingTTL + time.Second)
 	if _, _, pending := s.Latest("agent_b"); pending {
 		t.Error("pending past pendingTTL should be cleared by Latest")

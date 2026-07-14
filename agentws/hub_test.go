@@ -13,6 +13,7 @@ import (
 	"github.com/coder/websocket"
 
 	"github.com/nettact/protocol"
+	"github.com/nettact/protocol/permission"
 	"github.com/nettact/protocol/telemetry"
 	"github.com/nettact/protocol/wire"
 	"github.com/nettact/server-core/config"
@@ -20,6 +21,7 @@ import (
 	"github.com/nettact/server-core/hostlive"
 	"github.com/nettact/server-core/ingest"
 	"github.com/nettact/server-core/metrics"
+	"github.com/nettact/server-core/opissue"
 	"github.com/nettact/server-core/registry"
 	"github.com/nettact/server-core/site"
 	"github.com/nettact/server-core/store"
@@ -59,6 +61,7 @@ func newTestEnv(t *testing.T) *testEnv {
 		Ingest:   ingest.New(db, bus, metrics.New(db)),
 		Config:   cfg,
 		HostLive: hostLive,
+		OpIssue:  opissue.New(db, bus),
 		Bus:      bus,
 	})
 
@@ -150,7 +153,13 @@ func testHello() wire.Frame {
 		Hostname:      "ws-host",
 		Platform:      "linux",
 		AgentVersion:  "test",
-		Capabilities:  []string{"processes"},
+		Permissions: permission.PermissionReport{
+			Supported:  []string{"probe.icmp"},
+			Granted:    []string{"probe.icmp"},
+			Effective:  []string{"probe.icmp"},
+			Source:     "environment",
+			PolicyHash: "h1",
+		},
 	}}
 }
 
@@ -213,8 +222,8 @@ func TestConnectHelloOnline(t *testing.T) {
 	if a.Hostname != "ws-host" || a.Platform != "linux" || a.AgentVersion != "test" {
 		t.Errorf("reported info not refreshed: %q/%q/%q", a.Hostname, a.Platform, a.AgentVersion)
 	}
-	if len(a.Capabilities) != 1 || a.Capabilities[0] != "processes" {
-		t.Errorf("capabilities = %v, want [processes]", a.Capabilities)
+	if len(a.Effective) != 1 || a.Effective[0] != "probe.icmp" || a.PolicySource != "environment" {
+		t.Errorf("permissions = effective %v source %q, want [probe.icmp]/environment", a.Effective, a.PolicySource)
 	}
 	if !e.hub.IsConnected("agent_a") {
 		t.Error("hub does not report agent connected")
@@ -357,7 +366,7 @@ func TestSnapshotRequestPush(t *testing.T) {
 	e := newTestEnv(t)
 	e.seedAgent(t, "agent_a", "tok_a")
 
-	if e.hub.PushSnapshotRequest("agent_a", e.hostLive.Request("agent_a", true, true)) {
+	if e.hub.PushSnapshotRequest("agent_a", e.hostLive.Request("agent_a", []string{"host.process.basic.read", "host.connection.summary.read"})) {
 		t.Fatal("push to a disconnected agent must return false")
 	}
 
@@ -374,7 +383,7 @@ func TestSnapshotRequestPush(t *testing.T) {
 	}
 
 	// A fresh request while connected pushes directly.
-	req := e.hostLive.Request("agent_a", true, false)
+	req := e.hostLive.Request("agent_a", []string{"host.process.basic.read"})
 	if !e.hub.PushSnapshotRequest("agent_a", req) {
 		t.Fatal("push to a connected agent returned false")
 	}
@@ -382,21 +391,22 @@ func TestSnapshotRequestPush(t *testing.T) {
 	if f.SnapshotRequest == nil || f.SnapshotRequest.RequestID != req.RequestID {
 		t.Fatalf("pushed frame = %+v, want SnapshotRequest %s", f, req.RequestID)
 	}
-	if !f.SnapshotRequest.WantProcesses || f.SnapshotRequest.WantConnections {
-		t.Errorf("request flags = %+v, want processes only", f.SnapshotRequest)
+	if len(f.SnapshotRequest.Scopes) != 1 || f.SnapshotRequest.Scopes[0] != "host.process.basic.read" {
+		t.Errorf("request scopes = %+v, want [host.process.basic.read]", f.SnapshotRequest.Scopes)
 	}
 
 	// Answer it; the snapshot is stored (and the pending entry cleared) without
 	// any ack coming back.
+	total := 42
 	sendFrame(t, conn, wire.Frame{HostSnapshot: &telemetry.HostSnapshot{
-		TS: time.Now().UTC(), RequestID: req.RequestID, ProcessTotal: 42,
+		TS: time.Now().UTC(), RequestID: req.RequestID, ProcessTotal: &total,
 	}})
 	deadline := time.Now().Add(2 * time.Second)
 	for {
 		snap, ok, pending := e.hostLive.Latest("agent_a")
 		if ok && !pending {
-			if snap.ProcessTotal != 42 {
-				t.Errorf("stored snapshot ProcessTotal = %d, want 42", snap.ProcessTotal)
+			if snap.ProcessTotal == nil || *snap.ProcessTotal != 42 {
+				t.Errorf("stored snapshot ProcessTotal = %v, want 42", snap.ProcessTotal)
 			}
 			break
 		}
