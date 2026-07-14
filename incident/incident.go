@@ -123,17 +123,34 @@ func (s *Service) onResolved(a alert.Raised) {
 		log.Printf("incident lookup: %v", err)
 		return
 	}
-	s.addTimeline(ctx, incID, "alert.resolved", fmt.Sprintf("%s — %s 恢复", a.RuleName, a.Target))
+	// A resolve caused by deleting the alert's monitored object is recorded as a
+	// termination, not a recovery, so the timeline never disguises a deletion as a
+	// healthy probe recovery.
+	terminated := a.Reason == alert.ReasonDeleted
+	if terminated {
+		s.addTimeline(ctx, incID, "alert.terminated", fmt.Sprintf("%s — %s 监控终止（对象已删除）", a.RuleName, a.Target))
+	} else {
+		s.addTimeline(ctx, incID, "alert.resolved", fmt.Sprintf("%s — %s 恢复", a.RuleName, a.Target))
+	}
 
 	var firing int
 	_ = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM alerts WHERE site_id=? AND state='firing'`, a.SiteID).Scan(&firing)
 	if firing == 0 {
 		now := time.Now().UTC()
 		_, _ = s.db.ExecContext(ctx, `UPDATE incidents SET state='resolved', resolved_at=? WHERE id=?`, now, incID)
-		s.addTimeline(ctx, incID, "incident.resolved", "所有告警已恢复")
+		event, state := "incident.resolved", "resolved"
+		if terminated {
+			s.addTimeline(ctx, incID, "incident.terminated", "监控对象已删除，事故终止")
+			event, state = "incident.terminated", "terminated"
+		} else {
+			s.addTimeline(ctx, incID, "incident.resolved", "所有告警已恢复")
+		}
 		s.bus.Publish(eventbus.TopicIncidentUpdated, incID)
-		resolved := s.buildPayload(ctx, incID, a.SiteID, "incident.resolved", "resolved")
-		go s.notify(ctx, a.SiteID, resolved)
+		// Render the close notification as a termination (not a recovery) when the
+		// last firing alert was force-resolved by a deletion, so channel recipients
+		// aren't told the fault healthy-recovered.
+		closePayload := s.buildPayload(ctx, incID, a.SiteID, event, state)
+		go s.notify(ctx, a.SiteID, closePayload)
 		return
 	}
 	p := s.buildPayload(ctx, incID, a.SiteID, "incident.updated", "open")

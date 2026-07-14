@@ -39,7 +39,7 @@ func TestEvaluateAgentHostWiFiWildcard(t *testing.T) {
 	}
 
 	reg := registry.New(db, 0)
-	cfg := config.New(db, reg, nil)
+	cfg := config.New(db, reg, nil, nil)
 	gid, err := reg.CreateGroup(ctx, siteID, "wifi-agents")
 	if err != nil {
 		t.Fatalf("CreateGroup: %v", err)

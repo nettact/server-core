@@ -23,7 +23,7 @@ func TestWiFiHostAnchorIsNotInDesiredState(t *testing.T) {
 	}
 	seedAgent(t, db, "agent_wifi", siteID)
 
-	svc := New(db, registry.New(db, 0), nil)
+	svc := New(db, registry.New(db, 0), nil, nil)
 	if err := svc.SetSiteTargets(ctx, siteID, []ProbeTarget{
 		{Kind: "icmp", Target: "1.1.1.1", Enabled: true, AllAgents: true},
 		{Kind: "host", Target: "*", Enabled: true, AllAgents: true},

@@ -46,9 +46,12 @@ var layerOrder = map[string]int{"local": 0, "lan": 1, "wan": 2, "internet": 3, "
 // RenderTitle is the human headline (no machine event strings like
 // "incident.opened").
 func RenderTitle(p Payload, lang string) string {
+	terminated := p.Event == "incident.terminated" || p.State == "terminated"
 	resolved := p.Event == "incident.resolved" || p.State == "resolved"
 	if normLang(lang) == "en" {
 		switch {
+		case terminated:
+			return "Monitored object removed"
 		case resolved:
 			return "Alert resolved"
 		case p.Event == "incident.opened":
@@ -58,6 +61,8 @@ func RenderTitle(p Payload, lang string) string {
 		}
 	}
 	switch {
+	case terminated:
+		return "监控对象已删除"
 	case resolved:
 		return "告警已恢复"
 	case p.Event == "incident.opened":
@@ -71,6 +76,12 @@ func RenderTitle(p Payload, lang string) string {
 // suspected root-cause layer.
 func RenderScope(p Payload, lang string) string {
 	en := normLang(lang) == "en"
+	if p.Event == "incident.terminated" || p.State == "terminated" {
+		if en {
+			return "Monitored object removed; incident terminated."
+		}
+		return "监控对象已删除，事故终止。"
+	}
 	if p.Event == "incident.resolved" || p.State == "resolved" {
 		if en {
 			return "All alerts resolved."

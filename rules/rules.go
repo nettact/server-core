@@ -146,8 +146,16 @@ func (s *Service) SetEnabled(ctx context.Context, id string, enabled bool) error
 
 // Delete removes a rule. Any alerts it produced are cleared
 // first — alerts.rule_id references alert_rules(id) with foreign keys ON, so a
-// bare rule delete would fail once the rule has ever fired.
+// bare rule delete would fail once the rule has ever fired. Firing alerts are
+// force-resolved through the incident correlator first (TerminateForRule) so
+// deleting a rule mid-alarm closes its incident as a termination rather than
+// stranding it open or letting an unrelated later recovery false-close it.
 func (s *Service) Delete(ctx context.Context, id string) error {
+	if s.alerts != nil {
+		if err := s.alerts.TerminateForRule(ctx, id); err != nil {
+			return err
+		}
+	}
 	if _, err := s.db.ExecContext(ctx, `DELETE FROM alerts WHERE rule_id=?`, id); err != nil {
 		return err
 	}

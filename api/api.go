@@ -481,6 +481,17 @@ func (d Deps) handleDeleteAgent(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	// Force-resolve any alert this agent has firing BEFORE its rows are purged, so
+	// deleting an agent mid-alarm closes the incident as a termination rather than
+	// stranding it open or letting an unrelated later recovery false-close it. Runs
+	// outside DeleteAgent's transaction (the resolve event's incident handler writes
+	// to the DB and SQLite has a single writer); DeleteAgent then removes the rows.
+	if d.Alert != nil {
+		if err := d.Alert.TerminateForAgent(r.Context(), id); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	}
 	if err := d.Registry.DeleteAgent(r.Context(), id); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			writeError(w, http.StatusNotFound, "agent not found")

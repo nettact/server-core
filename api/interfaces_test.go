@@ -37,7 +37,7 @@ func TestHandleAgentInterfacesFreshnessAndShape(t *testing.T) {
 	}
 
 	reg := registry.New(db, 0)
-	d := Deps{Inventory: inventory.New(db), Config: config.New(db, reg, nil)}
+	d := Deps{Inventory: inventory.New(db), Config: config.New(db, reg, nil, nil)}
 	call := func() map[string]json.RawMessage {
 		t.Helper()
 		r := httptest.NewRequest("GET", "/api/v1/agents/agent_wifi/interfaces", nil)

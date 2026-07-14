@@ -15,6 +15,15 @@ import (
 	"github.com/nettact/server-core/store"
 )
 
+// Resolve reasons carried on TopicAlertResolved so the incident correlator can
+// tell a genuine probe recovery from an alert that was force-closed because its
+// monitored object was deleted. The zero value ("") is a normal recovery, so
+// existing publishers need no change.
+const (
+	ReasonRecovered = ""        // the probe recovered on its own
+	ReasonDeleted   = "deleted" // the alert's target / rule / agent was removed while alerting
+)
+
 // RuleView is the rule context the alert service needs (avoids importing rules).
 type RuleView struct {
 	ID            string
@@ -37,6 +46,11 @@ type Raised struct {
 	Severity string
 	Value    float64
 	At       time.Time
+	// Reason is set only on TopicAlertResolved: "" for a normal recovery,
+	// ReasonDeleted when the alert was force-closed because its monitored object
+	// (target, rule, or agent) was removed. Lets the incident correlator record a
+	// termination rather than a false recovery.
+	Reason string
 }
 
 // Alert is a stored alert row joined with its rule (for the UI). It carries the
@@ -221,13 +235,95 @@ func durationMet(rule RuleView, startedAt, now time.Time) bool {
 	return now.Sub(startedAt) >= time.Duration(rule.ForSeconds)*time.Second
 }
 
+// TerminateForRule force-resolves any open alert produced by a rule that is being
+// deleted. See terminate for the lifecycle contract.
+func (s *Service) TerminateForRule(ctx context.Context, ruleID string) error {
+	return s.terminate(ctx, `a.rule_id = ?`, ruleID)
+}
+
+// TerminateForTask force-resolves any open alert produced by the rules bound to a
+// monitor (probe_task) that is being deleted. See terminate for the contract.
+func (s *Service) TerminateForTask(ctx context.Context, taskID string) error {
+	return s.terminate(ctx, `a.rule_id IN (SELECT id FROM alert_rules WHERE probe_task_id = ?)`, taskID)
+}
+
+// TerminateForAgent force-resolves any open alert detected by an agent that is
+// being deleted. See terminate for the contract.
+func (s *Service) TerminateForAgent(ctx context.Context, agentID string) error {
+	return s.terminate(ctx, `a.agent_id = ?`, agentID)
+}
+
+// terminate resolves every open (pending/firing) alert selected by whereSQL
+// (correlated to alerts alias "a") because its owning object — target, rule, or
+// agent — is being removed. Each row is stamped resolved and, if it was firing,
+// TopicAlertResolved is published with ReasonDeleted so the incident correlator
+// unwinds it through the normal path: it records a "监控终止（对象已删除）" entry
+// and closes the incident as a termination rather than leaving it stranded open
+// or letting an unrelated later recovery false-close it as a healthy recovery.
+//
+// Callers MUST invoke this BEFORE deleting the alert rows and OUTSIDE any open
+// write transaction: the published event's incident handler writes to the DB, and
+// SQLite allows a single writer. The rows are left in place (resolved) for the
+// caller's own cascade to delete under its FK ordering. Idempotent — a second
+// call finds nothing open and resolves/publishes nothing.
+func (s *Service) terminate(ctx context.Context, whereSQL string, args ...any) error {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT a.id, a.rule_id, a.agent_id, a.site_id, a.target, a.value, a.state,
+		       COALESCE(r.name,''), COALESCE(r.layer,''), COALESCE(r.severity,'')
+		FROM alerts a
+		LEFT JOIN alert_rules r ON r.id = a.rule_id
+		WHERE a.state IN ('pending','firing') AND (`+whereSQL+`)`, args...)
+	if err != nil {
+		return err
+	}
+	type open struct {
+		id, ruleID, agentID, siteID, target, state, name, layer, severity string
+		value                                                             float64
+	}
+	var list []open
+	for rows.Next() {
+		var o open
+		if err := rows.Scan(&o.id, &o.ruleID, &o.agentID, &o.siteID, &o.target, &o.value, &o.state,
+			&o.name, &o.layer, &o.severity); err != nil {
+			rows.Close()
+			return err
+		}
+		list = append(list, o)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	now := time.Now().UTC()
+	for _, o := range list {
+		if _, err := s.db.ExecContext(ctx,
+			`UPDATE alerts SET state='resolved', resolved_at=?, last_eval_at=?, fail_count=0 WHERE id=?`,
+			now, now, o.id); err != nil {
+			return err
+		}
+		// Only firing alerts were correlated into an incident, so only they need a
+		// resolve event to unwind it; pending ones just clear silently.
+		if o.state == "firing" {
+			s.publishReason(eventbus.TopicAlertResolved, ReasonDeleted,
+				RuleView{ID: o.ruleID, Name: o.name, Layer: o.layer, Severity: o.severity},
+				o.id, o.agentID, o.siteID, o.target, o.value, now)
+		}
+	}
+	return nil
+}
+
 func (s *Service) publish(topic string, rule RuleView, id, agentID, siteID, target string, value float64, at time.Time) {
+	s.publishReason(topic, ReasonRecovered, rule, id, agentID, siteID, target, value, at)
+}
+
+func (s *Service) publishReason(topic, reason string, rule RuleView, id, agentID, siteID, target string, value float64, at time.Time) {
 	if s.bus == nil {
 		return
 	}
 	s.bus.Publish(topic, Raised{
 		ID: id, RuleID: rule.ID, RuleName: rule.Name, AgentID: agentID, SiteID: siteID,
-		Target: target, Layer: rule.Layer, Severity: rule.Severity, Value: value, At: at,
+		Target: target, Layer: rule.Layer, Severity: rule.Severity, Value: value, At: at, Reason: reason,
 	})
 }
 

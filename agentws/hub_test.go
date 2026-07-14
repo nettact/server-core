@@ -54,7 +54,7 @@ func newTestEnv(t *testing.T) *testEnv {
 	}
 	reg := registry.New(db, 0)
 	bus := eventbus.New()
-	cfg := config.New(db, reg, bus)
+	cfg := config.New(db, reg, bus, nil)
 	hostLive := hostlive.New()
 	hub := New(Deps{
 		Registry: reg,

@@ -13,6 +13,7 @@ import (
 	"github.com/google/uuid"
 
 	pcfg "github.com/nettact/protocol/config"
+	"github.com/nettact/server-core/alert"
 	"github.com/nettact/server-core/eventbus"
 	"github.com/nettact/server-core/registry"
 	"github.com/nettact/server-core/store"
@@ -37,13 +38,14 @@ const AgentScopePredicate = `(pt.all_agents=1 OR EXISTS(
 	WHERE ptg.task_id = pt.id AND agm.agent_id = ?))`
 
 type Service struct {
-	db  *store.DB
-	reg *registry.Service
-	bus *eventbus.Bus
+	db     *store.DB
+	reg    *registry.Service
+	bus    *eventbus.Bus
+	alerts *alert.Service // force-resolves alerts of deleted targets (nil-safe)
 }
 
-func New(db *store.DB, reg *registry.Service, bus *eventbus.Bus) *Service {
-	return &Service{db: db, reg: reg, bus: bus}
+func New(db *store.DB, reg *registry.Service, bus *eventbus.Bus, alerts *alert.Service) *Service {
+	return &Service{db: db, reg: reg, bus: bus, alerts: alerts}
 }
 
 // ProbeTarget is a site-scoped monitoring target managed via the UI.
@@ -144,6 +146,42 @@ func (s *Service) ListSiteTargets(ctx context.Context, siteID string) ([]ProbeTa
 // rules bound via probe_task_id survive edits; targets no longer present are
 // deleted along with their bound rules.
 func (s *Service) SetSiteTargets(ctx context.Context, siteID string, targets []ProbeTarget) error {
+	// Assign IDs to new targets so the keep-set is complete, then diff against the
+	// current targets to find which ones are being removed.
+	keep := make(map[string]bool, len(targets))
+	for i := range targets {
+		if targets[i].ID == "" {
+			targets[i].ID = "probe_" + uuid.NewString()
+		}
+		keep[targets[i].ID] = true
+	}
+	removed, err := s.removedTaskIDs(ctx, siteID, keep)
+	if err != nil {
+		return err
+	}
+	// Validate the incoming group bindings BEFORE terminating anything. Group
+	// reconciliation inside the transaction below rejects group ids that don't
+	// belong to this site; if that rejection fired after termination, we'd have
+	// force-resolved a removed target's live alerts for an update that is then
+	// rolled back — suppressing an active alarm the operator never actually
+	// removed. Checking up front makes termination safe to run pre-transaction.
+	if err := s.validateTargetGroups(ctx, siteID, targets); err != nil {
+		return err
+	}
+	// Force-resolve any alert firing for a removed target BEFORE opening the write
+	// transaction: TerminateForTask publishes resolve events whose incident handler
+	// writes to the DB, and SQLite allows only one writer, so it must not run inside
+	// our own open transaction. This closes the incident as a termination instead of
+	// stranding it open (or letting an unrelated later recovery false-close it) once
+	// the transaction below deletes the now-resolved alert rows.
+	if s.alerts != nil {
+		for _, id := range removed {
+			if err := s.alerts.TerminateForTask(ctx, id); err != nil {
+				return err
+			}
+		}
+	}
+
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -155,15 +193,8 @@ func (s *Service) SetSiteTargets(ctx context.Context, siteID string, targets []P
 		}
 	}()
 
-	// Assign IDs to new targets, then delete any existing target (and its bound
-	// rules) that is not in the incoming set.
-	keep := make(map[string]bool, len(targets))
-	for i := range targets {
-		if targets[i].ID == "" {
-			targets[i].ID = "probe_" + uuid.NewString()
-		}
-		keep[targets[i].ID] = true
-	}
+	// Delete any existing target (and its bound rules) that is not in the incoming
+	// set. Alert rows were already force-resolved above; here they are removed.
 	rows, err := tx.QueryContext(ctx,
 		`SELECT id FROM probe_tasks WHERE site_id=?`, siteID)
 	if err != nil {
@@ -257,6 +288,69 @@ func (s *Service) SetSiteTargets(ctx context.Context, siteID string, targets []P
 	// notice the version bump on their own.
 	if s.bus != nil {
 		s.bus.Publish(eventbus.TopicConfigChanged, eventbus.ConfigChanged{SiteID: siteID})
+	}
+	return nil
+}
+
+// removedTaskIDs returns the site's current probe_task IDs that are absent from
+// keep, i.e. the targets a SetSiteTargets call is about to delete. Read-only, run
+// before the write transaction so their alerts can be force-resolved first.
+func (s *Service) removedTaskIDs(ctx context.Context, siteID string, keep map[string]bool) ([]string, error) {
+	rows, err := s.db.Read().QueryContext(ctx, `SELECT id FROM probe_tasks WHERE site_id=?`, siteID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var removed []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		if !keep[id] {
+			removed = append(removed, id)
+		}
+	}
+	return removed, rows.Err()
+}
+
+// validateTargetGroups rejects the update up front if any group-scoped target
+// references a group that does not belong to siteID — the same rule the group
+// reconcile enforces inside the transaction, checked early so termination and the
+// transaction only run for an update that will actually commit. Read-only.
+func (s *Service) validateTargetGroups(ctx context.Context, siteID string, targets []ProbeTarget) error {
+	want := make(map[string]bool)
+	for _, t := range targets {
+		if t.AllAgents {
+			continue
+		}
+		for _, gid := range t.GroupIDs {
+			want[gid] = true
+		}
+	}
+	if len(want) == 0 {
+		return nil
+	}
+	rows, err := s.db.Read().QueryContext(ctx, `SELECT id FROM agent_groups WHERE site_id=?`, siteID)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	have := make(map[string]bool)
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return err
+		}
+		have[id] = true
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for gid := range want {
+		if !have[gid] {
+			return fmt.Errorf("agent group %q does not belong to site %s", gid, siteID)
+		}
 	}
 	return nil
 }

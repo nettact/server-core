@@ -25,10 +25,10 @@ import (
 // so each channel can render title/summary/details in its own language at
 // delivery time.
 type Payload struct {
-	Event          string        `json:"event"` // incident.opened | incident.updated | incident.resolved
+	Event          string        `json:"event"` // incident.opened | incident.updated | incident.resolved | incident.terminated
 	IncidentID     string        `json:"incident_id"`
 	SiteID         string        `json:"site_id"`
-	State          string        `json:"state"`             // open | resolved
+	State          string        `json:"state"`             // open | resolved | terminated
 	Severity       string        `json:"severity"`          // worst firing severity
 	Scope          string        `json:"scope"`             // "single" | "site"
 	AgentCount     int           `json:"agent_count"`       // distinct agents alerting
