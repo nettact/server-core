@@ -16,6 +16,11 @@ import (
 // e.g. "http://localhost:8080"). Used to build deep links in notifications.
 const KeyConsoleBaseURL = "console_base_url"
 
+// KeyDashboardLayout stores the instance-wide dashboard widget layout. The
+// authenticated console reads the same value from every browser connected to
+// this server instance.
+const KeyDashboardLayout = "dashboard_layout"
+
 type Service struct {
 	db *store.DB
 }

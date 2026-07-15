@@ -146,6 +146,8 @@ func Router(d Deps) http.Handler {
 			// Global server settings (e.g. console_base_url for notification links).
 			r.Get("/settings", d.handleGetSettings)
 			r.Put("/settings", d.handleUpdateSettings)
+			r.Get("/dashboard-layout", d.handleGetDashboardLayout)
+			r.Put("/dashboard-layout", d.handleUpdateDashboardLayout)
 		})
 	})
 
@@ -1260,7 +1262,7 @@ func (d Deps) handleCreateChannel(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"id": id})
 }
 
-// handleGetSettings returns all global settings as a flat map (e.g.
+// handleGetSettings returns public UI settings as a flat map (e.g.
 // {"console_base_url": "http://localhost:8080"}).
 func (d Deps) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 	all, err := d.Settings.All(r.Context())
@@ -1268,11 +1270,16 @@ func (d Deps) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	for key := range all {
+		if !knownSettingKeys[key] {
+			delete(all, key)
+		}
+	}
 	writeJSON(w, http.StatusOK, all)
 }
 
-// knownSettingKeys is the allow-list of settings a client may write, so the kv
-// store can't accumulate arbitrary client-supplied keys.
+// knownSettingKeys is the allow-list of settings the generic settings API may
+// expose or write. Internal values such as dashboard layout use dedicated APIs.
 var knownSettingKeys = map[string]bool{settings.KeyConsoleBaseURL: true}
 
 // handleUpdateSettings merges the posted keys. Only known keys are accepted;
