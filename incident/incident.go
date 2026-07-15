@@ -42,6 +42,15 @@ type TimelineEntry struct {
 	Message string    `json:"message"`
 }
 
+// Stats is the site-wide incident rollup used by the overview. Counts are
+// independent of list pagination, so an old open incident remains visible.
+type Stats struct {
+	Open        int    `json:"open"`
+	Opened24h   int    `json:"opened_24h"`
+	Resolved24h int    `json:"resolved_24h"`
+	TopLayer    string `json:"top_layer"`
+}
+
 type Service struct {
 	db       *store.DB
 	bus      *eventbus.Bus
@@ -369,6 +378,31 @@ func (s *Service) Count(ctx context.Context, siteID string) (int, error) {
 	var n int
 	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM incidents WHERE site_id=?`, siteID).Scan(&n)
 	return n, err
+}
+
+// OverviewStats returns exact current and rolling-window incident counts.
+func (s *Service) OverviewStats(ctx context.Context, siteID string, since time.Time) (Stats, error) {
+	var st Stats
+	err := s.db.QueryRowContext(ctx, `
+		SELECT
+			COALESCE(SUM(CASE WHEN state='open' THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN opened_at>=? THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN resolved_at>=? THEN 1 ELSE 0 END), 0)
+		FROM incidents WHERE site_id=?`, since, since, siteID).Scan(&st.Open, &st.Opened24h, &st.Resolved24h)
+	if err != nil {
+		return Stats{}, err
+	}
+	err = s.db.QueryRowContext(ctx, `
+		SELECT COALESCE(suspected_layer,'')
+		FROM incidents
+		WHERE site_id=? AND (state='open' OR opened_at>=?) AND COALESCE(suspected_layer,'')<>''
+		GROUP BY suspected_layer
+		ORDER BY COUNT(*) DESC, suspected_layer
+		LIMIT 1`, siteID, since).Scan(&st.TopLayer)
+	if errors.Is(err, sql.ErrNoRows) {
+		err = nil
+	}
+	return st, err
 }
 
 // List returns one page of incidents for a site, newest first.

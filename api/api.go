@@ -1046,8 +1046,13 @@ func (d Deps) handleListIncidents(w http.ResponseWriter, r *http.Request) {
 	if incs == nil {
 		incs = []incident.Incident{}
 	}
+	stats, err := d.Incident.OverviewStats(ctx, siteID, time.Now().Add(-24*time.Hour))
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"items": incs, "total": total, "page": page, "page_size": pageSize,
+		"items": incs, "total": total, "page": page, "page_size": pageSize, "summary": stats,
 	})
 }
 

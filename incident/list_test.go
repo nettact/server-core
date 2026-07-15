@@ -58,6 +58,44 @@ func TestListPagination(t *testing.T) {
 	}
 }
 
+func TestOverviewStatsAreIndependentOfPagination(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "stats.db"))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	ctx := context.Background()
+	if _, err := db.ExecContext(ctx, `INSERT INTO sites(id,name) VALUES('site_default','H')`); err != nil {
+		t.Fatalf("seed site: %v", err)
+	}
+
+	now := time.Date(2026, 7, 16, 2, 0, 0, 0, time.UTC)
+	rows := []struct {
+		id, state, layer string
+		opened, resolved any
+	}{
+		{"old-open", "open", "internet", now.Add(-72 * time.Hour), nil},
+		{"new-open", "open", "dns", now.Add(-2 * time.Hour), nil},
+		{"new-resolved", "resolved", "dns", now.Add(-3 * time.Hour), now.Add(-time.Hour)},
+		{"old-resolved", "resolved", "host", now.Add(-96 * time.Hour), now.Add(-48 * time.Hour)},
+	}
+	for _, row := range rows {
+		if _, err := db.ExecContext(ctx, `
+			INSERT INTO incidents(id, site_id, state, suspected_layer, opened_at, resolved_at)
+			VALUES(?, 'site_default', ?, ?, ?, ?)`, row.id, row.state, row.layer, row.opened, row.resolved); err != nil {
+			t.Fatalf("seed %s: %v", row.id, err)
+		}
+	}
+
+	got, err := New(db, nil, nil, nil).OverviewStats(ctx, "site_default", now.Add(-24*time.Hour))
+	if err != nil {
+		t.Fatalf("OverviewStats: %v", err)
+	}
+	if got.Open != 2 || got.Opened24h != 2 || got.Resolved24h != 1 || got.TopLayer != "dns" {
+		t.Fatalf("OverviewStats = %+v", got)
+	}
+}
+
 func first(x []Incident) string {
 	if len(x) == 0 {
 		return ""
