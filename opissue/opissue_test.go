@@ -34,13 +34,15 @@ func TestPredictProbeMonitorsClassifiesAgentsAndIncludesOfflineGroupMembers(t *t
 	insertAgent("agent-blocked", "Blocked Offline", "offline", `["probe.http"]`, `[]`, `[]`)
 	insertAgent("agent-unsupported", "Unsupported", "online", `[]`, `["probe.http"]`, `[]`)
 
-	exec(`INSERT INTO probe_tasks(id,site_id,kind,target,params,enabled,name,all_agents)
-		VALUES('mon-all','site_default','http','https://example.com','{}',1,'All agents',1)`)
+	exec(`INSERT INTO monitor_groups(id,site_id,name,all_agents) VALUES('mgrp-all','site_default','All',1)`)
+	exec(`INSERT INTO probe_tasks(id,site_id,group_id,kind,target,params,enabled,name)
+		VALUES('mon-all','site_default','mgrp-all','http','https://example.com','{}',1,'All agents')`)
 	exec(`INSERT INTO agent_groups(id,site_id,name) VALUES('group-1','site_default','Offline group')`)
 	exec(`INSERT INTO agent_group_members(group_id,agent_id) VALUES('group-1','agent-blocked')`)
-	exec(`INSERT INTO probe_tasks(id,site_id,kind,target,params,enabled,name,all_agents)
-		VALUES('mon-group','site_default','http','https://example.net','{}',1,'Group monitor',0)`)
-	exec(`INSERT INTO probe_task_groups(task_id,group_id) VALUES('mon-group','group-1')`)
+	exec(`INSERT INTO monitor_groups(id,site_id,name,all_agents) VALUES('mgrp-scoped','site_default','Scoped',0)`)
+	exec(`INSERT INTO monitor_group_agent_groups(monitor_group_id,agent_group_id) VALUES('mgrp-scoped','group-1')`)
+	exec(`INSERT INTO probe_tasks(id,site_id,group_id,kind,target,params,enabled,name)
+		VALUES('mon-group','site_default','mgrp-scoped','http','https://example.net','{}',1,'Group monitor')`)
 
 	warnings, err := New(db, nil).PredictProbeMonitors(ctx, "site_default")
 	if err != nil {

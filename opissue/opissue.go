@@ -409,10 +409,13 @@ func (s *Service) ReevaluateHostMonitorsForSite(ctx context.Context, siteID stri
 }
 
 // hostRequired returns the closure of host permissions required by a host
-// monitor's enabled bound rules. No bound rules ⇒ empty set (always active).
+// monitor's enabled group-rule conditions. No conditions ⇒ empty set (always
+// active).
 func hostRequired(ctx context.Context, tx *sql.Tx, monitorID string) (permission.Set, error) {
-	rows, err := tx.QueryContext(ctx,
-		`SELECT metric_kind FROM alert_rules WHERE probe_task_id=? AND enabled=1 AND is_template=0`, monitorID)
+	rows, err := tx.QueryContext(ctx, `
+		SELECT c.metric_kind FROM group_rule_conditions c
+		JOIN group_rules gr ON gr.id = c.rule_id
+		WHERE c.target_id=? AND gr.enabled=1`, monitorID)
 	if err != nil {
 		return nil, err
 	}
@@ -442,16 +445,19 @@ func hostRequired(ctx context.Context, tx *sql.Tx, monitorID string) (permission
 // alert.Service.ResolveOutOfScope.
 func (s *Service) ReconcileScope(ctx context.Context, siteID string) error {
 	// Correlated NOT-in-scope predicate: a monitor_status row is stranded when its
-	// monitor is disabled, or the row's agent is neither in a broadcast target nor
-	// any of the target's bound groups. Correlated on ms.agent_id (so it is NOT the
-	// shared single-placeholder config.AgentScopePredicate).
+	// monitor is disabled, or the row's agent is not covered by the monitor group's
+	// Agent scope (group broadcasts, or the agent is in one of its agent groups).
+	// Correlated on ms.agent_id (so it is NOT the shared single-placeholder
+	// config.AgentScopePredicate).
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT ms.agent_id, ms.monitor_id FROM monitor_status ms
 		  JOIN probe_tasks pt ON pt.id = ms.monitor_id
-		 WHERE pt.site_id=? AND (pt.enabled=0 OR NOT (pt.all_agents=1 OR EXISTS(
-		    SELECT 1 FROM probe_task_groups ptg
-		    JOIN agent_group_members agm ON agm.group_id = ptg.group_id
-		    WHERE ptg.task_id = pt.id AND agm.agent_id = ms.agent_id)))`, siteID)
+		 WHERE pt.site_id=? AND (pt.enabled=0 OR NOT EXISTS(
+		    SELECT 1 FROM monitor_groups mg
+		    WHERE mg.id = pt.group_id AND (mg.all_agents=1 OR EXISTS(
+		        SELECT 1 FROM monitor_group_agent_groups mgag
+		        JOIN agent_group_members agm ON agm.group_id = mgag.agent_group_id
+		        WHERE mgag.monitor_group_id = mg.id AND agm.agent_id = ms.agent_id))))`, siteID)
 	if err != nil {
 		return err
 	}
@@ -653,10 +659,12 @@ func scopedAgents(ctx context.Context, tx *sql.Tx, siteID, monitorID string) ([]
 		SELECT a.id, COALESCE(NULLIF(a.display_name,''), NULLIF(a.hostname,''), a.id),
 		       a.config_version, COALESCE(a.perm_effective,'[]'), COALESCE(a.perm_granted,'[]'), COALESCE(a.perm_supported,'[]'), COALESCE(a.policy_hash,'')
 		FROM agents a, probe_tasks pt
-		WHERE pt.id=? AND a.site_id=? AND a.revoked=0 AND (pt.all_agents=1 OR EXISTS(
-		    SELECT 1 FROM probe_task_groups ptg
-		    JOIN agent_group_members agm ON agm.group_id = ptg.group_id
-		    WHERE ptg.task_id = pt.id AND agm.agent_id = a.id))`, monitorID, siteID)
+		WHERE pt.id=? AND a.site_id=? AND a.revoked=0 AND EXISTS(
+		    SELECT 1 FROM monitor_groups mg
+		    WHERE mg.id = pt.group_id AND (mg.all_agents=1 OR EXISTS(
+		        SELECT 1 FROM monitor_group_agent_groups mgag
+		        JOIN agent_group_members agm ON agm.group_id = mgag.agent_group_id
+		        WHERE mgag.monitor_group_id = mg.id AND agm.agent_id = a.id)))`, monitorID, siteID)
 	if err != nil {
 		return nil, err
 	}

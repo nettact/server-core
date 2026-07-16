@@ -11,10 +11,10 @@ import (
 
 // AlertDetail is one firing alert's structured facts — enough to render a
 // human sentence ("website example.com returned HTTP 503") in any supported
-// language at delivery time. The incident correlator collects these from the DB
-// (alerts ⨝ alert_rules ⨝ probe_tasks ⨝ agents) and hands them to Notify, so
-// the language decision stays at the channel boundary rather than being baked
-// into a pre-rendered string.
+// language at delivery time. The incident layer collects these from the frozen
+// per-condition evidence (alert_evidence ⨝ alerts ⨝ agents) and hands them to
+// Notify, so the language decision stays at the channel boundary rather than
+// being baked into a pre-rendered string.
 type AlertDetail struct {
 	ProbeKind  string  `json:"probe_kind"`  // "icmp" | "dns" | "http" | "tcp" | "host" | ""
 	MetricKind string  `json:"metric_kind"` // telemetry.MetricKind, e.g. "probe.http.status"

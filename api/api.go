@@ -6,6 +6,7 @@
 package api
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -33,6 +34,7 @@ import (
 	"github.com/nettact/server-core/hostlive"
 	"github.com/nettact/server-core/identity"
 	"github.com/nettact/server-core/incident"
+	"github.com/nettact/server-core/incidentops"
 	"github.com/nettact/server-core/inventory"
 	"github.com/nettact/server-core/metrics"
 	"github.com/nettact/server-core/notification"
@@ -59,6 +61,7 @@ type Deps struct {
 	Rules        *rules.Service
 	Alert        *alert.Service
 	Incident     *incident.Service
+	IncidentOps  *incidentops.Service // incident snapshot + traceroute orchestration reads
 	Notification *notification.Service
 	Settings     *settings.Service
 	Audit        *audit.Service
@@ -117,6 +120,12 @@ func Router(d Deps) http.Handler {
 			r.Get("/sites/{id}/targets", d.handleListTargets)
 			r.Put("/sites/{id}/targets", d.handleSetTargets)
 			r.Post("/sites/{id}/purge-target", d.handlePurgeTarget)
+			// Monitor groups own targets, their Agent execution scope and the
+			// incident-merge policy shared by all of them.
+			r.Get("/sites/{id}/monitor-groups", d.handleListMonitorGroups)
+			r.Post("/sites/{id}/monitor-groups", d.handleCreateMonitorGroup)
+			r.Put("/monitor-groups/{id}", d.handleUpdateMonitorGroup)
+			r.Delete("/monitor-groups/{id}", d.handleDeleteMonitorGroup)
 			r.Get("/sites/{id}/devices", d.handleListDevices)
 			// Operational issues (monitors not running under the agent's permission
 			// policy). Kept separate from alerts/incidents (never alerted on).
@@ -132,13 +141,19 @@ func Router(d Deps) http.Handler {
 			r.Put("/agent-groups/{id}", d.handleUpdateAgentGroup)
 			r.Delete("/agent-groups/{id}", d.handleDeleteAgentGroup)
 			r.Get("/incidents", d.handleListIncidents)
+			r.Get("/incidents/{id}", d.handleGetIncident)
 			r.Get("/incidents/{id}/timeline", d.handleTimeline)
+			// Incident immutable snapshot, its referenced traceroute reports, and the
+			// full shared trace report hops (site-owned, session-protected).
+			r.Get("/incidents/{id}/snapshot", d.handleIncidentSnapshot)
+			r.Get("/incidents/{id}/traces", d.handleIncidentTraces)
+			r.Get("/trace-reports/{id}", d.handleTraceReport)
 			r.Get("/alerts", d.handleListAlerts)
-			// Alarm rules are configured per monitoring target.
-			r.Get("/targets/{id}/rules", d.handleListTargetRules)
-			r.Post("/targets/{id}/rules", d.handleCreateTargetRule)
-			r.Put("/rules/{id}", d.handleUpdateRule)
-			r.Delete("/rules/{id}", d.handleDeleteRule)
+			// Group-level one-layer AND/OR alert rules (configured on a monitor group).
+			r.Get("/monitor-groups/{id}/rules", d.handleListGroupRules)
+			r.Post("/monitor-groups/{id}/rules", d.handleCreateGroupRule)
+			r.Put("/group-rules/{id}", d.handleUpdateGroupRule)
+			r.Delete("/group-rules/{id}", d.handleDeleteGroupRule)
 			r.Get("/channels", d.handleListChannels)
 			r.Post("/channels", d.handleCreateChannel)
 			r.Put("/channels/{id}", d.handleUpdateChannel)
@@ -489,7 +504,7 @@ func (d Deps) handleDeleteAgent(w http.ResponseWriter, r *http.Request) {
 	// outside DeleteAgent's transaction (the resolve event's incident handler writes
 	// to the DB and SQLite has a single writer); DeleteAgent then removes the rows.
 	if d.Alert != nil {
-		if err := d.Alert.TerminateForAgent(r.Context(), id); err != nil {
+		if err := d.Rules.TerminateForAgent(r.Context(), id); err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
@@ -686,7 +701,7 @@ func (d Deps) handleSetTargets(w http.ResponseWriter, r *http.Request) {
 	}
 	// Narrowing a target's scope can strand alerts already firing for agents that
 	// just left it; resolve them so they don't stay firing forever.
-	if err := d.Alert.ResolveOutOfScope(r.Context(), siteID); err != nil {
+	if err := d.Rules.ResolveOutOfScope(r.Context(), siteID); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -782,7 +797,7 @@ func (d Deps) handleUpdateAgentGroup(w http.ResponseWriter, r *http.Request) {
 	}
 	// Agents removed from the group may have alerts still firing for targets scoped
 	// to it; resolve any that just went out of scope.
-	if err := d.Alert.ResolveOutOfScope(r.Context(), siteID); err != nil {
+	if err := d.Rules.ResolveOutOfScope(r.Context(), siteID); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -828,7 +843,7 @@ func (d Deps) handleDeleteAgentGroup(w http.ResponseWriter, r *http.Request) {
 	}
 	// Deleting the group drops its target bindings, so targets scoped only to it now
 	// reach nobody; resolve any alerts left firing for those targets.
-	if err := d.Alert.ResolveOutOfScope(r.Context(), siteID); err != nil {
+	if err := d.Rules.ResolveOutOfScope(r.Context(), siteID); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -1084,13 +1099,140 @@ func (d Deps) handleTimeline(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, tl)
 }
 
-// alertView is an active alert plus a human description of the fault, rendered
-// in both languages so the console can show "who fired and why" without
-// re-implementing the wording client-side.
+// handleGetIncident returns one incident with its member alert instances (each
+// carrying frozen per-condition evidence). Snapshot and trace detail are served
+// by later endpoints. Enforces site ownership.
+func (d Deps) handleGetIncident(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	inc, err := d.Incident.Get(r.Context(), id)
+	if errors.Is(err, sql.ErrNoRows) {
+		writeError(w, http.StatusNotFound, "incident not found")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if inc.SiteID != siteParam(r) {
+		writeError(w, http.StatusNotFound, "incident not found")
+		return
+	}
+	members, err := d.Alert.ListForIncident(r.Context(), id)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if members == nil {
+		members = []alert.Alert{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"incident": inc, "members": members})
+}
+
+// incidentOwned resolves an incident and enforces site ownership, writing the 404
+// itself and returning ok=false when the incident is missing or not in this site.
+func (d Deps) incidentOwned(w http.ResponseWriter, r *http.Request, id string) bool {
+	inc, err := d.Incident.Get(r.Context(), id)
+	if errors.Is(err, sql.ErrNoRows) {
+		writeError(w, http.StatusNotFound, "incident not found")
+		return false
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return false
+	}
+	if inc.SiteID != siteParam(r) {
+		writeError(w, http.StatusNotFound, "incident not found")
+		return false
+	}
+	return true
+}
+
+// handleIncidentSnapshot returns an incident's immutable snapshot (server base +
+// per-Agent scene entries). Site-owned.
+func (d Deps) handleIncidentSnapshot(w http.ResponseWriter, r *http.Request) {
+	if d.IncidentOps == nil {
+		writeError(w, http.StatusServiceUnavailable, "incident snapshots not available")
+		return
+	}
+	id := chi.URLParam(r, "id")
+	if !d.incidentOwned(w, r, id) {
+		return
+	}
+	view, ok, err := d.IncidentOps.Snapshot(r.Context(), id)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if !ok {
+		writeError(w, http.StatusNotFound, "snapshot not found")
+		return
+	}
+	writeJSON(w, http.StatusOK, view)
+}
+
+// handleIncidentTraces returns the traceroute reports referenced by an incident,
+// each summarized with this incident's active-reference count. Site-owned.
+func (d Deps) handleIncidentTraces(w http.ResponseWriter, r *http.Request) {
+	if d.IncidentOps == nil {
+		writeError(w, http.StatusServiceUnavailable, "diagnostics not available")
+		return
+	}
+	id := chi.URLParam(r, "id")
+	if !d.incidentOwned(w, r, id) {
+		return
+	}
+	traces, err := d.IncidentOps.TracesForIncident(r.Context(), id)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, traces)
+}
+
+// handleTraceReport returns one full shared traceroute report with all its hops,
+// read by report id so every referencing incident sees the same execution.
+// Site-owned via the report's own site id.
+func (d Deps) handleTraceReport(w http.ResponseWriter, r *http.Request) {
+	if d.IncidentOps == nil {
+		writeError(w, http.StatusServiceUnavailable, "diagnostics not available")
+		return
+	}
+	view, siteID, ok, err := d.IncidentOps.TraceReport(r.Context(), chi.URLParam(r, "id"))
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if !ok || siteID != siteParam(r) {
+		writeError(w, http.StatusNotFound, "trace report not found")
+		return
+	}
+	writeJSON(w, http.StatusOK, view)
+}
+
+// alertView is an active alert instance plus a human description of its top
+// fault, rendered in both languages so the console can show "who fired and why"
+// without re-implementing the wording client-side.
 type alertView struct {
 	alert.Alert
 	DescZh string `json:"desc_zh"`
 	DescEn string `json:"desc_en"`
+}
+
+// detailFromAlert builds a notification.AlertDetail from an alert instance's
+// first (worst) frozen evidence row, used only to render its description.
+func detailFromAlert(a alert.Alert) notification.AlertDetail {
+	det := notification.AlertDetail{Layer: a.Layer, Severity: a.Severity}
+	if len(a.Evidence) > 0 {
+		e := a.Evidence[0]
+		det.ProbeKind = e.ProbeKind
+		det.MetricKind = e.MetricKind
+		det.Comparator = e.Comparator
+		det.Threshold = e.Threshold
+		det.Value = e.Value
+		det.TargetName = e.TargetName
+		det.Target = e.TargetAddr
+	}
+	return det
 }
 
 func (d Deps) handleListAlerts(w http.ResponseWriter, r *http.Request) {
@@ -1101,13 +1243,7 @@ func (d Deps) handleListAlerts(w http.ResponseWriter, r *http.Request) {
 	}
 	views := make([]alertView, 0, len(alerts))
 	for _, a := range alerts {
-		// AgentHost is left off the detail so the description doesn't repeat the
-		// host — the console shows it in its own column.
-		det := notification.AlertDetail{
-			ProbeKind: a.ProbeKind, MetricKind: a.MetricKind, Comparator: a.Comparator,
-			Threshold: a.Threshold, Value: a.Value, TargetName: a.TargetName, Target: a.Target,
-			Layer: a.Layer, Severity: a.Severity,
-		}
+		det := detailFromAlert(a)
 		views = append(views, alertView{
 			Alert:  a,
 			DescZh: notification.DescribeDetail(det, "zh"),
@@ -1117,9 +1253,8 @@ func (d Deps) handleListAlerts(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, views)
 }
 
-// handleAgentAlerts returns the alarm history (firing + resolved) for one
-// agent, newest first — scoped to a user-created monitor via ?monitor=, or to
-// a target string via ?target= (host alerts, whose metrics carry no monitor).
+// handleAgentAlerts returns the alert-instance history (firing + resolved) for
+// one agent, newest first.
 func (d Deps) handleAgentAlerts(w http.ResponseWriter, r *http.Request) {
 	limit := 10
 	if s := r.URL.Query().Get("limit"); s != "" {
@@ -1127,13 +1262,7 @@ func (d Deps) handleAgentAlerts(w http.ResponseWriter, r *http.Request) {
 			limit = n
 		}
 	}
-	var alerts []alert.Alert
-	var err error
-	if mon := r.URL.Query().Get("monitor"); mon != "" {
-		alerts, err = d.Alert.ListForMonitor(r.Context(), chi.URLParam(r, "id"), mon, limit)
-	} else {
-		alerts, err = d.Alert.ListForTarget(r.Context(), chi.URLParam(r, "id"), r.URL.Query().Get("target"), limit)
-	}
+	alerts, err := d.Alert.ListForAgent(r.Context(), chi.URLParam(r, "id"), limit)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -1144,89 +1273,262 @@ func (d Deps) handleAgentAlerts(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, alerts)
 }
 
-// ---- alarm rules (per monitoring target) ----
+// ---- monitor groups ----
 
-func (d Deps) handleListTargetRules(w http.ResponseWriter, r *http.Request) {
-	rs, err := d.Rules.ListForTarget(r.Context(), chi.URLParam(r, "id"))
+func (d Deps) handleListMonitorGroups(w http.ResponseWriter, r *http.Request) {
+	groups, err := d.Config.ListGroups(r.Context(), chi.URLParam(r, "id"))
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if groups == nil {
+		groups = []config.MonitorGroup{}
+	}
+	writeJSON(w, http.StatusOK, groups)
+}
+
+// monitorGroupBody is the create/update payload for a monitor group.
+type monitorGroupBody struct {
+	Name          string   `json:"name"`
+	MergeEnabled  bool     `json:"merge_enabled"`
+	AllAgents     bool     `json:"all_agents"`
+	AgentGroupIDs []string `json:"agent_group_ids"`
+}
+
+func (d Deps) handleCreateMonitorGroup(w http.ResponseWriter, r *http.Request) {
+	siteID := chi.URLParam(r, "id")
+	var body monitorGroupBody
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid body")
+		return
+	}
+	name := strings.TrimSpace(body.Name)
+	if name == "" || utf8.RuneCountInString(name) > 128 {
+		writeError(w, http.StatusBadRequest, "group name is required (max 128)")
+		return
+	}
+	id, err := d.Config.CreateGroup(r.Context(), siteID, name, body.MergeEnabled, body.AllAgents, body.AgentGroupIDs)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	d.Audit.Log(r.Context(), "admin", "monitor_group.create", siteID, name)
+	writeJSON(w, http.StatusOK, map[string]string{"id": id})
+}
+
+func (d Deps) handleUpdateMonitorGroup(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	g, err := d.Config.GetGroup(r.Context(), id)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "monitor group not found")
+		return
+	}
+	if g.SiteID != siteParam(r) {
+		writeError(w, http.StatusNotFound, "monitor group not found")
+		return
+	}
+	var body monitorGroupBody
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid body")
+		return
+	}
+	name := strings.TrimSpace(body.Name)
+	if name == "" || utf8.RuneCountInString(name) > 128 {
+		writeError(w, http.StatusBadRequest, "group name is required (max 128)")
+		return
+	}
+	// Validate the whole submitted scope BEFORE any lifecycle mutation. The
+	// merge-flip termination below commits its own transaction and dispatches
+	// resolution notifications — irreversible. UpdateGroup would otherwise reject
+	// an unknown/cross-site agent_group_id only AFTER termination, so a failed
+	// request would still have force-resolved incidents. Validating the scope up
+	// front (the same rule UpdateGroup enforces) guarantees a rejected request has
+	// zero alert/incident lifecycle side effects.
+	if err := d.Config.ValidateGroupScope(r.Context(), g.SiteID, body.AllAgents, body.AgentGroupIDs); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	// A merge-policy flip changes the incident-grouping identity (open_key) for the
+	// whole group. Terminate the group's active alerts (configuration_changed)
+	// BEFORE committing the new policy, mirroring DeleteGroup/SetSiteTargets: this
+	// closes incidents opened under the old open_key while it still matches, so none
+	// can linger open under a stale grouping identity after the flip. A pure rename
+	// or agent-scope edit is not a merge change and must not terminate incidents.
+	if g.MergeEnabled != body.MergeEnabled {
+		if err := d.Rules.TerminateForGroup(r.Context(), id); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	}
+	siteID, err := d.Config.UpdateGroup(r.Context(), id, name, body.MergeEnabled, body.AllAgents, body.AgentGroupIDs)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	// A scope narrowing can strand alerts for agents that just left scope.
+	if err := d.Rules.ResolveOutOfScope(r.Context(), siteID); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	d.reconcileScope(r.Context(), siteID)
+	d.Audit.Log(r.Context(), "admin", "monitor_group.update", id, name)
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (d Deps) handleDeleteMonitorGroup(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	g, err := d.Config.GetGroup(r.Context(), id)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "monitor group not found")
+		return
+	}
+	if g.SiteID != siteParam(r) {
+		writeError(w, http.StatusNotFound, "monitor group not found")
+		return
+	}
+	siteID, err := d.Config.DeleteGroup(r.Context(), id)
+	if errors.Is(err, config.ErrDefaultGroup) {
+		writeError(w, http.StatusBadRequest, "the default monitor group cannot be deleted")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if err := d.Rules.ResolveOutOfScope(r.Context(), siteID); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	d.reconcileScope(r.Context(), siteID)
+	d.Audit.Log(r.Context(), "admin", "monitor_group.delete", id, "")
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// reconcileScope runs the operational-issue reconciliation that must follow any
+// monitor-group scope change (targets moving in/out of an agent's scope), and
+// re-predicts probe/host monitor status for the site. Best-effort: it logs
+// nothing here, matching the other scope-mutating handlers.
+func (d Deps) reconcileScope(ctx context.Context, siteID string) {
+	if d.OpIssue == nil {
+		return
+	}
+	_ = d.OpIssue.ReconcileScope(ctx, siteID)
+	_, _ = d.OpIssue.PredictProbeMonitors(ctx, siteID)
+	_ = d.OpIssue.ReevaluateHostMonitorsForSite(ctx, siteID)
+}
+
+// ---- group rules (one-layer AND/OR, configured on a monitor group) ----
+
+func (d Deps) handleListGroupRules(w http.ResponseWriter, r *http.Request) {
+	groupID := chi.URLParam(r, "id")
+	g, err := d.Config.GetGroup(r.Context(), groupID)
+	if err != nil || g.SiteID != siteParam(r) {
+		writeError(w, http.StatusNotFound, "monitor group not found")
+		return
+	}
+	rs, err := d.Rules.ListForGroup(r.Context(), groupID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	if rs == nil {
-		rs = []rules.Rule{}
+		rs = []rules.GroupRule{}
 	}
 	writeJSON(w, http.StatusOK, rs)
 }
 
-func (d Deps) handleCreateTargetRule(w http.ResponseWriter, r *http.Request) {
-	rule, ok := decodeRule(w, r)
+func (d Deps) handleCreateGroupRule(w http.ResponseWriter, r *http.Request) {
+	groupID := chi.URLParam(r, "id")
+	g, err := d.Config.GetGroup(r.Context(), groupID)
+	if err != nil || g.SiteID != siteParam(r) {
+		writeError(w, http.StatusNotFound, "monitor group not found")
+		return
+	}
+	rule, ok := decodeGroupRule(w, r)
 	if !ok {
 		return
 	}
-	probeTaskID := chi.URLParam(r, "id")
-	id, err := d.Rules.CreateForTarget(r.Context(), siteParam(r), probeTaskID, rule)
+	id, err := d.Rules.Create(r.Context(), g.SiteID, groupID, rule)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	// A host-target condition defines a host monitor's required permissions.
+	if d.OpIssue != nil {
+		_ = d.OpIssue.ReevaluateHostMonitorsForSite(r.Context(), g.SiteID)
+	}
+	d.Audit.Log(r.Context(), "admin", "group_rule.create", id, groupID)
+	writeJSON(w, http.StatusOK, map[string]string{"id": id})
+}
+
+func (d Deps) handleUpdateGroupRule(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	cur, err := d.Rules.GetRule(r.Context(), id)
+	if errors.Is(err, rules.ErrNotFound) {
+		writeError(w, http.StatusNotFound, "rule not found")
+		return
+	}
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	// A bound rule defines a host monitor's required host permissions, so its
-	// creation can change a host monitor's status; reevaluate the site.
-	if d.OpIssue != nil {
-		if err := d.OpIssue.ReevaluateHostMonitorsForSite(r.Context(), siteParam(r)); err != nil {
-			writeError(w, http.StatusInternalServerError, err.Error())
-			return
-		}
+	if cur.SiteID != siteParam(r) {
+		writeError(w, http.StatusNotFound, "rule not found")
+		return
 	}
-	d.Audit.Log(r.Context(), "admin", "rule.create", id, probeTaskID)
-	writeJSON(w, http.StatusOK, map[string]string{"id": id})
-}
-
-func (d Deps) handleUpdateRule(w http.ResponseWriter, r *http.Request) {
-	rule, ok := decodeRule(w, r)
+	rule, ok := decodeGroupRule(w, r)
 	if !ok {
 		return
 	}
-	rule.ID = chi.URLParam(r, "id")
+	rule.ID = id
 	if err := d.Rules.Update(r.Context(), rule); err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if d.OpIssue != nil {
-		if err := d.OpIssue.ReevaluateHostMonitorsForSite(r.Context(), siteParam(r)); err != nil {
-			writeError(w, http.StatusInternalServerError, err.Error())
-			return
-		}
+		_ = d.OpIssue.ReevaluateHostMonitorsForSite(r.Context(), cur.SiteID)
 	}
-	d.Audit.Log(r.Context(), "admin", "rule.update", rule.ID, "")
+	d.Audit.Log(r.Context(), "admin", "group_rule.update", id, "")
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
-func (d Deps) handleDeleteRule(w http.ResponseWriter, r *http.Request) {
+func (d Deps) handleDeleteGroupRule(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
+	cur, err := d.Rules.GetRule(r.Context(), id)
+	if errors.Is(err, rules.ErrNotFound) {
+		writeError(w, http.StatusNotFound, "rule not found")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if cur.SiteID != siteParam(r) {
+		writeError(w, http.StatusNotFound, "rule not found")
+		return
+	}
 	if err := d.Rules.Delete(r.Context(), id); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	if d.OpIssue != nil {
-		if err := d.OpIssue.ReevaluateHostMonitorsForSite(r.Context(), siteParam(r)); err != nil {
-			writeError(w, http.StatusInternalServerError, err.Error())
-			return
-		}
+		_ = d.OpIssue.ReevaluateHostMonitorsForSite(r.Context(), cur.SiteID)
 	}
-	d.Audit.Log(r.Context(), "admin", "rule.delete", id, "")
+	d.Audit.Log(r.Context(), "admin", "group_rule.delete", id, "")
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
-// decodeRule parses a rules.Rule from the request body, applying light defaults.
-func decodeRule(w http.ResponseWriter, r *http.Request) (rules.Rule, bool) {
-	var rule rules.Rule
-	if err := json.NewDecoder(io.LimitReader(r.Body, 8192)).Decode(&rule); err != nil {
+// decodeGroupRule parses a rules.GroupRule from the request body with light
+// structural checks; the full condition validation runs in rules.Create/Update.
+func decodeGroupRule(w http.ResponseWriter, r *http.Request) (rules.GroupRule, bool) {
+	var rule rules.GroupRule
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&rule); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid rule body")
-		return rules.Rule{}, false
+		return rules.GroupRule{}, false
 	}
-	if rule.Name == "" || rule.MetricKind == "" || rule.Comparator == "" {
-		writeError(w, http.StatusBadRequest, "name, metric_kind and comparator are required")
-		return rules.Rule{}, false
+	if strings.TrimSpace(rule.Name) == "" || (rule.Op != "and" && rule.Op != "or") {
+		writeError(w, http.StatusBadRequest, "name and op ('and'|'or') are required")
+		return rules.GroupRule{}, false
 	}
 	if rule.Severity == "" {
 		rule.Severity = "warn"
@@ -1284,12 +1586,23 @@ func (d Deps) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 }
 
 // knownSettingKeys is the allow-list of settings the generic settings API may
-// expose or write. Internal values such as dashboard layout use dedicated APIs.
-var knownSettingKeys = map[string]bool{settings.KeyConsoleBaseURL: true}
+// expose or write: the console base URL plus every incident-snapshot / diagnostic
+// integer knob (settings.IntKeys). Internal values such as the dashboard layout
+// use dedicated APIs.
+var knownSettingKeys = buildKnownSettingKeys()
+
+func buildKnownSettingKeys() map[string]bool {
+	m := map[string]bool{settings.KeyConsoleBaseURL: true}
+	for k := range settings.IntKeys {
+		m[k] = true
+	}
+	return m
+}
 
 // handleUpdateSettings merges the posted keys. Only known keys are accepted;
 // console_base_url is validated to be an absolute http(s) origin without a query
-// or fragment (or empty to clear it), since a deep-link path is appended to it.
+// or fragment (or empty to clear it), and every integer knob is range-checked
+// against its registered bounds.
 func (d Deps) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	var body map[string]string
 	if err := json.NewDecoder(io.LimitReader(r.Body, 8192)).Decode(&body); err != nil {
@@ -1312,6 +1625,21 @@ func (d Deps) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		body[settings.KeyConsoleBaseURL] = v
+	}
+	// Range-check the integer knobs against their registered bounds; normalize the
+	// stored form to the parsed integer.
+	for k, v := range body {
+		b, ok := settings.IntKeys[k]
+		if !ok {
+			continue
+		}
+		n, err := strconv.Atoi(strings.TrimSpace(v))
+		if err != nil || n < b.Min || n > b.Max {
+			writeError(w, http.StatusBadRequest, "setting "+k+" must be an integer in "+
+				strconv.Itoa(b.Min)+"-"+strconv.Itoa(b.Max))
+			return
+		}
+		body[k] = strconv.Itoa(n)
 	}
 	for k, v := range body {
 		if err := d.Settings.Set(r.Context(), k, v); err != nil {

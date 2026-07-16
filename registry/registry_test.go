@@ -42,7 +42,7 @@ func TestUpdateAndDeleteAgent(t *testing.T) {
 	mustExec(t, db, `INSERT INTO agent_group_members(group_id,agent_id) VALUES('grp1','agent_x')`)
 	mustExec(t, db, `INSERT INTO agent_packets(agent_id,sequence,received_at) VALUES('agent_x',1,?)`, now)
 	mustExec(t, db, `INSERT INTO events(id,agent_id,site_id,ts,type) VALUES('e1','agent_x','site_default',?,'t')`, now)
-	mustExec(t, db, `INSERT INTO alerts(id,agent_id,site_id,state,started_at) VALUES('al1','agent_x','site_default','firing',?)`, now)
+	mustExec(t, db, `INSERT INTO alerts(id,agent_id,site_id,group_id,state,started_at) VALUES('al1','agent_x','site_default','group','firing',?)`, now)
 
 	reg := New(db, 0)
 

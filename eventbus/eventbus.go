@@ -12,11 +12,40 @@ const (
 	TopicThresholdBreached = "metric.threshold.breached"
 	TopicAlertRaised       = "alert.raised"
 	TopicAlertResolved     = "alert.resolved"
+	TopicEvidenceAdded     = "alert.evidence.added"
 	TopicIncidentOpened    = "incident.opened"
 	TopicIncidentUpdated   = "incident.updated"
+	TopicIncidentResolved  = "incident.resolved"
 	TopicConfigChanged     = "config.changed"
 	TopicIssueChanged      = "issue.changed"
 )
+
+// IncidentEvent is the payload for the incident lifecycle topics
+// (TopicIncidentOpened / TopicIncidentUpdated / TopicIncidentResolved),
+// published post-commit by the fault engine so later notification, snapshot and
+// diagnostic handlers can react without sharing the write transaction.
+// Escalated is set on TopicIncidentUpdated when a membership change raised the
+// incident's severity (the only membership growth that notifies, per policy).
+type IncidentEvent struct {
+	IncidentID string
+	SiteID     string
+	GroupID    string
+	Severity   string
+	Escalated  bool
+}
+
+// EvidenceAdded is the payload for TopicEvidenceAdded, published post-commit
+// once per newly-frozen alert_evidence row (at alert fire time and whenever an
+// additional condition becomes satisfied on an already-firing alert). The
+// diagnostic trigger reads the evidence row by EvidenceID to derive its trace;
+// the id-only shape keeps the bus decoupled from trace specifics.
+type EvidenceAdded struct {
+	EvidenceID string
+	AlertID    string
+	IncidentID string
+	AgentID    string
+	SiteID     string
+}
 
 // TelemetryIngested is the payload for TopicTelemetryIngested.
 type TelemetryIngested struct {

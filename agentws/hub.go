@@ -21,6 +21,7 @@ import (
 
 	"github.com/nettact/protocol"
 	pcfg "github.com/nettact/protocol/config"
+	"github.com/nettact/protocol/telemetry"
 	"github.com/nettact/protocol/wire"
 	"github.com/nettact/server-core/config"
 	"github.com/nettact/server-core/eventbus"
@@ -47,6 +48,20 @@ type Deps struct {
 	HostLive *hostlive.Store  // in-memory live snapshots (never persisted)
 	OpIssue  *opissue.Service // operational-issue engine (monitor status + host re-eval)
 	Bus      *eventbus.Bus    // source of TopicConfigChanged pushes
+	// IncidentOps routes inbound incident-snapshot / trace-result frames and drives
+	// the on-connect re-push of still-outstanding, in-deadline snapshot/trace work.
+	// Optional (nil in a build without the orchestration wired).
+	IncidentOps IncidentOps
+}
+
+// IncidentOps is the incident snapshot/trace orchestration surface the hub needs:
+// ingest of agent results and the reconnect re-push. Satisfied by
+// *incidentops.Service; kept as an interface so agentws does not hard-depend on
+// its construction.
+type IncidentOps interface {
+	IngestSnapshot(ctx context.Context, agentID string, snap telemetry.IncidentSnapshot) error
+	IngestTrace(ctx context.Context, agentID string, res telemetry.TraceResult) error
+	OnAgentConnected(ctx context.Context, agentID string)
 }
 
 // Hub tracks the one live session per agent and fans server-initiated pushes
@@ -218,6 +233,13 @@ func (h *Hub) serve(ctx context.Context, agentID, siteID string, c wire.Conn) {
 			}
 		}
 	}
+	// Re-push still-outstanding, in-deadline incident-snapshot and traceroute work.
+	// The session is already registered above, so the orchestration's Pusher resolves
+	// to this live session. Runs before the read loop so a reconnect promptly resumes
+	// collection/execution.
+	if h.deps.IncidentOps != nil {
+		h.deps.IncidentOps.OnAgentConnected(ctx, agentID)
+	}
 
 	h.readLoop(ctx, s)
 }
@@ -273,6 +295,33 @@ func (h *Hub) PushSnapshotRequest(agentID string, req pcfg.SnapshotRequest) bool
 		return false
 	}
 	return s.enqueue(wire.Frame{SnapshotRequest: &req})
+}
+
+// PushIncidentSnapshotRequest pushes an incident-scene snapshot request to the
+// agent's live session, reporting false when the agent is offline (the entry then
+// stays collecting until its deadline or a reconnect re-push). Satisfies
+// incidentops.Pusher.
+func (h *Hub) PushIncidentSnapshotRequest(agentID string, req pcfg.IncidentSnapshotRequest) bool {
+	h.mu.Lock()
+	s := h.conns[agentID]
+	h.mu.Unlock()
+	if s == nil {
+		return false
+	}
+	return s.enqueue(wire.Frame{IncidentSnapshotRequest: &req})
+}
+
+// PushTraceRequest pushes a traceroute request to the agent's live session,
+// reporting false when the agent is offline (the report then stays queued for a
+// reconnect re-dispatch). Satisfies incidentops.Pusher.
+func (h *Hub) PushTraceRequest(agentID string, req pcfg.TraceRequest) bool {
+	h.mu.Lock()
+	s := h.conns[agentID]
+	h.mu.Unlock()
+	if s == nil {
+		return false
+	}
+	return s.enqueue(wire.Frame{TraceRequest: &req})
 }
 
 // Disconnect synchronously evicts an agent's live session (no-op when it has

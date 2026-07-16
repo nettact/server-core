@@ -26,13 +26,13 @@ func TestListPagination(t *testing.T) {
 	for i := 0; i < 25; i++ {
 		// opened_at increasing with i, so i=24 is newest.
 		if _, err := db.ExecContext(ctx,
-			`INSERT INTO incidents(id, site_id, state, summary, opened_at) VALUES(?,?, 'open', ?, ?)`,
-			fmt.Sprintf("inc_%02d", i), "site_default", fmt.Sprintf("s%02d", i), base.Add(time.Duration(i)*time.Minute)); err != nil {
+			`INSERT INTO incidents(id, site_id, group_id, open_key, state, summary, opened_at) VALUES(?,?, 'group', ?, 'open', ?, ?)`,
+			fmt.Sprintf("inc_%02d", i), "site_default", fmt.Sprintf("alert:%02d", i), fmt.Sprintf("s%02d", i), base.Add(time.Duration(i)*time.Minute)); err != nil {
 			t.Fatalf("seed incident %d: %v", i, err)
 		}
 	}
 
-	svc := New(db, nil, nil, nil)
+	svc := New(db)
 
 	total, err := svc.Count(ctx, "site_default")
 	if err != nil || total != 25 {
@@ -81,13 +81,13 @@ func TestOverviewStatsAreIndependentOfPagination(t *testing.T) {
 	}
 	for _, row := range rows {
 		if _, err := db.ExecContext(ctx, `
-			INSERT INTO incidents(id, site_id, state, suspected_layer, opened_at, resolved_at)
-			VALUES(?, 'site_default', ?, ?, ?, ?)`, row.id, row.state, row.layer, row.opened, row.resolved); err != nil {
+			INSERT INTO incidents(id, site_id, group_id, open_key, state, suspected_layer, opened_at, resolved_at)
+			VALUES(?, 'site_default', 'group', ?, ?, ?, ?, ?)`, row.id, "alert:"+row.id, row.state, row.layer, row.opened, row.resolved); err != nil {
 			t.Fatalf("seed %s: %v", row.id, err)
 		}
 	}
 
-	got, err := New(db, nil, nil, nil).OverviewStats(ctx, "site_default", now.Add(-24*time.Hour))
+	got, err := New(db).OverviewStats(ctx, "site_default", now.Add(-24*time.Hour))
 	if err != nil {
 		t.Fatalf("OverviewStats: %v", err)
 	}

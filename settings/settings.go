@@ -7,6 +7,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"strconv"
 	"strings"
 
 	"github.com/nettact/server-core/store"
@@ -21,11 +22,82 @@ const KeyConsoleBaseURL = "console_base_url"
 // this server instance.
 const KeyDashboardLayout = "dashboard_layout"
 
+// Incident-snapshot (INCIDENT-002) and diagnostic-traceroute (DIAG-001) tuning
+// knobs, plus evidence retention. Each is a UI-editable, server-validated int
+// setting stored in app_settings; the bounds and defaults live in one table
+// (IntKeys) so the API validator and the typed accessors never drift.
+const (
+	KeyIncidentSnapshotDeadlineMs = "incident_snapshot_deadline_ms"
+	KeyIncidentSnapshotMaxBytes   = "incident_snapshot_max_bytes"
+	KeyDiagEnabled                = "diag_enabled"
+	KeyDiagTotalTimeoutMs         = "diag_total_timeout_ms"
+	KeyDiagMaxHops                = "diag_max_hops"
+	KeyDiagAttemptsPerHop         = "diag_attempts_per_hop"
+	KeyDiagAgentConcurrency       = "diag_agent_concurrency"
+	KeyDiagGlobalConcurrency      = "diag_global_concurrency"
+	KeyDiagResolveHops            = "diag_resolve_hops"
+	KeyEvidenceRetentionDays      = "evidence_retention_days"
+)
+
+// IntBounds is one integer setting's default and inclusive [Min,Max] range.
+type IntBounds struct {
+	Default int
+	Min     int
+	Max     int
+}
+
+// IntKeys is the single source of truth for the incident/diagnostic integer
+// settings: their defaults and validated bounds. The generic settings API reads
+// it to (a) allow-list the keys, (b) reject out-of-range values, and the typed
+// accessors below read it to fall back to the default on unset/invalid values.
+// Booleans (diag_enabled, diag_resolve_hops) are modeled as 0/1 ints.
+var IntKeys = map[string]IntBounds{
+	KeyIncidentSnapshotDeadlineMs: {Default: 10000, Min: 1000, Max: 60000},
+	KeyIncidentSnapshotMaxBytes:   {Default: 262144, Min: 65536, Max: 1048576},
+	KeyDiagEnabled:                {Default: 1, Min: 0, Max: 1},
+	KeyDiagTotalTimeoutMs:         {Default: 30000, Min: 5000, Max: 120000},
+	KeyDiagMaxHops:                {Default: 30, Min: 1, Max: 64},
+	KeyDiagAttemptsPerHop:         {Default: 3, Min: 1, Max: 5},
+	KeyDiagAgentConcurrency:       {Default: 4, Min: 1, Max: 16},
+	KeyDiagGlobalConcurrency:      {Default: 16, Min: 1, Max: 64},
+	KeyDiagResolveHops:            {Default: 0, Min: 0, Max: 1},
+	KeyEvidenceRetentionDays:      {Default: 30, Min: 1, Max: 365},
+}
+
 type Service struct {
 	db *store.DB
 }
 
 func New(db *store.DB) *Service { return &Service{db: db} }
+
+// Int returns the stored value for an integer key, falling back to the key's
+// registered default when unset, unparseable, or out of bounds. Unknown keys
+// return (0, false). Nil-safe so tests without a settings service degrade to
+// defaults.
+func (s *Service) Int(ctx context.Context, key string) (int, bool) {
+	b, ok := IntKeys[key]
+	if !ok {
+		return 0, false
+	}
+	if s == nil {
+		return b.Default, true
+	}
+	v, err := s.Get(ctx, key)
+	if err != nil || v == "" {
+		return b.Default, true
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(v))
+	if err != nil || n < b.Min || n > b.Max {
+		return b.Default, true
+	}
+	return n, true
+}
+
+// Bool reads a 0/1 integer key as a boolean (default applied on unset/invalid).
+func (s *Service) Bool(ctx context.Context, key string) bool {
+	n, _ := s.Int(ctx, key)
+	return n != 0
+}
 
 // Get returns the value for key, or "" if unset.
 func (s *Service) Get(ctx context.Context, key string) (string, error) {

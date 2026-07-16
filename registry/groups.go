@@ -8,9 +8,9 @@ import (
 	"github.com/google/uuid"
 )
 
-// AgentGroup is a named set of agents within a site. A target scoped to a group
-// (config all_agents=0) is pushed only to that group's members; an agent may
-// belong to several groups.
+// AgentGroup is a named set of agents within a site. A monitor group scoped to
+// specific agent groups (all_agents=0) pushes its targets only to the members of
+// those agent groups; an agent may belong to several groups.
 type AgentGroup struct {
 	ID        string    `json:"id"`
 	SiteID    string    `json:"site_id"`
@@ -128,11 +128,11 @@ func (s *Service) UpdateGroup(ctx context.Context, groupID, name string, agentID
 	return siteID, nil
 }
 
-// DeleteGroup removes a group, its membership rows, and its target bindings
-// (probe_task_groups), then bumps config_version for the site. Targets bound only
-// to this group fall back to reaching no agents until re-scoped. Returns the
-// group's site id (so the caller can resolve alerts stranded by the removed
-// bindings) and sql.ErrNoRows if no such group.
+// DeleteGroup removes an agent group, its membership rows, and its monitor-group
+// scope bindings (monitor_group_agent_groups), then bumps config_version for the
+// site. Monitor groups scoped only to this agent group fall back to reaching no
+// agents until re-scoped. Returns the group's site id (so the caller can resolve
+// alerts stranded by the removed bindings) and sql.ErrNoRows if no such group.
 func (s *Service) DeleteGroup(ctx context.Context, groupID string) (string, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -146,7 +146,7 @@ func (s *Service) DeleteGroup(ctx context.Context, groupID string) (string, erro
 	}
 	for _, stmt := range []string{
 		`DELETE FROM agent_group_members WHERE group_id=?`,
-		`DELETE FROM probe_task_groups WHERE group_id=?`,
+		`DELETE FROM monitor_group_agent_groups WHERE agent_group_id=?`,
 		`DELETE FROM agent_groups WHERE id=?`,
 	} {
 		if _, err := tx.ExecContext(ctx, stmt, groupID); err != nil {

@@ -38,6 +38,7 @@ type testEnv struct {
 	cfg      *config.Service
 	hostLive *hostlive.Store
 	bus      *eventbus.Bus
+	groupID  string
 }
 
 func newTestEnv(t *testing.T) *testEnv {
@@ -55,6 +56,10 @@ func newTestEnv(t *testing.T) *testEnv {
 	reg := registry.New(db, 0)
 	bus := eventbus.New()
 	cfg := config.New(db, reg, bus, nil)
+	groupID, err := cfg.EnsureDefaultGroup(ctx, site.DefaultSiteID)
+	if err != nil {
+		t.Fatalf("ensure default monitor group: %v", err)
+	}
 	hostLive := hostlive.New()
 	hub := New(Deps{
 		Registry: reg,
@@ -67,7 +72,7 @@ func newTestEnv(t *testing.T) *testEnv {
 
 	srv := httptest.NewServer(http.HandlerFunc(hub.HandleUpgrade))
 	t.Cleanup(srv.Close)
-	return &testEnv{srv: srv, hub: hub, db: db, reg: reg, cfg: cfg, hostLive: hostLive, bus: bus}
+	return &testEnv{srv: srv, hub: hub, db: db, reg: reg, cfg: cfg, hostLive: hostLive, bus: bus, groupID: groupID}
 }
 
 // setTargets replaces the default site's broadcast targets, bumping every
@@ -77,7 +82,7 @@ func (e *testEnv) setTargets(t *testing.T, targets ...string) {
 	t.Helper()
 	pts := make([]config.ProbeTarget, 0, len(targets))
 	for _, tgt := range targets {
-		pts = append(pts, config.ProbeTarget{Kind: "icmp", Target: tgt, Enabled: true, AllAgents: true})
+		pts = append(pts, config.ProbeTarget{GroupID: e.groupID, Kind: "icmp", Target: tgt, Enabled: true})
 	}
 	if err := e.cfg.SetSiteTargets(context.Background(), site.DefaultSiteID, pts); err != nil {
 		t.Fatalf("set targets: %v", err)
