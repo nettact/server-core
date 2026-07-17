@@ -298,7 +298,7 @@ func (s *Service) appendEvidence(ctx context.Context, tx *sql.Tx, r evalRule, al
 		if err := freezeEvidence(ctx, tx, alertID, incidentID, agentID, siteID, c, results[c.id].value, now, out); err != nil {
 			return err
 		}
-		addTimeline(ctx, tx, incidentID, "alert.evidence", s.faultLine(ctx, tx, alertID), alertID, now)
+		addTimeline(ctx, tx, incidentID, "alert.evidence", s.evidenceLine(ctx, tx, alertID, c.id), alertID, now)
 	}
 	return nil
 }

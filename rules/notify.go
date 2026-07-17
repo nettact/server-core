@@ -217,3 +217,25 @@ func (s *Service) incidentURL(ctx context.Context, incidentID string) string {
 	}
 	return base + "/incidents?incident=" + url.QueryEscape(incidentID)
 }
+
+// evidenceLine renders one evidence-added timeline event from only the condition
+// inserted by that event. An already-firing OR rule can accumulate multiple
+// condition rows over time; re-rendering every row would keep the first target as
+// the headline and mislabel a later target as "N issues in total".
+func (s *Service) evidenceLine(ctx context.Context, tx *sql.Tx, alertID, conditionID string) string {
+	rows, err := tx.QueryContext(ctx, `
+		SELECT e.probe_kind, e.metric_kind, e.comparator, e.threshold, e.value, e.target_name, e.target_addr,
+		       COALESCE(a.layer,''), a.severity, COALESCE(NULLIF(ag.display_name,''), ag.hostname,'')
+		FROM alert_evidence e
+		JOIN alerts a ON a.id = e.alert_id
+		LEFT JOIN agents ag ON ag.id = a.agent_id
+		WHERE e.alert_id=? AND e.condition_id=?`, alertID, conditionID)
+	if err != nil {
+		return ""
+	}
+	details := scanDetails(rows)
+	if len(details) == 0 {
+		return ""
+	}
+	return notification.DescribeDetail(details[0], "zh")
+}
