@@ -53,7 +53,7 @@ func newTestEnv(t *testing.T) *testEnv {
 	if err := site.New(db).EnsureDefault(ctx); err != nil {
 		t.Fatalf("ensure default site: %v", err)
 	}
-	reg := registry.New(db, 0)
+	reg := registry.New(db, 0, nil)
 	bus := eventbus.New()
 	cfg := config.New(db, reg, bus, nil)
 	groupID, err := cfg.EnsureDefaultGroup(ctx, site.DefaultSiteID)
@@ -63,7 +63,7 @@ func newTestEnv(t *testing.T) *testEnv {
 	hostLive := hostlive.New()
 	hub := New(Deps{
 		Registry: reg,
-		Ingest:   ingest.New(db, bus, metrics.New(db)),
+		Ingest:   ingest.New(db, bus, metrics.New(db), nil),
 		Config:   cfg,
 		HostLive: hostLive,
 		OpIssue:  opissue.New(db, bus),

@@ -36,7 +36,7 @@ func TestHandleAgentInterfacesFreshnessAndShape(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	reg := registry.New(db, 0)
+	reg := registry.New(db, 0, nil)
 	d := Deps{Inventory: inventory.New(db), Config: config.New(db, reg, nil, nil)}
 	call := func() map[string]json.RawMessage {
 		t.Helper()

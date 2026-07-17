@@ -10,6 +10,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/nettact/protocol/telemetry"
 	"github.com/nettact/server-core/alert"
 	"github.com/nettact/server-core/config"
 	"github.com/nettact/server-core/eventbus"
@@ -33,6 +34,7 @@ type evalCond struct {
 	failThreshold, forSeconds            int
 	kind, targetStr, targetName          string
 	port                                 int // frozen trigger-time TCP port (from the target's probe params)
+	configSerial                         int // target's current material generation (probe_tasks.config_serial)
 }
 
 // condResult is the outcome of looking up a condition's latest metric this pass.
@@ -43,48 +45,84 @@ type condResult struct {
 	satisfied bool // current satisfied verdict (after applying state)
 }
 
-// EvaluateAgent evaluates every group rule in this agent's scope against the
-// agent's latest metrics and drives the fault flow. Per-(condition, Agent) state
-// (consecutive failures, dwell, satisfied) is persisted so a restart never resets
-// counters; alert firing/resolution, evidence freezing and group-aware incident
-// maintenance all execute in ONE write transaction, and lifecycle/evidence events
-// are published (and notifications dispatched) only after commit — honoring the
-// single-write-connection and "no DB-writing bus handler inside an open tx"
-// invariants. Called coalesced per agent off each telemetry.ingested event.
-func (s *Service) EvaluateAgent(ctx context.Context, agentID, siteID string) error {
-	live, err := s.loadScopedRules(ctx, agentID, siteID)
-	if err != nil {
-		return err
-	}
-	if len(live) == 0 {
-		return nil
-	}
+// batchValue is one accepted-batch reading, keyed for an in-tx evaluation.
+type batchValue struct {
+	value float64
+	ts    int64
+}
 
-	// Metric lookups first (in-memory latest cache), outside the write tx.
-	sinceUnix := time.Now().Add(-5 * time.Minute).Unix()
-	results := make(map[string]*condResult) // condition id → result
-	for _, r := range live {
-		for _, c := range r.conds {
-			res := &condResult{}
-			var found []metrics.TargetValue
-			var lerr error
-			if c.kind == "host" {
-				found, lerr = s.metrics.LatestPerSeries(ctx, agentID, c.metricKind, c.targetStr, sinceUnix)
-			} else {
-				found, lerr = s.metrics.LatestByMonitor(ctx, agentID, c.metricKind, c.targetID, sinceUnix)
+// Overlay carries an accepted ingest batch's newest per-series readings so an
+// in-tx evaluation observes the samples this commit is inserting — the metrics
+// latest cache is only refreshed post-commit, so it still holds the previous
+// cycle mid-tx. Probe metrics are keyed by (monitorID, kind); system/host
+// metrics by (kind, target). Readings are already 5-minute-window filtered by
+// BuildOverlay. A nil *Overlay (the standalone EvaluateAgent wrapper) contributes
+// nothing, so evaluation falls back to the cache exactly as before.
+type Overlay struct {
+	probe map[string]batchValue // monitorID + "\x00" + kind
+	host  map[string]batchValue // kind + "\x00" + target
+}
+
+// BuildOverlay indexes an accepted metric batch into an Overlay, keeping the
+// newest reading per series within the 5-minute window (WAL-backfill packets
+// carry old agent timestamps and must not flip a condition). The batch is
+// current-generation by construction (ingest gated it), so no serial is keyed.
+func BuildOverlay(ms []telemetry.Metric, sinceUnix int64) *Overlay {
+	o := &Overlay{probe: map[string]batchValue{}, host: map[string]batchValue{}}
+	for i := range ms {
+		m := ms[i]
+		ts := m.TS.Unix()
+		if ts <= sinceUnix {
+			continue
+		}
+		if m.MonitorID != "" {
+			k := m.MonitorID + "\x00" + string(m.Kind)
+			if ex, ok := o.probe[k]; !ok || ts > ex.ts {
+				o.probe[k] = batchValue{value: m.Value, ts: ts}
 			}
-			if lerr != nil {
-				return lerr
-			}
-			if len(found) > 0 {
-				res.hasData = true
-				res.value = found[0].Value
-				res.breach = compare(found[0].Value, c.comparator, c.threshold)
-			}
-			results[c.id] = res
+			continue
+		}
+		k := string(m.Kind) + "\x00" + m.Target
+		if ex, ok := o.host[k]; !ok || ts > ex.ts {
+			o.host[k] = batchValue{value: m.Value, ts: ts}
 		}
 	}
+	return o
+}
 
+func (o *Overlay) probeValue(monitorID, kind string) (float64, int64, bool) {
+	if o == nil {
+		return 0, 0, false
+	}
+	v, ok := o.probe[monitorID+"\x00"+kind]
+	return v.value, v.ts, ok
+}
+
+func (o *Overlay) hostValue(kind, target string) (float64, int64, bool) {
+	if o == nil {
+		return 0, 0, false
+	}
+	v, ok := o.host[kind+"\x00"+target]
+	return v.value, v.ts, ok
+}
+
+// Outcome is one EvaluateAgentTx pass's post-commit work: the events and
+// notifications the tx owner must publish after a successful commit (via
+// PublishOutcome), and the target ids whose current rule state may have shifted
+// this pass (for the caller's status event). It is discarded on rollback.
+type Outcome struct {
+	out              *txOut
+	siteID           string
+	ChangedTargetIDs []string
+}
+
+// EvaluateAgent evaluates every group rule in this agent's scope against the
+// agent's latest metrics and drives the fault flow in one write transaction,
+// publishing lifecycle events and dispatching notifications only after commit. It
+// is the thin standalone wrapper around EvaluateAgentTx retained for the rules
+// test suite (production telemetry runs the split path inside the ingest tx). A
+// nil overlay means the evaluation reads purely from the metrics latest cache.
+func (s *Service) EvaluateAgent(ctx context.Context, agentID, siteID string) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -95,6 +133,82 @@ func (s *Service) EvaluateAgent(ctx context.Context, agentID, siteID string) err
 			_ = tx.Rollback()
 		}
 	}()
+	out, err := s.EvaluateAgentTx(ctx, tx, agentID, siteID, nil)
+	if err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	committed = true
+	s.PublishOutcome(ctx, out)
+	return nil
+}
+
+// EvaluateAgentTx runs one evaluation pass inside the caller's open write
+// transaction: it loads the agent's scoped rules (in-tx, so definitions match
+// what this commit is consistent with), reads each condition's latest value from
+// the metrics cache merged newest-wins with the accepted-batch overlay, updates
+// per-(condition, Agent) state, and fires/appends/closes alert instances with
+// frozen evidence and group-aware incidents. All DB writes land in the caller's
+// tx so samples, condition state, alerts, incidents and evidence commit
+// atomically; the returned Outcome carries the post-commit publications for
+// PublishOutcome. Generation-aware lookups (LatestByMonitor by config_serial, the
+// current-generation overlay) keep an obsolete generation's sample from being
+// read as current.
+func (s *Service) EvaluateAgentTx(ctx context.Context, tx *sql.Tx, agentID, siteID string, overlay *Overlay) (*Outcome, error) {
+	live, err := s.loadScopedRules(ctx, tx, agentID, siteID)
+	if err != nil {
+		return nil, err
+	}
+	if len(live) == 0 {
+		return &Outcome{out: &txOut{}, siteID: siteID}, nil
+	}
+
+	// Metric lookups: cache (previous cycle mid-tx) merged newest-wins with the
+	// accepted-batch overlay (this cycle). Both are already 5-minute-window bounded.
+	sinceUnix := time.Now().Add(-5 * time.Minute).Unix()
+	results := make(map[string]*condResult) // condition id → result
+	targetSet := map[string]bool{}
+	for _, r := range live {
+		for _, c := range r.conds {
+			targetSet[c.targetID] = true
+			res := &condResult{}
+			var found []metrics.TargetValue
+			var lerr error
+			if c.kind == "host" {
+				found, lerr = s.metrics.LatestPerSeries(ctx, agentID, c.metricKind, c.targetStr, sinceUnix)
+			} else {
+				found, lerr = s.metrics.LatestByMonitor(ctx, agentID, c.metricKind, c.targetID, c.configSerial, sinceUnix)
+			}
+			if lerr != nil {
+				return nil, lerr
+			}
+			var val float64
+			var ts int64
+			var have bool
+			if len(found) > 0 {
+				val, ts, have = found[0].Value, found[0].TS, true
+			}
+			var ov float64
+			var ots int64
+			var ook bool
+			if c.kind == "host" {
+				ov, ots, ook = overlay.hostValue(c.metricKind, c.targetStr)
+			} else {
+				ov, ots, ook = overlay.probeValue(c.targetID, c.metricKind)
+			}
+			if ook && (!have || ots >= ts) {
+				val, have = ov, true
+			}
+			if have {
+				res.hasData = true
+				res.value = val
+				res.breach = compare(val, c.comparator, c.threshold)
+			}
+			results[c.id] = res
+		}
+	}
 
 	now := time.Now().UTC()
 	out := &txOut{}
@@ -106,7 +220,7 @@ func (s *Service) EvaluateAgent(ctx context.Context, agentID, siteID string) err
 			res := results[c.id]
 			sat, err := s.applyConditionState(ctx, tx, c, agentID, res, now)
 			if err != nil {
-				return err
+				return nil, err
 			}
 			res.satisfied = sat
 			if sat {
@@ -121,16 +235,25 @@ func (s *Service) EvaluateAgent(ctx context.Context, agentID, siteID string) err
 			shouldFire = satisfiedCount > 0
 		}
 		if err := s.applyRuleTransition(ctx, tx, r, agentID, siteID, results, shouldFire, now, out); err != nil {
-			return err
+			return nil, err
 		}
 	}
 
-	if err := tx.Commit(); err != nil {
-		return err
+	changed := make([]string, 0, len(targetSet))
+	for id := range targetSet {
+		changed = append(changed, id)
 	}
-	committed = true
-	s.publishAndNotify(ctx, out)
-	return nil
+	return &Outcome{out: out, siteID: siteID, ChangedTargetIDs: changed}, nil
+}
+
+// PublishOutcome fans an Outcome's accumulated lifecycle events out on the bus
+// and dispatches its notifications, off the write path. The tx owner calls it
+// only after a successful commit; it is a no-op for a nil Outcome.
+func (s *Service) PublishOutcome(ctx context.Context, out *Outcome) {
+	if out == nil {
+		return
+	}
+	s.publishAndNotify(ctx, out.out)
 }
 
 // applyConditionState updates rule_condition_state from this pass's metric and
@@ -484,13 +607,21 @@ func groupMeta(ctx context.Context, tx *sql.Tx, ruleID string) (groupID, groupNa
 	return groupID, groupName, merge == 1, err
 }
 
+// rowQueryer is the read subset shared by the read pool and an open *sql.Tx, so
+// loadScopedRules can read rule definitions inside the caller's write tx.
+type rowQueryer interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+}
+
 // loadScopedRules assembles the enabled group rules in an agent's scope with
-// their conditions and each condition's target identity.
-func (s *Service) loadScopedRules(ctx context.Context, agentID, siteID string) ([]evalRule, error) {
-	rows, err := s.db.Read().QueryContext(ctx, `
+// their conditions and each condition's target identity, reading through q (the
+// caller's tx during an in-tx evaluation) so definitions are consistent with the
+// commit.
+func (s *Service) loadScopedRules(ctx context.Context, q rowQueryer, agentID, siteID string) ([]evalRule, error) {
+	rows, err := q.QueryContext(ctx, `
 		SELECT gr.id, gr.group_id, gr.op, COALESCE(gr.layer,''), gr.severity, COALESCE(gr.channel_ids,'[]'), gr.name,
 		       c.id, c.target_id, c.metric_kind, c.comparator, c.threshold, c.fail_threshold, c.for_seconds,
-		       pt.kind, COALESCE(pt.target,''), COALESCE(pt.name,''), COALESCE(pt.params,'')
+		       pt.kind, COALESCE(pt.target,''), COALESCE(pt.name,''), COALESCE(pt.params,''), pt.config_serial
 		FROM group_rules gr
 		JOIN group_rule_conditions c ON c.rule_id = gr.id
 		JOIN probe_tasks pt ON pt.id = c.target_id
@@ -508,7 +639,7 @@ func (s *Service) loadScopedRules(ctx context.Context, agentID, siteID string) (
 		var params string
 		if err := rows.Scan(&rid, &groupID, &op, &layer, &sev, &chans, &name,
 			&c.id, &c.targetID, &c.metricKind, &c.comparator, &c.threshold, &c.failThreshold, &c.forSeconds,
-			&c.kind, &c.targetStr, &c.targetName, &params); err != nil {
+			&c.kind, &c.targetStr, &c.targetName, &params, &c.configSerial); err != nil {
 			return nil, err
 		}
 		c.port = portFromParams(params)

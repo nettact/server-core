@@ -9,6 +9,8 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"log"
+	"strings"
 	"sync"
 	"time"
 
@@ -16,6 +18,7 @@ import (
 	"github.com/nettact/protocol/telemetry"
 	"github.com/nettact/server-core/eventbus"
 	"github.com/nettact/server-core/metrics"
+	"github.com/nettact/server-core/rules"
 	"github.com/nettact/server-core/store"
 )
 
@@ -26,10 +29,21 @@ type Ack struct {
 	ServerTime      time.Time `json:"server_time"`
 }
 
+// Evaluator is the fault-engine surface ingest drives inside its own sample
+// transaction so telemetry samples and their rule evaluation reach one committed
+// state atomically. Satisfied by *rules.Service; kept as a small interface so
+// ingest unit tests can pass nil (evaluation is then skipped). PublishOutcome runs
+// post-commit, off the write path.
+type Evaluator interface {
+	EvaluateAgentTx(ctx context.Context, tx *sql.Tx, agentID, siteID string, overlay *rules.Overlay) (*rules.Outcome, error)
+	PublishOutcome(ctx context.Context, out *rules.Outcome)
+}
+
 type Service struct {
 	db      *store.DB
 	bus     *eventbus.Bus
 	metrics *metrics.Store
+	rules   Evaluator // nil-safe: telemetry then commits without inline evaluation
 
 	// Per-agent highest-sequence watermark, cached so the hot ingest path does
 	// not re-run MAX(sequence) on every packet. Loaded from the DB on first
@@ -38,8 +52,8 @@ type Service struct {
 	highSeq map[string]uint64
 }
 
-func New(db *store.DB, bus *eventbus.Bus, m *metrics.Store) *Service {
-	return &Service{db: db, bus: bus, metrics: m, highSeq: make(map[string]uint64)}
+func New(db *store.DB, bus *eventbus.Bus, m *metrics.Store, ev Evaluator) *Service {
+	return &Service{db: db, bus: bus, metrics: m, rules: ev, highSeq: make(map[string]uint64)}
 }
 
 // Ingest stores one telemetry packet idempotently and returns the ack watermark.
@@ -49,11 +63,30 @@ func (s *Service) Ingest(ctx context.Context, agentID, siteID string, pkt teleme
 	}
 	now := time.Now().UTC()
 
+	// Provenance gate (pre-tx, read pool): a probe sample is accepted only if its
+	// monitor still exists AND its ConfigSerial exactly matches the target's
+	// current material generation. Unknown monitors (deleted/recreated), lower
+	// serials (obsolete backlog / replay), and higher serials (corrupt/forged
+	// future) are dropped. System metrics (MonitorID=="") carry generation 0 and
+	// always pass. The authoritative re-check runs inside the write tx below.
+	var accepted []telemetry.Metric
+	if len(pkt.Metrics) > 0 {
+		serials, err := s.probeSerials(ctx, s.db.Read(), monitorIDs(pkt.Metrics))
+		if err != nil {
+			return Ack{}, err
+		}
+		var dropped int
+		accepted, dropped = filterByGeneration(pkt.Metrics, serials)
+		if dropped > 0 {
+			log.Printf("ingest: dropped %d obsolete-generation probe samples from agent %s", dropped, agentID)
+		}
+	}
+
 	// Resolve series ids before opening the tx (SQLite is single-connection).
 	var seriesIDs map[string]int64
-	if len(pkt.Metrics) > 0 {
+	if len(accepted) > 0 {
 		var err error
-		if seriesIDs, err = s.metrics.EnsureSeries(ctx, agentID, siteID, pkt.Metrics); err != nil {
+		if seriesIDs, err = s.metrics.EnsureSeries(ctx, agentID, siteID, accepted); err != nil {
 			return Ack{}, err
 		}
 	}
@@ -78,8 +111,20 @@ func (s *Service) Ingest(ctx context.Context, agentID, siteID string, pkt teleme
 	}
 	affected, _ := res.RowsAffected()
 
+	var acceptedTx []telemetry.Metric
+	var outcome *rules.Outcome
 	if affected > 0 {
-		if err := s.metrics.InsertSamples(ctx, tx, agentID, seriesIDs, pkt.Metrics); err != nil {
+		// Authoritative in-tx re-check: config edits serialize on the single write
+		// connection, so a serial read here has no TOCTOU with the pre-tx filter.
+		acceptedTx = accepted
+		if len(accepted) > 0 {
+			serials, err := s.probeSerials(ctx, tx, monitorIDs(accepted))
+			if err != nil {
+				return Ack{}, err
+			}
+			acceptedTx, _ = filterByGeneration(accepted, serials)
+		}
+		if err := s.metrics.InsertSamples(ctx, tx, agentID, seriesIDs, acceptedTx); err != nil {
 			return Ack{}, err
 		}
 		for _, e := range pkt.Events {
@@ -100,9 +145,24 @@ func (s *Service) Ingest(ctx context.Context, agentID, siteID string, pkt teleme
 		// round. This gives each (agent, sequence) a single, unambiguous
 		// last-wins current state, ordered by the monotonic packet sequence. The
 		// packet's metrics are passed so the same round's wifi.* numerics are
-		// projected onto the interface rows (matched by exact Metric.TS).
+		// projected onto the interface rows (matched by exact Metric.TS). wifi.*
+		// are system metrics (MonitorID==""), unaffected by the provenance gate.
 		if n := len(pkt.InterfaceSnapshots); n > 0 {
 			if err := applyInterfaceSnapshot(ctx, tx, agentID, pkt.InterfaceSnapshots[n-1], pkt.Metrics, pkt.Sequence, now); err != nil {
+				return Ack{}, err
+			}
+		}
+		// Rule evaluation runs INSIDE this sample transaction so samples,
+		// rule_condition_state, alerts, incidents and evidence commit atomically:
+		// the next status read can never observe updated alerts with stale condition
+		// state or vice versa. An evaluation error rolls the whole batch back and the
+		// agent's ack is withheld (it retries the sequence). The overlay carries the
+		// accepted batch so the in-tx pass sees this cycle's values before the
+		// post-commit latest-cache refresh.
+		if s.rules != nil {
+			overlay := rules.BuildOverlay(acceptedTx, now.Add(-5*time.Minute).Unix())
+			outcome, err = s.rules.EvaluateAgentTx(ctx, tx, agentID, siteID, overlay)
+			if err != nil {
 				return Ack{}, err
 			}
 		}
@@ -114,13 +174,26 @@ func (s *Service) Ingest(ctx context.Context, agentID, siteID string, pkt teleme
 	committed = true
 
 	if affected > 0 {
-		// Fold the committed batch into the in-memory latest cache (only after
-		// commit — a rolled-back batch must not surface as "current").
-		if len(pkt.Metrics) > 0 {
-			s.metrics.UpdateLatest(agentID, seriesIDs, pkt.Metrics)
+		// Post-commit, in order: refresh the in-memory latest cache (only after
+		// commit — a rolled-back batch must not surface as "current"), publish the
+		// rule outcome's lifecycle events/notifications, then one precise
+		// target-status event over the accepted probe monitors ∪ the rule outcome's
+		// changed targets.
+		if len(acceptedTx) > 0 {
+			s.metrics.UpdateLatest(agentID, seriesIDs, acceptedTx)
+		}
+		if s.rules != nil && outcome != nil {
+			s.rules.PublishOutcome(ctx, outcome)
 		}
 		if s.bus != nil {
-			s.bus.Publish(eventbus.TopicTelemetryIngested, eventbus.TelemetryIngested{AgentID: agentID, SiteID: siteID})
+			ids := monitorIDs(acceptedTx)
+			if outcome != nil {
+				ids = append(ids, outcome.ChangedTargetIDs...)
+			}
+			if len(ids) > 0 {
+				s.bus.Publish(eventbus.TopicTargetStatusChanged,
+					eventbus.TargetStatusChanged{SiteID: siteID, TargetIDs: dedupeStrings(ids)})
+			}
 		}
 	}
 
@@ -129,6 +202,99 @@ func (s *Service) Ingest(ctx context.Context, agentID, siteID string, pkt teleme
 		return Ack{}, err
 	}
 	return Ack{HighestSequence: high, ServerTime: now}, nil
+}
+
+// rowQuerier is the read subset shared by the read pool (*store.DB / *sql.DB) and
+// an open *sql.Tx, so the provenance serial lookup runs both pre-tx and in-tx.
+type rowQuerier interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+}
+
+// monitorIDs returns the distinct non-empty MonitorIDs referenced by a batch.
+func monitorIDs(ms []telemetry.Metric) []string {
+	seen := map[string]bool{}
+	var out []string
+	for i := range ms {
+		id := ms[i].MonitorID
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		out = append(out, id)
+	}
+	return out
+}
+
+// dedupeStrings returns the distinct non-empty strings of ss, preserving order.
+func dedupeStrings(ss []string) []string {
+	seen := make(map[string]bool, len(ss))
+	out := make([]string, 0, len(ss))
+	for _, s := range ss {
+		if s == "" || seen[s] {
+			continue
+		}
+		seen[s] = true
+		out = append(out, s)
+	}
+	return out
+}
+
+// probeSerials loads the current material generation (config_serial) of each
+// referenced probe target. Absent ids simply do not appear in the map.
+func (s *Service) probeSerials(ctx context.Context, q rowQuerier, ids []string) (map[string]int, error) {
+	out := make(map[string]int, len(ids))
+	if len(ids) == 0 {
+		return out, nil
+	}
+	query := `SELECT id, config_serial FROM probe_tasks WHERE id IN (` + placeholders(len(ids)) + `)`
+	args := make([]any, len(ids))
+	for i, id := range ids {
+		args[i] = id
+	}
+	rows, err := q.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id string
+		var serial int
+		if err := rows.Scan(&id, &serial); err != nil {
+			return nil, err
+		}
+		out[id] = serial
+	}
+	return out, rows.Err()
+}
+
+// filterByGeneration keeps system metrics (MonitorID=="") verbatim and each probe
+// metric only when its ConfigSerial exactly equals the target's current serial.
+// Returns the accepted metrics and the number dropped.
+func filterByGeneration(ms []telemetry.Metric, serials map[string]int) ([]telemetry.Metric, int) {
+	accepted := make([]telemetry.Metric, 0, len(ms))
+	dropped := 0
+	for i := range ms {
+		m := ms[i]
+		if m.MonitorID == "" {
+			accepted = append(accepted, m)
+			continue
+		}
+		cur, ok := serials[m.MonitorID]
+		if !ok || m.ConfigSerial != cur {
+			dropped++
+			continue
+		}
+		accepted = append(accepted, m)
+	}
+	return accepted, dropped
+}
+
+// placeholders returns "?,?,…" with n placeholders for an IN clause.
+func placeholders(n int) string {
+	if n <= 0 {
+		return ""
+	}
+	return strings.TrimSuffix(strings.Repeat("?,", n), ",")
 }
 
 // watermark returns the agent's highest confirmed sequence, maintained in

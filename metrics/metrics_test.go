@@ -73,7 +73,7 @@ func TestMonitorSeriesIsolation(t *testing.T) {
 		mon  string
 		want float64
 	}{{"probe_m1", 10}, {"probe_m2", 200}} {
-		got, err := s.LatestByMonitor(ctx, "agent_a", string(telemetry.ICMPRTTms), tc.mon, now.Unix()-60)
+		got, err := s.LatestByMonitor(ctx, "agent_a", string(telemetry.ICMPRTTms), tc.mon, 0, now.Unix()-60)
 		if err != nil {
 			t.Fatalf("LatestByMonitor(%s): %v", tc.mon, err)
 		}
@@ -108,7 +108,7 @@ func TestMonitorSeriesIsolation(t *testing.T) {
 	if removed != 1 {
 		t.Errorf("PurgeMonitor removed %d series, want 1", removed)
 	}
-	left, err := s.LatestByMonitor(ctx, "agent_a", string(telemetry.ICMPRTTms), "probe_m2", now.Unix()-60)
+	left, err := s.LatestByMonitor(ctx, "agent_a", string(telemetry.ICMPRTTms), "probe_m2", 0, now.Unix()-60)
 	if err != nil {
 		t.Fatalf("LatestByMonitor after purge: %v", err)
 	}
@@ -217,6 +217,61 @@ func TestRetentionPrunes(t *testing.T) {
 	}
 	if n != 1 {
 		t.Errorf("samples after retention = %d, want 1 (old sample pruned)", n)
+	}
+}
+
+func TestCurrentSnapshotUsesOnlyAuthoritativeGeneration(t *testing.T) {
+	db, s := openStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Second)
+	if _, err := db.ExecContext(ctx, `INSERT INTO sites(id,name) VALUES('site_default','Default')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO monitor_groups(id,site_id,name,all_agents) VALUES('group','site_default','All',1)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO probe_tasks(id,site_id,group_id,kind,target,params,enabled,config_serial,config_changed_at)
+		VALUES('monitor','site_default','group','http','https://example.test','{}',1,2,?)`, now); err != nil {
+		t.Fatal(err)
+	}
+	old := telemetry.Metric{
+		TS: now, Kind: telemetry.HTTPOK, Target: "https://example.test", Layer: telemetry.LayerService,
+		Value: 0, Unit: telemetry.UnitBool, MonitorID: "monitor", ConfigSerial: 1,
+	}
+	ingestBatch(t, db, s, "agent", []telemetry.Metric{old})
+	got, err := s.LatestSnapshot(ctx, "agent", now.Add(-time.Minute).Unix())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("old generation surfaced before current sample: %+v", got)
+	}
+
+	current := old
+	current.TS = now.Add(time.Second)
+	current.Value = 1
+	current.ConfigSerial = 2
+	ingestBatch(t, db, s, "agent", []telemetry.Metric{current})
+	got, err = s.LatestSnapshot(ctx, "agent", now.Add(-time.Minute).Unix())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Value != 1 {
+		t.Fatalf("current snapshot = %+v, want generation-2 value 1", got)
+	}
+	series, err := s.ListSeries(ctx, "agent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(series) != 1 || series[0].MonitorID != "monitor" {
+		t.Fatalf("logical selectors = %+v, want one generation-neutral row", series)
+	}
+	history, err := s.Query(ctx, Query{AgentID: "agent", MonitorID: "monitor", Kind: string(telemetry.HTTPOK), SinceUnix: now.Add(-time.Minute).Unix()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(history) != 2 || history[0].Value != 0 || history[1].Value != 1 {
+		t.Fatalf("history = %+v, want both generations", history)
 	}
 }
 

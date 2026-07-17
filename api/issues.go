@@ -14,6 +14,7 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"github.com/nettact/server-core/opissue"
+	"github.com/nettact/server-core/sse"
 )
 
 // pingInterval is how often the SSE stream emits a comment ping so idle
@@ -103,26 +104,13 @@ func (d Deps) handleAgentMonitorStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, rows)
 }
 
-func (d Deps) handleTargetAgentStatus(w http.ResponseWriter, r *http.Request) {
-	if d.OpIssue == nil {
-		writeError(w, http.StatusServiceUnavailable, "issues not available")
-		return
-	}
-	rows, err := d.OpIssue.MonitorStatuses(r.Context(), chi.URLParam(r, "id"))
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	if rows == nil {
-		rows = []opissue.MonitorStatusRow{}
-	}
-	writeJSON(w, http.StatusOK, rows)
-}
-
-// handleEvents is the Server-Sent Events stream. It emits a full, idempotent
-// issues snapshot on connect and on every issue change for the site, plus a
-// comment ping every 25s. A slow client is dropped by the broker (its channel
-// closes) and this handler returns, letting the browser's EventSource reconnect.
+// handleEvents is the Server-Sent Events stream. It multiplexes two live streams
+// for the site on one connection: authoritative "issues" snapshots (emitted on
+// connect and re-queried on every issue change) and precise
+// "target.status.changed" events (written verbatim so the client coalesces a
+// batch status refresh). A comment ping every 25s keeps idle connections open. A
+// slow client is dropped by the broker (its channel closes) and this handler
+// returns, letting the browser's EventSource reconnect.
 func (d Deps) handleEvents(w http.ResponseWriter, r *http.Request) {
 	if d.SSE == nil || d.OpIssue == nil {
 		writeError(w, http.StatusServiceUnavailable, "events not available")
@@ -142,7 +130,9 @@ func (d Deps) handleEvents(w http.ResponseWriter, r *http.Request) {
 	id, ch := d.SSE.Subscribe(siteID)
 	defer d.SSE.Unsubscribe(id)
 
-	d.writeIssueSnapshot(w, flusher, r, siteID) // emit current state (incl. unread) on subscribe
+	// On connect emit only the issues snapshot; the target-status client performs
+	// its own initial full fetch over the batch API.
+	d.writeIssueSnapshot(w, flusher, r, siteID)
 
 	ping := time.NewTicker(ssePingInterval)
 	defer ping.Stop()
@@ -154,11 +144,21 @@ func (d Deps) handleEvents(w http.ResponseWriter, r *http.Request) {
 		case <-ping.C:
 			_, _ = io.WriteString(w, ": ping\n\n")
 			flusher.Flush()
-		case _, open := <-ch:
+		case ev, open := <-ch:
 			if !open {
 				return // dropped by the broker (slow consumer)
 			}
-			d.writeIssueSnapshot(w, flusher, r, siteID)
+			switch ev.Name {
+			case sse.EventTargetStatusChanged:
+				// Precise payload written verbatim; the client coalesces a batch refresh.
+				_, _ = io.WriteString(w, "event: "+ev.Name+"\ndata: ")
+				_, _ = w.Write(ev.Data)
+				_, _ = io.WriteString(w, "\n\n")
+				flusher.Flush()
+			default:
+				// "issues" (Data nil): re-query and write an authoritative snapshot.
+				d.writeIssueSnapshot(w, flusher, r, siteID)
+			}
 		}
 	}
 }

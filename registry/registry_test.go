@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nettact/server-core/eventbus"
 	"github.com/nettact/server-core/store"
 )
 
@@ -36,15 +37,24 @@ func TestUpdateAndDeleteAgent(t *testing.T) {
 	mustExec(t, db, `INSERT INTO agents(id,site_id,public_key,token_hash,status) VALUES('agent_x','site_default',x'00','h','online')`)
 	mustExec(t, db, `INSERT INTO interfaces(id,agent_id,name) VALUES('if1','agent_x','eth0')`)
 	mustExec(t, db, `INSERT INTO agent_wifi(agent_id,state,sampled_at,last_sequence) VALUES('agent_x','ok',?,1)`, now)
-	mustExec(t, db, `INSERT INTO config_versions(id,agent_id,version,desired_state,created_at) VALUES('cv1','agent_x',1,'{}',?)`, now)
 	mustExec(t, db, `INSERT INTO agent_status_history(id,agent_id,status,changed_at) VALUES('ash1','agent_x','online',?)`, now)
 	mustExec(t, db, `INSERT INTO agent_groups(id,site_id,name) VALUES('grp1','site_default','g')`)
 	mustExec(t, db, `INSERT INTO agent_group_members(group_id,agent_id) VALUES('grp1','agent_x')`)
 	mustExec(t, db, `INSERT INTO agent_packets(agent_id,sequence,received_at) VALUES('agent_x',1,?)`, now)
 	mustExec(t, db, `INSERT INTO events(id,agent_id,site_id,ts,type) VALUES('e1','agent_x','site_default',?,'t')`, now)
 	mustExec(t, db, `INSERT INTO alerts(id,agent_id,site_id,group_id,state,started_at) VALUES('al1','agent_x','site_default','group','firing',?)`, now)
+	mustExec(t, db, `INSERT INTO monitor_groups(id,site_id,name,all_agents) VALUES('mg1','site_default','all',1)`)
+	mustExec(t, db, `INSERT INTO probe_tasks(id,site_id,group_id,kind,target,params,enabled) VALUES('mon1','site_default','mg1','http','https://example.test','{}',1)`)
+	mustExec(t, db, `INSERT INTO group_rules(id,group_id,site_id,name,op) VALUES('rule1','mg1','site_default','down','or')`)
+	mustExec(t, db, `INSERT INTO group_rule_conditions(id,rule_id,target_id,metric_kind,comparator,threshold) VALUES('cond1','rule1','mon1','probe.http.ok','lt',1)`)
+	mustExec(t, db, `INSERT INTO rule_condition_state(condition_id,agent_id,satisfied,last_eval_at) VALUES('cond1','agent_x',1,?)`, now)
 
-	reg := New(db, 0)
+	bus := eventbus.New()
+	var statusEvents []eventbus.TargetStatusChanged
+	bus.Subscribe(eventbus.TopicTargetStatusChanged, func(m eventbus.Message) {
+		statusEvents = append(statusEvents, m.Payload.(eventbus.TargetStatusChanged))
+	})
+	reg := New(db, 0, bus)
 
 	// UpdateAgent sets the operator-editable display name and Get reflects it.
 	if err := reg.UpdateAgent(ctx, "agent_x", "My Agent"); err != nil {
@@ -62,9 +72,12 @@ func TestUpdateAndDeleteAgent(t *testing.T) {
 	if err := reg.DeleteAgent(ctx, "agent_x"); err != nil {
 		t.Fatalf("DeleteAgent: %v", err)
 	}
+	if len(statusEvents) != 1 || statusEvents[0].SiteID != "site_default" || len(statusEvents[0].TargetIDs) != 0 {
+		t.Fatalf("delete status events = %+v, want one site-wide refresh", statusEvents)
+	}
 	for _, tbl := range []string{
-		"interfaces", "agent_wifi", "config_versions", "agent_status_history", "agent_group_members",
-		"agent_packets", "events", "alerts",
+		"interfaces", "agent_wifi", "agent_status_history", "agent_group_members",
+		"agent_packets", "events", "alerts", "rule_condition_state",
 	} {
 		var n int
 		if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM `+tbl+` WHERE agent_id='agent_x'`).Scan(&n); err != nil {
@@ -111,7 +124,7 @@ func TestSweepStaleExcludesConnected(t *testing.T) {
 			id, stale)
 	}
 
-	reg := New(db, 0)
+	reg := New(db, 0, nil)
 	n, err := reg.SweepStale(ctx, 10*time.Second, []string{"agent_connected"})
 	if err != nil {
 		t.Fatalf("SweepStale: %v", err)
@@ -155,7 +168,7 @@ func TestStatusHistoryReturnsOnlyNewestTwentyEvents(t *testing.T) {
 			fmt.Sprintf("ash_%02d", i), []string{"offline", "online"}[i%2], base.Add(time.Duration(i)*time.Minute))
 	}
 
-	history, err := New(db, 0).StatusHistory(ctx, "agent_history")
+	history, err := New(db, 0, nil).StatusHistory(ctx, "agent_history")
 	if err != nil {
 		t.Fatalf("StatusHistory: %v", err)
 	}

@@ -31,7 +31,7 @@ func openRulesTest(t *testing.T) (*store.DB, context.Context, *config.Service, s
 			t.Fatalf("seed agent %s: %v", id, err)
 		}
 	}
-	reg := registry.New(db, 0)
+	reg := registry.New(db, 0, nil)
 	cfg := config.New(db, reg, nil, nil)
 	groupID, err := cfg.CreateGroup(ctx, "site_default", "network", true, true, nil)
 	if err != nil {
@@ -43,9 +43,13 @@ func openRulesTest(t *testing.T) (*store.DB, context.Context, *config.Service, s
 func seedMonitorSample(t *testing.T, db *store.DB, agentID, monitorID, kind, target string, value float64) {
 	t.Helper()
 	ctx := context.Background()
+	// Series identity is generation-aware: seed the series at the target's current
+	// material generation so the rule engine's current-generation lookup finds it.
+	var serial int
+	_ = db.QueryRowContext(ctx, `SELECT COALESCE(config_serial,0) FROM probe_tasks WHERE id=?`, monitorID).Scan(&serial)
 	res, err := db.ExecContext(ctx,
-		`INSERT INTO series(agent_id,site_id,monitor_id,kind,target,layer,unit) VALUES(?,'site_default',?,?,?,'','')`,
-		agentID, monitorID, kind, target)
+		`INSERT INTO series(agent_id,site_id,monitor_id,kind,target,layer,unit,config_serial) VALUES(?,'site_default',?,?,?,'','',?)`,
+		agentID, monitorID, kind, target, serial)
 	if err != nil {
 		t.Fatalf("insert series: %v", err)
 	}
@@ -162,5 +166,55 @@ func TestEvidenceAndNotificationRoutingAreFrozenAndCosmeticUpdatePreservesLifecy
 	}
 	if state != "resolved" || reason != "configuration_changed" {
 		t.Fatalf("semantic update result = %s/%s, want resolved/configuration_changed", state, reason)
+	}
+}
+
+func TestRuleDisableClearsLiveConditionStateAndSeverityIsValidated(t *testing.T) {
+	db, ctx, cfg, groupID := openRulesTest(t)
+	if err := cfg.SetSiteTargets(ctx, "site_default", []config.ProbeTarget{{
+		ID: "http", GroupID: groupID, Kind: "http", Target: "https://example.test", Enabled: true,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	svc := New(db, metrics.New(db), nil, nil, nil, nil)
+	if _, err := svc.Create(ctx, "site_default", groupID, GroupRule{
+		Name: "bad severity", Op: "or", Severity: "emergency",
+		Conditions: []RuleCondition{{TargetID: "http", MetricKind: "probe.http.ok", Comparator: "lt", Threshold: 1}},
+	}); err == nil {
+		t.Fatal("out-of-enum severity was accepted")
+	}
+	ruleID, err := svc.Create(ctx, "site_default", groupID, GroupRule{
+		Name: "http down", Op: "or", Severity: "warn",
+		Conditions: []RuleCondition{{TargetID: "http", MetricKind: "probe.http.ok", Comparator: "lt", Threshold: 1}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var conditionID string
+	if err := db.QueryRowContext(ctx, `SELECT id FROM group_rule_conditions WHERE rule_id=?`, ruleID).Scan(&conditionID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO rule_condition_state(condition_id,agent_id,satisfied,last_value,last_eval_at)
+		VALUES(?, 'agent_a', 1, 0, ?)`, conditionID, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.SetEnabled(ctx, ruleID, false); err != nil {
+		t.Fatal(err)
+	}
+	var n int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM rule_condition_state WHERE condition_id=?`, conditionID).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("disable retained %d live condition rows", n)
+	}
+	if err := svc.SetEnabled(ctx, ruleID, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM rule_condition_state WHERE condition_id=?`, conditionID).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatal("re-enable resurrected condition state without telemetry")
 	}
 }

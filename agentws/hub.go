@@ -161,10 +161,15 @@ func (h *Hub) serve(ctx context.Context, agentID, siteID string, c wire.Conn) {
 	_ = h.deps.Registry.SetReportedConfigVersion(ctx, agentID, hello.ReportedConfigVersion)
 	_ = h.deps.Registry.TouchLastSeen(ctx, agentID)
 	// The agent's effective policy just refreshed, so recompute which of its host
-	// monitors are permission-blocked (probe monitors arrive via MonitorStatus).
+	// monitors are permission-blocked (probe monitors arrive via MonitorStatus),
+	// and seed predicted rows for its applicable probe monitors so a freshly
+	// connected agent's pairs have an assignment clock before its first frame.
 	if h.deps.OpIssue != nil {
 		if err := h.deps.OpIssue.ReevaluateHostMonitors(ctx, agentID); err != nil {
 			log.Printf("agentws: reevaluate host monitors for %s: %v", agentID, err)
+		}
+		if err := h.deps.OpIssue.PredictProbeMonitorsForAgent(ctx, agentID); err != nil {
+			log.Printf("agentws: predict probe monitors for %s: %v", agentID, err)
 		}
 	}
 

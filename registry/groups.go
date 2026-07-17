@@ -77,7 +77,7 @@ func (s *Service) CreateGroup(ctx context.Context, siteID, name string) (string,
 }
 
 // UpdateGroup renames a group and reconciles its membership to exactly agentIDs,
-// then bumps config_version for the site so affected agents pick up the change on
+// then bumps the site config serial so affected agents pick up the change on
 // their next telemetry ack. Returns the group's site id (so the caller can resolve
 // alerts stranded by agents leaving the group's scope) and sql.ErrNoRows if no
 // such group.
@@ -119,7 +119,7 @@ func (s *Service) UpdateGroup(ctx context.Context, groupID, name string, agentID
 		}
 	}
 	if _, err := tx.ExecContext(ctx,
-		`UPDATE agents SET config_version=config_version+1 WHERE site_id=?`, siteID); err != nil {
+		`UPDATE sites SET config_serial=config_serial+1 WHERE id=?`, siteID); err != nil {
 		return "", err
 	}
 	if err := tx.Commit(); err != nil {
@@ -129,8 +129,8 @@ func (s *Service) UpdateGroup(ctx context.Context, groupID, name string, agentID
 }
 
 // DeleteGroup removes an agent group, its membership rows, and its monitor-group
-// scope bindings (monitor_group_agent_groups), then bumps config_version for the
-// site. Monitor groups scoped only to this agent group fall back to reaching no
+// scope bindings (monitor_group_agent_groups), then bumps the site config serial.
+// Monitor groups scoped only to this agent group fall back to reaching no
 // agents until re-scoped. Returns the group's site id (so the caller can resolve
 // alerts stranded by the removed bindings) and sql.ErrNoRows if no such group.
 func (s *Service) DeleteGroup(ctx context.Context, groupID string) (string, error) {
@@ -154,7 +154,7 @@ func (s *Service) DeleteGroup(ctx context.Context, groupID string) (string, erro
 		}
 	}
 	if _, err := tx.ExecContext(ctx,
-		`UPDATE agents SET config_version=config_version+1 WHERE site_id=?`, siteID); err != nil {
+		`UPDATE sites SET config_serial=config_serial+1 WHERE id=?`, siteID); err != nil {
 		return "", err
 	}
 	if err := tx.Commit(); err != nil {

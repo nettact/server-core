@@ -44,6 +44,7 @@ import (
 	"github.com/nettact/server-core/settings"
 	"github.com/nettact/server-core/site"
 	"github.com/nettact/server-core/sse"
+	"github.com/nettact/server-core/targetstatus"
 
 	neturl "net/url"
 )
@@ -65,14 +66,15 @@ type Deps struct {
 	Notification *notification.Service
 	Settings     *settings.Service
 	Audit        *audit.Service
-	HostLive     *hostlive.Store  // in-memory live process/connection snapshots (never persisted)
-	OpIssue      *opissue.Service // operational-issue engine (monitor status + issues)
-	SSE          *sse.Broker      // Server-Sent Events fan-out for live issue updates
-	AgentWS      *agentws.Hub     // persistent agent WebSocket channel (telemetry + config downlink)
-	Bus          *eventbus.Bus    // TopicConfigChanged for config mutations outside config.Service (group scope edits)
-	SPA          http.Handler     // optional embedded web UI (served for non-/api routes)
-	Dev          bool             // relax CORS for the Vite origin
-	SecureCookie bool             // set Secure on the session cookie (production/HTTPS)
+	HostLive     *hostlive.Store       // in-memory live process/connection snapshots (never persisted)
+	OpIssue      *opissue.Service      // operational-issue engine (monitor status + issues)
+	TargetStatus *targetstatus.Service // authoritative current target-status aggregation (read-time)
+	SSE          *sse.Broker           // Server-Sent Events fan-out for live issue + target-status updates
+	AgentWS      *agentws.Hub          // persistent agent WebSocket channel (telemetry + config downlink)
+	Bus          *eventbus.Bus         // TopicConfigChanged for config mutations outside config.Service (group scope edits)
+	SPA          http.Handler          // optional embedded web UI (served for non-/api routes)
+	Dev          bool                  // relax CORS for the Vite origin
+	SecureCookie bool                  // set Secure on the session cookie (production/HTTPS)
 }
 
 func Router(d Deps) http.Handler {
@@ -132,8 +134,9 @@ func Router(d Deps) http.Handler {
 			r.Get("/issues", d.handleListIssues)
 			r.Post("/issues/mark-read", d.handleMarkIssuesRead)
 			r.Get("/issues/unread-count", d.handleIssuesUnreadCount)
-			r.Get("/targets/{id}/agent-status", d.handleTargetAgentStatus)
-			// Server-Sent Events stream for live issue updates.
+			// Authoritative current status for every target of a site, in one batch.
+			r.Get("/sites/{id}/target-statuses", d.handleTargetStatuses)
+			// Server-Sent Events stream for live issue + target-status updates.
 			r.Get("/events", d.handleEvents)
 			// Agent groups: named sets of agents that scope monitoring targets.
 			r.Get("/sites/{id}/agent-groups", d.handleListAgentGroups)
@@ -1117,7 +1120,7 @@ func (d Deps) handleGetIncident(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "incident not found")
 		return
 	}
-	members, err := d.Alert.ListForIncident(r.Context(), id)
+	members, abnormalTargetCount, err := d.Alert.IncidentDetail(r.Context(), id)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -1125,7 +1128,11 @@ func (d Deps) handleGetIncident(w http.ResponseWriter, r *http.Request) {
 	if members == nil {
 		members = []alert.Alert{}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"incident": inc, "members": members})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"incident":              inc,
+		"members":               members,
+		"abnormal_target_count": abnormalTargetCount,
+	})
 }
 
 // incidentOwned resolves an incident and enforces site ownership, writing the 404
@@ -1348,18 +1355,10 @@ func (d Deps) handleUpdateMonitorGroup(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	// A merge-policy flip changes the incident-grouping identity (open_key) for the
-	// whole group. Terminate the group's active alerts (configuration_changed)
-	// BEFORE committing the new policy, mirroring DeleteGroup/SetSiteTargets: this
-	// closes incidents opened under the old open_key while it still matches, so none
-	// can linger open under a stale grouping identity after the flip. A pure rename
-	// or agent-scope edit is not a merge change and must not terminate incidents.
-	if g.MergeEnabled != body.MergeEnabled {
-		if err := d.Rules.TerminateForGroup(r.Context(), id); err != nil {
-			writeError(w, http.StatusInternalServerError, err.Error())
-			return
-		}
-	}
+	// The whole submitted scope is validated read-only above so a rejected request
+	// has zero lifecycle side effects. A merge-policy flip terminates the group's
+	// active alerts (configuration_changed) inside UpdateGroup's own transaction, so
+	// no incident lingers under a stale grouping identity.
 	siteID, err := d.Config.UpdateGroup(r.Context(), id, name, body.MergeEnabled, body.AllAgents, body.AgentGroupIDs)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -1370,7 +1369,10 @@ func (d Deps) handleUpdateMonitorGroup(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	d.reconcileScope(r.Context(), siteID)
+	if err := d.reconcileScope(r.Context(), siteID); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
 	d.Audit.Log(r.Context(), "admin", "monitor_group.update", id, name)
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
@@ -1399,22 +1401,30 @@ func (d Deps) handleDeleteMonitorGroup(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	d.reconcileScope(r.Context(), siteID)
+	if err := d.reconcileScope(r.Context(), siteID); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
 	d.Audit.Log(r.Context(), "admin", "monitor_group.delete", id, "")
 	w.WriteHeader(http.StatusNoContent)
 }
 
 // reconcileScope runs the operational-issue reconciliation that must follow any
 // monitor-group scope change (targets moving in/out of an agent's scope), and
-// re-predicts probe/host monitor status for the site. Best-effort: it logs
-// nothing here, matching the other scope-mutating handlers.
-func (d Deps) reconcileScope(ctx context.Context, siteID string) {
+// re-predicts probe/host monitor status for the site. It returns the first failure
+// so the mutating handler can answer a truthful 500 instead of a 2xx that leaves
+// authoritative current state obsolete or immediately expired (SRV-008).
+func (d Deps) reconcileScope(ctx context.Context, siteID string) error {
 	if d.OpIssue == nil {
-		return
+		return nil
 	}
-	_ = d.OpIssue.ReconcileScope(ctx, siteID)
-	_, _ = d.OpIssue.PredictProbeMonitors(ctx, siteID)
-	_ = d.OpIssue.ReevaluateHostMonitorsForSite(ctx, siteID)
+	if err := d.OpIssue.ReconcileScope(ctx, siteID); err != nil {
+		return err
+	}
+	if _, err := d.OpIssue.PredictProbeMonitors(ctx, siteID); err != nil {
+		return err
+	}
+	return d.OpIssue.ReevaluateHostMonitorsForSite(ctx, siteID)
 }
 
 // ---- group rules (one-layer AND/OR, configured on a monitor group) ----
@@ -1455,7 +1465,10 @@ func (d Deps) handleCreateGroupRule(w http.ResponseWriter, r *http.Request) {
 	}
 	// A host-target condition defines a host monitor's required permissions.
 	if d.OpIssue != nil {
-		_ = d.OpIssue.ReevaluateHostMonitorsForSite(r.Context(), g.SiteID)
+		if err := d.OpIssue.ReevaluateHostMonitorsForSite(r.Context(), g.SiteID); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
 	}
 	d.Audit.Log(r.Context(), "admin", "group_rule.create", id, groupID)
 	writeJSON(w, http.StatusOK, map[string]string{"id": id})
@@ -1486,7 +1499,10 @@ func (d Deps) handleUpdateGroupRule(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if d.OpIssue != nil {
-		_ = d.OpIssue.ReevaluateHostMonitorsForSite(r.Context(), cur.SiteID)
+		if err := d.OpIssue.ReevaluateHostMonitorsForSite(r.Context(), cur.SiteID); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
 	}
 	d.Audit.Log(r.Context(), "admin", "group_rule.update", id, "")
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
@@ -1512,7 +1528,10 @@ func (d Deps) handleDeleteGroupRule(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if d.OpIssue != nil {
-		_ = d.OpIssue.ReevaluateHostMonitorsForSite(r.Context(), cur.SiteID)
+		if err := d.OpIssue.ReevaluateHostMonitorsForSite(r.Context(), cur.SiteID); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
 	}
 	d.Audit.Log(r.Context(), "admin", "group_rule.delete", id, "")
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})

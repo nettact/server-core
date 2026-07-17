@@ -97,15 +97,6 @@ CREATE TABLE probe_tasks(
   enabled INTEGER NOT NULL DEFAULT 1
 );
 
-CREATE TABLE config_versions(
-  id TEXT PRIMARY KEY,
-  agent_id TEXT NOT NULL REFERENCES agents(id),
-  version INTEGER NOT NULL,
-  desired_state TEXT NOT NULL,
-  created_at TIMESTAMP NOT NULL,
-  UNIQUE(agent_id, version)
-);
-
 -- ===== dedup (idempotent ingest, §3.3 / §5.1) =====
 CREATE TABLE agent_packets(
   agent_id TEXT NOT NULL,

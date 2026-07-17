@@ -8,16 +8,17 @@ import "sync"
 
 // Well-known topics.
 const (
-	TopicTelemetryIngested = "telemetry.ingested"
-	TopicThresholdBreached = "metric.threshold.breached"
-	TopicAlertRaised       = "alert.raised"
-	TopicAlertResolved     = "alert.resolved"
-	TopicEvidenceAdded     = "alert.evidence.added"
-	TopicIncidentOpened    = "incident.opened"
-	TopicIncidentUpdated   = "incident.updated"
-	TopicIncidentResolved  = "incident.resolved"
-	TopicConfigChanged     = "config.changed"
-	TopicIssueChanged      = "issue.changed"
+	TopicThresholdBreached    = "metric.threshold.breached"
+	TopicAlertRaised          = "alert.raised"
+	TopicAlertResolved        = "alert.resolved"
+	TopicEvidenceAdded        = "alert.evidence.added"
+	TopicIncidentOpened       = "incident.opened"
+	TopicIncidentUpdated      = "incident.updated"
+	TopicIncidentResolved     = "incident.resolved"
+	TopicConfigChanged        = "config.changed"
+	TopicIssueChanged         = "issue.changed"
+	TopicTargetStatusChanged  = "target.status.changed"
+	TopicAgentLivenessChanged = "agent.liveness.changed"
 )
 
 // IncidentEvent is the payload for the incident lifecycle topics
@@ -47,10 +48,23 @@ type EvidenceAdded struct {
 	SiteID     string
 }
 
-// TelemetryIngested is the payload for TopicTelemetryIngested.
-type TelemetryIngested struct {
-	AgentID string
+// TargetStatusChanged is the payload for TopicTargetStatusChanged, published
+// post-commit after any change that can alter a target's authoritative current
+// status (telemetry + rule evaluation, execution-dimension reports, config/rule/
+// scope mutations). It carries only the affected site and target ids; an empty
+// TargetIDs means the whole site changed and the client should fully refresh.
+type TargetStatusChanged struct {
+	SiteID    string
+	TargetIDs []string
+}
+
+// AgentLivenessChanged is the payload for TopicAgentLivenessChanged, published
+// post-commit when an agent flips online↔offline. Liveness affects every target
+// in the agent's scope, so a bridge fans it out to a site-wide status refresh.
+type AgentLivenessChanged struct {
 	SiteID  string
+	AgentID string
+	Status  string // online | offline
 }
 
 // ConfigChanged is the payload for TopicConfigChanged, published after a site's

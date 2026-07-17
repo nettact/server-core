@@ -4,10 +4,11 @@
 // read via resolution-aware queries so any time range returns a bounded number
 // of points.
 //
-// Series are keyed by (agent, monitor, kind, target): monitor_id is the
-// user-created monitor (probe_tasks.id) stamped by the agent, so two monitors
-// on the same target string keep distinct series. System metrics (host.*,
-// iface.up, agent.*, the built-in gateway probe) carry monitor_id ”.
+// Series are keyed by (agent, monitor, kind, target, config_serial): monitor_id is
+// the user-created monitor (probe_tasks.id) stamped by the agent, and config_serial
+// is the target's material generation, so a material edit starts a fresh series and
+// old-generation samples never surface as current. System metrics (host.*,
+// iface.up, agent.*) carry monitor_id ” and generation 0.
 //
 // Hot reads (the /latest snapshot and rule evaluation, which runs on every
 // ingest) are served from an in-memory latest-value cache updated at ingest —
@@ -18,6 +19,7 @@ import (
 	"context"
 	"database/sql"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -26,14 +28,18 @@ import (
 	"github.com/nettact/server-core/store"
 )
 
-// seriesIdent is the in-memory identity of one series row.
+// seriesIdent is the in-memory identity of one series row. config_serial is part
+// of the identity: a material target edit starts a new generation (new series id)
+// even when kind/target/params coincide textually, so old-generation samples
+// never surface as current.
 type seriesIdent struct {
-	id        int64
-	monitorID string
-	kind      string
-	target    string
-	layer     string
-	unit      string
+	id           int64
+	monitorID    string
+	kind         string
+	target       string
+	layer        string
+	unit         string
+	configSerial int
 }
 
 type latestVal struct {
@@ -61,13 +67,13 @@ func New(db *store.DB) *Store {
 	}
 }
 
-func seriesKey(agentID, monitorID, kind, target string) string {
-	return agentID + "\x1f" + monitorID + "\x1f" + kind + "\x1f" + target
+func seriesKey(agentID, monitorID, kind, target string, configSerial int) string {
+	return agentID + "\x1f" + monitorID + "\x1f" + kind + "\x1f" + target + "\x1f" + strconv.Itoa(configSerial)
 }
 
 // registerLocked adds a series identity to the in-memory registry. Caller holds s.mu.
 func (s *Store) registerLocked(agentID string, ident *seriesIdent) {
-	s.cache[seriesKey(agentID, ident.monitorID, ident.kind, ident.target)] = ident.id
+	s.cache[seriesKey(agentID, ident.monitorID, ident.kind, ident.target, ident.configSerial)] = ident.id
 	ag := s.byAgent[agentID]
 	if ag == nil {
 		ag = make(map[int64]*seriesIdent)
@@ -84,7 +90,7 @@ func (s *Store) warmAgentLocked(ctx context.Context, agentID string) error {
 		return nil
 	}
 	rows, err := s.db.Read().QueryContext(ctx, `
-		SELECT id, COALESCE(monitor_id,''), kind, COALESCE(target,''), COALESCE(layer,''), COALESCE(unit,'')
+		SELECT id, COALESCE(monitor_id,''), kind, COALESCE(target,''), COALESCE(layer,''), COALESCE(unit,''), config_serial
 		FROM series WHERE agent_id=?`, agentID)
 	if err != nil {
 		return err
@@ -92,7 +98,7 @@ func (s *Store) warmAgentLocked(ctx context.Context, agentID string) error {
 	var idents []*seriesIdent
 	for rows.Next() {
 		var si seriesIdent
-		if err := rows.Scan(&si.id, &si.monitorID, &si.kind, &si.target, &si.layer, &si.unit); err != nil {
+		if err := rows.Scan(&si.id, &si.monitorID, &si.kind, &si.target, &si.layer, &si.unit, &si.configSerial); err != nil {
 			rows.Close()
 			return err
 		}
@@ -124,8 +130,11 @@ func (s *Store) warmAgentLocked(ctx context.Context, agentID string) error {
 }
 
 // EnsureSeries resolves (creating if needed) the series id for every metric,
-// returning a key→id map. It runs on the write DB directly (autocommit) and
-// MUST be called before opening the ingest transaction.
+// returning a key→id map. Each series is keyed by the metric's ConfigSerial (the
+// target generation ingest has already verified equals the target's current
+// serial), so a material edit lands in a fresh series. System metrics carry
+// serial 0. It runs on the write DB directly (autocommit) and MUST be called
+// before opening the ingest transaction.
 func (s *Store) EnsureSeries(ctx context.Context, agentID, siteID string, ms []telemetry.Metric) (map[string]int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -133,7 +142,7 @@ func (s *Store) EnsureSeries(ctx context.Context, agentID, siteID string, ms []t
 	out := make(map[string]int64, len(ms))
 	for i := range ms {
 		m := &ms[i]
-		key := seriesKey(agentID, m.MonitorID, string(m.Kind), m.Target)
+		key := seriesKey(agentID, m.MonitorID, string(m.Kind), m.Target, m.ConfigSerial)
 		if _, ok := out[key]; ok {
 			continue
 		}
@@ -142,19 +151,19 @@ func (s *Store) EnsureSeries(ctx context.Context, agentID, siteID string, ms []t
 			continue
 		}
 		if _, err := s.db.ExecContext(ctx, `
-			INSERT OR IGNORE INTO series(agent_id, site_id, monitor_id, kind, target, layer, unit)
-			VALUES(?,?,?,?,?,?,?)`, agentID, siteID, m.MonitorID, string(m.Kind), m.Target, string(m.Layer), m.Unit); err != nil {
+			INSERT OR IGNORE INTO series(agent_id, site_id, monitor_id, kind, target, layer, unit, config_serial)
+			VALUES(?,?,?,?,?,?,?,?)`, agentID, siteID, m.MonitorID, string(m.Kind), m.Target, string(m.Layer), m.Unit, m.ConfigSerial); err != nil {
 			return nil, err
 		}
 		var id int64
 		if err := s.db.QueryRowContext(ctx,
-			`SELECT id FROM series WHERE agent_id=? AND monitor_id=? AND kind=? AND target=?`,
-			agentID, m.MonitorID, string(m.Kind), m.Target).Scan(&id); err != nil {
+			`SELECT id FROM series WHERE agent_id=? AND monitor_id=? AND kind=? AND target=? AND config_serial=?`,
+			agentID, m.MonitorID, string(m.Kind), m.Target, m.ConfigSerial).Scan(&id); err != nil {
 			return nil, err
 		}
 		s.registerLocked(agentID, &seriesIdent{
 			id: id, monitorID: m.MonitorID, kind: string(m.Kind), target: m.Target,
-			layer: string(m.Layer), unit: m.Unit,
+			layer: string(m.Layer), unit: m.Unit, configSerial: m.ConfigSerial,
 		})
 		out[key] = id
 	}
@@ -173,7 +182,7 @@ func (s *Store) InsertSamples(ctx context.Context, tx *sql.Tx, agentID string, i
 	defer stmt.Close()
 	for i := range ms {
 		m := &ms[i]
-		id, ok := ids[seriesKey(agentID, m.MonitorID, string(m.Kind), m.Target)]
+		id, ok := ids[seriesKey(agentID, m.MonitorID, string(m.Kind), m.Target, m.ConfigSerial)]
 		if !ok {
 			continue
 		}
@@ -191,7 +200,7 @@ func (s *Store) UpdateLatest(agentID string, ids map[string]int64, ms []telemetr
 	defer s.mu.Unlock()
 	for i := range ms {
 		m := &ms[i]
-		id, ok := ids[seriesKey(agentID, m.MonitorID, string(m.Kind), m.Target)]
+		id, ok := ids[seriesKey(agentID, m.MonitorID, string(m.Kind), m.Target, m.ConfigSerial)]
 		if !ok {
 			continue
 		}
@@ -249,7 +258,9 @@ type seriesMeta struct {
 
 // Query returns points for the matching series at a resolution appropriate to
 // the range. Rollup values are bucket averages (total/cnt). Runs on the read
-// pool so a long chart query never stalls ingest.
+// pool so a long chart query never stalls ingest. Series are matched across ALL
+// generations (config_serial is ignored) and the merged points are ordered by
+// (kind, target, monitor, ts) so history stays continuous across material edits.
 func (s *Store) Query(ctx context.Context, q Query) ([]Point, error) {
 	now := time.Now().Unix()
 	since := q.SinceUnix
@@ -319,6 +330,20 @@ func (s *Store) Query(ctx context.Context, q Query) ([]Point, error) {
 			return nil, err
 		}
 	}
+	// Merge generations: same (kind, target, monitor) logical series may now span
+	// several config_serial rows; order deterministically by ts within each.
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].Kind != out[j].Kind {
+			return out[i].Kind < out[j].Kind
+		}
+		if out[i].Target != out[j].Target {
+			return out[i].Target < out[j].Target
+		}
+		if out[i].MonitorID != out[j].MonitorID {
+			return out[i].MonitorID < out[j].MonitorID
+		}
+		return out[i].TS.Before(out[j].TS)
+	})
 	return out, nil
 }
 
@@ -357,11 +382,14 @@ type SeriesInfo struct {
 	MonitorID string `json:"monitor_id,omitempty"`
 }
 
-// ListSeries returns every series recorded for an agent (from the dictionary,
-// regardless of how recently it reported) ordered by kind then target.
+// ListSeries returns every logical series recorded for an agent (from the
+// dictionary, regardless of how recently it reported) ordered by kind then target.
+// A monitor may now have several stored generations (config_serial) of the same
+// (monitor, kind, target); the selector is generation-neutral, so those collapse
+// to one row via DISTINCT — the console picks a logical series, not a generation.
 func (s *Store) ListSeries(ctx context.Context, agentID string) ([]SeriesInfo, error) {
 	rows, err := s.db.Read().QueryContext(ctx, `
-		SELECT kind, COALESCE(target,''), COALESCE(layer,''), COALESCE(unit,''), COALESCE(monitor_id,'')
+		SELECT DISTINCT kind, COALESCE(target,''), COALESCE(layer,''), COALESCE(unit,''), COALESCE(monitor_id,'')
 		FROM series WHERE agent_id=? ORDER BY kind, target`, agentID)
 	if err != nil {
 		return nil, err
@@ -381,11 +409,28 @@ func (s *Store) ListSeries(ctx context.Context, agentID string) ([]SeriesInfo, e
 // LatestSnapshot returns the newest sample per series for an agent (all kinds)
 // within the sinceUnix lower bound — one point per series instead of a full
 // range. Served from the in-memory latest cache (warmed from the DB once per
-// agent per process), so the dashboard's poll never touches SQLite.
+// agent per process), so the dashboard's poll never touches SQLite for samples.
 func (s *Store) LatestSnapshot(ctx context.Context, agentID string, sinceUnix int64) ([]Point, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.warmAgentLocked(ctx, agentID); err != nil {
+		return nil, err
+	}
+	// A monitor may now have several stored generations (config_serial). Only its
+	// AUTHORITATIVE current generation — probe_tasks.config_serial — may surface as
+	// the current value; a cached older-generation sample must never be shown as
+	// current even when the current generation has no sample yet (it then yields no
+	// value). System series (monitor_id='') are unique per (kind, target) and pass
+	// through directly. Resolve the current generation of every monitor referenced
+	// by this agent's series from probe_tasks.
+	monitorIDs := map[string]bool{}
+	for _, si := range s.byAgent[agentID] {
+		if si.monitorID != "" {
+			monitorIDs[si.monitorID] = true
+		}
+	}
+	currentSerial, err := s.currentSerialsLocked(ctx, monitorIDs)
+	if err != nil {
 		return nil, err
 	}
 	var out []Point
@@ -397,6 +442,14 @@ func (s *Store) LatestSnapshot(ctx context.Context, agentID string, sinceUnix in
 		// are unaffected; only this snapshot output excludes them.
 		if strings.HasPrefix(string(si.kind), "wifi.") {
 			continue
+		}
+		if si.monitorID != "" {
+			// Drop any generation other than the target's authoritative current one
+			// (and any monitor no longer present in probe_tasks).
+			cur, ok := currentSerial[si.monitorID]
+			if !ok || si.configSerial != cur {
+				continue
+			}
 		}
 		lv, ok := s.latest[id]
 		if !ok || lv.ts < sinceUnix {
@@ -416,10 +469,48 @@ func (s *Store) LatestSnapshot(ctx context.Context, agentID string, sinceUnix in
 	return out, nil
 }
 
-// TargetValue is the latest value of a series (for the rule engine).
+// currentSerialsLocked resolves each given monitor id to its authoritative current
+// generation (probe_tasks.config_serial). A monitor with no probe_tasks row (deleted)
+// is absent from the result. Called while s.mu is held (a plain read on the read
+// pool, matching warmAgentLocked's pattern).
+func (s *Store) currentSerialsLocked(ctx context.Context, monitorIDs map[string]bool) (map[string]int, error) {
+	out := make(map[string]int, len(monitorIDs))
+	if len(monitorIDs) == 0 {
+		return out, nil
+	}
+	ids := make([]any, 0, len(monitorIDs))
+	ph := make([]byte, 0, len(monitorIDs)*2)
+	for id := range monitorIDs {
+		ids = append(ids, id)
+		if len(ph) > 0 {
+			ph = append(ph, ',')
+		}
+		ph = append(ph, '?')
+	}
+	rows, err := s.db.Read().QueryContext(ctx,
+		`SELECT id, config_serial FROM probe_tasks WHERE id IN (`+string(ph)+`)`, ids...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id string
+		var serial int
+		if err := rows.Scan(&id, &serial); err != nil {
+			return nil, err
+		}
+		out[id] = serial
+	}
+	return out, rows.Err()
+}
+
+// TargetValue is the latest value of a series (for the rule engine). TS is the
+// sample's unix timestamp, used by an in-tx evaluation to merge the accepted
+// batch newest-wins over this cached value.
 type TargetValue struct {
 	Target string
 	Value  float64
+	TS     int64
 }
 
 // LatestPerSeries returns the newest value per matching SYSTEM series
@@ -440,14 +531,16 @@ func (s *Store) LatestPerSeries(ctx context.Context, agentID, kind, glob string,
 		if !ok || lv.ts <= sinceUnix {
 			continue
 		}
-		out = append(out, TargetValue{Target: si.target, Value: lv.value})
+		out = append(out, TargetValue{Target: si.target, Value: lv.value, TS: lv.ts})
 	}
 	return out, nil
 }
 
-// LatestByMonitor returns the newest value of one monitor's series for a kind
-// since sinceUnix — probe rules bind by monitor id. Served from the latest cache.
-func (s *Store) LatestByMonitor(ctx context.Context, agentID, kind, monitorID string, sinceUnix int64) ([]TargetValue, error) {
+// LatestByMonitor returns the newest value of one monitor's series for a kind and
+// exact target generation (configSerial) since sinceUnix — probe rules bind by
+// monitor id, and requiring the current generation keeps an obsolete generation's
+// sample from being read as current. Served from the latest cache.
+func (s *Store) LatestByMonitor(ctx context.Context, agentID, kind, monitorID string, configSerial int, sinceUnix int64) ([]TargetValue, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.warmAgentLocked(ctx, agentID); err != nil {
@@ -455,14 +548,14 @@ func (s *Store) LatestByMonitor(ctx context.Context, agentID, kind, monitorID st
 	}
 	var out []TargetValue
 	for id, si := range s.byAgent[agentID] {
-		if si.monitorID != monitorID || si.kind != kind {
+		if si.monitorID != monitorID || si.kind != kind || si.configSerial != configSerial {
 			continue
 		}
 		lv, ok := s.latest[id]
 		if !ok || lv.ts <= sinceUnix {
 			continue
 		}
-		out = append(out, TargetValue{Target: si.target, Value: lv.value})
+		out = append(out, TargetValue{Target: si.target, Value: lv.value, TS: lv.ts})
 	}
 	return out, nil
 }

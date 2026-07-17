@@ -71,6 +71,34 @@ func (s *Service) publishAndNotify(ctx context.Context, out *txOut) {
 	}
 }
 
+// publishTargetStatus emits one precise TopicTargetStatusChanged for the given
+// site + affected target ids after a committing rule-lifecycle change. Empty
+// target sets publish nothing (no committing change touched a target).
+func (s *Service) publishTargetStatus(siteID string, targetIDs []string) {
+	if s.bus == nil {
+		return
+	}
+	ids := dedupeStrings(targetIDs)
+	if len(ids) == 0 {
+		return
+	}
+	s.bus.Publish(eventbus.TopicTargetStatusChanged, eventbus.TargetStatusChanged{SiteID: siteID, TargetIDs: ids})
+}
+
+// dedupeStrings returns the distinct non-empty strings of ss, preserving order.
+func dedupeStrings(ss []string) []string {
+	seen := make(map[string]bool, len(ss))
+	out := make([]string, 0, len(ss))
+	for _, s := range ss {
+		if s == "" || seen[s] {
+			continue
+		}
+		seen[s] = true
+		out = append(out, s)
+	}
+	return out
+}
+
 // buildIncidentPayload assembles a notification payload from an incident's
 // current state and firing-member evidence.
 func (s *Service) buildIncidentPayload(ctx context.Context, incidentID, siteID, event, state string) notification.Payload {

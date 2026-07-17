@@ -130,13 +130,20 @@ func (s *Service) Enroll(ctx context.Context, req enroll.EnrollRequest) (enroll.
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO agents(id, site_id, public_key, token_hash, hostname, platform, agent_version,
 		                   perm_supported, perm_granted, perm_effective, policy_source, policy_hash,
-		                   status, config_version, reported_config_version, last_seen_at, created_at)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?, 'online', 0, 0, ?, ?)`,
+		                   status, reported_config_version, last_seen_at, created_at)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?, 'online', 0, ?, ?)`,
 		agentID, siteID, []byte(req.PublicKey), sha256hex(agentToken),
 		req.Hostname, req.Platform, req.AgentVersion,
 		marshalStrings(req.Permissions.Supported), marshalStrings(req.Permissions.Granted),
 		marshalStrings(req.Permissions.Effective), req.Permissions.Source, req.Permissions.PolicyHash,
 		now, now); err != nil {
+		return enroll.EnrollResponse{}, err
+	}
+	// The site config serial is the desired-config axis; report it (informational —
+	// the agent starts at appliedConfigVersion = -1 and applies the first pushed
+	// DesiredState regardless).
+	var siteSerial int
+	if err := tx.QueryRowContext(ctx, `SELECT config_serial FROM sites WHERE id=?`, siteID).Scan(&siteSerial); err != nil {
 		return enroll.EnrollResponse{}, err
 	}
 	if _, err := tx.ExecContext(ctx,
@@ -155,7 +162,7 @@ func (s *Service) Enroll(ctx context.Context, req enroll.EnrollRequest) (enroll.
 
 	return enroll.EnrollResponse{
 		AgentID: agentID, SiteID: siteID, AgentToken: agentToken,
-		ServerTime: now, ConfigVersion: 0,
+		ServerTime: now, ConfigVersion: siteSerial,
 	}, nil
 }
 
@@ -177,7 +184,9 @@ func (s *Service) AuthenticateAgent(ctx context.Context, token string) (agentID,
 
 // --- config version (agents table) ---
 
-// ConfigStatus is an agent's desired vs reported config version.
+// ConfigStatus is an agent's desired vs reported config version. The desired
+// version is the site-level config_serial (the single desired-config axis);
+// reported is the per-agent watermark of what the agent last applied.
 type ConfigStatus struct {
 	SiteID          string
 	ConfigVersion   int
@@ -187,19 +196,14 @@ type ConfigStatus struct {
 func (s *Service) ConfigStatus(ctx context.Context, agentID string) (ConfigStatus, error) {
 	var c ConfigStatus
 	err := s.db.QueryRowContext(ctx,
-		`SELECT site_id, config_version, reported_config_version FROM agents WHERE id=?`, agentID).
+		`SELECT a.site_id, COALESCE(st.config_serial,0), a.reported_config_version
+		 FROM agents a JOIN sites st ON st.id = a.site_id WHERE a.id=?`, agentID).
 		Scan(&c.SiteID, &c.ConfigVersion, &c.ReportedVersion)
 	return c, err
 }
 
 func (s *Service) SetReportedConfigVersion(ctx context.Context, agentID string, v int) error {
 	_, err := s.db.ExecContext(ctx, `UPDATE agents SET reported_config_version=? WHERE id=?`, v, agentID)
-	return err
-}
-
-// BumpConfigVersionForSite marks every agent in a site as needing new config.
-func (s *Service) BumpConfigVersionForSite(ctx context.Context, siteID string) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE agents SET config_version=config_version+1 WHERE site_id=?`, siteID)
 	return err
 }
 

@@ -29,7 +29,7 @@ func openWiFiIngest(t *testing.T) (*store.DB, *Service, *inventory.Service, *met
 		t.Fatalf("seed agent: %v", err)
 	}
 	m := metrics.New(db)
-	return db, New(db, nil, m), inventory.New(db), m
+	return db, New(db, nil, m, nil), inventory.New(db), m
 }
 
 func wifiPacket(seq uint64, sampled time.Time, state telemetry.WiFiLinkState, ssid string, interfaces bool) telemetry.Packet {
@@ -131,5 +131,24 @@ func TestInterfaceSnapshotUsesSequenceAndExactRoundNumerics(t *testing.T) {
 	var cols int
 	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_table_info('interfaces') WHERE name='wifi_tx_mbps'`).Scan(&cols); err != nil || cols != 1 {
 		t.Fatalf("wifi_tx_mbps migration column count=%d err=%v", cols, err)
+	}
+}
+
+func TestProbeMetricsRequireExactTargetGeneration(t *testing.T) {
+	metrics := []telemetry.Metric{
+		{Kind: telemetry.HostCPUPct},
+		{Kind: telemetry.HTTPOK, MonitorID: "current", ConfigSerial: 5},
+		{Kind: telemetry.HTTPOK, MonitorID: "stale", ConfigSerial: 4},
+		{Kind: telemetry.HTTPOK, MonitorID: "future", ConfigSerial: 6},
+		{Kind: telemetry.HTTPOK, MonitorID: "deleted", ConfigSerial: 5},
+	}
+	accepted, dropped := filterByGeneration(metrics, map[string]int{
+		"current": 5, "stale": 5, "future": 5,
+	})
+	if dropped != 3 {
+		t.Fatalf("dropped = %d, want stale + future + deleted", dropped)
+	}
+	if len(accepted) != 2 || accepted[0].MonitorID != "" || accepted[1].MonitorID != "current" {
+		t.Fatalf("accepted = %+v, want system + exact-current", accepted)
 	}
 }

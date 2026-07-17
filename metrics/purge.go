@@ -3,12 +3,13 @@ package metrics
 import "context"
 
 // PurgeMonitor deletes every series (with its samples and rollups) recorded by
-// one user-created monitor, across all agents. Returns the series removed.
+// one user-created monitor, across all agents and all its generations. Returns
+// the series removed.
 func (s *Store) PurgeMonitor(ctx context.Context, siteID, monitorID string) (int, error) {
 	if monitorID == "" {
 		return 0, nil // '' is the system-series marker, never a purgable monitor
 	}
-	return s.purge(ctx, `SELECT id, agent_id, monitor_id, kind, target FROM series WHERE site_id=? AND monitor_id=?`,
+	return s.purge(ctx, `SELECT id, agent_id, monitor_id, kind, target, config_serial FROM series WHERE site_id=? AND monitor_id=?`,
 		siteID, monitorID)
 }
 
@@ -17,13 +18,13 @@ func (s *Store) PurgeMonitor(ctx context.Context, siteID, monitorID string) (int
 // monitor via PurgeMonitor, so a shared target string never collateral-damages
 // another monitor's history.
 func (s *Store) PurgeTarget(ctx context.Context, siteID, target string) (int, error) {
-	return s.purge(ctx, `SELECT id, agent_id, monitor_id, kind, target FROM series WHERE site_id=? AND target=? AND monitor_id=''`,
+	return s.purge(ctx, `SELECT id, agent_id, monitor_id, kind, target, config_serial FROM series WHERE site_id=? AND target=? AND monitor_id=''`,
 		siteID, target)
 }
 
 // PurgeAgent deletes all series for an agent (e.g. when the agent is removed).
 func (s *Store) PurgeAgent(ctx context.Context, agentID string) (int, error) {
-	return s.purge(ctx, `SELECT id, agent_id, monitor_id, kind, target FROM series WHERE agent_id=?`, agentID)
+	return s.purge(ctx, `SELECT id, agent_id, monitor_id, kind, target, config_serial FROM series WHERE agent_id=?`, agentID)
 }
 
 func (s *Store) purge(ctx context.Context, sel string, args ...any) (int, error) {
@@ -37,11 +38,12 @@ func (s *Store) purge(ctx context.Context, sel string, args ...any) (int, error)
 	type sk struct {
 		id                           int64
 		agent, monitor, kind, target string
+		configSerial                 int
 	}
 	var list []sk
 	for rows.Next() {
 		var k sk
-		if err := rows.Scan(&k.id, &k.agent, &k.monitor, &k.kind, &k.target); err != nil {
+		if err := rows.Scan(&k.id, &k.agent, &k.monitor, &k.kind, &k.target, &k.configSerial); err != nil {
 			rows.Close()
 			return 0, err
 		}
@@ -64,7 +66,7 @@ func (s *Store) purge(ctx context.Context, sel string, args ...any) (int, error)
 		if _, err := s.db.ExecContext(ctx, `DELETE FROM series WHERE id=?`, k.id); err != nil {
 			return 0, err
 		}
-		delete(s.cache, seriesKey(k.agent, k.monitor, k.kind, k.target))
+		delete(s.cache, seriesKey(k.agent, k.monitor, k.kind, k.target, k.configSerial))
 		delete(s.latest, k.id)
 		if ag := s.byAgent[k.agent]; ag != nil {
 			delete(ag, k.id)

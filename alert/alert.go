@@ -41,18 +41,23 @@ type Raised struct {
 }
 
 // Evidence is one immutable, frozen condition that contributed to a firing alert.
+// The evidence row itself never changes; CurrentlyAbnormal is a read-time overlay
+// (STATUS-001) computed from CURRENT condition state, not from the frozen row: it
+// is true only while the evidence's alert is still firing AND its (condition,
+// agent) rule state is currently satisfied. False ⇒ recovered historical evidence.
 type Evidence struct {
-	ID          string    `json:"id"`
-	ConditionID string    `json:"condition_id"`
-	TargetID    string    `json:"target_id"`
-	TargetName  string    `json:"target_name"`
-	TargetAddr  string    `json:"target_addr"`
-	ProbeKind   string    `json:"probe_kind"`
-	MetricKind  string    `json:"metric_kind"`
-	Comparator  string    `json:"comparator"`
-	Threshold   float64   `json:"threshold"`
-	Value       float64   `json:"value"`
-	ObservedAt  time.Time `json:"observed_at"`
+	ID                string    `json:"id"`
+	ConditionID       string    `json:"condition_id"`
+	TargetID          string    `json:"target_id"`
+	TargetName        string    `json:"target_name"`
+	TargetAddr        string    `json:"target_addr"`
+	ProbeKind         string    `json:"probe_kind"`
+	MetricKind        string    `json:"metric_kind"`
+	Comparator        string    `json:"comparator"`
+	Threshold         float64   `json:"threshold"`
+	Value             float64   `json:"value"`
+	ObservedAt        time.Time `json:"observed_at"`
+	CurrentlyAbnormal bool      `json:"currently_abnormal"`
 }
 
 // Alert is a stored alert instance joined with its rule/group/agent for the UI,
@@ -107,11 +112,108 @@ func (s *Service) ListForAgent(ctx context.Context, agentID string, limit int) (
 		WHERE a.agent_id=? ORDER BY a.started_at DESC LIMIT ?`, agentID, limit)
 }
 
-// ListForIncident returns the alert instances belonging to one incident (its
-// members), firing first then by start time, each with evidence.
-func (s *Service) ListForIncident(ctx context.Context, incidentID string) ([]Alert, error) {
-	return s.query(ctx, `SELECT `+alertCols+` `+alertFrom+`
+// IncidentDetail returns one incident's member alerts (each with frozen evidence
+// stamped with its read-time currently_abnormal overlay) and the incident's
+// current abnormal-target count, all read in ONE read snapshot transaction so the
+// evidence overlay and the count reflect the same committed condition/alert state.
+//
+// currently_abnormal per evidence = its alert is firing AND the (condition, agent)
+// rule state is currently satisfied. abnormal_target_count = the number of
+// distinct targets currently abnormal across the incident's firing alerts,
+// computed from live rule_condition_state — deliberately decoupled from the
+// immutable evidence count (recovered conditions keep their frozen evidence but
+// do not count).
+func (s *Service) IncidentDetail(ctx context.Context, incidentID string) ([]Alert, int, error) {
+	tx, err := s.db.Read().BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return nil, 0, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	rows, err := tx.QueryContext(ctx, `SELECT `+alertCols+` `+alertFrom+`
 		WHERE a.incident_id=? ORDER BY CASE WHEN a.state='firing' THEN 0 ELSE 1 END, a.started_at DESC`, incidentID)
+	if err != nil {
+		return nil, 0, err
+	}
+	var out []Alert
+	for rows.Next() {
+		var a Alert
+		var resolved sql.NullTime
+		if err := rows.Scan(&a.ID, &a.RuleID, &a.RuleName, &a.GroupID, &a.GroupName,
+			&a.AgentID, &a.AgentHost, &a.SiteID, &a.Layer, &a.Severity, &a.State,
+			&a.ResolveReason, &a.IncidentID, &a.StartedAt, &resolved); err != nil {
+			rows.Close()
+			return nil, 0, err
+		}
+		if resolved.Valid {
+			t := resolved.Time
+			a.ResolvedAt = &t
+		}
+		a.Evidence = []Evidence{}
+		out = append(out, a)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, 0, err
+	}
+
+	if len(out) > 0 {
+		byID := make(map[string]*Alert, len(out))
+		ids := make([]any, 0, len(out))
+		ph := make([]byte, 0, len(out)*2)
+		for i := range out {
+			byID[out[i].ID] = &out[i]
+			if len(ph) > 0 {
+				ph = append(ph, ',')
+			}
+			ph = append(ph, '?')
+			ids = append(ids, out[i].ID)
+		}
+		erows, err := tx.QueryContext(ctx, `
+			SELECT e.alert_id, e.id, e.condition_id, e.target_id, e.target_name, e.target_addr, e.probe_kind,
+			       e.metric_kind, e.comparator, e.threshold, e.value, e.observed_at,
+			       CASE WHEN a.state='firing' AND COALESCE(rcs.satisfied,0)=1 THEN 1 ELSE 0 END
+			FROM alert_evidence e
+			JOIN alerts a ON a.id = e.alert_id
+			LEFT JOIN rule_condition_state rcs ON rcs.condition_id = e.condition_id AND rcs.agent_id = a.agent_id
+			WHERE e.alert_id IN (`+string(ph)+`) ORDER BY e.observed_at`, ids...)
+		if err != nil {
+			return nil, 0, err
+		}
+		for erows.Next() {
+			var alertID string
+			var e Evidence
+			var abnormal int
+			if err := erows.Scan(&alertID, &e.ID, &e.ConditionID, &e.TargetID, &e.TargetName, &e.TargetAddr,
+				&e.ProbeKind, &e.MetricKind, &e.Comparator, &e.Threshold, &e.Value, &e.ObservedAt, &abnormal); err != nil {
+				erows.Close()
+				return nil, 0, err
+			}
+			e.CurrentlyAbnormal = abnormal == 1
+			if a := byID[alertID]; a != nil {
+				a.Evidence = append(a.Evidence, e)
+			}
+		}
+		erows.Close()
+		if err := erows.Err(); err != nil {
+			return nil, 0, err
+		}
+	}
+
+	var abnormalTargets int
+	if err := tx.QueryRowContext(ctx, `
+		SELECT COUNT(DISTINCT grc.target_id)
+		FROM alerts a
+		JOIN group_rule_conditions grc ON grc.rule_id = a.rule_id
+		JOIN rule_condition_state rcs ON rcs.condition_id = grc.id AND rcs.agent_id = a.agent_id
+		WHERE a.incident_id=? AND a.state='firing' AND rcs.satisfied=1`, incidentID).Scan(&abnormalTargets); err != nil {
+		return nil, 0, err
+	}
+
+	if out == nil {
+		out = []Alert{}
+	}
+	return out, abnormalTargets, nil
 }
 
 // query runs a read-only list on the read pool and backfills evidence in one

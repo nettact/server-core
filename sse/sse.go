@@ -1,25 +1,46 @@
-// Package sse is a minimal Server-Sent Events fan-out used to push live
-// operational-issue updates to connected consoles. It is intentionally tiny: a
-// broker holds one buffered signal channel per subscriber; a site notification is
-// a non-blocking send, and a subscriber that cannot keep up (its buffer overflows)
-// is dropped by closing its channel — the HTTP handler then ends that response and
-// the browser's EventSource reconnects. The broker carries no payload: it only
-// signals "site X changed", and the SSE handler re-queries the authoritative state
-// and writes a full, idempotent snapshot.
+// Package sse is a minimal Server-Sent Events fan-out used to push live updates
+// to connected consoles. It is intentionally tiny: a broker holds one buffered
+// event channel per subscriber; a site notification is a non-blocking send, and a
+// subscriber that cannot keep up (its buffer overflows) is dropped by closing its
+// channel — the HTTP handler then ends that response and the browser's EventSource
+// reconnects.
+//
+// Events are typed (STATUS-001): the broker now carries a small Event value so it
+// can multiplex more than one stream on one connection. Two kinds ride it:
+//
+//   - "issues" (Data nil) — a signal only; the SSE handler re-queries the
+//     authoritative operational-issue state and writes a full, idempotent
+//     snapshot, exactly as before.
+//   - "target.status.changed" (Data set) — the precise affected-id payload, written
+//     to the client verbatim so it can coalesce a batch refresh.
 package sse
 
 import "sync"
 
-// subChanCap bounds a subscriber's pending signals before it is treated as a slow
+// subChanCap bounds a subscriber's pending events before it is treated as a slow
 // consumer and dropped.
 const subChanCap = 64
 
-type sub struct {
-	siteID string
-	ch     chan struct{}
+// Well-known SSE event names carried by Event.Name.
+const (
+	EventIssues              = "issues"
+	EventTargetStatusChanged = "target.status.changed"
+)
+
+// Event is one server-sent event to fan out to a site's subscribers. Name is the
+// SSE event name; Data is the pre-marshaled JSON payload written verbatim, or nil
+// when the handler should re-query authoritative state (the issues snapshot).
+type Event struct {
+	Name string
+	Data []byte
 }
 
-// Broker fans site-change signals out to per-connection subscribers.
+type sub struct {
+	siteID string
+	ch     chan Event
+}
+
+// Broker fans typed site events out to per-connection subscribers.
 type Broker struct {
 	mu   sync.Mutex
 	subs map[int]*sub
@@ -32,14 +53,14 @@ func NewBroker() *Broker {
 }
 
 // Subscribe registers a subscriber for a site and returns its id plus a
-// receive-only channel that fires (a) on every Notify for the site and (b) is
+// receive-only channel that delivers every Event notified for the site and is
 // closed when the subscriber is dropped (overflow) or Unsubscribed.
-func (b *Broker) Subscribe(siteID string) (int, <-chan struct{}) {
+func (b *Broker) Subscribe(siteID string) (int, <-chan Event) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	id := b.next
 	b.next++
-	s := &sub{siteID: siteID, ch: make(chan struct{}, subChanCap)}
+	s := &sub{siteID: siteID, ch: make(chan Event, subChanCap)}
 	b.subs[id] = s
 	return id, s.ch
 }
@@ -52,9 +73,9 @@ func (b *Broker) Unsubscribe(id int) {
 	b.closeLocked(id)
 }
 
-// Notify signals every subscriber of siteID. A subscriber whose buffer is full is
-// dropped (its channel closed) rather than blocking the publisher.
-func (b *Broker) Notify(siteID string) {
+// Notify delivers ev to every subscriber of siteID. A subscriber whose buffer is
+// full is dropped (its channel closed) rather than blocking the publisher.
+func (b *Broker) Notify(siteID string, ev Event) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	for id, s := range b.subs {
@@ -62,7 +83,7 @@ func (b *Broker) Notify(siteID string) {
 			continue
 		}
 		select {
-		case s.ch <- struct{}{}:
+		case s.ch <- ev:
 		default:
 			b.closeLocked(id) // slow consumer: drop it
 		}

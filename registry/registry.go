@@ -13,6 +13,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/nettact/protocol/permission"
+	"github.com/nettact/server-core/eventbus"
 	"github.com/nettact/server-core/store"
 )
 
@@ -48,28 +49,52 @@ const statusHistoryLimit = 20
 type Service struct {
 	db        *store.DB
 	maxAgents int // 0 = unlimited
+	bus       *eventbus.Bus
 }
 
-// New constructs the registry. maxAgents caps enrollment (0 = unlimited). The
+// New constructs the registry. maxAgents caps enrollment (0 = unlimited). bus may
+// be nil in tests (agent-liveness events are then simply not published). The
 // quota is a product requirement (default 50); note architecture §7/§15 advise
 // against hard-limiting Lite — it is intentionally configurable.
-func New(db *store.DB, maxAgents int) *Service {
-	return &Service{db: db, maxAgents: maxAgents}
+func New(db *store.DB, maxAgents int, bus *eventbus.Bus) *Service {
+	return &Service{db: db, maxAgents: maxAgents, bus: bus}
+}
+
+// publishLiveness emits a TopicAgentLivenessChanged so a bridge can fan an
+// online↔offline flip out to a site-wide target-status refresh (liveness affects
+// every target in the agent's scope).
+func (s *Service) publishLiveness(siteID, agentID, status string) {
+	if s.bus != nil && siteID != "" {
+		s.bus.Publish(eventbus.TopicAgentLivenessChanged,
+			eventbus.AgentLivenessChanged{SiteID: siteID, AgentID: agentID, Status: status})
+	}
+}
+
+// publishSiteStatus emits a site-wide TopicTargetStatusChanged (empty TargetIDs =
+// whole-site refresh) after a change whose scope is the entire site's target set,
+// such as an agent being deleted — its removal changes applicable_agents and the
+// aggregation of every target it was in scope for.
+func (s *Service) publishSiteStatus(siteID string) {
+	if s.bus != nil && siteID != "" {
+		s.bus.Publish(eventbus.TopicTargetStatusChanged,
+			eventbus.TargetStatusChanged{SiteID: siteID})
+	}
 }
 
 // TouchLastSeen bumps an agent's last-seen timestamp and marks it online,
-// recording an offline→online transition in the status history when the agent
-// was previously offline.
+// recording an offline→online transition in the status history (and publishing a
+// liveness event) when the agent was previously offline.
 func (s *Service) TouchLastSeen(ctx context.Context, id string) error {
 	now := time.Now().UTC()
-	var prev string
-	_ = s.db.QueryRowContext(ctx, `SELECT status FROM agents WHERE id=?`, id).Scan(&prev)
+	var prev, siteID string
+	_ = s.db.QueryRowContext(ctx, `SELECT status, site_id FROM agents WHERE id=?`, id).Scan(&prev, &siteID)
 	if _, err := s.db.ExecContext(ctx,
 		`UPDATE agents SET last_seen_at=?, status='online' WHERE id=?`, now, id); err != nil {
 		return err
 	}
 	if prev != "online" {
 		s.recordStatus(ctx, id, "online", now)
+		s.publishLiveness(siteID, id, "online")
 	}
 	return nil
 }
@@ -122,7 +147,7 @@ func (s *Service) SweepStale(ctx context.Context, threshold time.Duration, exclu
 	now := time.Now().UTC()
 	cutoff := now.Add(-threshold)
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id FROM agents WHERE revoked=0 AND status='online' AND last_seen_at IS NOT NULL AND last_seen_at < ?`, cutoff)
+		`SELECT id, site_id FROM agents WHERE revoked=0 AND status='online' AND last_seen_at IS NOT NULL AND last_seen_at < ?`, cutoff)
 	if err != nil {
 		return 0, err
 	}
@@ -130,32 +155,34 @@ func (s *Service) SweepStale(ctx context.Context, threshold time.Duration, exclu
 	for _, id := range exclude {
 		excluded[id] = true
 	}
-	var stale []string
+	type staleAgent struct{ id, siteID string }
+	var stale []staleAgent
 	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
+		var a staleAgent
+		if err := rows.Scan(&a.id, &a.siteID); err != nil {
 			rows.Close()
 			return 0, err
 		}
-		if excluded[id] {
+		if excluded[a.id] {
 			continue
 		}
-		stale = append(stale, id)
+		stale = append(stale, a)
 	}
 	rows.Close()
 	changed := 0
-	for _, id := range stale {
+	for _, a := range stale {
 		// Re-check the stale condition atomically in the UPDATE: if a keepalive
 		// touch marked the agent online (bumping last_seen_at) between the SELECT
 		// above and here, the WHERE fails and we neither flip it offline nor write
 		// a bogus history row.
 		res, err := s.db.ExecContext(ctx,
-			`UPDATE agents SET status='offline' WHERE id=? AND status='online' AND last_seen_at < ?`, id, cutoff)
+			`UPDATE agents SET status='offline' WHERE id=? AND status='online' AND last_seen_at < ?`, a.id, cutoff)
 		if err != nil {
 			return changed, err
 		}
 		if n, _ := res.RowsAffected(); n > 0 {
-			s.recordStatus(ctx, id, "offline", now)
+			s.recordStatus(ctx, a.id, "offline", now)
+			s.publishLiveness(a.siteID, a.id, "offline")
 			changed++
 		}
 	}
@@ -267,13 +294,17 @@ func (s *Service) UpdateAgent(ctx context.Context, id, displayName string) error
 
 // DeleteAgent hard-deletes an agent and the rows that belong to it. Foreign keys
 // are enforced (store.Open sets foreign_keys=ON), so FK-constrained child rows
-// (interfaces, config_versions, agent_status_history, agent_group_members,
-// monitor_status, operational_issues) must go before the agent row; the non-FK
-// per-agent tables (agent_packets, events, alerts) are cleared too so no orphaned
-// rows survive. All in one transaction.
+// (interfaces, agent_status_history, agent_group_members, monitor_status,
+// operational_issues) must go before the agent row; the non-FK per-agent tables
+// (agent_packets, events, alerts, rule_condition_state) are cleared too so no
+// orphaned rows survive. rule_condition_state keys on agent_id with no FK cascade,
+// so its per-agent live rows must be deleted explicitly here. All in one transaction.
 // Time-series data (series/samples/rollups, plus the metrics store's in-memory
 // cache) is NOT handled here — callers purge it via metrics.Store.PurgeAgent so
 // the cache stays consistent. Returns sql.ErrNoRows if no agent has that id.
+// After a successful commit it publishes a site-wide target-status refresh so
+// batch-driven consoles drop the removed agent (and its per-target contribution)
+// immediately instead of at the next unrelated event.
 func (s *Service) DeleteAgent(ctx context.Context, id string) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -281,10 +312,16 @@ func (s *Service) DeleteAgent(ctx context.Context, id string) error {
 	}
 	defer tx.Rollback()
 
+	// Capture the agent's site before its row is removed so the post-commit refresh
+	// targets the right site. A missing row surfaces as sql.ErrNoRows (not-found).
+	var siteID string
+	if err := tx.QueryRowContext(ctx, `SELECT site_id FROM agents WHERE id=?`, id).Scan(&siteID); err != nil {
+		return err
+	}
+
 	for _, stmt := range []string{
 		`DELETE FROM interfaces WHERE agent_id=?`,
 		`DELETE FROM agent_wifi WHERE agent_id=?`,
-		`DELETE FROM config_versions WHERE agent_id=?`,
 		`DELETE FROM agent_status_history WHERE agent_id=?`,
 		`DELETE FROM agent_group_members WHERE agent_id=?`,
 		`DELETE FROM monitor_status WHERE agent_id=?`,
@@ -292,6 +329,7 @@ func (s *Service) DeleteAgent(ctx context.Context, id string) error {
 		`DELETE FROM agent_packets WHERE agent_id=?`,
 		`DELETE FROM events WHERE agent_id=?`,
 		`DELETE FROM alerts WHERE agent_id=?`,
+		`DELETE FROM rule_condition_state WHERE agent_id=?`,
 	} {
 		if _, err := tx.ExecContext(ctx, stmt, id); err != nil {
 			return err
@@ -305,5 +343,9 @@ func (s *Service) DeleteAgent(ctx context.Context, id string) error {
 	if n, _ := res.RowsAffected(); n == 0 {
 		return sql.ErrNoRows
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	s.publishSiteStatus(siteID)
+	return nil
 }

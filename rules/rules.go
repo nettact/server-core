@@ -221,6 +221,11 @@ func (s *Service) Create(ctx context.Context, siteID, groupID string, r GroupRul
 		return "", err
 	}
 	committed = true
+	// A new rule's conditions can become currently satisfied on the next ingest and
+	// its rule_name feeds the status active-condition DTOs; publish so the batch
+	// status refreshes for the referenced targets. Alert/incident lifecycle is not
+	// disturbed (nothing is terminated by a create).
+	s.publishTargetStatus(siteID, ruleTargetIDs(r))
 	return id, nil
 }
 
@@ -248,15 +253,20 @@ func (s *Service) Update(ctx context.Context, r GroupRule) error {
 		// are unchanged, so per-condition state and frozen evidence stay intact and no
 		// active incident is disturbed.
 		chans, _ := json.Marshal(normStrings(r.ChannelIDs))
-		_, err := s.db.ExecContext(ctx,
-			`UPDATE group_rules SET name=?, channel_ids=? WHERE id=?`, r.Name, string(chans), r.ID)
-		return err
+		if _, err := s.db.ExecContext(ctx,
+			`UPDATE group_rules SET name=?, channel_ids=? WHERE id=?`, r.Name, string(chans), r.ID); err != nil {
+			return err
+		}
+		// A rename changes the rule_name surfaced in the status active-condition DTOs
+		// for any currently-satisfied condition; publish so the batch status refreshes
+		// the drill-down context. Lifecycle stays untouched (non-semantic edit).
+		s.publishTargetStatus(cur.SiteID, ruleTargetIDs(cur))
+		return nil
 	}
-	// Semantic change: terminate active alerts before mutating (single-writer
-	// discipline).
-	if err := s.TerminateForRule(ctx, r.ID); err != nil {
-		return err
-	}
+	// Semantic change: terminate the rule's firing alerts (configuration_changed)
+	// and replace its definition in ONE write transaction, so a status reader can
+	// never observe a terminated alert alongside the old condition set. The next
+	// telemetry ingest re-evaluates cleanly under the new definition.
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -267,6 +277,10 @@ func (s *Service) Update(ctx context.Context, r GroupRule) error {
 			_ = tx.Rollback()
 		}
 	}()
+	pub, err := s.terminateForRuleTx(ctx, tx, r.ID)
+	if err != nil {
+		return err
+	}
 	chans, _ := json.Marshal(normStrings(r.ChannelIDs))
 	if _, err := tx.ExecContext(ctx,
 		`UPDATE group_rules SET name=?, op=?, layer=?, severity=?, channel_ids=?, enabled=? WHERE id=?`,
@@ -284,7 +298,24 @@ func (s *Service) Update(ctx context.Context, r GroupRule) error {
 		return err
 	}
 	committed = true
+	if pub != nil {
+		pub(ctx)
+	}
+	s.publishTargetStatus(cur.SiteID, ruleTargetIDs(cur, r))
 	return nil
+}
+
+// ruleTargetIDs collects the distinct condition target ids of the given rules —
+// the targets whose current rule state a lifecycle change may shift, for the
+// precise status event.
+func ruleTargetIDs(rs ...GroupRule) []string {
+	var out []string
+	for _, r := range rs {
+		for _, c := range r.Conditions {
+			out = append(out, c.TargetID)
+		}
+	}
+	return out
 }
 
 // ruleSemanticChanged reports whether the edit from cur→next alters fault
@@ -339,24 +370,73 @@ func conditionKeys(cs []RuleCondition) map[string]int {
 }
 
 // SetEnabled toggles a rule. Disabling terminates its active alerts as a
-// configuration change; enabling lets the next ingest re-evaluate.
+// configuration change in the same transaction as the flip; enabling lets the
+// next ingest re-evaluate. Either way one precise status event is published.
 func (s *Service) SetEnabled(ctx context.Context, id string, enabled bool) error {
+	cur, err := s.GetRule(ctx, id)
+	if errors.Is(err, ErrNotFound) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
 	if !enabled {
-		if err := s.TerminateForRule(ctx, id); err != nil {
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
 			return err
 		}
+		committed := false
+		defer func() {
+			if !committed {
+				_ = tx.Rollback()
+			}
+		}()
+		pub, err := s.terminateForRuleTx(ctx, tx, id)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE group_rules SET enabled=0 WHERE id=?`, id); err != nil {
+			return err
+		}
+		// Clear the rule's per-Agent condition state in the same commit as the disable.
+		// Otherwise a retained satisfied=1 row survives the disable and, on re-enable,
+		// is immediately read by the status query as a current breach without any fresh
+		// telemetry. Evidence on the (now-resolved) alerts is untouched — this is live
+		// condition state, not immutable history.
+		if _, err := tx.ExecContext(ctx,
+			`DELETE FROM rule_condition_state WHERE condition_id IN (
+				SELECT id FROM group_rule_conditions WHERE rule_id=?)`, id); err != nil {
+			return err
+		}
+		if err := tx.Commit(); err != nil {
+			return err
+		}
+		committed = true
+		if pub != nil {
+			pub(ctx)
+		}
+		s.publishTargetStatus(cur.SiteID, ruleTargetIDs(cur))
+		return nil
 	}
-	_, err := s.db.ExecContext(ctx, `UPDATE group_rules SET enabled=? WHERE id=?`, boolInt(enabled), id)
-	return err
+	if _, err := s.db.ExecContext(ctx, `UPDATE group_rules SET enabled=1 WHERE id=?`, id); err != nil {
+		return err
+	}
+	s.publishTargetStatus(cur.SiteID, ruleTargetIDs(cur))
+	return nil
 }
 
 // Delete removes a rule and everything hanging off it, terminating its firing
-// alerts as a configuration change first so their incidents close cleanly. The
-// resolved alert rows and their frozen evidence are preserved as immutable
-// history: alerts.rule_id is ON DELETE SET NULL, so the reference nulls out while
-// the frozen rule_name/group_name keep the display facts.
+// alerts as a configuration change in the same transaction as the delete so their
+// incidents close cleanly. The resolved alert rows and their frozen evidence are
+// preserved as immutable history: alerts.rule_id is ON DELETE SET NULL, so the
+// reference nulls out while the frozen rule_name/group_name keep the display
+// facts. Idempotent — deleting an absent rule is a no-op.
 func (s *Service) Delete(ctx context.Context, id string) error {
-	if err := s.TerminateForRule(ctx, id); err != nil {
+	cur, err := s.GetRule(ctx, id)
+	if errors.Is(err, ErrNotFound) {
+		return nil
+	}
+	if err != nil {
 		return err
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -369,6 +449,10 @@ func (s *Service) Delete(ctx context.Context, id string) error {
 			_ = tx.Rollback()
 		}
 	}()
+	pub, err := s.terminateForRuleTx(ctx, tx, id)
+	if err != nil {
+		return err
+	}
 	// The rule delete cascades its conditions and their per-Agent state and nulls
 	// the rule_id of the (now-resolved) alert rows that referenced it, leaving the
 	// alerts and their alert_evidence intact.
@@ -379,6 +463,10 @@ func (s *Service) Delete(ctx context.Context, id string) error {
 		return err
 	}
 	committed = true
+	if pub != nil {
+		pub(ctx)
+	}
+	s.publishTargetStatus(cur.SiteID, ruleTargetIDs(cur))
 	return nil
 }
 
@@ -402,6 +490,13 @@ func insertConditions(ctx context.Context, tx *sql.Tx, ruleID string, conds []Ru
 
 var validComparators = map[string]bool{"gt": true, "gte": true, "lt": true, "lte": true, "eq": true}
 
+// validSeverities is the frozen severity enum the status API and its worst-severity
+// aggregation rank (rules/notify.go, targetstatus.severityRank). A rule whose
+// severity escapes this set could be breaching/alerting while worst_severity is
+// omitted (its rank is unknown), yielding an internally inconsistent status
+// response — so validation rejects anything outside it.
+var validSeverities = map[string]bool{"info": true, "warn": true, "error": true, "critical": true}
+
 // validate enforces the group-rule contract: a valid op, a non-empty condition
 // list, in-group target references, target-kind/metric compatibility, valid
 // comparators/bounds, and no duplicate (target, metric, comparator, threshold)
@@ -412,6 +507,9 @@ func (s *Service) validate(ctx context.Context, r GroupRule) error {
 	}
 	if strings.TrimSpace(r.Name) == "" {
 		return errors.New("rule name is required")
+	}
+	if !validSeverities[defSeverity(r.Severity)] {
+		return fmt.Errorf("invalid severity %q (must be info, warn, error or critical)", r.Severity)
 	}
 	if len(r.Conditions) == 0 {
 		return errors.New("a rule needs at least one condition")

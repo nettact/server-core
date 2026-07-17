@@ -3,8 +3,10 @@ package config
 import (
 	"context"
 	"path/filepath"
+	"sync"
 	"testing"
 
+	"github.com/nettact/server-core/eventbus"
 	"github.com/nettact/server-core/registry"
 	"github.com/nettact/server-core/store"
 )
@@ -31,9 +33,126 @@ func openConfigTestDB(t *testing.T) (*store.DB, context.Context) {
 	return db, ctx
 }
 
+func TestSetSiteTargetsIsIdempotentAndSiteSafe(t *testing.T) {
+	db, ctx := openConfigTestDB(t)
+	reg := registry.New(db, 0, nil)
+	bus := eventbus.New()
+	svc := New(db, reg, bus, nil)
+	var configEvents int
+	var statusEvents []eventbus.TargetStatusChanged
+	bus.Subscribe(eventbus.TopicConfigChanged, func(eventbus.Message) { configEvents++ })
+	bus.Subscribe(eventbus.TopicTargetStatusChanged, func(m eventbus.Message) {
+		statusEvents = append(statusEvents, m.Payload.(eventbus.TargetStatusChanged))
+	})
+	localGroup, err := svc.CreateGroup(ctx, "site_default", "local", false, true, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherGroup, err := svc.CreateGroup(ctx, "site_other", "other", false, true, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	local := ProbeTarget{ID: "local", GroupID: localGroup, Kind: "http", Name: "Before", Target: "https://local.test", Enabled: true}
+	if err := svc.SetSiteTargets(ctx, "site_default", []ProbeTarget{local}); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.SetSiteTargets(ctx, "site_other", []ProbeTarget{{ID: "foreign", GroupID: otherGroup, Kind: "dns", Target: "example.test", Enabled: true}}); err != nil {
+		t.Fatal(err)
+	}
+	configEvents = 0
+	statusEvents = nil
+	var before int
+	if err := db.QueryRowContext(ctx, `SELECT config_serial FROM sites WHERE id='site_default'`).Scan(&before); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.SetSiteTargets(ctx, "site_default", []ProbeTarget{local}); err != nil {
+		t.Fatal(err)
+	}
+	var after int
+	_ = db.QueryRowContext(ctx, `SELECT config_serial FROM sites WHERE id='site_default'`).Scan(&after)
+	if after != before {
+		t.Fatalf("identical save serial = %d, want %d", after, before)
+	}
+	if configEvents != 0 || len(statusEvents) != 0 {
+		t.Fatalf("identical save published config/status events: %d/%+v", configEvents, statusEvents)
+	}
+
+	local.Name = "After"
+	if err := svc.SetSiteTargets(ctx, "site_default", []ProbeTarget{local}); err != nil {
+		t.Fatal(err)
+	}
+	_ = db.QueryRowContext(ctx, `SELECT config_serial FROM sites WHERE id='site_default'`).Scan(&after)
+	if after != before {
+		t.Fatalf("name-only save serial = %d, want %d", after, before)
+	}
+	var name string
+	_ = db.QueryRowContext(ctx, `SELECT name FROM probe_tasks WHERE id='local'`).Scan(&name)
+	if name != "After" {
+		t.Fatalf("name = %q, want After", name)
+	}
+	if configEvents != 0 || len(statusEvents) != 1 || len(statusEvents[0].TargetIDs) != 1 || statusEvents[0].TargetIDs[0] != "local" {
+		t.Fatalf("name-only events = config:%d status:%+v", configEvents, statusEvents)
+	}
+
+	if err := svc.SetSiteTargets(ctx, "site_default", []ProbeTarget{{ID: "foreign", GroupID: localGroup, Kind: "dns", Target: "changed.test", Enabled: true}}); err == nil {
+		t.Fatal("cross-site target id was accepted")
+	}
+	var foreignSite, foreignTarget string
+	if err := db.QueryRowContext(ctx, `SELECT site_id,target FROM probe_tasks WHERE id='foreign'`).Scan(&foreignSite, &foreignTarget); err != nil {
+		t.Fatal(err)
+	}
+	if foreignSite != "site_other" || foreignTarget != "example.test" {
+		t.Fatalf("foreign target mutated to %s/%s", foreignSite, foreignTarget)
+	}
+	var localCount int
+	_ = db.QueryRowContext(ctx, `SELECT COUNT(*) FROM probe_tasks WHERE id='local' AND site_id='site_default'`).Scan(&localCount)
+	if localCount != 1 {
+		t.Fatal("rejected cross-site request changed the local replacement set")
+	}
+}
+
+func TestConcurrentTargetReplacementNeverMergesSets(t *testing.T) {
+	db, ctx := openConfigTestDB(t)
+	svc := New(db, registry.New(db, 0, nil), nil, nil)
+	const groupID = "group-default"
+	if _, err := db.ExecContext(ctx, `INSERT INTO monitor_groups(id,site_id,name,is_default,all_agents) VALUES(?,'site_default','Default',1,1)`, groupID); err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 0; i < 10; i++ {
+		start := make(chan struct{})
+		errCh := make(chan error, 2)
+		var wg sync.WaitGroup
+		for _, id := range []string{"set-a", "set-b"} {
+			id := id
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				errCh <- svc.SetSiteTargets(ctx, "site_default", []ProbeTarget{{ID: id, GroupID: groupID, Kind: "icmp", Target: id, Enabled: true}})
+			}()
+		}
+		close(start)
+		wg.Wait()
+		close(errCh)
+		for err := range errCh {
+			if err != nil {
+				t.Fatalf("concurrent replacement: %v", err)
+			}
+		}
+		got, err := svc.ListSiteTargets(ctx, "site_default")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != 1 || (got[0].ID != "set-a" && got[0].ID != "set-b") {
+			t.Fatalf("replacement merged sets: %+v", got)
+		}
+	}
+}
+
 func TestDesiredStateUsesMonitorGroupScope(t *testing.T) {
 	db, ctx := openConfigTestDB(t)
-	reg := registry.New(db, 0)
+	reg := registry.New(db, 0, nil)
 	svc := New(db, reg, nil, nil)
 
 	agid, err := reg.CreateGroup(ctx, "site_default", "agents-a")
@@ -90,7 +209,7 @@ func TestDesiredStateUsesMonitorGroupScope(t *testing.T) {
 
 func TestValidateGroupScopeRejectsBeforeMutation(t *testing.T) {
 	db, ctx := openConfigTestDB(t)
-	reg := registry.New(db, 0)
+	reg := registry.New(db, 0, nil)
 	svc := New(db, reg, nil, nil)
 	other, err := reg.CreateGroup(ctx, "site_other", "other-site")
 	if err != nil {
@@ -110,7 +229,7 @@ func TestValidateGroupScopeRejectsBeforeMutation(t *testing.T) {
 
 func TestHostAnchorIsStoredButNotPushed(t *testing.T) {
 	db, ctx := openConfigTestDB(t)
-	svc := New(db, registry.New(db, 0), nil, nil)
+	svc := New(db, registry.New(db, 0, nil), nil, nil)
 	groupID, err := svc.CreateGroup(ctx, "site_default", "all", false, true, nil)
 	if err != nil {
 		t.Fatalf("create monitor group: %v", err)
