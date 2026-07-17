@@ -102,7 +102,7 @@ func (s *Service) Bool(ctx context.Context, key string) bool {
 // Get returns the value for key, or "" if unset.
 func (s *Service) Get(ctx context.Context, key string) (string, error) {
 	var v string
-	err := s.db.QueryRowContext(ctx, `SELECT value FROM app_settings WHERE key=?`, key).Scan(&v)
+	err := s.db.Read().QueryRowContext(ctx, `SELECT value FROM app_settings WHERE key=?`, key).Scan(&v)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", nil
 	}
@@ -111,7 +111,7 @@ func (s *Service) Get(ctx context.Context, key string) (string, error) {
 
 // All returns every stored setting as a map.
 func (s *Service) All(ctx context.Context) (map[string]string, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT key, value FROM app_settings`)
+	rows, err := s.db.Read().QueryContext(ctx, `SELECT key, value FROM app_settings`)
 	if err != nil {
 		return nil, err
 	}

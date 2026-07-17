@@ -56,7 +56,7 @@ func TestTraceCohortClosesAfterMissedResolutionCallback(t *testing.T) {
 	db, ctx := openIncidentOpsTest(t)
 	seedIncidentAlert(t, db, "inc_1", "alert_1", "agent_a", "firing")
 	seedIncidentAlert(t, db, "inc_2", "alert_2", "agent_a", "firing")
-	svc := New(db, nil, nil, nil)
+	svc := New(db, nil, settings.New(db), nil)
 	plan := derivedTrace{mode: "icmp", destKey: "ip:1.1.1.1", destHost: "1.1.1.1", destIP: "1.1.1.1"}
 
 	first, created, _, err := svc.singleFlight(ctx, eventbus.EvidenceAdded{
@@ -201,5 +201,45 @@ func TestSnapshotSizeCapIncludesBaseAndEntries(t *testing.T) {
 	}
 	if len(storedBase)+len(storedPayload) != total {
 		t.Fatalf("stored bytes=%d, reported total=%d", len(storedBase)+len(storedPayload), total)
+	}
+}
+
+// TestWriteIncidentBaseDoesNotSelfDeadlockWithProductionSettings exercises the
+// real server-lite wiring shape: a non-nil settings service is consulted while
+// the fault engine already owns the database's single write connection. Settings
+// reads must use the read pool; using the write handle waits forever for the
+// surrounding transaction to release its own connection.
+func TestWriteIncidentBaseDoesNotSelfDeadlockWithProductionSettings(t *testing.T) {
+	db, ctx := openIncidentOpsTest(t)
+	now := time.Now().UTC()
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin tx: %v", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO incidents(id,site_id,group_id,group_name,open_key,state,opened_at)
+		VALUES('inc_deadlock','site_default','group','Group','alert:deadlock','open',?)`, now); err != nil {
+		_ = tx.Rollback()
+		t.Fatalf("seed incident: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- New(db, nil, settings.New(db), nil).WriteIncidentBase(ctx, tx, "inc_deadlock", now)
+	}()
+
+	select {
+	case err := <-done:
+		_ = tx.Rollback()
+		if err != nil {
+			t.Fatalf("write incident base: %v", err)
+		}
+	case <-time.After(time.Second):
+		_ = tx.Rollback()
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+		}
+		t.Fatal("WriteIncidentBase deadlocked reading settings through the single write connection")
 	}
 }
