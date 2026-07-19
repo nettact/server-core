@@ -1260,8 +1260,9 @@ func (d Deps) handleListAlerts(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, views)
 }
 
-// handleAgentAlerts returns the alert-instance history (firing + resolved) for
-// one agent, newest first.
+// handleAgentAlerts returns one target's alert-instance history (firing +
+// resolved) for one Agent, newest first. Exactly one stable monitor id or system
+// target address is required; an unscoped Agent-wide history is not exposed.
 func (d Deps) handleAgentAlerts(w http.ResponseWriter, r *http.Request) {
 	limit := 10
 	if s := r.URL.Query().Get("limit"); s != "" {
@@ -1269,7 +1270,16 @@ func (d Deps) handleAgentAlerts(w http.ResponseWriter, r *http.Request) {
 			limit = n
 		}
 	}
-	alerts, err := d.Alert.ListForAgent(r.Context(), chi.URLParam(r, "id"), limit)
+	monitorID := r.URL.Query().Get("monitor")
+	targetAddr := r.URL.Query().Get("target")
+	if (monitorID == "") == (targetAddr == "") {
+		writeError(w, http.StatusBadRequest, "exactly one of monitor or target is required")
+		return
+	}
+	alerts, err := d.Alert.ListForAgent(r.Context(), chi.URLParam(r, "id"), alert.TargetScope{
+		MonitorID: monitorID,
+		Address:   targetAddr,
+	}, limit)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return

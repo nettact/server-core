@@ -102,14 +102,45 @@ func (s *Service) ListActive(ctx context.Context, siteID string) ([]Alert, error
 		WHERE a.site_id=? AND a.state='firing' ORDER BY a.started_at DESC`, siteID)
 }
 
-// ListForAgent returns an agent's alert-instance history (firing + resolved),
-// newest first and capped to limit, each with its frozen evidence.
-func (s *Service) ListForAgent(ctx context.Context, agentID string, limit int) ([]Alert, error) {
+// TargetScope identifies the one monitored entity whose alert history is being
+// requested. User-created monitors use their stable monitor id; system/host
+// series use the frozen target address carried by alert evidence.
+type TargetScope struct {
+	MonitorID string
+	Address   string
+}
+
+// ListForAgent returns one target's alert-instance history for an Agent (firing
+// + resolved), newest first and capped to limit. The EXISTS predicate is applied
+// before ORDER/LIMIT so unrelated recent alerts cannot displace matching rows.
+// Returned evidence is scoped too, keeping a multi-condition group alert focused
+// on the target whose history page requested it.
+func (s *Service) ListForAgent(ctx context.Context, agentID string, scope TargetScope, limit int) ([]Alert, error) {
 	if limit <= 0 || limit > 500 {
 		limit = 50
 	}
-	return s.query(ctx, `SELECT `+alertCols+` `+alertFrom+`
-		WHERE a.agent_id=? ORDER BY a.started_at DESC LIMIT ?`, agentID, limit)
+	column, value := "e.target_id", scope.MonitorID
+	if value == "" {
+		column, value = "e.target_addr", scope.Address
+	}
+	alerts, err := s.query(ctx, `SELECT `+alertCols+` `+alertFrom+`
+		WHERE a.agent_id=? AND EXISTS (
+			SELECT 1 FROM alert_evidence e WHERE e.alert_id=a.id AND `+column+`=?
+		) ORDER BY a.started_at DESC LIMIT ?`, agentID, value, limit)
+	if err != nil {
+		return nil, err
+	}
+	for i := range alerts {
+		evidence := alerts[i].Evidence[:0]
+		for _, item := range alerts[i].Evidence {
+			if (scope.MonitorID != "" && item.TargetID == scope.MonitorID) ||
+				(scope.MonitorID == "" && item.TargetAddr == scope.Address) {
+				evidence = append(evidence, item)
+			}
+		}
+		alerts[i].Evidence = evidence
+	}
+	return alerts, nil
 }
 
 // IncidentDetail returns one incident's member alerts (each with frozen evidence
