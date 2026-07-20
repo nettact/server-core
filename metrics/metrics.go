@@ -55,7 +55,25 @@ type Store struct {
 	byAgent map[string]map[int64]*seriesIdent // agent -> its series identities
 	latest  map[int64]latestVal               // series id -> newest sample
 	warmed  map[string]bool                   // agent -> identities+latest loaded from DB
+	purged  map[int64]purgeWindow             // series id -> last purged range; see UpdateLatest
 }
+
+// purgeWindow is a deleted [from, to) sample range. An UpdateLatest fold whose
+// ts lands inside it may belong to a batch that committed BEFORE the purge ran
+// (the rows are gone), so such folds re-verify against the DB instead of
+// resurrecting deleted samples in the latest cache. until bounds the guard in
+// wall-clock time; it is stamped when PurgeRange RELEASES s.mu (not when the
+// window is recorded), so a fold that spent an arbitrarily long purge blocked
+// on the mutex still finds a live guard. Only folds already in flight at purge
+// time can race, and those land within milliseconds of the unlock, so entries
+// expire quickly instead of forcing DB reads forever (a full-history purge has
+// to==maxTS). Expired entries are swept by the next fold or purge.
+type purgeWindow struct{ from, to, until int64 }
+
+// purgeGuardSeconds is how long a purge window keeps guarding folds. Generous
+// versus the actual commit→fold gap (milliseconds) yet short enough that the
+// hot ingest path returns to pure cache hits almost immediately.
+const purgeGuardSeconds = 30
 
 func New(db *store.DB) *Store {
 	return &Store{
@@ -64,6 +82,7 @@ func New(db *store.DB) *Store {
 		byAgent: make(map[string]map[int64]*seriesIdent),
 		latest:  make(map[int64]latestVal),
 		warmed:  make(map[string]bool),
+		purged:  make(map[int64]purgeWindow),
 	}
 }
 
@@ -195,6 +214,15 @@ func (s *Store) InsertSamples(ctx context.Context, tx *sql.Tx, agentID string, i
 
 // UpdateLatest folds a committed batch into the in-memory latest cache. Call
 // after the ingest transaction commits.
+//
+// Purge interleaving: ingest can commit its tx, then lose the race for s.mu to
+// a PurgeRange that deletes the just-committed rows — after which this fold
+// would resurrect a deleted sample as "latest". PurgeRange records the window
+// it deleted; any fold whose ts lands inside that window re-reads the actual
+// newest row from the DB instead of trusting the batch value. If that re-read
+// fails the cache entry is evicted (not left stale): the next reader misses the
+// cache and the next successful fold or warm-up repopulates it — a deleted
+// sample must never be served as current.
 func (s *Store) UpdateLatest(agentID string, ids map[string]int64, ms []telemetry.Metric) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -205,9 +233,39 @@ func (s *Store) UpdateLatest(agentID string, ids map[string]int64, ms []telemetr
 			continue
 		}
 		ts := m.TS.Unix()
+		if w, purgedOK := s.purged[id]; purgedOK {
+			if time.Now().Unix() > w.until {
+				delete(s.purged, id) // guard expired; no racing fold can remain in flight
+			} else if ts >= w.from && ts < w.to {
+				if err := s.refreshLatestLocked(context.Background(), id); err != nil {
+					delete(s.latest, id) // never risk serving the purged value; next fold repopulates
+				}
+				continue
+			}
+		}
 		if cur, ok := s.latest[id]; !ok || ts >= cur.ts {
 			s.latest[id] = latestVal{ts: ts, value: m.Value}
 		}
+	}
+}
+
+// refreshLatestLocked re-reads a series' newest surviving sample from the DB
+// into the latest cache (or evicts the entry when none remain). Caller holds
+// s.mu and decides how to handle a read failure.
+func (s *Store) refreshLatestLocked(ctx context.Context, id int64) error {
+	var ts int64
+	var v float64
+	err := s.db.Read().QueryRowContext(ctx,
+		`SELECT ts, value FROM samples WHERE series_id=? ORDER BY ts DESC LIMIT 1`, id).Scan(&ts, &v)
+	switch err {
+	case nil:
+		s.latest[id] = latestVal{ts: ts, value: v}
+		return nil
+	case sql.ErrNoRows:
+		delete(s.latest, id)
+		return nil
+	default:
+		return err
 	}
 }
 

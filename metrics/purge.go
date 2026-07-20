@@ -119,6 +119,7 @@ func (s *Store) PurgeSeriesIDs(ctx context.Context, ids []int64) (PurgeCounts, e
 func (s *Store) evictLocked(agent, monitor, kind, target string, configSerial int, id int64) {
 	delete(s.cache, seriesKey(agent, monitor, kind, target, configSerial))
 	delete(s.latest, id)
+	delete(s.purged, id)
 	if ag := s.byAgent[agent]; ag != nil {
 		delete(ag, id)
 	}

@@ -3,6 +3,7 @@ package metrics
 import (
 	"context"
 	"database/sql"
+	"time"
 )
 
 // rollupTiers pairs each rollup table with its bucket width (seconds). Buckets
@@ -52,6 +53,7 @@ func (s *Store) PurgeRange(ctx context.Context, ids []int64, from, to int64) (Pu
 	defer s.mu.Unlock()
 
 	var counts PurgeCounts
+	windows := make(map[int64]purgeWindow, len(ids))
 	for _, id := range ids {
 		// Raw: precise range delete.
 		res, err := s.db.ExecContext(ctx, `DELETE FROM samples WHERE series_id=? AND ts>=? AND ts<?`, id, from, to)
@@ -81,23 +83,46 @@ func (s *Store) PurgeRange(ctx context.Context, ids []int64, from, to int64) (Pu
 			}
 		}
 
+		windows[id] = purgeWindow{from: from, to: to} // until stamped below, at unlock time
+
 		// Refresh the latest cache if the newest known sample was just deleted.
 		if lv, ok := s.latest[id]; ok && lv.ts >= from && lv.ts < to {
-			var ts int64
-			var v float64
-			err := s.db.Read().QueryRowContext(ctx,
-				`SELECT ts, value FROM samples WHERE series_id=? ORDER BY ts DESC LIMIT 1`, id).Scan(&ts, &v)
-			switch err {
-			case nil:
-				s.latest[id] = latestVal{ts: ts, value: v}
-			case sql.ErrNoRows:
-				delete(s.latest, id)
-			default:
+			if err := s.refreshLatestLocked(ctx, id); err != nil {
 				return counts, err
 			}
 		}
 	}
 	_, _ = s.db.ExecContext(ctx, `PRAGMA incremental_vacuum(2000)`)
+
+	// Record the deleted windows so an in-flight ingest that committed BEFORE this
+	// purge but folds its latest-cache update AFTER it (UpdateLatest runs post-
+	// commit, outside this lock) re-verifies against the DB instead of resurrecting
+	// a just-deleted sample. The expiry is stamped HERE — after all deletes and the
+	// vacuum, just before the lock is released — so a fold that spent the whole
+	// purge blocked on s.mu still sees a live guard no matter how long the purge
+	// took. Sweeping expired entries here also bounds the map: without it, a series
+	// that never ingests again would keep its entry for the process lifetime (only
+	// UpdateLatest for the same id deletes on expiry). Entries from the most recent
+	// purge batch remain until the next purge or fold — bounded and small.
+	now := time.Now().Unix()
+	for id, w := range s.purged {
+		if now > w.until {
+			delete(s.purged, id)
+		}
+	}
+	until := now + purgeGuardSeconds
+	for id, w := range windows {
+		if prev, ok := s.purged[id]; ok { // widen over a still-pending prior window
+			if prev.from < w.from {
+				w.from = prev.from
+			}
+			if prev.to > w.to {
+				w.to = prev.to
+			}
+		}
+		w.until = until
+		s.purged[id] = w
+	}
 	return counts, nil
 }
 

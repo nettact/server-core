@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/nettact/server-core/metrics"
 )
 
 // maxTS is an upper bound past any real unix-seconds timestamp, used to clear a
@@ -198,16 +200,27 @@ func (s *Service) runItem(ctx context.Context, run jobRun, jobID string, it pend
 	}
 
 	// Delete (idempotent): a re-run resolves to fewer/zero ids and removes nothing.
+	var actual metrics.PurgeCounts
 	switch {
 	case !full:
-		_, err = s.metrics.PurgeRange(ctx, ids, run.from, run.to)
+		actual, err = s.metrics.PurgeRange(ctx, ids, run.from, run.to)
 	case keepRow:
-		_, err = s.metrics.PurgeRange(ctx, ids, 0, maxTS) // clear all data, keep the row
+		actual, err = s.metrics.PurgeRange(ctx, ids, 0, maxTS) // clear all data, keep the row
 	default:
-		_, err = s.metrics.PurgeSeriesIDs(ctx, ids)
+		actual, err = s.metrics.PurgeSeriesIDs(ctx, ids)
 	}
 	if err != nil {
 		return s.failOrCancel(ctx, jobID, it.idx, err)
+	}
+
+	// Counter precision vs crash-safety: on the normal path (the plan was measured
+	// in THIS run, moments before the delete) the delete's own result is strictly
+	// more accurate — rows may have arrived or been retention-pruned in between —
+	// so report it. On a crash re-run (hasPlan: the plan was persisted by an
+	// earlier attempt) the rows are already gone and the delete returns zero, so
+	// the persisted plan is the only truthful record.
+	if !hasPlan {
+		planned = plannedCounts{S: actual.Samples, R: actual.Rollups, E: actual.Series}
 	}
 
 	detail := fmt.Sprintf("%d samples, %d rollup rows, %d series", planned.S, planned.R, planned.E)
