@@ -101,12 +101,16 @@ func TestMonitorSeriesIsolation(t *testing.T) {
 	}
 
 	// Purging one monitor leaves the sibling intact.
-	removed, err := s.PurgeMonitor(ctx, "site_default", "probe_m1")
+	ids, err := s.ResolveSeriesIDs(ctx, "site_default", "agent_a", "probe_m1", string(telemetry.ICMPRTTms), "1.1.1.1")
 	if err != nil {
-		t.Fatalf("PurgeMonitor: %v", err)
+		t.Fatalf("ResolveSeriesIDs: %v", err)
 	}
-	if removed != 1 {
-		t.Errorf("PurgeMonitor removed %d series, want 1", removed)
+	removed, err := s.PurgeSeriesIDs(ctx, ids)
+	if err != nil {
+		t.Fatalf("PurgeSeriesIDs: %v", err)
+	}
+	if removed.Series != 1 {
+		t.Errorf("PurgeSeriesIDs removed %d series, want 1", removed.Series)
 	}
 	left, err := s.LatestByMonitor(ctx, "agent_a", string(telemetry.ICMPRTTms), "probe_m2", 0, now.Unix()-60)
 	if err != nil {

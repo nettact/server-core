@@ -29,6 +29,7 @@ import (
 	"github.com/nettact/server-core/agentws"
 	"github.com/nettact/server-core/alert"
 	"github.com/nettact/server-core/audit"
+	"github.com/nettact/server-core/cleanup"
 	"github.com/nettact/server-core/config"
 	"github.com/nettact/server-core/eventbus"
 	"github.com/nettact/server-core/hostlive"
@@ -56,6 +57,7 @@ type Deps struct {
 	Identity     *identity.Service
 	Registry     *registry.Service
 	Metrics      *metrics.Store
+	Cleanup      *cleanup.Service
 	Config       *config.Service
 	Site         *site.Service
 	Inventory    *inventory.Service
@@ -121,7 +123,13 @@ func Router(d Deps) http.Handler {
 			r.Post("/enrollment-tokens", d.handleCreateToken)
 			r.Get("/sites/{id}/targets", d.handleListTargets)
 			r.Put("/sites/{id}/targets", d.handleSetTargets)
-			r.Post("/sites/{id}/purge-target", d.handlePurgeTarget)
+			// History data cleanup: controlled series inventory, dry-run preview, and
+			// async delete jobs (whole series or a time range; one-click orphan cleanup).
+			r.Get("/sites/{id}/cleanup/series", d.handleCleanupSeries)
+			r.Post("/sites/{id}/cleanup/preview", d.handleCleanupPreview)
+			r.Post("/sites/{id}/cleanup/jobs", d.handleCreateCleanupJob)
+			r.Get("/sites/{id}/cleanup/jobs", d.handleListCleanupJobs)
+			r.Get("/cleanup/jobs/{id}", d.handleGetCleanupJob)
 			// Monitor groups own targets, their Agent execution scope and the
 			// incident-merge policy shared by all of them.
 			r.Get("/sites/{id}/monitor-groups", d.handleListMonitorGroups)
@@ -999,40 +1007,6 @@ func validateAcceptedStatuses(s string) error {
 		return errors.New("invalid accepted_statuses: " + s)
 	}
 	return nil
-}
-
-// handlePurgeTarget clears history for exactly one of: a user-created monitor
-// (monitor_id — that monitor's series across all agents), or a system-series
-// target string (target — e.g. a removed interface; monitor data is never
-// touched via the string form, so a shared target can't collateral-damage
-// another monitor).
-func (d Deps) handlePurgeTarget(w http.ResponseWriter, r *http.Request) {
-	var body struct {
-		MonitorID string `json:"monitor_id"`
-		Target    string `json:"target"`
-	}
-	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&body); err != nil ||
-		(body.MonitorID == "") == (body.Target == "") {
-		writeError(w, http.StatusBadRequest, "exactly one of monitor_id or target required")
-		return
-	}
-	siteID := chi.URLParam(r, "id")
-	var n int
-	var err error
-	var subject string
-	if body.MonitorID != "" {
-		subject = body.MonitorID
-		n, err = d.Metrics.PurgeMonitor(r.Context(), siteID, body.MonitorID)
-	} else {
-		subject = body.Target
-		n, err = d.Metrics.PurgeTarget(r.Context(), siteID, body.Target)
-	}
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	d.Audit.Log(r.Context(), "admin", "metrics.purge_target", subject, strconv.Itoa(n)+" series")
-	writeJSON(w, http.StatusOK, map[string]int{"purged_series": n})
 }
 
 func (d Deps) handleListDevices(w http.ResponseWriter, r *http.Request) {
