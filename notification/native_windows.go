@@ -6,8 +6,14 @@ import (
 	"context"
 	"encoding/base64"
 	"os/exec"
+	"syscall"
 	"unicode/utf16"
 )
+
+// createNoWindow (CREATE_NO_WINDOW) stops Windows from allocating a console
+// for powershell.exe — without it a console window flashes on every toast
+// when the parent is a GUI process (the desktop app).
+const createNoWindow = 0x08000000
 
 // NativeSupported reports whether this build can pop OS desktop notifications.
 func NativeSupported() bool { return true }
@@ -64,8 +70,10 @@ $toast = New-Object Windows.UI.Notifications.ToastNotification $doc
 [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($appId).Show($toast)`
 
 	enc := base64.StdEncoding.EncodeToString(utf16LE(script))
-	return exec.CommandContext(ctx, "powershell.exe",
-		"-NoProfile", "-NonInteractive", "-EncodedCommand", enc).Run()
+	cmd := exec.CommandContext(ctx, "powershell.exe",
+		"-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-EncodedCommand", enc)
+	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: createNoWindow, HideWindow: true}
+	return cmd.Run()
 }
 
 func utf16LE(s string) []byte {
