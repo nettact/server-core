@@ -72,7 +72,7 @@ func (s *Service) EnsureAdmin(ctx context.Context, username, password string) (U
 func (s *Service) Authenticate(ctx context.Context, username, password string) (User, error) {
 	var u User
 	var hash string
-	err := s.db.QueryRowContext(ctx,
+	err := s.db.Read().QueryRowContext(ctx,
 		`SELECT id, username, password_hash FROM users WHERE username=?`, username).
 		Scan(&u.ID, &u.Username, &hash)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -101,13 +101,16 @@ func (s *Service) CreateSession(ctx context.Context, userID string) (string, tim
 }
 
 // ValidateSession returns the user for a session id, or ErrAuth if missing/expired.
+// It reads through the read-only pool: requireSession wraps every console API
+// route, so validation must never queue behind the single write connection (a
+// long rollup/retention transaction would otherwise stall every endpoint).
 func (s *Service) ValidateSession(ctx context.Context, sessionID string) (User, error) {
 	if sessionID == "" {
 		return User{}, ErrAuth
 	}
 	var u User
 	var exp time.Time
-	err := s.db.QueryRowContext(ctx,
+	err := s.db.Read().QueryRowContext(ctx,
 		`SELECT u.id, u.username, s.expires_at FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.id=?`,
 		sessionID).Scan(&u.ID, &u.Username, &exp)
 	if errors.Is(err, sql.ErrNoRows) {

@@ -78,8 +78,11 @@ func (s *Store) allSeriesIDs(ctx context.Context) ([]int64, error) {
 	return ids, rows.Err()
 }
 
-// rollupTier downsamples src → dst for every series, one transaction per run
-// with prepared statements reused across series.
+// rollupTier downsamples src → dst for every series in chunks of series per
+// transaction. One giant transaction would hold the single write connection for
+// the whole catch-up after downtime — minutes of aggregation during which every
+// write-handle query (and thus much of the HTTP API) stalls; chunking releases
+// the writer between batches, exactly like Retention.
 func (s *Store) rollupTier(ctx context.Context, ids []int64, res, dst, src string, srcRaw bool, bucket, now int64) error {
 	upTo := alignDown(now, bucket)
 	if upTo <= 0 {
@@ -105,6 +108,33 @@ func (s *Store) rollupTier(ctx context.Context, ids []int64, res, dst, src strin
 		return err
 	}
 
+	bkt := strconv.FormatInt(bucket, 10)
+	expr := `(ts/` + bkt + `)*` + bkt
+	var aggSQL string
+	if srcRaw {
+		aggSQL = `SELECT ` + expr + `, COUNT(*), SUM(value), MIN(value), MAX(value)
+			FROM samples WHERE series_id=? AND ts>=? AND ts<? GROUP BY ` + expr
+	} else {
+		aggSQL = `SELECT ` + expr + `, SUM(cnt), SUM(total), MIN(vmin), MAX(vmax)
+			FROM ` + src + ` WHERE series_id=? AND ts>=? AND ts<? GROUP BY ` + expr
+	}
+
+	const batch = 64 // series per transaction
+	for start := 0; start < len(ids); start += batch {
+		end := start + batch
+		if end > len(ids) {
+			end = len(ids)
+		}
+		if err := s.rollupBatch(ctx, ids[start:end], states, res, dst, aggSQL, bucket, upTo); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// rollupBatch downsamples one batch of series inside a single transaction with
+// prepared statements reused across the batch.
+func (s *Store) rollupBatch(ctx context.Context, ids []int64, states map[int64]int64, res, dst, aggSQL string, bucket, upTo int64) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -116,16 +146,6 @@ func (s *Store) rollupTier(ctx context.Context, ids []int64, res, dst, src strin
 		}
 	}()
 
-	bkt := strconv.FormatInt(bucket, 10)
-	expr := `(ts/` + bkt + `)*` + bkt
-	var aggSQL string
-	if srcRaw {
-		aggSQL = `SELECT ` + expr + `, COUNT(*), SUM(value), MIN(value), MAX(value)
-			FROM samples WHERE series_id=? AND ts>=? AND ts<? GROUP BY ` + expr
-	} else {
-		aggSQL = `SELECT ` + expr + `, SUM(cnt), SUM(total), MIN(vmin), MAX(vmax)
-			FROM ` + src + ` WHERE series_id=? AND ts>=? AND ts<? GROUP BY ` + expr
-	}
 	agg, err := tx.PrepareContext(ctx, aggSQL)
 	if err != nil {
 		return err
