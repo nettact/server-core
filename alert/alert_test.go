@@ -66,3 +66,44 @@ func TestListForAgentScopesBeforeLimitAndFiltersEvidence(t *testing.T) {
 		t.Fatalf("address-scoped alerts = %+v", alerts)
 	}
 }
+
+func TestCountActive(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "alerts.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	ctx := context.Background()
+	now := time.Now().UTC()
+	if _, err := db.ExecContext(ctx, `INSERT INTO sites(id,name,created_at) VALUES('site_default','Default',?)`, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO agents(id,site_id,public_key,token_hash,status) VALUES('agent-1','site_default',x'00','h','online')`); err != nil {
+		t.Fatal(err)
+	}
+	insert := func(id, state string) {
+		t.Helper()
+		if _, err := db.ExecContext(ctx, `INSERT INTO alerts(id,agent_id,site_id,group_id,state,severity,started_at) VALUES(?,?,?,?,?,?,?)`,
+			id, "agent-1", "site_default", "group-1", state, "warn", now); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	service := New(db)
+	n, err := service.CountActive(ctx, "site_default")
+	if err != nil || n != 0 {
+		t.Fatalf("empty CountActive = %d, %v", n, err)
+	}
+
+	insert("a-firing-1", "firing")
+	insert("a-firing-2", "firing")
+	insert("a-resolved", "resolved")
+	n, err = service.CountActive(ctx, "site_default")
+	if err != nil || n != 2 {
+		t.Fatalf("CountActive = %d, %v; want 2", n, err)
+	}
+	n, err = service.CountActive(ctx, "site_other")
+	if err != nil || n != 0 {
+		t.Fatalf("other-site CountActive = %d, %v; want 0", n, err)
+	}
+}

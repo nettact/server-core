@@ -102,6 +102,14 @@ func (s *Service) ListActive(ctx context.Context, siteID string) ([]Alert, error
 		WHERE a.site_id=? AND a.state='firing' ORDER BY a.started_at DESC`, siteID)
 }
 
+// CountActive returns the number of firing alert instances for a site.
+func (s *Service) CountActive(ctx context.Context, siteID string) (int, error) {
+	var n int
+	err := s.db.Read().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM alerts WHERE site_id=? AND state='firing'`, siteID).Scan(&n)
+	return n, err
+}
+
 // TargetScope identifies the one monitored entity whose alert history is being
 // requested. User-created monitors use their stable monitor id; system/host
 // series use the frozen target address carried by alert evidence.
