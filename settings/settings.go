@@ -14,8 +14,14 @@ import (
 )
 
 // KeyConsoleBaseURL is the console's externally-reachable origin (scheme+host,
-// e.g. "http://localhost:8080"). Used to build deep links in notifications.
+// e.g. "http://localhost:12450"). Used to build deep links in notifications.
 const KeyConsoleBaseURL = "console_base_url"
+
+// KeyListenAddr is the UI-configured HTTP listen address ("host:port", host
+// limited to 127.0.0.1 or 0.0.0.0). It overrides the -addr flag and the built-in
+// default; the server resolves it at startup (standalone: next start; desktop:
+// immediate embedded restart).
+const KeyListenAddr = "listen_addr"
 
 // KeyDashboardLayout stores the instance-wide dashboard widget layout. The
 // authenticated console reads the same value from every browser connected to

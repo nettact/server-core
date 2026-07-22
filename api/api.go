@@ -77,6 +77,24 @@ type Deps struct {
 	SPA          http.Handler          // optional embedded web UI (served for non-/api routes)
 	Dev          bool                  // relax CORS for the Vite origin
 	SecureCookie bool                  // set Secure on the session cookie (production/HTTPS)
+
+	// ListenStatus reports how the running server is actually bound (nil when the
+	// host doesn't provide one, e.g. bare server-core tests).
+	ListenStatus func(ctx context.Context) *ListenStatus
+	// ApplyListenAddr is non-nil only in desktop mode: it triggers an embedded
+	// server restart onto the newly saved listen address (asynchronously, after
+	// the settings PUT response is written).
+	ApplyListenAddr func(ctx context.Context, addr string) error
+}
+
+// ListenStatus describes the server's actual listen binding for server-info.
+type ListenStatus struct {
+	EffectiveAddr string `json:"effective_addr"`
+	Source        string `json:"source"` // "default" | "flag" | "db"
+	Desktop       bool   `json:"desktop"`
+	PendingAddr   string `json:"pending_addr,omitempty"`  // stored setting differing from the effective bind
+	FallbackFrom  string `json:"fallback_from,omitempty"` // configured addr that failed to bind at startup
+	OverridesFlag bool   `json:"overrides_flag"`          // Source=="db" while an explicit -addr flag was passed
 }
 
 func Router(d Deps) http.Handler {
@@ -240,14 +258,22 @@ func (d Deps) handleMe(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, u)
 }
 
-// handleServerInfo reports the host OS and whether native desktop notifications
-// are available on this build, so the UI can conditionally offer the "system"
-// notification channel.
+// handleServerInfo reports the host OS, whether native desktop notifications
+// are available on this build, and (when the host provides it) the listen
+// binding status so the UI can show effective vs pending listen settings.
 func (d Deps) handleServerInfo(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{
+	out := map[string]any{
 		"os":            runtime.GOOS,
 		"native_notify": notification.NativeSupported(),
-	})
+	}
+	if d.ListenStatus != nil {
+		ls := d.ListenStatus(r.Context())
+		if v, _ := d.Settings.Get(r.Context(), settings.KeyListenAddr); v != "" && v != ls.EffectiveAddr {
+			ls.PendingAddr = v
+		}
+		out["listen"] = ls
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 func (d Deps) requireSession(next http.Handler) http.Handler {
@@ -1573,7 +1599,7 @@ func (d Deps) handleCreateChannel(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleGetSettings returns public UI settings as a flat map (e.g.
-// {"console_base_url": "http://localhost:8080"}).
+// {"console_base_url": "http://localhost:12450"}).
 func (d Deps) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 	all, err := d.Settings.All(r.Context())
 	if err != nil {
@@ -1589,13 +1615,16 @@ func (d Deps) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 }
 
 // knownSettingKeys is the allow-list of settings the generic settings API may
-// expose or write: the console base URL plus every incident-snapshot / diagnostic
-// integer knob (settings.IntKeys). Internal values such as the dashboard layout
-// use dedicated APIs.
+// expose or write: the console base URL, the listen address, plus every
+// incident-snapshot / diagnostic integer knob (settings.IntKeys). Internal
+// values such as the dashboard layout use dedicated APIs.
 var knownSettingKeys = buildKnownSettingKeys()
 
 func buildKnownSettingKeys() map[string]bool {
-	m := map[string]bool{settings.KeyConsoleBaseURL: true}
+	m := map[string]bool{
+		settings.KeyConsoleBaseURL: true,
+		settings.KeyListenAddr:     true,
+	}
 	for k := range settings.IntKeys {
 		m[k] = true
 	}
@@ -1604,8 +1633,9 @@ func buildKnownSettingKeys() map[string]bool {
 
 // handleUpdateSettings merges the posted keys. Only known keys are accepted;
 // console_base_url is validated to be an absolute http(s) origin without a query
-// or fragment (or empty to clear it), and every integer knob is range-checked
-// against its registered bounds.
+// or fragment (or empty to clear it), listen_addr is validated (host allow-list,
+// port range, bind probe) and reports its effect timing in the response, and
+// every integer knob is range-checked against its registered bounds.
 func (d Deps) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	var body map[string]string
 	if err := json.NewDecoder(io.LimitReader(r.Body, 8192)).Decode(&body); err != nil {
@@ -1629,6 +1659,29 @@ func (d Deps) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		}
 		body[settings.KeyConsoleBaseURL] = v
 	}
+	listenChanged := false
+	var listenNew string
+	if v, ok := body[settings.KeyListenAddr]; ok {
+		v = strings.TrimSpace(v)
+		if v != "" {
+			var effective string
+			if d.ListenStatus != nil {
+				effective = d.ListenStatus(r.Context()).EffectiveAddr
+			}
+			if msg := validateListenAddr(v, effective); msg != "" {
+				writeError(w, http.StatusBadRequest, msg)
+				return
+			}
+		}
+		body[settings.KeyListenAddr] = v
+		cur, err := d.Settings.Get(r.Context(), settings.KeyListenAddr)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		listenChanged = v != cur
+		listenNew = v
+	}
 	// Range-check the integer knobs against their registered bounds; normalize the
 	// stored form to the parsed integer.
 	for k, v := range body {
@@ -1651,7 +1704,59 @@ func (d Deps) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	d.Audit.Log(r.Context(), "admin", "settings.update", "", "")
+	if listenChanged {
+		if d.ApplyListenAddr != nil {
+			if err := d.ApplyListenAddr(r.Context(), listenNew); err != nil {
+				writeError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]any{"ok": true, "listen_effect": "restarting"})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "listen_effect": "pending"})
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+// validateListenAddr checks a listen_addr setting value: "host:port" with host
+// restricted to 127.0.0.1 (loopback) or 0.0.0.0 (all interfaces) and a port in
+// 1-65535. When the requested port differs from the currently bound one it also
+// probes with a real bind so "port in use" and "permission denied" fail at save
+// time (best-effort: the port can still be taken before the restart — the
+// startup fallback in liteserver covers that). Returns "" when valid, else a
+// user-facing error message.
+func validateListenAddr(v, effectiveAddr string) string {
+	host, portStr, err := net.SplitHostPort(v)
+	if err != nil {
+		return "listen_addr must be host:port, e.g. 127.0.0.1:12450"
+	}
+	if host != "127.0.0.1" && host != "0.0.0.0" {
+		return "listen_addr host must be 127.0.0.1 (local only) or 0.0.0.0 (all interfaces)"
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil || port < 1 || port > 65535 {
+		return "listen_addr port must be an integer in 1-65535"
+	}
+	// Same port as the current bind: the server itself holds it, so a probe would
+	// false-positive; a pure mode flip (127.0.0.1 <-> 0.0.0.0) needs no probe.
+	if _, curPort, err := net.SplitHostPort(effectiveAddr); err == nil && curPort == portStr {
+		return ""
+	}
+	ln, err := net.Listen("tcp", v)
+	if err != nil {
+		msg := err.Error()
+		switch {
+		case strings.Contains(msg, "address already in use") || strings.Contains(msg, "Only one usage of each socket address"):
+			return "port " + portStr + " is already in use by another program"
+		case strings.Contains(msg, "permission denied") || strings.Contains(msg, "access permissions"):
+			return "binding port " + portStr + " was denied (insufficient permission)"
+		default:
+			return "cannot listen on " + v + ": " + msg
+		}
+	}
+	_ = ln.Close()
+	return ""
 }
 
 func (d Deps) handleUpdateChannel(w http.ResponseWriter, r *http.Request) {
