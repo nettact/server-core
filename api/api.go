@@ -192,6 +192,8 @@ func Router(d Deps) http.Handler {
 			r.Put("/settings", d.handleUpdateSettings)
 			r.Get("/dashboard-layout", d.handleGetDashboardLayout)
 			r.Put("/dashboard-layout", d.handleUpdateDashboardLayout)
+			r.Get("/onboarding", d.handleGetOnboardingState)
+			r.Put("/onboarding", d.handleUpdateOnboardingState)
 		})
 	})
 
@@ -1617,7 +1619,7 @@ func (d Deps) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 // knownSettingKeys is the allow-list of settings the generic settings API may
 // expose or write: the console base URL, the listen address, plus every
 // incident-snapshot / diagnostic integer knob (settings.IntKeys). Internal
-// values such as the dashboard layout use dedicated APIs.
+// values such as the dashboard layout and onboarding state use dedicated APIs.
 var knownSettingKeys = buildKnownSettingKeys()
 
 func buildKnownSettingKeys() map[string]bool {

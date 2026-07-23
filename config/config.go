@@ -474,31 +474,6 @@ func reconcileGroupScope(ctx context.Context, tx txExec, groupID, siteID string,
 
 // ---- targets ----
 
-// SeedDefaults inserts a few public ICMP targets plus a default-NIC gateway
-// monitor for a site if it has none, all in the site's default monitor group, so
-// agents get useful public-reachability and LAN-gateway monitoring out of the box.
-func (s *Service) SeedDefaults(ctx context.Context, siteID string) error {
-	defaultID, err := s.EnsureDefaultGroup(ctx, siteID)
-	if err != nil {
-		return err
-	}
-	var n int
-	if err := s.db.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM probe_tasks WHERE site_id=?`, siteID).Scan(&n); err != nil {
-		return err
-	}
-	if n > 0 {
-		return nil
-	}
-	defaults := []ProbeTarget{
-		{Kind: "icmp", Target: "1.1.1.1", Enabled: true, GroupID: defaultID},
-		{Kind: "icmp", Target: "8.8.8.8", Enabled: true, GroupID: defaultID},
-		{Kind: "icmp", Target: "223.5.5.5", Enabled: true, GroupID: defaultID},
-		{Kind: "gateway", Target: "gateway", Enabled: true, GroupID: defaultID},
-	}
-	return s.SetSiteTargets(ctx, siteID, defaults)
-}
-
 // ListSiteTargets returns the site's monitoring targets (each with its owning
 // monitor group id) for the management UI.
 func (s *Service) ListSiteTargets(ctx context.Context, siteID string) ([]ProbeTarget, error) {
@@ -545,7 +520,7 @@ func (s *Service) ListSiteTargets(ctx context.Context, siteID string) ([]ProbeTa
 // precise target.status.changed so the batch exposes the new user-visible name.
 func (s *Service) SetSiteTargets(ctx context.Context, siteID string, targets []ProbeTarget) error {
 	// Resolve/assign the default group so a target may omit group_id (it lands in
-	// the default group) — used by SeedDefaults and lenient API callers.
+	// the default group) — used by lenient API callers.
 	defaultID, err := s.defaultGroupID(ctx, siteID)
 	if err != nil {
 		return err

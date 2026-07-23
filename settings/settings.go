@@ -28,6 +28,12 @@ const KeyListenAddr = "listen_addr"
 // this server instance.
 const KeyDashboardLayout = "dashboard_layout"
 
+// KeyOnboardingState stores the console's first-run onboarding progress
+// (structured JSON: status/step/selected regions/banner state). It is served
+// through dedicated /api/v1/onboarding endpoints and is never exposed through
+// the generic settings API.
+const KeyOnboardingState = "onboarding_state"
+
 // Incident-snapshot (INCIDENT-002) and diagnostic-traceroute (DIAG-001) tuning
 // knobs, plus evidence retention. Each is a UI-editable, server-validated int
 // setting stored in app_settings; the bounds and defaults live in one table
