@@ -13,6 +13,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -185,8 +186,10 @@ func Router(d Deps) http.Handler {
 			r.Delete("/group-rules/{id}", d.handleDeleteGroupRule)
 			r.Get("/channels", d.handleListChannels)
 			r.Post("/channels", d.handleCreateChannel)
+			r.Post("/channels/test", d.handleTestChannel)
 			r.Put("/channels/{id}", d.handleUpdateChannel)
 			r.Delete("/channels/{id}", d.handleDeleteChannel)
+			r.Post("/channels/{id}/apply-to-all", d.handleApplyChannelToAllRules)
 			// Global server settings (e.g. console_base_url for notification links).
 			r.Get("/settings", d.handleGetSettings)
 			r.Put("/settings", d.handleUpdateSettings)
@@ -1569,6 +1572,60 @@ func decodeGroupRule(w http.ResponseWriter, r *http.Request) (rules.GroupRule, b
 
 // ---- notification channels ----
 
+// maxChannelBodyBytes bounds channel create/update/test request bodies. Webhook
+// channels can carry a custom header set and a body template, so the limit sits
+// well above the few-hundred-byte email/system configs.
+const maxChannelBodyBytes = 32 << 10
+
+// methodPattern / headerNamePattern validate a webhook's custom HTTP method and
+// header names (RFC 7230 token charset for names).
+var (
+	methodPattern     = regexp.MustCompile(`^[A-Z]{1,16}$`)
+	headerNamePattern = regexp.MustCompile("^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
+)
+
+// validateWebhookConfig checks a webhook channel's config and returns a
+// user-facing error message, or "" when valid. The url may embed {{variables}},
+// so it is prefix-checked rather than fully parsed.
+func validateWebhookConfig(cfg map[string]string) string {
+	u := strings.TrimSpace(cfg["url"])
+	if u == "" {
+		return "webhook url is required"
+	}
+	if !strings.HasPrefix(u, "http://") && !strings.HasPrefix(u, "https://") {
+		return "webhook url must start with http:// or https://"
+	}
+	if m := strings.TrimSpace(cfg["method"]); m != "" && !methodPattern.MatchString(m) {
+		return "method must be 1-16 uppercase letters"
+	}
+	if raw := strings.TrimSpace(cfg["headers"]); raw != "" {
+		var hdrs map[string]string
+		if json.Unmarshal([]byte(raw), &hdrs) != nil {
+			return "headers must be a JSON object of string values"
+		}
+		for k, v := range hdrs {
+			if !headerNamePattern.MatchString(k) {
+				return "invalid header name: " + k
+			}
+			if strings.ContainsAny(v, "\r\n") {
+				return "header value must not contain CR or LF"
+			}
+		}
+	}
+	return ""
+}
+
+// webhookAuditDetail reduces a webhook URL to a non-secret identifier for the
+// audit log: scheme://host only. Many providers (Slack, DingTalk) carry an
+// access token in the URL path/query, which must not be persisted to the
+// append-only audit trail. Falls back to "webhook" when the URL can't be parsed.
+func webhookAuditDetail(rawURL string) string {
+	if u, err := neturl.Parse(rawURL); err == nil && u.Host != "" {
+		return u.Scheme + "://" + u.Host
+	}
+	return "webhook"
+}
+
 func (d Deps) handleListChannels(w http.ResponseWriter, r *http.Request) {
 	chans, err := d.Notification.List(r.Context())
 	if err != nil {
@@ -1587,9 +1644,15 @@ func (d Deps) handleCreateChannel(w http.ResponseWriter, r *http.Request) {
 		Type   string            `json:"type"`
 		Config map[string]string `json:"config"`
 	}
-	if err := json.NewDecoder(io.LimitReader(r.Body, 8192)).Decode(&body); err != nil || (body.Type != "webhook" && body.Type != "email" && body.Type != "system") {
+	if err := json.NewDecoder(io.LimitReader(r.Body, maxChannelBodyBytes)).Decode(&body); err != nil || (body.Type != "webhook" && body.Type != "email" && body.Type != "system") {
 		writeError(w, http.StatusBadRequest, "type must be webhook, email or system")
 		return
+	}
+	if body.Type == "webhook" {
+		if msg := validateWebhookConfig(body.Config); msg != "" {
+			writeError(w, http.StatusBadRequest, msg)
+			return
+		}
 	}
 	id, err := d.Notification.Create(r.Context(), body.Name, body.Type, body.Config)
 	if err != nil {
@@ -1598,6 +1661,38 @@ func (d Deps) handleCreateChannel(w http.ResponseWriter, r *http.Request) {
 	}
 	d.Audit.Log(r.Context(), "admin", "channel.create", body.Type, body.Name)
 	writeJSON(w, http.StatusOK, map[string]string{"id": id})
+}
+
+// handleTestChannel sends a sample incident to a webhook config WITHOUT saving a
+// channel, so an operator can validate a custom method / headers / body template
+// from the add or edit form. Only webhook channels are testable. The request
+// always returns 200 with the delivery outcome — a delivery failure is a result,
+// not an API error.
+func (d Deps) handleTestChannel(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Type   string            `json:"type"`
+		Config map[string]string `json:"config"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, maxChannelBodyBytes)).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid body")
+		return
+	}
+	if body.Type != "webhook" {
+		writeError(w, http.StatusBadRequest, "only webhook channels can be tested")
+		return
+	}
+	if msg := validateWebhookConfig(body.Config); msg != "" {
+		writeError(w, http.StatusBadRequest, msg)
+		return
+	}
+	p := notification.SampleWebhookPayload(d.Settings.ConsoleBaseURL(r.Context()))
+	status, snippet, err := d.Notification.TestWebhook(r.Context(), body.Config, p)
+	d.Audit.Log(r.Context(), "admin", "channel.test", body.Type, webhookAuditDetail(body.Config["url"]))
+	resp := map[string]any{"ok": err == nil && status < 300, "status_code": status, "body": snippet}
+	if err != nil {
+		resp["error"] = err.Error()
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // handleGetSettings returns public UI settings as a flat map (e.g.
@@ -1767,11 +1862,30 @@ func (d Deps) handleUpdateChannel(w http.ResponseWriter, r *http.Request) {
 		Enabled bool              `json:"enabled"`
 		Config  map[string]string `json:"config"` // nil/omitted = keep existing
 	}
-	if err := json.NewDecoder(io.LimitReader(r.Body, 8192)).Decode(&body); err != nil {
+	if err := json.NewDecoder(io.LimitReader(r.Body, maxChannelBodyBytes)).Decode(&body); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid body")
 		return
 	}
 	id := chi.URLParam(r, "id")
+	// When config is supplied for a webhook channel, validate it. The update body
+	// carries no type, so look it up (also gives a clean 404 for a bad id).
+	if body.Config != nil {
+		ch, err := d.Notification.Get(r.Context(), id)
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			writeError(w, http.StatusNotFound, "channel not found")
+			return
+		case err != nil:
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		if ch.Type == "webhook" {
+			if msg := validateWebhookConfig(body.Config); msg != "" {
+				writeError(w, http.StatusBadRequest, msg)
+				return
+			}
+		}
+	}
 	if err := d.Notification.Update(r.Context(), id, body.Name, body.Enabled, body.Config); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -1786,6 +1900,29 @@ func (d Deps) handleDeleteChannel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+// handleApplyChannelToAllRules adds this channel to every alert rule's channel
+// set — a convenience so an operator doesn't have to tick it on each rule. Only
+// future firings pick it up; open incidents keep their frozen routing. Returns
+// the number of rules changed.
+func (d Deps) handleApplyChannelToAllRules(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	switch _, err := d.Notification.Get(r.Context(), id); {
+	case errors.Is(err, sql.ErrNoRows):
+		writeError(w, http.StatusNotFound, "channel not found")
+		return
+	case err != nil:
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	n, err := d.Rules.AddChannelToAllRules(r.Context(), id)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	d.Audit.Log(r.Context(), "admin", "channel.apply_all", id, strconv.Itoa(n))
+	writeJSON(w, http.StatusOK, map[string]int{"updated": n})
 }
 
 func (d Deps) handleAgentStatusHistory(w http.ResponseWriter, r *http.Request) {

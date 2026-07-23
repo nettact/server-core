@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"mime"
 	"net/http"
@@ -75,6 +76,24 @@ func (s *Service) List(ctx context.Context) ([]Channel, error) {
 		out = append(out, redact(c))
 	}
 	return out, rows.Err()
+}
+
+// Get returns a single channel by id with its config UNREDACTED — callers like
+// the update handler need the real stored values to validate against. Returns
+// sql.ErrNoRows when the channel does not exist.
+func (s *Service) Get(ctx context.Context, id string) (Channel, error) {
+	var c Channel
+	var cfg string
+	var enabled int
+	err := s.db.QueryRowContext(ctx,
+		`SELECT id, COALESCE(name,''), type, config, enabled FROM notification_channels WHERE id=?`, id).
+		Scan(&c.ID, &c.Name, &c.Type, &cfg, &enabled)
+	if err != nil {
+		return Channel{}, err
+	}
+	_ = json.Unmarshal([]byte(cfg), &c.Config)
+	c.Enabled = enabled == 1
+	return c, nil
 }
 
 // Create adds a channel. config is stored as JSON.
@@ -160,29 +179,125 @@ type webhookBody struct {
 }
 
 func (s *Service) sendWebhook(ctx context.Context, cfg map[string]string, p Payload) {
-	url := cfg["url"]
-	if url == "" {
-		return
+	status, _, err := s.deliverWebhook(ctx, cfg, p)
+	switch {
+	case err != nil:
+		log.Printf("notify webhook %s: %v", cfg["url"], err)
+	case status >= 300:
+		log.Printf("notify webhook %s: status %d", cfg["url"], status)
+	}
+}
+
+// deliverWebhook builds and sends one webhook request from cfg and returns the
+// response status plus a short snippet of the response body (first 512 bytes).
+// It honors the channel's method / headers / URL / body template (see
+// template.go); an empty body template falls back to the default structured
+// webhookBody. The snippet lets a test send surface soft failures like
+// DingTalk's HTTP-200 errcode replies. Callers guarantee cfg["url"] is non-empty
+// (API-layer validation).
+func (s *Service) deliverWebhook(ctx context.Context, cfg map[string]string, p Payload) (int, string, error) {
+	rawURL := cfg["url"]
+	if rawURL == "" {
+		return 0, "", fmt.Errorf("webhook url is empty")
 	}
 	lang := cfg["lang"]
-	lines := RenderDetails(p.Details, lang)
-	body, _ := json.Marshal(webhookBody{
-		Payload: p,
-		Title:   RenderTitle(p, lang),
-		Text:    RenderScope(p, lang),
-		Lines:   lines,
-	})
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
-	if err != nil {
-		return
+	vars := buildVars(p, lang)
+
+	method := strings.ToUpper(strings.TrimSpace(cfg["method"]))
+	if method == "" {
+		method = http.MethodPost
 	}
-	req.Header.Set("Content-Type", "application/json")
+	target := substitute(rawURL, vars, escapeURLValue)
+
+	var body []byte
+	if strings.TrimSpace(cfg["body"]) != "" {
+		body = []byte(substitute(cfg["body"], vars, escapeJSONValue))
+	} else {
+		body, _ = json.Marshal(webhookBody{
+			Payload: p,
+			Title:   RenderTitle(p, lang),
+			Text:    RenderScope(p, lang),
+			Lines:   RenderDetails(p.Details, lang),
+		})
+	}
+
+	// GET/HEAD carry no request body.
+	sendBody := method != http.MethodGet && method != http.MethodHead
+	var reqBody io.Reader
+	if sendBody {
+		reqBody = bytes.NewReader(body)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, target, reqBody)
+	if err != nil {
+		return 0, "", err
+	}
+	// Custom headers first, so an explicit Content-Type wins over the default.
+	explicitCT := false
+	if raw := strings.TrimSpace(cfg["headers"]); raw != "" {
+		var hdrs map[string]string
+		if json.Unmarshal([]byte(raw), &hdrs) == nil {
+			for k, v := range hdrs {
+				req.Header.Set(k, substitute(v, vars, escapeHeaderValue))
+				if strings.EqualFold(k, "Content-Type") {
+					explicitCT = true
+				}
+			}
+		}
+	}
+	if sendBody && !explicitCT {
+		req.Header.Set("Content-Type", "application/json")
+	}
+
 	resp, err := s.client.Do(req)
 	if err != nil {
-		log.Printf("notify webhook %s: %v", url, err)
-		return
+		return 0, "", err
 	}
-	resp.Body.Close()
+	defer resp.Body.Close()
+	snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+	return resp.StatusCode, string(snippet), nil
+}
+
+// TestWebhook delivers p to the webhook described by cfg WITHOUT persisting a
+// channel, returning the HTTP status, a response snippet and any transport
+// error. It backs the "send test" button so an operator can validate a custom
+// method / headers / body template against sample data before saving.
+func (s *Service) TestWebhook(ctx context.Context, cfg map[string]string, p Payload) (int, string, error) {
+	return s.deliverWebhook(ctx, cfg, p)
+}
+
+// SampleWebhookPayload builds a representative payload for test sends: one
+// HTTP-503 fault on a single host, deep-linked into consoleBase when configured.
+// The event is "test" so the rendered title/text and the {{event}} variable mark
+// it clearly as a test, letting receivers distinguish it from a real incident.
+func SampleWebhookPayload(consoleBase string) Payload {
+	link := ""
+	if consoleBase != "" {
+		link = consoleBase + "/incidents?incident=inc_sample"
+	}
+	return Payload{
+		Event:          "test",
+		IncidentID:     "inc_sample",
+		SiteID:         "site_sample",
+		State:          "open",
+		Severity:       "critical",
+		Scope:          "single",
+		AgentCount:     1,
+		SuspectedLayer: "service",
+		Details: []AlertDetail{{
+			ProbeKind:  "http",
+			MetricKind: "probe.http.status",
+			Comparator: "eq",
+			Threshold:  200,
+			Value:      503,
+			TargetName: "Example Site",
+			Target:     "https://example.com",
+			Layer:      "service",
+			Severity:   "critical",
+			AgentHost:  "living-room",
+		}},
+		URL: link,
+		At:  time.Now().UTC(),
+	}
 }
 
 func (s *Service) sendEmail(cfg map[string]string, p Payload) {

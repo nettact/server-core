@@ -46,6 +46,12 @@ var layerOrder = map[string]int{"local": 0, "lan": 1, "wan": 2, "internet": 3, "
 // RenderTitle is the human headline (no machine event strings like
 // "incident.opened").
 func RenderTitle(p Payload, lang string) string {
+	if p.Event == "test" {
+		if normLang(lang) == "en" {
+			return "NetTact test notification"
+		}
+		return "NetTact 测试通知"
+	}
 	terminated := p.Event == "incident.terminated" || p.State == "terminated"
 	resolved := p.Event == "incident.resolved" || p.State == "resolved"
 	if normLang(lang) == "en" {
@@ -76,6 +82,12 @@ func RenderTitle(p Payload, lang string) string {
 // suspected root-cause layer.
 func RenderScope(p Payload, lang string) string {
 	en := normLang(lang) == "en"
+	if p.Event == "test" {
+		if en {
+			return "This is a test notification from NetTact."
+		}
+		return "这是一条来自 NetTact 的测试通知。"
+	}
 	if p.Event == "incident.terminated" || p.State == "terminated" {
 		if en {
 			return "Monitored object removed; incident terminated."

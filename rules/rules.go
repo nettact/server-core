@@ -372,6 +372,68 @@ func conditionKeys(cs []RuleCondition) map[string]int {
 // SetEnabled toggles a rule. Disabling terminates its active alerts as a
 // configuration change in the same transaction as the flip; enabling lets the
 // next ingest re-evaluate. Either way one precise status event is published.
+// AddChannelToAllRules adds channelID to every group rule's channel_ids that does
+// not already include it, returning how many rules were changed. This is a
+// channel-only (non-semantic) edit: it applies in place without terminating any
+// firing alert. Open incidents keep their frozen routing, so only future firings
+// pick up the added channel.
+func (s *Service) AddChannelToAllRules(ctx context.Context, channelID string) (int, error) {
+	if channelID == "" {
+		return 0, fmt.Errorf("channel id is empty")
+	}
+	rows, err := s.db.Read().QueryContext(ctx, `SELECT id, COALESCE(channel_ids,'[]') FROM group_rules`)
+	if err != nil {
+		return 0, err
+	}
+	type pending struct {
+		id    string
+		chans []string
+	}
+	var todo []pending
+	for rows.Next() {
+		var id, chans string
+		if err := rows.Scan(&id, &chans); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		var ids []string
+		_ = json.Unmarshal([]byte(chans), &ids)
+		if containsString(ids, channelID) {
+			continue
+		}
+		todo = append(todo, pending{id: id, chans: append(ids, channelID)})
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return 0, err
+	}
+	rows.Close()
+	if len(todo) == 0 {
+		return 0, nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+	for _, p := range todo {
+		b, _ := json.Marshal(p.chans)
+		if _, err := tx.ExecContext(ctx, `UPDATE group_rules SET channel_ids=? WHERE id=?`, string(b), p.id); err != nil {
+			return 0, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	committed = true
+	return len(todo), nil
+}
+
 func (s *Service) SetEnabled(ctx context.Context, id string, enabled bool) error {
 	cur, err := s.GetRule(ctx, id)
 	if errors.Is(err, ErrNotFound) {
@@ -604,6 +666,15 @@ func normStrings(ss []string) []string {
 		return []string{}
 	}
 	return ss
+}
+
+func containsString(ss []string, target string) bool {
+	for _, s := range ss {
+		if s == target {
+			return true
+		}
+	}
+	return false
 }
 
 func boolInt(b bool) int {
