@@ -29,10 +29,10 @@ func TestAggregateDecisionTable(t *testing.T) {
 		{"all offline", true, []agentAgg{{exec: execAgentOffline, online: false}, {exec: execAgentOffline, online: false}}, displayAgentOffline, 2},
 		{"fresh pending", true, []agentAgg{{exec: execPending, online: true}}, displayPending, 1},
 		{"expired pending", true, []agentAgg{{exec: execPending, online: true, pendingExpired: true}}, displayNoData, 1},
-		{"healthy with stale minority", true, []agentAgg{online(execCollecting, probeHealthy, ruleNormal), online(execCollecting, probeStale, ruleNormal)}, displayHealthy, 1},
+		{"healthy with stale minority", true, []agentAgg{online(execCollecting, probeHealthy, ruleNormal), online(execCollecting, probeStale, ruleNormal)}, displayHealthy, 0},
 		{"stale", true, []agentAgg{online(execCollecting, probeStale, ruleNormal)}, displayStale, 1},
 		{"no data", true, []agentAgg{online(execCollecting, probeNoData, ruleNormal)}, displayNoData, 1},
-		{"host not applicable", true, []agentAgg{online(execCollecting, probeNotApplicable, ruleNormal)}, displayHealthy, 1},
+		{"host not applicable", true, []agentAgg{online(execCollecting, probeNotApplicable, ruleNormal)}, displayHealthy, 0},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

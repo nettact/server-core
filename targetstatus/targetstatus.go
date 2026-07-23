@@ -568,7 +568,9 @@ func (s *Service) deriveAgent(t *targetRow, p applicablePair, now time.Time,
 
 // aggregate applies the fixed display-priority decision table to a target's
 // per-agent classifications, returning the target display_state and the
-// affected_agents count for that state. First matching rule wins.
+// affected_agents count — the number of agents in an abnormal state. A healthy
+// display (including host targets and healthy-with-degraded-minority) is not a
+// problem, so its affected count is 0. First matching rule wins.
 func aggregate(t *targetRow, agents []agentAgg) (string, int) {
 	if !t.enabled {
 		return displayDisabled, 0
@@ -642,14 +644,14 @@ func aggregate(t *targetRow, agents []agentAgg) (string, int) {
 	case x == 0:
 		return displayBlocked, blocked
 	case healthy > 0:
-		return displayHealthy, healthy
+		return displayHealthy, 0
 	case stale > 0:
 		return displayStale, stale
 	case nodata > 0:
 		return displayNoData, nodata
 	default:
 		// X non-empty, all not_applicable (host targets collecting normally).
-		return displayHealthy, x
+		return displayHealthy, 0
 	}
 }
 
