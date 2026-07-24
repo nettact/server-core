@@ -121,6 +121,7 @@ func Router(d Deps) http.Handler {
 		r.Group(func(r chi.Router) {
 			r.Use(d.requireSession)
 			r.Post("/auth/logout", d.handleLogout)
+			r.Post("/auth/password", d.handleChangePassword)
 			r.Get("/auth/me", d.handleMe)
 			r.Get("/server-info", d.handleServerInfo)
 			r.Get("/quota", d.handleQuota)
@@ -231,13 +232,16 @@ func (d Deps) handleLogin(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid body")
 		return
 	}
-	u, err := d.Identity.Authenticate(r.Context(), body.Username, body.Password)
+	// LoginSession verifies the password and mints the session atomically, so a
+	// password change racing this login can't hand out a session for the old
+	// password. A bad credential (or a password rotated mid-login) is ErrAuth →
+	// 401; anything else is a real server error.
+	u, sid, exp, err := d.Identity.LoginSession(r.Context(), body.Username, body.Password)
 	if err != nil {
-		writeError(w, http.StatusUnauthorized, "invalid credentials")
-		return
-	}
-	sid, exp, err := d.Identity.CreateSession(r.Context(), u.ID)
-	if err != nil {
+		if errors.Is(err, identity.ErrAuth) {
+			writeError(w, http.StatusUnauthorized, "invalid credentials")
+			return
+		}
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -264,6 +268,47 @@ func (d Deps) handleLogout(w http.ResponseWriter, r *http.Request) {
 		_ = d.Identity.DeleteSession(r.Context(), c.Value)
 	}
 	http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: "", Path: "/", HttpOnly: true, MaxAge: -1})
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+// handleChangePassword rotates the logged-in admin's password. UpdatePassword
+// verifies the current password, applies the policy to the new one, swaps the
+// hash and revokes every OTHER session — all in one transaction — so any other
+// logged-in client is forced to re-authenticate while this session survives.
+// Runs under requireSession, so a valid session is guaranteed; the session id is
+// re-read here to identify the user and to mark which session to keep.
+//
+// A wrong old password is 403 "invalid old password" — deliberately distinct
+// from requireSession's 401 "login required" so the console can tell "your
+// session lapsed, log in again" apart from "that current-password field is
+// wrong" and route the user accordingly.
+func (d Deps) handleChangePassword(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		OldPassword string `json:"old_password"`
+		NewPassword string `json:"new_password"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid body")
+		return
+	}
+	sid := cookieVal(r, sessionCookie)
+	u, err := d.Identity.ValidateSession(r.Context(), sid)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, "login required")
+		return
+	}
+	switch err := d.Identity.UpdatePassword(r.Context(), u.ID, body.OldPassword, body.NewPassword, sid); {
+	case errors.Is(err, identity.ErrAuth):
+		writeError(w, http.StatusForbidden, "invalid old password")
+		return
+	case errors.Is(err, identity.ErrPasswordPolicy):
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	case err != nil:
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	d.Audit.Log(r.Context(), u.Username, "auth.password_changed", "", "")
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
