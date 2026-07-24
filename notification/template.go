@@ -23,6 +23,7 @@ var varPattern = regexp.MustCompile(`\{\{\s*([a-z_]+)\s*\}\}`)
 //	lines            per-target fault sentences, newline-joined
 //	target           worst-first primary target name
 //	targets          distinct target names, worst-first, comma-joined
+//	agents           agent names for a connectivity event, comma-joined
 //	event/state/severity/scope/incident_id/site_id/suspected_layer/url  raw Payload fields
 //	agent_count      number of distinct alerting agents
 //	at               incident time, RFC3339
@@ -46,13 +47,23 @@ func buildVars(p Payload, lang string) map[string]string {
 	if len(targets) > 0 {
 		target = targets[0]
 	}
+	// agents: names present in a connectivity event, comma-joined.
+	var agentNames []string
+	for _, a := range p.Agents {
+		name := a.Name
+		if name == "" {
+			name = a.AgentID
+		}
+		agentNames = append(agentNames, name)
+	}
 	return map[string]string{
 		"title":           RenderTitle(p, lang),
 		"text":            RenderScope(p, lang),
 		"summary":         RenderSummary(p, lang),
-		"lines":           strings.Join(RenderDetails(p.Details, lang), "\n"),
+		"lines":           strings.Join(RenderLines(p, lang), "\n"),
 		"target":          target,
 		"targets":         strings.Join(targets, ", "),
+		"agents":          strings.Join(agentNames, ", "),
 		"event":           p.Event,
 		"state":           p.State,
 		"severity":        p.Severity,

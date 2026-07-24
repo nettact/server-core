@@ -27,6 +27,8 @@ import (
 	"github.com/nettact/protocol/permission"
 	"github.com/nettact/protocol/telemetry"
 	"github.com/nettact/protocol/wire"
+	"github.com/nettact/server-core/agentalert"
+	"github.com/nettact/server-core/agentstatus"
 	"github.com/nettact/server-core/agentws"
 	"github.com/nettact/server-core/alert"
 	"github.com/nettact/server-core/audit"
@@ -72,6 +74,8 @@ type Deps struct {
 	HostLive     *hostlive.Store       // in-memory live process/connection snapshots (never persisted)
 	OpIssue      *opissue.Service      // operational-issue engine (monitor status + issues)
 	TargetStatus *targetstatus.Service // authoritative current target-status aggregation (read-time)
+	AgentStatus  *agentstatus.Service  // per-agent health/resource rollup for the Agent status list (read-time)
+	AgentAlert   *agentalert.Engine    // agent offline/recovery connectivity-alert engine
 	SSE          *sse.Broker           // Server-Sent Events fan-out for live issue + target-status updates
 	AgentWS      *agentws.Hub          // persistent agent WebSocket channel (telemetry + config downlink)
 	Bus          *eventbus.Bus         // TopicConfigChanged for config mutations outside config.Service (group scope edits)
@@ -163,6 +167,10 @@ func Router(d Deps) http.Handler {
 			r.Get("/issues/unread-count", d.handleIssuesUnreadCount)
 			// Authoritative current status for every target of a site, in one batch.
 			r.Get("/sites/{id}/target-statuses", d.handleTargetStatuses)
+			// Per-agent health + resource rollup for the Agent status list (AGENT-001),
+			// and the agent connectivity alert history (AGENT-002).
+			r.Get("/sites/{id}/agent-statuses", d.handleAgentStatuses)
+			r.Get("/agent-alerts", d.handleListConnAlerts)
 			// Server-Sent Events stream for live issue + target-status updates.
 			r.Get("/events", d.handleEvents)
 			// Agent groups: named sets of agents that scope monitoring targets.
@@ -497,24 +505,49 @@ func (d Deps) handleGetAgent(w http.ResponseWriter, r *http.Request) {
 
 func (d Deps) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
+	// Pointer fields distinguish "omitted" from a zero value, so a mute-only
+	// patch never clears the display name and vice versa.
 	var body struct {
-		DisplayName string `json:"display_name"`
+		DisplayName             *string `json:"display_name"`
+		ConnectivityAlertsMuted *bool   `json:"connectivity_alerts_muted"`
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&body); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid body")
 		return
 	}
-	if err := d.Registry.UpdateAgent(r.Context(), id, body.DisplayName); err != nil {
+	if body.DisplayName != nil {
+		if err := d.Registry.UpdateAgent(r.Context(), id, *body.DisplayName); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				writeError(w, http.StatusNotFound, "agent not found")
+				return
+			}
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		d.Audit.Log(r.Context(), "admin", "agent.update", id, *body.DisplayName)
+	}
+	if body.ConnectivityAlertsMuted != nil {
+		if err := d.Registry.SetConnectivityMuted(r.Context(), id, *body.ConnectivityAlertsMuted); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				writeError(w, http.StatusNotFound, "agent not found")
+				return
+			}
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		// Muting closes any firing connectivity alert immediately (no notification);
+		// unmuting lets the next engine tick reopen if still offline past grace.
+		if d.AgentAlert != nil {
+			d.AgentAlert.OnMuteChanged(r.Context(), id, *body.ConnectivityAlertsMuted)
+		}
+		d.Audit.Log(r.Context(), "admin", "agent.mute", id, strconv.FormatBool(*body.ConnectivityAlertsMuted))
+	}
+	a, err := d.Registry.Get(r.Context(), id)
+	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			writeError(w, http.StatusNotFound, "agent not found")
 			return
 		}
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	d.Audit.Log(r.Context(), "admin", "agent.update", id, body.DisplayName)
-	a, err := d.Registry.Get(r.Context(), id)
-	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -1719,8 +1752,10 @@ var knownSettingKeys = buildKnownSettingKeys()
 
 func buildKnownSettingKeys() map[string]bool {
 	m := map[string]bool{
-		settings.KeyConsoleBaseURL: true,
-		settings.KeyListenAddr:     true,
+		settings.KeyConsoleBaseURL:       true,
+		settings.KeyListenAddr:           true,
+		settings.KeyAgentAlertSeverity:   true, // string; validated explicitly below
+		settings.KeyAgentAlertChannelIDs: true, // string (JSON array); validated explicitly below
 	}
 	for k := range settings.IntKeys {
 		m[k] = true
@@ -1778,6 +1813,36 @@ func (d Deps) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		}
 		listenChanged = v != cur
 		listenNew = v
+	}
+	// Agent connectivity-alert severity: a fixed enum, or "" to clear (= warn).
+	if v, ok := body[settings.KeyAgentAlertSeverity]; ok {
+		v = strings.TrimSpace(v)
+		switch v {
+		case "", "info", "warn", "error", "critical":
+		default:
+			writeError(w, http.StatusBadRequest, "agent_alert_severity must be one of info|warn|error|critical")
+			return
+		}
+		body[settings.KeyAgentAlertSeverity] = v
+	}
+	// Agent connectivity-alert channel IDs: a JSON array of non-empty strings, or
+	// "" to clear (= all enabled channels).
+	if v, ok := body[settings.KeyAgentAlertChannelIDs]; ok {
+		v = strings.TrimSpace(v)
+		if v != "" {
+			var ids []string
+			if json.Unmarshal([]byte(v), &ids) != nil || len(ids) > 64 {
+				writeError(w, http.StatusBadRequest, "agent_alert_channel_ids must be a JSON array of up to 64 channel ids")
+				return
+			}
+			for _, id := range ids {
+				if strings.TrimSpace(id) == "" {
+					writeError(w, http.StatusBadRequest, "agent_alert_channel_ids must not contain empty ids")
+					return
+				}
+			}
+		}
+		body[settings.KeyAgentAlertChannelIDs] = v
 	}
 	// Range-check the integer knobs against their registered bounds; normalize the
 	// stored form to the parsed integer.

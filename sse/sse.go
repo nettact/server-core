@@ -25,6 +25,11 @@ const subChanCap = 64
 const (
 	EventIssues              = "issues"
 	EventTargetStatusChanged = "target.status.changed"
+	// EventAgentStatusChanged (Data set: {"site_id":...}) signals that a site's
+	// agent-status list changed (liveness flip, connectivity alert, or a rule
+	// alert/issue affecting an agent). Written verbatim; the console coalesces and
+	// refetches the whole agent-status list.
+	EventAgentStatusChanged = "agent.status.changed"
 )
 
 // Event is one server-sent event to fan out to a site's subscribers. Name is the

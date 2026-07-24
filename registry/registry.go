@@ -36,12 +36,21 @@ type Agent struct {
 	PolicyHash   string     `json:"policy_hash"`
 	LastSeenAt   *time.Time `json:"last_seen_at"`
 	CreatedAt    time.Time  `json:"created_at"`
+	// Connectivity provenance (AGENT-001/002): FirstConnectedAt is nil until the
+	// agent completes its first Hello (nil = never connected, distinct from
+	// offline). LastDisconnectKind annotates why the most recent session ended.
+	// ConnectivityAlertsMuted suppresses offline/recovery alerts for this agent.
+	FirstConnectedAt        *time.Time `json:"first_connected_at"`
+	LastDisconnectKind      string     `json:"last_disconnect_kind"`
+	ConnectivityAlertsMuted bool       `json:"connectivity_alerts_muted"`
 }
 
-// StatusEvent is one online/offline transition in an agent's history.
+// StatusEvent is one online/offline transition in an agent's history. Reason
+// carries the disconnect kind for offline transitions (” for online).
 type StatusEvent struct {
 	Status    string    `json:"status"` // online | offline
 	ChangedAt time.Time `json:"changed_at"`
+	Reason    string    `json:"reason,omitempty"`
 }
 
 const statusHistoryLimit = 20
@@ -93,10 +102,51 @@ func (s *Service) TouchLastSeen(ctx context.Context, id string) error {
 		return err
 	}
 	if prev != "online" {
-		s.recordStatus(ctx, id, "online", now)
+		s.recordStatus(ctx, id, "online", "", now)
 		s.publishLiveness(siteID, id, "online")
 	}
 	return nil
+}
+
+// MarkFirstConnected stamps first_connected_at the first time an agent completes
+// a Hello; the NULL-only WHERE makes every later connect a no-op, so the value
+// records the agent's very first connection and never moves. Until it is set the
+// status list reports the agent as never-connected rather than offline.
+func (s *Service) MarkFirstConnected(ctx context.Context, id string) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE agents SET first_connected_at=? WHERE id=? AND first_connected_at IS NULL`,
+		time.Now().UTC(), id)
+	return err
+}
+
+// RecordDisconnect stores how an agent's most recent session ended (see the
+// last_disconnect_kind vocabulary in migration 0016). The sweeper reads it when
+// it flips the agent offline, and the alert engine maps it to an alert reason.
+func (s *Service) RecordDisconnect(ctx context.Context, id, kind string) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE agents SET last_disconnect_kind=? WHERE id=?`, kind, id)
+	return err
+}
+
+// SetConnectivityMuted toggles the per-agent connectivity-alert mute switch.
+// Returns sql.ErrNoRows if no live agent has that id.
+func (s *Service) SetConnectivityMuted(ctx context.Context, id string, muted bool) error {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE agents SET connectivity_alerts_muted=? WHERE id=? AND revoked=0`, boolToInt(muted), id)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+func boolToInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
 }
 
 // UpdatePermissions refreshes an agent's reported local permission policy
@@ -147,7 +197,7 @@ func (s *Service) SweepStale(ctx context.Context, threshold time.Duration, exclu
 	now := time.Now().UTC()
 	cutoff := now.Add(-threshold)
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, site_id FROM agents WHERE revoked=0 AND status='online' AND last_seen_at IS NOT NULL AND last_seen_at < ?`, cutoff)
+		`SELECT id, site_id, COALESCE(last_disconnect_kind,'') FROM agents WHERE revoked=0 AND status='online' AND last_seen_at IS NOT NULL AND last_seen_at < ?`, cutoff)
 	if err != nil {
 		return 0, err
 	}
@@ -155,11 +205,11 @@ func (s *Service) SweepStale(ctx context.Context, threshold time.Duration, exclu
 	for _, id := range exclude {
 		excluded[id] = true
 	}
-	type staleAgent struct{ id, siteID string }
+	type staleAgent struct{ id, siteID, kind string }
 	var stale []staleAgent
 	for rows.Next() {
 		var a staleAgent
-		if err := rows.Scan(&a.id, &a.siteID); err != nil {
+		if err := rows.Scan(&a.id, &a.siteID, &a.kind); err != nil {
 			rows.Close()
 			return 0, err
 		}
@@ -181,7 +231,7 @@ func (s *Service) SweepStale(ctx context.Context, threshold time.Duration, exclu
 			return changed, err
 		}
 		if n, _ := res.RowsAffected(); n > 0 {
-			s.recordStatus(ctx, a.id, "offline", now)
+			s.recordStatus(ctx, a.id, "offline", a.kind, now)
 			s.publishLiveness(a.siteID, a.id, "offline")
 			changed++
 		}
@@ -189,16 +239,16 @@ func (s *Service) SweepStale(ctx context.Context, threshold time.Duration, exclu
 	return changed, nil
 }
 
-func (s *Service) recordStatus(ctx context.Context, agentID, status string, at time.Time) {
+func (s *Service) recordStatus(ctx context.Context, agentID, status, reason string, at time.Time) {
 	_, _ = s.db.ExecContext(ctx,
-		`INSERT INTO agent_status_history(id, agent_id, status, changed_at) VALUES(?,?,?,?)`,
-		"ash_"+uuid.NewString(), agentID, status, at)
+		`INSERT INTO agent_status_history(id, agent_id, status, reason, changed_at) VALUES(?,?,?,?,?)`,
+		"ash_"+uuid.NewString(), agentID, status, reason, at)
 }
 
 // StatusHistory returns at most 20 online/offline transitions, newest first.
 func (s *Service) StatusHistory(ctx context.Context, agentID string) ([]StatusEvent, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT status, changed_at FROM agent_status_history WHERE agent_id=? ORDER BY changed_at DESC LIMIT ?`,
+		`SELECT status, COALESCE(reason,''), changed_at FROM agent_status_history WHERE agent_id=? ORDER BY changed_at DESC LIMIT ?`,
 		agentID, statusHistoryLimit)
 	if err != nil {
 		return nil, err
@@ -207,7 +257,7 @@ func (s *Service) StatusHistory(ctx context.Context, agentID string) ([]StatusEv
 	var out []StatusEvent
 	for rows.Next() {
 		var e StatusEvent
-		if err := rows.Scan(&e.Status, &e.ChangedAt); err != nil {
+		if err := rows.Scan(&e.Status, &e.Reason, &e.ChangedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, e)
@@ -219,7 +269,8 @@ func (s *Service) List(ctx context.Context) ([]Agent, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, site_id, COALESCE(display_name,''), COALESCE(hostname,''), COALESCE(platform,''), COALESCE(agent_version,''),
 		       status, COALESCE(perm_supported,'[]'), COALESCE(perm_granted,'[]'), COALESCE(perm_effective,'[]'),
-		       COALESCE(policy_source,''), COALESCE(policy_hash,''), last_seen_at, created_at
+		       COALESCE(policy_source,''), COALESCE(policy_hash,''), last_seen_at, created_at,
+		       first_connected_at, COALESCE(last_disconnect_kind,''), connectivity_alerts_muted
 		FROM agents WHERE revoked=0 ORDER BY created_at`)
 	if err != nil {
 		return nil, err
@@ -229,9 +280,11 @@ func (s *Service) List(ctx context.Context) ([]Agent, error) {
 	for rows.Next() {
 		var a Agent
 		var sup, gr, eff string
-		var lastSeen sql.NullTime
+		var lastSeen, firstConn sql.NullTime
+		var muted int
 		if err := rows.Scan(&a.ID, &a.SiteID, &a.DisplayName, &a.Hostname, &a.Platform, &a.AgentVersion,
-			&a.Status, &sup, &gr, &eff, &a.PolicySource, &a.PolicyHash, &lastSeen, &a.CreatedAt); err != nil {
+			&a.Status, &sup, &gr, &eff, &a.PolicySource, &a.PolicyHash, &lastSeen, &a.CreatedAt,
+			&firstConn, &a.LastDisconnectKind, &muted); err != nil {
 			return nil, err
 		}
 		unmarshalStrings(sup, &a.Supported)
@@ -241,6 +294,11 @@ func (s *Service) List(ctx context.Context) ([]Agent, error) {
 			t := lastSeen.Time
 			a.LastSeenAt = &t
 		}
+		if firstConn.Valid {
+			t := firstConn.Time
+			a.FirstConnectedAt = &t
+		}
+		a.ConnectivityAlertsMuted = muted != 0
 		out = append(out, a)
 	}
 	return out, rows.Err()
@@ -248,15 +306,18 @@ func (s *Service) List(ctx context.Context) ([]Agent, error) {
 
 func (s *Service) Get(ctx context.Context, id string) (Agent, error) {
 	var a Agent
-	var lastSeen sql.NullTime
+	var lastSeen, firstConn sql.NullTime
 	var sup, gr, eff string
+	var muted int
 	err := s.db.QueryRowContext(ctx, `
 		SELECT id, site_id, COALESCE(display_name,''), COALESCE(hostname,''), COALESCE(platform,''), COALESCE(agent_version,''),
 		       status, COALESCE(perm_supported,'[]'), COALESCE(perm_granted,'[]'), COALESCE(perm_effective,'[]'),
-		       COALESCE(policy_source,''), COALESCE(policy_hash,''), last_seen_at, created_at
+		       COALESCE(policy_source,''), COALESCE(policy_hash,''), last_seen_at, created_at,
+		       first_connected_at, COALESCE(last_disconnect_kind,''), connectivity_alerts_muted
 		FROM agents WHERE id=? AND revoked=0`, id).
 		Scan(&a.ID, &a.SiteID, &a.DisplayName, &a.Hostname, &a.Platform, &a.AgentVersion, &a.Status,
-			&sup, &gr, &eff, &a.PolicySource, &a.PolicyHash, &lastSeen, &a.CreatedAt)
+			&sup, &gr, &eff, &a.PolicySource, &a.PolicyHash, &lastSeen, &a.CreatedAt,
+			&firstConn, &a.LastDisconnectKind, &muted)
 	if err != nil {
 		return Agent{}, err
 	}
@@ -267,6 +328,11 @@ func (s *Service) Get(ctx context.Context, id string) (Agent, error) {
 		t := lastSeen.Time
 		a.LastSeenAt = &t
 	}
+	if firstConn.Valid {
+		t := firstConn.Time
+		a.FirstConnectedAt = &t
+	}
+	a.ConnectivityAlertsMuted = muted != 0
 	return a, nil
 }
 
@@ -296,8 +362,9 @@ func (s *Service) UpdateAgent(ctx context.Context, id, displayName string) error
 // are enforced (store.Open sets foreign_keys=ON), so FK-constrained child rows
 // (interfaces, agent_status_history, agent_group_members, monitor_status,
 // operational_issues) must go before the agent row; the non-FK per-agent tables
-// (agent_packets, events, alerts, rule_condition_state) are cleared too so no
-// orphaned rows survive. rule_condition_state keys on agent_id with no FK cascade,
+// (agent_packets, events, alerts, rule_condition_state, agent_alerts) are cleared
+// too so no orphaned rows survive. Deleting an agent removes its connectivity
+// alerts outright (no recovery notification), matching the hard-delete policy. rule_condition_state keys on agent_id with no FK cascade,
 // so its per-agent live rows must be deleted explicitly here. All in one transaction.
 // Time-series data (series/samples/rollups, plus the metrics store's in-memory
 // cache) is NOT handled here — callers purge it via metrics.Store.PurgeAgent so
@@ -330,6 +397,7 @@ func (s *Service) DeleteAgent(ctx context.Context, id string) error {
 		`DELETE FROM events WHERE agent_id=?`,
 		`DELETE FROM alerts WHERE agent_id=?`,
 		`DELETE FROM rule_condition_state WHERE agent_id=?`,
+		`DELETE FROM agent_alerts WHERE agent_id=?`,
 	} {
 		if _, err := tx.ExecContext(ctx, stmt, id); err != nil {
 			return err

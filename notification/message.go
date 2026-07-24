@@ -5,6 +5,7 @@ import (
 	"math"
 	"sort"
 	"strconv"
+	"time"
 
 	"github.com/nettact/protocol/telemetry"
 )
@@ -26,6 +27,18 @@ type AlertDetail struct {
 	Layer      string  `json:"layer"`       // local|lan|wan|internet|dns|service|wireless
 	Severity   string  `json:"severity"`    // info|warn|error|critical
 	AgentHost  string  `json:"agent_host"`  // display_name or hostname of the detecting agent
+}
+
+// AgentDetail is one agent's facts for a connectivity event (agent.offline /
+// agent.recovered). Name is frozen at fire (display name → hostname fallback);
+// LastSeenAt is the agent's last-seen time when it went offline; Reason is the
+// offline cause (unexpected | clean_shutdown | version_incompatible), empty on
+// recovery.
+type AgentDetail struct {
+	AgentID    string    `json:"agent_id"`
+	Name       string    `json:"name"`
+	LastSeenAt time.Time `json:"last_seen_at"`
+	Reason     string    `json:"reason,omitempty"`
 }
 
 // maxDetailLines caps how many specific fault lines a single notification lists;
@@ -51,6 +64,18 @@ func RenderTitle(p Payload, lang string) string {
 			return "NetTact test notification"
 		}
 		return "NetTact 测试通知"
+	}
+	if p.Event == "agent.offline" {
+		if normLang(lang) == "en" {
+			return "Agent offline"
+		}
+		return "Agent 离线告警"
+	}
+	if p.Event == "agent.recovered" {
+		if normLang(lang) == "en" {
+			return "Agent connection recovered"
+		}
+		return "Agent 已恢复连接"
 	}
 	terminated := p.Event == "incident.terminated" || p.State == "terminated"
 	resolved := p.Event == "incident.resolved" || p.State == "resolved"
@@ -87,6 +112,32 @@ func RenderScope(p Payload, lang string) string {
 			return "This is a test notification from NetTact."
 		}
 		return "这是一条来自 NetTact 的测试通知。"
+	}
+	if p.Event == "agent.offline" {
+		n := p.AgentCount
+		if n == 0 {
+			n = len(p.Agents)
+		}
+		if en {
+			if n == 1 {
+				return "1 agent went offline."
+			}
+			return fmt.Sprintf("%d agents went offline.", n)
+		}
+		return fmt.Sprintf("%d 个 Agent 已离线。", n)
+	}
+	if p.Event == "agent.recovered" {
+		n := p.AgentCount
+		if n == 0 {
+			n = len(p.Agents)
+		}
+		if en {
+			if n == 1 {
+				return "1 agent reconnected."
+			}
+			return fmt.Sprintf("%d agents reconnected.", n)
+		}
+		return fmt.Sprintf("%d 个 Agent 已恢复连接。", n)
 	}
 	if p.Event == "incident.terminated" || p.State == "terminated" {
 		if en {
@@ -159,6 +210,82 @@ func RenderDetails(details []AlertDetail, lang string) []string {
 		}
 	}
 	return out
+}
+
+// RenderLines dispatches to the right per-item renderer for the payload's event:
+// agent connectivity events render per-agent lines, everything else renders the
+// per-target firing facts. This is the single entry point the webhook / email /
+// native channels use, so a new event shape works across all three at once.
+func RenderLines(p Payload, lang string) []string {
+	switch p.Event {
+	case "agent.offline", "agent.recovered":
+		return RenderAgentLines(p, lang)
+	default:
+		return RenderDetails(p.Details, lang)
+	}
+}
+
+// RenderAgentLines renders one human line per agent in a connectivity event, up
+// to maxDetailLines, with a "+N more" tail when truncated. Offline lines carry
+// the cause and last-seen time; recovery lines just state the reconnection.
+func RenderAgentLines(p Payload, lang string) []string {
+	en := normLang(lang) == "en"
+	limit := len(p.Agents)
+	if limit > maxDetailLines {
+		limit = maxDetailLines
+	}
+	out := make([]string, 0, limit+1)
+	for _, a := range p.Agents[:limit] {
+		name := a.Name
+		if name == "" {
+			name = a.AgentID
+		}
+		if p.Event == "agent.recovered" {
+			if en {
+				out = append(out, fmt.Sprintf("%s: reconnected", name))
+			} else {
+				out = append(out, fmt.Sprintf("%s：已恢复连接", name))
+			}
+			continue
+		}
+		lastSeen := a.LastSeenAt.Format("2006-01-02 15:04")
+		if en {
+			out = append(out, fmt.Sprintf("%s: %s, last seen %s", name, offlineReasonLabel(a.Reason, lang), lastSeen))
+		} else {
+			out = append(out, fmt.Sprintf("%s：%s，最后在线 %s", name, offlineReasonLabel(a.Reason, lang), lastSeen))
+		}
+	}
+	if rest := len(p.Agents) - limit; rest > 0 {
+		if en {
+			out = append(out, fmt.Sprintf("+%d more", rest))
+		} else {
+			out = append(out, fmt.Sprintf("另有 %d 个", rest))
+		}
+	}
+	return out
+}
+
+// offlineReasonLabel renders a connectivity-alert offline reason as a short
+// human phrase.
+func offlineReasonLabel(reason, lang string) string {
+	en := normLang(lang) == "en"
+	switch reason {
+	case "clean_shutdown":
+		if en {
+			return "shut down normally"
+		}
+		return "正常关机"
+	case "version_incompatible":
+		if en {
+			return "version incompatible"
+		}
+		return "版本不兼容"
+	default: // "unexpected" or ""
+		if en {
+			return "unexpectedly lost"
+		}
+		return "意外失联"
+	}
 }
 
 // RenderSummary is the one-line incident summary stored for the console list and

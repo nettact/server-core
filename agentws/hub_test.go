@@ -576,3 +576,94 @@ func TestDialLocal(t *testing.T) {
 		t.Fatalf("CloseAll close = %v, want CloseGoingAway", err)
 	}
 }
+
+// waitDisconnectKind polls the agent's recorded last_disconnect_kind until it
+// matches want (session teardown runs asynchronously to the client close).
+func (e *testEnv) waitDisconnectKind(t *testing.T, agentID, want string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if a, err := e.reg.Get(context.Background(), agentID); err == nil && a.LastDisconnectKind == want {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	a, _ := e.reg.Get(context.Background(), agentID)
+	t.Fatalf("last_disconnect_kind = %q, want %q", a.LastDisconnectKind, want)
+}
+
+// TestFirstConnectedAndCleanDisconnect covers the AGENT-002 provenance: the first
+// Hello stamps first_connected_at, and a peer-initiated normal close is recorded
+// as a clean disconnect.
+func TestFirstConnectedAndCleanDisconnect(t *testing.T) {
+	e := newTestEnv(t)
+	e.seedAgent(t, "agent_a", "tok_a")
+
+	conn := e.dial(t, "tok_a", wire.SubprotocolJSON)
+	sendFrame(t, conn, testHello())
+	_ = readFrame(t, conn) // DesiredState
+
+	if a, _ := e.reg.Get(context.Background(), "agent_a"); a.FirstConnectedAt == nil {
+		t.Fatal("first_connected_at not stamped on Hello")
+	}
+
+	_ = conn.Close(websocket.StatusNormalClosure, "bye")
+	e.waitDisconnectKind(t, "agent_a", "clean")
+}
+
+// TestUnexpectedDisconnectKind severs the TCP without a close handshake; the read
+// error carries no close code, so the disconnect is classified unexpected.
+func TestUnexpectedDisconnectKind(t *testing.T) {
+	e := newTestEnv(t)
+	e.seedAgent(t, "agent_a", "tok_a")
+
+	conn := e.dial(t, "tok_a", wire.SubprotocolJSON)
+	sendFrame(t, conn, testHello())
+	_ = readFrame(t, conn)
+	_ = conn.CloseNow() // abrupt close, no close frame
+	e.waitDisconnectKind(t, "agent_a", "error")
+}
+
+// TestSupersededDoesNotOverwriteProvenance reconnects the same agent, then cleanly
+// closes the replacement. The kicked (superseded) session must NOT write disconnect
+// provenance — it no longer owns the agent's slot — so the final recorded kind is
+// the replacement's "clean", never "superseded". This guards the race where a slow
+// superseded teardown could otherwise clobber the live session's disconnect kind.
+func TestSupersededDoesNotOverwriteProvenance(t *testing.T) {
+	e := newTestEnv(t)
+	e.seedAgent(t, "agent_a", "tok_a")
+
+	conn1 := e.dial(t, "tok_a", wire.SubprotocolJSON)
+	sendFrame(t, conn1, testHello())
+	_ = readFrame(t, conn1)
+
+	conn2 := e.dial(t, "tok_a", wire.SubprotocolJSON)
+	sendFrame(t, conn2, testHello())
+	_ = readFrame(t, conn2)
+
+	// Let the kicked session's close handshake complete so its teardown runs.
+	expectClose(t, conn1, wire.CloseSuperseded)
+
+	// The live replacement then closes cleanly; its teardown owns provenance.
+	_ = conn2.Close(websocket.StatusNormalClosure, "bye")
+	e.waitDisconnectKind(t, "agent_a", "clean")
+}
+
+// TestBadSchemaRecordsVersionIncompatible rejects a Hello with an unsupported
+// schema; the disconnect kind maps to version-incompatible and first_connected_at
+// stays NULL (the agent never completed a valid Hello).
+func TestBadSchemaRecordsVersionIncompatible(t *testing.T) {
+	e := newTestEnv(t)
+	e.seedAgent(t, "agent_a", "tok_a")
+
+	conn := e.dial(t, "tok_a", wire.SubprotocolJSON)
+	hello := testHello()
+	hello.Hello.SchemaVersion = 9999 // > protocol.SchemaVersion
+	sendFrame(t, conn, hello)
+	expectClose(t, conn, wire.CloseUnsupportedSchema)
+
+	e.waitDisconnectKind(t, "agent_a", "unsupported_schema")
+	if a, _ := e.reg.Get(context.Background(), "agent_a"); a.FirstConnectedAt != nil {
+		t.Fatal("first_connected_at set despite an unsupported-schema Hello")
+	}
+}

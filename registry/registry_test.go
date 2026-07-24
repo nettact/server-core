@@ -48,6 +48,7 @@ func TestUpdateAndDeleteAgent(t *testing.T) {
 	mustExec(t, db, `INSERT INTO group_rules(id,group_id,site_id,name,op) VALUES('rule1','mg1','site_default','down','or')`)
 	mustExec(t, db, `INSERT INTO group_rule_conditions(id,rule_id,target_id,metric_kind,comparator,threshold) VALUES('cond1','rule1','mon1','probe.http.ok','lt',1)`)
 	mustExec(t, db, `INSERT INTO rule_condition_state(condition_id,agent_id,satisfied,last_eval_at) VALUES('cond1','agent_x',1,?)`, now)
+	mustExec(t, db, `INSERT INTO agent_alerts(id,site_id,agent_id,status,reason,offline_since,opened_at) VALUES('aa1','site_default','agent_x','firing','unexpected',?,?)`, now, now)
 
 	bus := eventbus.New()
 	var statusEvents []eventbus.TargetStatusChanged
@@ -77,7 +78,7 @@ func TestUpdateAndDeleteAgent(t *testing.T) {
 	}
 	for _, tbl := range []string{
 		"interfaces", "agent_wifi", "agent_status_history", "agent_group_members",
-		"agent_packets", "events", "alerts", "rule_condition_state",
+		"agent_packets", "events", "alerts", "rule_condition_state", "agent_alerts",
 	} {
 		var n int
 		if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM `+tbl+` WHERE agent_id='agent_x'`).Scan(&n); err != nil {
@@ -101,6 +102,67 @@ func TestUpdateAndDeleteAgent(t *testing.T) {
 	}
 	if err := reg.UpdateAgent(ctx, "nope", "x"); !errors.Is(err, sql.ErrNoRows) {
 		t.Errorf("UpdateAgent(missing) = %v, want sql.ErrNoRows", err)
+	}
+}
+
+// TestConnectivityProvenance covers the AGENT-001/002 registry additions:
+// first-connected is stamped once and never moves, disconnect kind is recorded
+// and surfaced by SweepStale into the history reason, and the mute switch flips.
+func TestConnectivityProvenance(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	ctx := context.Background()
+	stale := time.Now().UTC().Add(-time.Hour)
+
+	mustExec(t, db, `INSERT INTO sites(id,name,created_at) VALUES('site_default','def',?)`, stale)
+	mustExec(t, db, `INSERT INTO agents(id,site_id,public_key,token_hash,status,last_seen_at) VALUES('agent_c','site_default',x'00','h','online',?)`, stale)
+	reg := New(db, 0, nil)
+
+	// first_connected_at is nil until the first Hello, then stamped once.
+	a, _ := reg.Get(ctx, "agent_c")
+	if a.FirstConnectedAt != nil {
+		t.Fatalf("expected nil first_connected_at, got %v", a.FirstConnectedAt)
+	}
+	if err := reg.MarkFirstConnected(ctx, "agent_c"); err != nil {
+		t.Fatalf("MarkFirstConnected: %v", err)
+	}
+	a, _ = reg.Get(ctx, "agent_c")
+	if a.FirstConnectedAt == nil {
+		t.Fatalf("expected first_connected_at set")
+	}
+	first := *a.FirstConnectedAt
+	if err := reg.MarkFirstConnected(ctx, "agent_c"); err != nil { // idempotent
+		t.Fatalf("MarkFirstConnected 2: %v", err)
+	}
+	a, _ = reg.Get(ctx, "agent_c")
+	if !a.FirstConnectedAt.Equal(first) {
+		t.Fatalf("first_connected_at moved: %v -> %v", first, *a.FirstConnectedAt)
+	}
+
+	// RecordDisconnect feeds the offline transition's history reason.
+	if err := reg.RecordDisconnect(ctx, "agent_c", "clean"); err != nil {
+		t.Fatalf("RecordDisconnect: %v", err)
+	}
+	if _, err := reg.SweepStale(ctx, 10*time.Second, nil); err != nil {
+		t.Fatalf("SweepStale: %v", err)
+	}
+	hist, _ := reg.StatusHistory(ctx, "agent_c")
+	if len(hist) == 0 || hist[0].Status != "offline" || hist[0].Reason != "clean" {
+		t.Fatalf("expected offline/clean history, got %+v", hist)
+	}
+
+	// Mute switch flips and surfaces on Get.
+	if err := reg.SetConnectivityMuted(ctx, "agent_c", true); err != nil {
+		t.Fatalf("SetConnectivityMuted: %v", err)
+	}
+	if a, _ = reg.Get(ctx, "agent_c"); !a.ConnectivityAlertsMuted {
+		t.Fatalf("expected muted=true")
+	}
+	if err := reg.SetConnectivityMuted(ctx, "nope", true); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("SetConnectivityMuted(missing) = %v, want sql.ErrNoRows", err)
 	}
 }
 

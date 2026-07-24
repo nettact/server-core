@@ -47,16 +47,38 @@ type session struct {
 	// wait on it so a caller — notably agent deletion — knows no ingest is still
 	// in flight before it purges the agent's series.
 	closed chan struct{}
+
+	// closeMu guards the close code captured by the first shutdown. serve()'s
+	// teardown reads it to classify why the session ended (server-initiated
+	// supersede/revoke/shutdown/error vs a peer-initiated close it must instead
+	// read off the read error).
+	closeMu   sync.Mutex
+	closeCode wire.CloseCode
+	closeSet  bool
 }
 
 // shutdown closes the connection with the given code and stops the writer
 // and ping goroutines. Safe to call from any goroutine, any number of times;
-// only the first code/reason wins.
+// only the first code/reason wins — and only that first code is captured for
+// disconnect classification.
 func (s *session) shutdown(code wire.CloseCode, reason string) {
 	s.once.Do(func() {
+		s.closeMu.Lock()
+		s.closeCode, s.closeSet = code, true
+		s.closeMu.Unlock()
 		close(s.done)
 		_ = s.conn.Close(code, reason)
 	})
+}
+
+// closeInfo returns the code the session was first shut down with, and whether
+// a server-side shutdown set it. When set=false the session ended because the
+// read loop saw the peer close (or the link break) first, and the caller must
+// classify from the read error instead.
+func (s *session) closeInfo() (wire.CloseCode, bool) {
+	s.closeMu.Lock()
+	defer s.closeMu.Unlock()
+	return s.closeCode, s.closeSet
 }
 
 // enqueue hands a frame to the writer goroutine. It blocks briefly on a full
@@ -131,8 +153,12 @@ func (s *session) pingLoop(reg *registry.Service) {
 // readLoop consumes agent->server frames until the connection dies. Because
 // there is a single reader and a single ordered write queue, acks go back in
 // the same order the packets arrived (the link guarantees message order), which
-// is what the agent's WAL-pruning watermark logic relies on.
-func (h *Hub) readLoop(ctx context.Context, s *session) {
+// is what the agent's WAL-pruning watermark logic relies on. It returns the
+// terminal ReadFrame error so serve() can classify a peer-initiated close; when
+// readLoop itself decides to shut the session down (bad frame, ingest failure,
+// unexpected frame) it returns nil and the captured local close code carries the
+// classification instead.
+func (h *Hub) readLoop(ctx context.Context, s *session) error {
 	for {
 		frame, err := s.conn.ReadFrame(ctx)
 		if err != nil {
@@ -142,8 +168,9 @@ func (h *Hub) readLoop(ctx context.Context, s *session) {
 			// Any other error is a normal disconnect handled by the deferred teardown.
 			if errors.Is(err, errBadFrame) {
 				s.shutdown(wire.CloseProtocolError, "bad frame")
+				return nil
 			}
-			return // closed, kicked, or broken — the deferred teardown handles it
+			return err // closed, kicked, or broken — the deferred teardown handles it
 		}
 		switch {
 		case frame.Packet != nil:
@@ -153,13 +180,13 @@ func (h *Hub) readLoop(ctx context.Context, s *session) {
 				// it reconnect and retry rather than stream into a failing server.
 				log.Printf("agentws: ingest from %s: %v", s.agentID, err)
 				s.shutdown(wire.CloseInternalError, "ingest failed")
-				return
+				return nil
 			}
 			_ = h.deps.Registry.TouchLastSeen(ctx, s.agentID)
 			_ = h.deps.Registry.SetReportedConfigVersion(ctx, s.agentID, frame.Packet.ReportedConfigVersion)
 			wack := wire.Ack(ack)
 			if !s.enqueue(wire.Frame{Ack: &wack}) {
-				return
+				return nil
 			}
 		case frame.HostSnapshot != nil:
 			// Stored in memory only, latest-wins and idempotent; never acked.
@@ -197,7 +224,7 @@ func (h *Hub) readLoop(ctx context.Context, s *session) {
 			// A second Hello, or a server->agent frame kind (Ack / DesiredState /
 			// SnapshotRequest) coming FROM the agent: both are protocol violations.
 			s.shutdown(wire.CloseProtocolError, "unexpected frame")
-			return
+			return nil
 		}
 	}
 }

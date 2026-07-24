@@ -144,11 +144,16 @@ func (h *Hub) serve(ctx context.Context, agentID, siteID string, c wire.Conn) {
 	frame, err := c.ReadFrame(helloCtx)
 	cancel()
 	if err != nil || frame.Hello == nil {
+		_ = h.deps.Registry.RecordDisconnect(ctx, agentID, "error")
 		_ = c.Close(wire.CloseProtocolError, "first frame must be hello")
 		return
 	}
 	hello := frame.Hello
 	if err := protocol.ValidateSchema(hello.SchemaVersion); err != nil {
+		// Record the reason at a point where the agent identity is already known
+		// (auth happened before the upgrade), so a firing connectivity alert can
+		// map it to "version incompatible" rather than a generic loss.
+		_ = h.deps.Registry.RecordDisconnect(ctx, agentID, "unsupported_schema")
 		_ = c.Close(wire.CloseUnsupportedSchema, "unsupported schema")
 		return
 	}
@@ -160,6 +165,10 @@ func (h *Hub) serve(ctx context.Context, agentID, siteID string, c wire.Conn) {
 	_ = h.deps.Registry.UpdateReportedInfo(ctx, agentID, hello.Hostname, hello.Platform, hello.AgentVersion)
 	_ = h.deps.Registry.SetReportedConfigVersion(ctx, agentID, hello.ReportedConfigVersion)
 	_ = h.deps.Registry.TouchLastSeen(ctx, agentID)
+	// Stamp the first-ever connection (no-op after the first): until this is set
+	// the agent is "never connected", which the status list and alert engine
+	// treat differently from an agent that connected and later went offline.
+	_ = h.deps.Registry.MarkFirstConnected(ctx, agentID)
 	// The agent's effective policy just refreshed, so recompute which of its host
 	// monitors are permission-blocked (probe monitors arrive via MonitorStatus),
 	// and seed predicted rows for its applicable probe monitors so a freshly
@@ -199,21 +208,36 @@ func (h *Hub) serve(ctx context.Context, agentID, siteID string, c wire.Conn) {
 		go old.shutdown(wire.CloseSuperseded, "superseded")
 	}
 
+	var readErr error
 	defer func() {
+		// Classify BEFORE the default shutdown below: a peer-initiated close leaves
+		// closeSet=false and carries its code in readErr, while a server-initiated
+		// shutdown (supersede/revoke/CloseAll/ping/write/ingest error) already set
+		// the local code. The default shutdown here would otherwise stamp
+		// CloseNormalClosure and mask an unexpected drop as a clean one.
+		kind := classifyDisconnect(readErr, s)
 		s.shutdown(wire.CloseNormalClosure, "")
 		// Unregister by identity: if a newer session already took this agent's
 		// slot (we were kicked), we must not evict the replacement.
 		h.mu.Lock()
-		if h.conns[agentID] == s {
+		wasCurrent := h.conns[agentID] == s
+		if wasCurrent {
 			delete(h.conns, agentID)
 		}
 		h.mu.Unlock()
-		// Stamp last_seen_at one final time; status stays 'online' and the
-		// sweeper flips it after the grace period, so a quick reconnect never
-		// shows a bogus offline blip. The request ctx may already be dead here.
-		tctx, tcancel := context.WithTimeout(context.Background(), 5*time.Second)
-		_ = h.deps.Registry.TouchLastSeen(tctx, agentID)
-		tcancel()
+		// Only the session that still owns the agent's slot writes liveness and
+		// provenance. If a newer session already superseded us, IT owns them (its
+		// Hello re-stamped last_seen and it will record its own disconnect kind on
+		// teardown); a late teardown here must not overwrite the newer session's
+		// disconnect kind with "superseded" or re-stamp last_seen. When we are the
+		// current session, record how it ended and stamp last_seen_at one final
+		// time so a quick reconnect never shows a bogus offline blip.
+		if wasCurrent {
+			tctx, tcancel := context.WithTimeout(context.Background(), 5*time.Second)
+			_ = h.deps.Registry.RecordDisconnect(tctx, agentID, kind)
+			_ = h.deps.Registry.TouchLastSeen(tctx, agentID)
+			tcancel()
+		}
 	}()
 
 	go s.writeLoop()
@@ -246,7 +270,36 @@ func (h *Hub) serve(ctx context.Context, agentID, siteID string, c wire.Conn) {
 		h.deps.IncidentOps.OnAgentConnected(ctx, agentID)
 	}
 
-	h.readLoop(ctx, s)
+	readErr = h.readLoop(ctx, s)
+}
+
+// classifyDisconnect maps how a session ended to a last_disconnect_kind. A
+// server-initiated shutdown captured the local close code (supersede kick, agent
+// revoke, graceful CloseAll, or a ping/write/ingest failure); a peer-initiated
+// close leaves the local code unset and carries its RFC 6455 code in the read
+// error. Both WebSocket and the in-process pipe surface peer codes through
+// wire.CloseStatus, so the desktop's bundled agent classifies identically.
+func classifyDisconnect(readErr error, s *session) string {
+	if code, set := s.closeInfo(); set {
+		switch code {
+		case wire.CloseSuperseded:
+			return "superseded"
+		case wire.CloseRevoked:
+			return "revoked"
+		case wire.CloseGoingAway:
+			return "server_shutdown"
+		case wire.CloseNormalClosure:
+			return "clean"
+		default:
+			return "error"
+		}
+	}
+	switch wire.CloseStatus(readErr) {
+	case wire.CloseNormalClosure, wire.CloseGoingAway:
+		return "clean"
+	default:
+		return "error"
+	}
 }
 
 // DialLocal authenticates the token and, on success, attaches an in-process

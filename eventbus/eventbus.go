@@ -19,6 +19,7 @@ const (
 	TopicIssueChanged         = "issue.changed"
 	TopicTargetStatusChanged  = "target.status.changed"
 	TopicAgentLivenessChanged = "agent.liveness.changed"
+	TopicAgentAlertChanged    = "agent.alert.changed"
 )
 
 // IncidentEvent is the payload for the incident lifecycle topics
@@ -65,6 +66,15 @@ type AgentLivenessChanged struct {
 	SiteID  string
 	AgentID string
 	Status  string // online | offline
+}
+
+// AgentAlertChanged is the payload for TopicAgentAlertChanged, published by the
+// agent-alert engine after it opens or resolves a connectivity alert, so a
+// bridge can fan a fresh agent-status snapshot out to connected consoles. It
+// carries only the affected site; the console refetches the whole site's
+// agent-status list.
+type AgentAlertChanged struct {
+	SiteID string
 }
 
 // ConfigChanged is the payload for TopicConfigChanged, published after a site's

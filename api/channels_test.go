@@ -163,9 +163,9 @@ func TestWebhookAuditDetail(t *testing.T) {
 	cases := map[string]string{
 		"https://oapi.dingtalk.com/robot/send?access_token=SECRET": "https://oapi.dingtalk.com",
 		"https://hooks.slack.com/services/T00/B00/XXXXSECRET":      "https://hooks.slack.com",
-		"http://192.168.1.5:9000/notify?key=abc":                  "http://192.168.1.5:9000",
-		"not a url":                                               "webhook",
-		"":                                                        "webhook",
+		"http://192.168.1.5:9000/notify?key=abc":                   "http://192.168.1.5:9000",
+		"not a url":                                                "webhook",
+		"":                                                         "webhook",
 	}
 	for in, want := range cases {
 		if got := webhookAuditDetail(in); got != want {

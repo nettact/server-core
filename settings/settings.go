@@ -51,6 +51,20 @@ const (
 	KeyEvidenceRetentionDays      = "evidence_retention_days"
 )
 
+// Agent connectivity-alert (AGENT-002) knobs. The int knobs live in IntKeys
+// (auto-exposed and bounds-checked by the settings API); the two free-form
+// string keys are validated explicitly in the API handler and added to its
+// allow-list. agent_status_stale_seconds also drives the status list's
+// resource-staleness marking (AGENT-001).
+const (
+	KeyAgentAlertEnabled        = "agent_alert_enabled"         // 0/1
+	KeyAgentAlertGraceSeconds   = "agent_alert_grace_seconds"   // offline grace before an alert fires
+	KeyAgentAlertRecoverSeconds = "agent_alert_recover_seconds" // sustained-online confirmation before resolve
+	KeyAgentStatusStaleSeconds  = "agent_status_stale_seconds"  // resource sample freshness cutoff
+	KeyAgentAlertSeverity       = "agent_alert_severity"        // '' (=warn) | info | warn | error | critical
+	KeyAgentAlertChannelIDs     = "agent_alert_channel_ids"     // JSON array; '' / [] = all enabled channels
+)
+
 // IntBounds is one integer setting's default and inclusive [Min,Max] range.
 type IntBounds struct {
 	Default int
@@ -74,6 +88,14 @@ var IntKeys = map[string]IntBounds{
 	KeyDiagGlobalConcurrency:      {Default: 16, Min: 1, Max: 64},
 	KeyDiagResolveHops:            {Default: 0, Min: 0, Max: 1},
 	KeyEvidenceRetentionDays:      {Default: 30, Min: 1, Max: 365},
+	// Agent connectivity alerts. Grace min (15s) stays above the sweeper's 10s
+	// presence grace so an offline alert is always strictly slower than the UI
+	// flipping the agent offline; stale default (120s) is ~4x the 30s host-metric
+	// collection interval.
+	KeyAgentAlertEnabled:        {Default: 1, Min: 0, Max: 1},
+	KeyAgentAlertGraceSeconds:   {Default: 60, Min: 15, Max: 3600},
+	KeyAgentAlertRecoverSeconds: {Default: 30, Min: 5, Max: 600},
+	KeyAgentStatusStaleSeconds:  {Default: 120, Min: 30, Max: 3600},
 }
 
 type Service struct {

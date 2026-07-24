@@ -26,7 +26,7 @@ import (
 // so each channel can render title/summary/details in its own language at
 // delivery time.
 type Payload struct {
-	Event          string        `json:"event"` // incident.opened | incident.updated | incident.resolved | incident.terminated
+	Event          string        `json:"event"` // incident.opened | incident.updated | incident.resolved | incident.terminated | agent.offline | agent.recovered
 	IncidentID     string        `json:"incident_id"`
 	SiteID         string        `json:"site_id"`
 	State          string        `json:"state"`             // open | resolved | terminated
@@ -34,8 +34,9 @@ type Payload struct {
 	Scope          string        `json:"scope"`             // "single" | "site"
 	AgentCount     int           `json:"agent_count"`       // distinct agents alerting
 	SuspectedLayer string        `json:"suspected_layer"`   // root-cause layer code
-	Details        []AlertDetail `json:"details,omitempty"` // per-target firing facts
-	URL            string        `json:"url,omitempty"`     // deep link to the incident in the console
+	Details        []AlertDetail `json:"details,omitempty"` // per-target firing facts (incident events)
+	Agents         []AgentDetail `json:"agents,omitempty"`  // per-agent facts (agent.offline / agent.recovered events)
+	URL            string        `json:"url,omitempty"`     // deep link to the incident/agents view in the console
 	At             time.Time     `json:"at"`
 }
 
@@ -217,7 +218,7 @@ func (s *Service) deliverWebhook(ctx context.Context, cfg map[string]string, p P
 			Payload: p,
 			Title:   RenderTitle(p, lang),
 			Text:    RenderScope(p, lang),
-			Lines:   RenderDetails(p.Details, lang),
+			Lines:   RenderLines(p, lang),
 		})
 	}
 
@@ -318,7 +319,7 @@ func (s *Service) sendEmail(cfg map[string]string, p Payload) {
 	var b strings.Builder
 	b.WriteString(RenderScope(p, lang))
 	b.WriteString("\r\n")
-	for _, line := range RenderDetails(p.Details, lang) {
+	for _, line := range RenderLines(p, lang) {
 		b.WriteString("\r\n- ")
 		b.WriteString(line)
 	}
@@ -357,7 +358,7 @@ func (s *Service) sendNative(ctx context.Context, lang string, p Payload) {
 	defer cancel()
 	title := RenderTitle(p, lang)
 	body := RenderScope(p, lang)
-	if lines := RenderDetails(p.Details, lang); len(lines) > 0 {
+	if lines := RenderLines(p, lang); len(lines) > 0 {
 		body = body + "\n" + lines[0] // keep the toast short — lead with the top fault
 	}
 	// p.URL is attached as the toast's click action (protocol activation) rather

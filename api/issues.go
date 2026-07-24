@@ -149,7 +149,7 @@ func (d Deps) handleEvents(w http.ResponseWriter, r *http.Request) {
 				return // dropped by the broker (slow consumer)
 			}
 			switch ev.Name {
-			case sse.EventTargetStatusChanged:
+			case sse.EventTargetStatusChanged, sse.EventAgentStatusChanged:
 				// Precise payload written verbatim; the client coalesces a batch refresh.
 				_, _ = io.WriteString(w, "event: "+ev.Name+"\ndata: ")
 				_, _ = w.Write(ev.Data)
