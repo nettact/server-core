@@ -43,6 +43,28 @@ type condResult struct {
 	value     float64
 	breach    bool
 	satisfied bool // current satisfied verdict (after applying state)
+	// reasonCode is the sibling probe.<kind>.error_class value this pass (a
+	// telemetry.ProbeReason* code), frozen onto evidence when the alert fires so the
+	// notice states WHY it failed. 0 (ProbeReasonNone) for host/nat or a clean probe.
+	reasonCode int
+}
+
+// reasonMetricKind maps a probe kind to the metric that carries its failure-reason
+// code, or ("", false) for a kind with no reason concept (host, nat). gateway pings
+// emit through the shared ICMP metric set, so they read the ICMP reason.
+func reasonMetricKind(probeKind string) (string, bool) {
+	switch probeKind {
+	case "icmp", "gateway":
+		return string(telemetry.ICMPErrorClass), true
+	case "dns":
+		return string(telemetry.DNSErrorClass), true
+	case "http":
+		return string(telemetry.HTTPErrorClass), true
+	case "tcp":
+		return string(telemetry.TCPErrorClass), true
+	default:
+		return "", false
+	}
 }
 
 // batchValue is one accepted-batch reading, keyed for an in-tx evaluation.
@@ -199,12 +221,37 @@ func (s *Service) EvaluateAgentTx(ctx context.Context, tx *sql.Tx, agentID, site
 				ov, ots, ook = overlay.probeValue(c.targetID, c.metricKind)
 			}
 			if ook && (!have || ots >= ts) {
-				val, have = ov, true
+				val, ts, have = ov, ots, true
 			}
 			if have {
 				res.hasData = true
 				res.value = val
 				res.breach = compare(val, c.comparator, c.threshold)
+			}
+			// Sibling failure-reason: the probe emits probe.<kind>.error_class in the
+			// same cycle as the condition metric, sharing its TS. Merge overlay∪cache
+			// newest-wins, keyed by the same monitor, then accept the reason ONLY when
+			// its timestamp equals the chosen value's — a condition metric omitted on
+			// failure (HTTP latency/status, TCP connect_ms) can be older than the
+			// newest error_class, and pairing an old value with a newer unrelated
+			// failure reason would misattribute the cause.
+			if reasonKind, okKind := reasonMetricKind(c.kind); okKind && have {
+				rfound, rerr := s.metrics.LatestByMonitor(ctx, agentID, reasonKind, c.targetID, c.configSerial, sinceUnix)
+				if rerr != nil {
+					return nil, rerr
+				}
+				var rval float64
+				var rts int64
+				var rhave bool
+				if len(rfound) > 0 {
+					rval, rts, rhave = rfound[0].Value, rfound[0].TS, true
+				}
+				if rov, rots, rook := overlay.probeValue(c.targetID, reasonKind); rook && (!rhave || rots >= rts) {
+					rval, rts, rhave = rov, rots, true
+				}
+				if rhave && rts == ts {
+					res.reasonCode = int(rval)
+				}
 			}
 			results[c.id] = res
 		}
@@ -364,7 +411,7 @@ func (s *Service) fireAlert(ctx context.Context, tx *sql.Tx, r evalRule, agentID
 	}
 	for _, c := range r.conds {
 		if results[c.id].satisfied {
-			if err := freezeEvidence(ctx, tx, alertID, incidentID, agentID, siteID, c, results[c.id].value, now, out); err != nil {
+			if err := freezeEvidence(ctx, tx, alertID, incidentID, agentID, siteID, c, results[c.id].value, results[c.id].reasonCode, now, out); err != nil {
 				return err
 			}
 		}
@@ -418,7 +465,7 @@ func (s *Service) appendEvidence(ctx context.Context, tx *sql.Tx, r evalRule, al
 		if n > 0 {
 			continue
 		}
-		if err := freezeEvidence(ctx, tx, alertID, incidentID, agentID, siteID, c, results[c.id].value, now, out); err != nil {
+		if err := freezeEvidence(ctx, tx, alertID, incidentID, agentID, siteID, c, results[c.id].value, results[c.id].reasonCode, now, out); err != nil {
 			return err
 		}
 		addTimeline(ctx, tx, incidentID, "alert.evidence", s.evidenceLine(ctx, tx, alertID, c.id), alertID, now)
@@ -479,13 +526,13 @@ func (s *Service) closeAlert(ctx context.Context, tx *sql.Tx, alertID, ruleID, a
 }
 
 // event for the post-commit diagnostic trigger.
-func freezeEvidence(ctx context.Context, tx *sql.Tx, alertID, incidentID, agentID, siteID string, c evalCond, value float64, now time.Time, out *txOut) error {
+func freezeEvidence(ctx context.Context, tx *sql.Tx, alertID, incidentID, agentID, siteID string, c evalCond, value float64, reasonCode int, now time.Time, out *txOut) error {
 	evID := "evd_" + uuid.NewString()
 	res, err := tx.ExecContext(ctx,
 		`INSERT OR IGNORE INTO alert_evidence(id, alert_id, condition_id, target_id, target_name, target_addr, target_port,
-		    probe_kind, metric_kind, comparator, threshold, value, observed_at)
-		 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		evID, alertID, c.id, c.targetID, c.targetName, c.targetStr, c.port, c.kind, c.metricKind, c.comparator, c.threshold, value, now)
+		    probe_kind, metric_kind, comparator, threshold, value, reason_code, observed_at)
+		 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		evID, alertID, c.id, c.targetID, c.targetName, c.targetStr, c.port, c.kind, c.metricKind, c.comparator, c.threshold, value, reasonCode, now)
 	if err != nil {
 		return err
 	}

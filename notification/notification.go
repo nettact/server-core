@@ -26,18 +26,33 @@ import (
 // so each channel can render title/summary/details in its own language at
 // delivery time.
 type Payload struct {
-	Event          string        `json:"event"` // incident.opened | incident.updated | incident.resolved | incident.terminated | agent.offline | agent.recovered
-	IncidentID     string        `json:"incident_id"`
-	SiteID         string        `json:"site_id"`
-	State          string        `json:"state"`             // open | resolved | terminated
-	Severity       string        `json:"severity"`          // worst firing severity
-	Scope          string        `json:"scope"`             // "single" | "site"
-	AgentCount     int           `json:"agent_count"`       // distinct agents alerting
-	SuspectedLayer string        `json:"suspected_layer"`   // root-cause layer code
-	Details        []AlertDetail `json:"details,omitempty"` // per-target firing facts (incident events)
-	Agents         []AgentDetail `json:"agents,omitempty"`  // per-agent facts (agent.offline / agent.recovered events)
-	URL            string        `json:"url,omitempty"`     // deep link to the incident/agents view in the console
-	At             time.Time     `json:"at"`
+	Event          string `json:"event"` // incident.opened | incident.updated | incident.resolved | incident.terminated | agent.offline | agent.recovered
+	IncidentID     string `json:"incident_id"`
+	SiteID         string `json:"site_id"`
+	State          string `json:"state"`                // open | resolved | terminated
+	Severity       string `json:"severity"`             // worst firing severity
+	Scope          string `json:"scope"`                // "single" | "site"
+	AgentCount     int    `json:"agent_count"`          // distinct agents alerting
+	SuspectedLayer string `json:"suspected_layer"`      // root-cause layer code
+	GroupName      string `json:"group_name,omitempty"` // incident's frozen alert-group name
+	// GroupMerged is true when the incident merges the whole group's alerts
+	// (monitor_groups.merge_enabled), so a terminal notice may speak for the group
+	// ("all alerts recovered"). False ⇒ a per-alert incident: sibling alerts in the
+	// same group may still be firing, and the wording must stay per-alert.
+	GroupMerged      bool              `json:"group_merged,omitempty"`
+	Details          []AlertDetail     `json:"details,omitempty"`           // per-target firing facts (incident events)
+	RecoveredTargets []RecoveredTarget `json:"recovered_targets,omitempty"` // targets that came back (resolved/terminated events)
+	Agents           []AgentDetail     `json:"agents,omitempty"`            // per-agent facts (agent.offline / agent.recovered events)
+	URL              string            `json:"url,omitempty"`               // deep link to the incident/agents view in the console
+	At               time.Time         `json:"at"`
+}
+
+// RecoveredTarget is one monitored target that was part of a now-resolved incident,
+// listed in the recovery notice so it names the group AND what came back.
+type RecoveredTarget struct {
+	Name      string `json:"name"`       // operator-set friendly name, optional
+	Addr      string `json:"addr"`       // address ("1.1.1.1", "https://…", "host:port")
+	ProbeKind string `json:"probe_kind"` // "icmp" | "dns" | "http" | "tcp" | "gateway" | ""
 }
 
 // Channel is a notification destination.

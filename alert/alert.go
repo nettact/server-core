@@ -56,6 +56,7 @@ type Evidence struct {
 	Comparator        string    `json:"comparator"`
 	Threshold         float64   `json:"threshold"`
 	Value             float64   `json:"value"`
+	ReasonCode        int       `json:"reason_code"` // frozen probe failure reason (telemetry.ProbeReason*); 0 = none
 	ObservedAt        time.Time `json:"observed_at"`
 	CurrentlyAbnormal bool      `json:"currently_abnormal"`
 }
@@ -210,7 +211,7 @@ func (s *Service) IncidentDetail(ctx context.Context, incidentID string) ([]Aler
 		}
 		erows, err := tx.QueryContext(ctx, `
 			SELECT e.alert_id, e.id, e.condition_id, e.target_id, e.target_name, e.target_addr, e.probe_kind,
-			       e.metric_kind, e.comparator, e.threshold, e.value, e.observed_at,
+			       e.metric_kind, e.comparator, e.threshold, e.value, e.reason_code, e.observed_at,
 			       CASE WHEN a.state='firing' AND COALESCE(rcs.satisfied,0)=1 THEN 1 ELSE 0 END
 			FROM alert_evidence e
 			JOIN alerts a ON a.id = e.alert_id
@@ -224,7 +225,7 @@ func (s *Service) IncidentDetail(ctx context.Context, incidentID string) ([]Aler
 			var e Evidence
 			var abnormal int
 			if err := erows.Scan(&alertID, &e.ID, &e.ConditionID, &e.TargetID, &e.TargetName, &e.TargetAddr,
-				&e.ProbeKind, &e.MetricKind, &e.Comparator, &e.Threshold, &e.Value, &e.ObservedAt, &abnormal); err != nil {
+				&e.ProbeKind, &e.MetricKind, &e.Comparator, &e.Threshold, &e.Value, &e.ReasonCode, &e.ObservedAt, &abnormal); err != nil {
 				erows.Close()
 				return nil, 0, err
 			}
@@ -308,7 +309,7 @@ func (s *Service) loadEvidence(ctx context.Context, byID map[string]*Alert) erro
 	}
 	rows, err := s.db.Read().QueryContext(ctx, `
 		SELECT alert_id, id, condition_id, target_id, target_name, target_addr, probe_kind,
-		       metric_kind, comparator, threshold, value, observed_at
+		       metric_kind, comparator, threshold, value, reason_code, observed_at
 		FROM alert_evidence WHERE alert_id IN (`+string(ph)+`) ORDER BY observed_at`, ids...)
 	if err != nil {
 		return err
@@ -318,7 +319,7 @@ func (s *Service) loadEvidence(ctx context.Context, byID map[string]*Alert) erro
 		var alertID string
 		var e Evidence
 		if err := rows.Scan(&alertID, &e.ID, &e.ConditionID, &e.TargetID, &e.TargetName, &e.TargetAddr,
-			&e.ProbeKind, &e.MetricKind, &e.Comparator, &e.Threshold, &e.Value, &e.ObservedAt); err != nil {
+			&e.ProbeKind, &e.MetricKind, &e.Comparator, &e.Threshold, &e.Value, &e.ReasonCode, &e.ObservedAt); err != nil {
 			return err
 		}
 		if a := byID[alertID]; a != nil {

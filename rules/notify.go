@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/nettact/server-core/alert"
@@ -102,9 +103,10 @@ func dedupeStrings(ss []string) []string {
 // buildIncidentPayload assembles a notification payload from an incident's
 // current state and firing-member evidence.
 func (s *Service) buildIncidentPayload(ctx context.Context, incidentID, siteID, event, state string) notification.Payload {
-	var severity, suspected string
+	var severity, suspected, groupName, openKey string
 	_ = s.db.Read().QueryRowContext(ctx,
-		`SELECT severity, COALESCE(suspected_layer,'') FROM incidents WHERE id=?`, incidentID).Scan(&severity, &suspected)
+		`SELECT severity, COALESCE(suspected_layer,''), COALESCE(group_name,''), COALESCE(open_key,'') FROM incidents WHERE id=?`, incidentID).
+		Scan(&severity, &suspected, &groupName, &openKey)
 	details := s.incidentDetails(ctx, incidentID)
 	agents := map[string]bool{}
 	for _, d := range details {
@@ -114,7 +116,7 @@ func (s *Service) buildIncidentPayload(ctx context.Context, incidentID, siteID, 
 	if len(agents) > 1 {
 		scope = "site"
 	}
-	return notification.Payload{
+	p := notification.Payload{
 		Event:          event,
 		IncidentID:     incidentID,
 		SiteID:         siteID,
@@ -123,17 +125,61 @@ func (s *Service) buildIncidentPayload(ctx context.Context, incidentID, siteID, 
 		Scope:          scope,
 		AgentCount:     len(agents),
 		SuspectedLayer: suspected,
-		Details:        details,
-		URL:            s.incidentURL(ctx, incidentID),
-		At:             time.Now().UTC(),
+		GroupName:      groupName,
+		// "grp:" open_key ⇒ the incident merges the whole group's alerts, so terminal
+		// notices may make a group-wide claim; "alert:" ⇒ per-alert incident (unmerged
+		// group) whose siblings may still be firing.
+		GroupMerged: strings.HasPrefix(openKey, "grp:"),
+		Details:     details,
+		URL:         s.incidentURL(ctx, incidentID),
+		At:          time.Now().UTC(),
 	}
+	// A terminal notice fires post-commit, after the last member has resolved, so
+	// Details (firing-only) is empty. List the affected targets from the incident's
+	// frozen evidence so the notice names the group AND what came back — scoped to
+	// the members matching the close reason (a member force-resolved by a config
+	// change must never be announced as "recovered", and vice versa).
+	switch event {
+	case "incident.resolved":
+		p.RecoveredTargets = s.incidentClosedTargets(ctx, incidentID, alert.ReasonRecovered)
+	case "incident.terminated":
+		p.RecoveredTargets = s.incidentClosedTargets(ctx, incidentID, alert.ReasonConfigChanged)
+	}
+	return p
+}
+
+// incidentClosedTargets returns the DISTINCT targets of an incident's member
+// alerts that closed with the given resolve reason, read from their frozen
+// evidence (rows persist past resolution). Backs the terminal notice's target
+// list: recovered members for a resolve notice, terminated members for a
+// termination notice.
+func (s *Service) incidentClosedTargets(ctx context.Context, incidentID, reason string) []notification.RecoveredTarget {
+	rows, err := s.db.Read().QueryContext(ctx, `
+		SELECT DISTINCT e.target_name, e.target_addr, e.probe_kind
+		FROM alert_evidence e
+		JOIN alerts a ON a.id = e.alert_id
+		WHERE a.incident_id=? AND a.resolve_reason=?
+		ORDER BY e.probe_kind, e.target_name, e.target_addr`, incidentID, reason)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	var out []notification.RecoveredTarget
+	for rows.Next() {
+		var rt notification.RecoveredTarget
+		if err := rows.Scan(&rt.Name, &rt.Addr, &rt.ProbeKind); err != nil {
+			continue
+		}
+		out = append(out, rt)
+	}
+	return out
 }
 
 // incidentDetails returns the AlertDetail facts for an incident's firing-member
 // evidence, read on the read pool.
 func (s *Service) incidentDetails(ctx context.Context, incidentID string) []notification.AlertDetail {
 	rows, err := s.db.Read().QueryContext(ctx, `
-		SELECT e.probe_kind, e.metric_kind, e.comparator, e.threshold, e.value, e.target_name, e.target_addr,
+		SELECT e.probe_kind, e.metric_kind, e.comparator, e.threshold, e.value, e.reason_code, e.target_name, e.target_addr,
 		       COALESCE(a.layer,''), a.severity, COALESCE(NULLIF(ag.display_name,''), ag.hostname,'')
 		FROM alert_evidence e
 		JOIN alerts a ON a.id = e.alert_id
@@ -149,7 +195,7 @@ func (s *Service) incidentDetails(ctx context.Context, incidentID string) []noti
 // evidence, inside the write tx.
 func renderIncidentSummary(ctx context.Context, tx *sql.Tx, incidentID string) string {
 	rows, err := tx.QueryContext(ctx, `
-		SELECT e.probe_kind, e.metric_kind, e.comparator, e.threshold, e.value, e.target_name, e.target_addr,
+		SELECT e.probe_kind, e.metric_kind, e.comparator, e.threshold, e.value, e.reason_code, e.target_name, e.target_addr,
 		       COALESCE(a.layer,''), a.severity, COALESCE(NULLIF(ag.display_name,''), ag.hostname,'')
 		FROM alert_evidence e
 		JOIN alerts a ON a.id = e.alert_id
@@ -166,7 +212,7 @@ func renderIncidentSummary(ctx context.Context, tx *sql.Tx, incidentID string) s
 // frozen evidence, inside the write tx.
 func (s *Service) faultLine(ctx context.Context, tx *sql.Tx, alertID string) string {
 	rows, err := tx.QueryContext(ctx, `
-		SELECT e.probe_kind, e.metric_kind, e.comparator, e.threshold, e.value, e.target_name, e.target_addr,
+		SELECT e.probe_kind, e.metric_kind, e.comparator, e.threshold, e.value, e.reason_code, e.target_name, e.target_addr,
 		       COALESCE(a.layer,''), a.severity, COALESCE(NULLIF(ag.display_name,''), ag.hostname,'')
 		FROM alert_evidence e
 		JOIN alerts a ON a.id = e.alert_id
@@ -188,7 +234,7 @@ func scanDetails(rows *sql.Rows) []notification.AlertDetail {
 	for rows.Next() {
 		var d notification.AlertDetail
 		if err := rows.Scan(&d.ProbeKind, &d.MetricKind, &d.Comparator, &d.Threshold, &d.Value,
-			&d.TargetName, &d.Target, &d.Layer, &d.Severity, &d.AgentHost); err != nil {
+			&d.ReasonCode, &d.TargetName, &d.Target, &d.Layer, &d.Severity, &d.AgentHost); err != nil {
 			continue
 		}
 		out = append(out, d)
@@ -252,7 +298,7 @@ func (s *Service) incidentURL(ctx context.Context, incidentID string) string {
 // the headline and mislabel a later target as "N issues in total".
 func (s *Service) evidenceLine(ctx context.Context, tx *sql.Tx, alertID, conditionID string) string {
 	rows, err := tx.QueryContext(ctx, `
-		SELECT e.probe_kind, e.metric_kind, e.comparator, e.threshold, e.value, e.target_name, e.target_addr,
+		SELECT e.probe_kind, e.metric_kind, e.comparator, e.threshold, e.value, e.reason_code, e.target_name, e.target_addr,
 		       COALESCE(a.layer,''), a.severity, COALESCE(NULLIF(ag.display_name,''), ag.hostname,'')
 		FROM alert_evidence e
 		JOIN alerts a ON a.id = e.alert_id

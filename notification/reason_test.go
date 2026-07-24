@@ -1,0 +1,121 @@
+package notification
+
+import (
+	"strings"
+	"testing"
+
+	"github.com/nettact/protocol/telemetry"
+)
+
+// TestReasonClause verifies the "（原因：…）" / " (reason: …)" suffix is appended to a
+// firing detail when a failure reason is frozen, and suppressed both when there is
+// no reason and when the metric is itself an error_class series (no double-render).
+func TestReasonClause(t *testing.T) {
+	// ICMP 100% loss with a frozen "unreachable" reason.
+	loss := AlertDetail{
+		ProbeKind: "icmp", MetricKind: string(telemetry.ICMPLoss), Target: "1.1.1.1",
+		Comparator: "gte", Threshold: 50, Value: 100, ReasonCode: telemetry.ProbeReasonUnreachable,
+	}
+	if got := DescribeDetail(loss, "zh"); !strings.Contains(got, "（原因：网络不可达）") {
+		t.Errorf("zh reason suffix missing: %q", got)
+	}
+	if got := DescribeDetail(loss, "en"); !strings.Contains(got, "(reason: network unreachable)") {
+		t.Errorf("en reason suffix missing: %q", got)
+	}
+
+	// No reason (pure threshold breach) → no suffix.
+	noReason := AlertDetail{ProbeKind: "icmp", MetricKind: string(telemetry.ICMPRTTms), Target: "1.1.1.1", Value: 40, ReasonCode: telemetry.ProbeReasonNone}
+	if got := DescribeDetail(noReason, "zh"); strings.Contains(got, "原因") {
+		t.Errorf("unexpected reason suffix: %q", got)
+	}
+
+	// A rule ON an error_class metric already states the class → must not double-render.
+	onClass := AlertDetail{
+		ProbeKind: "tcp", MetricKind: string(telemetry.TCPErrorClass), Target: "host:443",
+		Value: float64(telemetry.ProbeReasonRefused), ReasonCode: telemetry.ProbeReasonRefused,
+	}
+	if got := DescribeDetail(onClass, "zh"); strings.Contains(got, "（原因") || !strings.Contains(got, "请求被拒绝") {
+		t.Errorf("error_class detail = %q, want the class once, no reason suffix", got)
+	}
+	// The non-TCP error_class kinds render the class too instead of a raw "kind = 3".
+	onICMPClass := AlertDetail{
+		ProbeKind: "icmp", MetricKind: string(telemetry.ICMPErrorClass), Target: "1.1.1.1",
+		Value: float64(telemetry.ProbeReasonUnreachable), ReasonCode: telemetry.ProbeReasonUnreachable,
+	}
+	if got := DescribeDetail(onICMPClass, "zh"); !strings.Contains(got, "探测错误：网络不可达") || strings.Contains(got, "error_class") {
+		t.Errorf("icmp error_class detail = %q, want a rendered class, not the raw kind", got)
+	}
+}
+
+// TestResolvedWithGroup verifies the recovery notice wording: a MERGED incident may
+// claim the whole group recovered and lists the recovered targets; an UNMERGED
+// (per-alert) incident names the group without a group-wide claim; and a payload
+// with no group name falls back to the original anonymous wording.
+func TestResolvedWithGroup(t *testing.T) {
+	merged := Payload{
+		Event: "incident.resolved", State: "resolved", GroupName: "客厅网络", GroupMerged: true,
+		RecoveredTargets: []RecoveredTarget{
+			{Name: "商城", Addr: "https://example.com", ProbeKind: "http"},
+			{Addr: "1.1.1.1", ProbeKind: "icmp"},
+		},
+	}
+	if got := RenderTitle(merged, "zh"); got != "告警组「客厅网络」已恢复" {
+		t.Errorf("zh merged title = %q", got)
+	}
+	if got := RenderTitle(merged, "en"); got != `Alert group "客厅网络" recovered` {
+		t.Errorf("en merged title = %q", got)
+	}
+	if got := RenderScope(merged, "zh"); !strings.Contains(got, "客厅网络") || !strings.Contains(got, "已全部恢复") {
+		t.Errorf("zh merged scope = %q", got)
+	}
+	lines := RenderLines(merged, "zh")
+	if len(lines) != 2 {
+		t.Fatalf("want 2 recovered lines, got %d: %v", len(lines), lines)
+	}
+	if !strings.Contains(lines[0], "商城") || !strings.Contains(lines[0], "已恢复") {
+		t.Errorf("recovered line = %q", lines[0])
+	}
+
+	// Unmerged: each alert has its own incident, so no "all recovered" claim.
+	unmerged := Payload{Event: "incident.resolved", State: "resolved", GroupName: "客厅网络"}
+	if got := RenderTitle(unmerged, "zh"); got != "告警已恢复（客厅网络）" {
+		t.Errorf("zh unmerged title = %q", got)
+	}
+	if got := RenderScope(unmerged, "zh"); !strings.Contains(got, "一项告警已恢复") || strings.Contains(got, "全部") {
+		t.Errorf("zh unmerged scope = %q", got)
+	}
+	if got := RenderScope(unmerged, "en"); !strings.Contains(got, "An alert in group") {
+		t.Errorf("en unmerged scope = %q", got)
+	}
+
+	// No group name → falls back to the original anonymous wording.
+	bare := Payload{Event: "incident.resolved", State: "resolved"}
+	if got := RenderTitle(bare, "zh"); got != "告警已恢复" {
+		t.Errorf("bare title = %q", got)
+	}
+	if got := RenderScope(bare, "zh"); got != "所有告警已恢复。" {
+		t.Errorf("bare scope = %q", got)
+	}
+}
+
+// TestTerminatedLinesAreNotRecovered verifies a configuration-termination notice
+// never describes its targets as "recovered" — the monitoring stopped, nothing
+// came back healthy.
+func TestTerminatedLinesAreNotRecovered(t *testing.T) {
+	p := Payload{
+		Event: "incident.terminated", State: "terminated", GroupName: "客厅网络", GroupMerged: true,
+		RecoveredTargets: []RecoveredTarget{{Name: "商城", Addr: "https://example.com", ProbeKind: "http"}},
+	}
+	zh := RenderLines(p, "zh")
+	if len(zh) != 1 || strings.Contains(zh[0], "已恢复") || !strings.Contains(zh[0], "已停止监控") {
+		t.Errorf("zh terminated lines = %v, want 已停止监控 and no 已恢复", zh)
+	}
+	en := RenderLines(p, "en")
+	if len(en) != 1 || strings.Contains(en[0], "recovered") || !strings.Contains(en[0], "no longer monitored") {
+		t.Errorf("en terminated lines = %v, want 'no longer monitored' and no 'recovered'", en)
+	}
+	// Title/scope keep the termination wording, never recovery.
+	if got := RenderTitle(p, "zh"); got != "监控对象已删除" {
+		t.Errorf("terminated title = %q", got)
+	}
+}

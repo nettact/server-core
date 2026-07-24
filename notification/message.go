@@ -27,6 +27,10 @@ type AlertDetail struct {
 	Layer      string  `json:"layer"`       // local|lan|wan|internet|dns|service|wireless
 	Severity   string  `json:"severity"`    // info|warn|error|critical
 	AgentHost  string  `json:"agent_host"`  // display_name or hostname of the detecting agent
+	// ReasonCode is the frozen probe failure-reason (telemetry.ProbeReason*): the
+	// underlying cause (unreachable / DNS-failed / timeout) rendered as "（原因：…）".
+	// 0 (ProbeReasonNone) ⇒ a pure threshold breach with no classified cause.
+	ReasonCode int `json:"reason_code"`
 }
 
 // AgentDetail is one agent's facts for a connectivity event (agent.offline /
@@ -84,6 +88,15 @@ func RenderTitle(p Payload, lang string) string {
 		case terminated:
 			return "Monitored object removed"
 		case resolved:
+			// A group-wide claim is only honest for a merged incident (one incident =
+			// the whole group). An unmerged group's incident is a single alert, whose
+			// siblings may still be firing — name the group without speaking for it.
+			switch {
+			case p.GroupName != "" && p.GroupMerged:
+				return fmt.Sprintf("Alert group %q recovered", p.GroupName)
+			case p.GroupName != "":
+				return fmt.Sprintf("Alert recovered (%s)", p.GroupName)
+			}
 			return "Alert resolved"
 		case p.Event == "incident.opened":
 			return "Network alert"
@@ -95,6 +108,12 @@ func RenderTitle(p Payload, lang string) string {
 	case terminated:
 		return "监控对象已删除"
 	case resolved:
+		switch {
+		case p.GroupName != "" && p.GroupMerged:
+			return fmt.Sprintf("告警组「%s」已恢复", p.GroupName)
+		case p.GroupName != "":
+			return fmt.Sprintf("告警已恢复（%s）", p.GroupName)
+		}
 		return "告警已恢复"
 	case p.Event == "incident.opened":
 		return "网络告警"
@@ -146,6 +165,21 @@ func RenderScope(p Payload, lang string) string {
 		return "监控对象已删除，事故终止。"
 	}
 	if p.Event == "incident.resolved" || p.State == "resolved" {
+		// Only a merged incident spans the whole group; an unmerged group's incident
+		// is one alert, so "all alerts recovered" would be a false group-wide claim
+		// while sibling incidents may still be firing.
+		switch {
+		case p.GroupName != "" && p.GroupMerged:
+			if en {
+				return fmt.Sprintf("All alerts in group %q have recovered.", p.GroupName)
+			}
+			return fmt.Sprintf("告警组「%s」的告警已全部恢复。", p.GroupName)
+		case p.GroupName != "":
+			if en {
+				return fmt.Sprintf("An alert in group %q has recovered.", p.GroupName)
+			}
+			return fmt.Sprintf("告警组「%s」的一项告警已恢复。", p.GroupName)
+		}
 		if en {
 			return "All alerts resolved."
 		}
@@ -220,9 +254,61 @@ func RenderLines(p Payload, lang string) []string {
 	switch p.Event {
 	case "agent.offline", "agent.recovered":
 		return RenderAgentLines(p, lang)
+	case "incident.resolved", "incident.terminated":
+		return RenderRecoveredLines(p, lang)
 	default:
 		return RenderDetails(p.Details, lang)
 	}
+}
+
+// RenderRecoveredLines renders one line per target in a resolved/terminated
+// notice, up to maxDetailLines with a "+N more" tail — so the terminal notice
+// names the group AND the affected targets, instead of a bare "所有告警已恢复".
+// A terminated close is a configuration removal, not a recovery, so its lines say
+// the monitoring stopped rather than claiming the target came back healthy.
+func RenderRecoveredLines(p Payload, lang string) []string {
+	en := normLang(lang) == "en"
+	terminated := p.Event == "incident.terminated"
+	limit := len(p.RecoveredTargets)
+	if limit > maxDetailLines {
+		limit = maxDetailLines
+	}
+	out := make([]string, 0, limit+1)
+	for _, rt := range p.RecoveredTargets[:limit] {
+		subj := recoveredSubject(rt, lang)
+		switch {
+		case terminated && en:
+			out = append(out, subj+" is no longer monitored")
+		case terminated:
+			out = append(out, subj+" 已停止监控")
+		case en:
+			out = append(out, subj+" recovered")
+		default:
+			out = append(out, subj+" 已恢复")
+		}
+	}
+	if rest := len(p.RecoveredTargets) - limit; rest > 0 {
+		if en {
+			out = append(out, fmt.Sprintf("+%d more", rest))
+		} else {
+			out = append(out, fmt.Sprintf("另有 %d 项", rest))
+		}
+	}
+	return out
+}
+
+// recoveredSubject names a recovered target as "<kind> <name>（<addr>）", reusing the
+// same kind noun / name+addr shape as the firing detail lines.
+func recoveredSubject(rt RecoveredTarget, lang string) string {
+	name := rt.Addr
+	if rt.Name != "" && rt.Name != rt.Addr {
+		if normLang(lang) == "en" {
+			name = fmt.Sprintf("%s (%s)", rt.Name, rt.Addr)
+		} else {
+			name = fmt.Sprintf("%s（%s）", rt.Name, rt.Addr)
+		}
+	}
+	return kindNoun(rt.ProbeKind, lang) + " " + name
 }
 
 // RenderAgentLines renders one human line per agent in a connectivity event, up
@@ -358,7 +444,11 @@ func describeZh(d AlertDetail) string {
 	case telemetry.TCPTLSms:
 		s = fmt.Sprintf("%s TLS 握手耗时 %sms%s", subj, num(d.Value), thrZh(d, "ms"))
 	case telemetry.TCPErrorClass:
-		s = fmt.Sprintf("%s 连接错误：%s", subj, tcpErrorClassZh(int(d.Value)))
+		s = fmt.Sprintf("%s 连接错误：%s", subj, probeReasonZh(int(d.Value)))
+	case telemetry.ICMPErrorClass, telemetry.DNSErrorClass, telemetry.HTTPErrorClass:
+		// A rule placed directly on a reason series renders the class as its whole
+		// sentence (the appended "（原因：…）" clause is suppressed for these kinds).
+		s = fmt.Sprintf("%s 探测错误：%s", subj, probeReasonZh(int(d.Value)))
 	case telemetry.HostCPUPct:
 		s = fmt.Sprintf("%s CPU 使用率 %s%%%s", subj, num(d.Value), thrZh(d, "%"))
 	case telemetry.HostMemPct:
@@ -376,10 +466,41 @@ func describeZh(d AlertDetail) string {
 	default:
 		s = fmt.Sprintf("%s：%s = %s%s", subj, d.MetricKind, num(d.Value), thrZh(d, ""))
 	}
+	if r := reasonClause(d); r != "" {
+		s += fmt.Sprintf("（原因：%s）", r)
+	}
 	if d.AgentHost != "" {
 		s += fmt.Sprintf("（来自 %s）", d.AgentHost)
 	}
 	return s
+}
+
+// reasonClause returns the localized failure reason to append as "（原因：…）", or ""
+// when there is no classified cause. It is suppressed for a rule placed directly on
+// an *.error_class metric — that sentence already states the class, so appending it
+// again would double-render.
+func reasonClause(d AlertDetail) string {
+	if d.ReasonCode == telemetry.ProbeReasonNone || isErrorClassKind(d.MetricKind) {
+		return ""
+	}
+	return probeReasonZh(d.ReasonCode)
+}
+
+func reasonClauseEn(d AlertDetail) string {
+	if d.ReasonCode == telemetry.ProbeReasonNone || isErrorClassKind(d.MetricKind) {
+		return ""
+	}
+	return probeReasonEn(d.ReasonCode)
+}
+
+// isErrorClassKind reports whether the metric is itself a probe failure-reason
+// series, whose sentence already carries the class.
+func isErrorClassKind(metricKind string) bool {
+	switch telemetry.MetricKind(metricKind) {
+	case telemetry.TCPErrorClass, telemetry.ICMPErrorClass, telemetry.DNSErrorClass, telemetry.HTTPErrorClass:
+		return true
+	}
+	return false
 }
 
 func subjectZh(d AlertDetail) string {
@@ -441,7 +562,11 @@ func describeEn(d AlertDetail) string {
 	case telemetry.TCPTLSms:
 		s = fmt.Sprintf("%s TLS handshake in %sms%s", subj, num(d.Value), thrEn(d, "ms"))
 	case telemetry.TCPErrorClass:
-		s = fmt.Sprintf("%s connection error: %s", subj, tcpErrorClassEn(int(d.Value)))
+		s = fmt.Sprintf("%s connection error: %s", subj, probeReasonEn(int(d.Value)))
+	case telemetry.ICMPErrorClass, telemetry.DNSErrorClass, telemetry.HTTPErrorClass:
+		// A rule placed directly on a reason series renders the class as its whole
+		// sentence (the appended " (reason: …)" clause is suppressed for these kinds).
+		s = fmt.Sprintf("%s probe error: %s", subj, probeReasonEn(int(d.Value)))
 	case telemetry.HostCPUPct:
 		s = fmt.Sprintf("%s CPU usage is %s%%%s", subj, num(d.Value), thrEn(d, "%"))
 	case telemetry.HostMemPct:
@@ -458,6 +583,9 @@ func describeEn(d AlertDetail) string {
 		s = fmt.Sprintf("Wi-Fi adapter %s link quality is %s%%%s", d.Target, num(d.Value), thrEn(d, "%"))
 	default:
 		s = fmt.Sprintf("%s: %s = %s%s", subj, d.MetricKind, num(d.Value), thrEn(d, ""))
+	}
+	if r := reasonClauseEn(d); r != "" {
+		s += fmt.Sprintf(" (reason: %s)", r)
 	}
 	if d.AgentHost != "" {
 		s += fmt.Sprintf(" (on %s)", d.AgentHost)
@@ -481,43 +609,46 @@ func thrEn(d AlertDetail, unit string) string {
 	return fmt.Sprintf(" (threshold %s %s%s)", sym, num(d.Threshold), unit)
 }
 
-// tcpErrorClassZh/En render a probe.tcp.error_class code (telemetry.TCPErr*) as a
-// short human reason. Unknown codes fall back to the raw number.
-func tcpErrorClassZh(code int) string {
+// probeReasonZh/En render a probe.*.error_class code (telemetry.ProbeReason*) as a
+// short human reason, shared by the TCP error-class sentence and the appended
+// "（原因：…）" clause on every probe. The wording is probe-neutral: a timeout may be
+// a lost ICMP echo, not a "connection", and a refusal may be a DNS server
+// declining a query, not a closed port. Unknown codes fall back to the raw number.
+func probeReasonZh(code int) string {
 	switch code {
-	case telemetry.TCPErrNone:
+	case telemetry.ProbeReasonNone:
 		return "无"
-	case telemetry.TCPErrTimeout:
-		return "连接超时"
-	case telemetry.TCPErrRefused:
-		return "连接被拒绝"
-	case telemetry.TCPErrUnreachable:
+	case telemetry.ProbeReasonTimeout:
+		return "超时无响应"
+	case telemetry.ProbeReasonRefused:
+		return "请求被拒绝"
+	case telemetry.ProbeReasonUnreachable:
 		return "网络不可达"
-	case telemetry.TCPErrDNS:
+	case telemetry.ProbeReasonDNS:
 		return "DNS 解析失败"
-	case telemetry.TCPErrTLS:
+	case telemetry.ProbeReasonTLS:
 		return "TLS 握手失败"
-	case telemetry.TCPErrOther:
+	case telemetry.ProbeReasonOther:
 		return "其它错误"
 	}
 	return fmt.Sprintf("未知错误（%d）", code)
 }
 
-func tcpErrorClassEn(code int) string {
+func probeReasonEn(code int) string {
 	switch code {
-	case telemetry.TCPErrNone:
+	case telemetry.ProbeReasonNone:
 		return "none"
-	case telemetry.TCPErrTimeout:
-		return "connection timed out"
-	case telemetry.TCPErrRefused:
-		return "connection refused"
-	case telemetry.TCPErrUnreachable:
+	case telemetry.ProbeReasonTimeout:
+		return "timed out (no response)"
+	case telemetry.ProbeReasonRefused:
+		return "refused by peer"
+	case telemetry.ProbeReasonUnreachable:
 		return "network unreachable"
-	case telemetry.TCPErrDNS:
+	case telemetry.ProbeReasonDNS:
 		return "DNS resolution failed"
-	case telemetry.TCPErrTLS:
+	case telemetry.ProbeReasonTLS:
 		return "TLS handshake failed"
-	case telemetry.TCPErrOther:
+	case telemetry.ProbeReasonOther:
 		return "other error"
 	}
 	return fmt.Sprintf("unknown error (%d)", code)
