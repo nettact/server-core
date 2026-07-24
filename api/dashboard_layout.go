@@ -115,7 +115,7 @@ func validateDashboardLayout(layout dashboardLayout) error {
 		}
 		seen[card.ID] = struct{}{}
 		switch card.Size {
-		case "compact", "medium", "wide":
+		case "compact", "medium", "wide", "tall":
 		default:
 			return errors.New("dashboard card size is invalid")
 		}

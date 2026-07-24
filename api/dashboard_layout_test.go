@@ -63,6 +63,22 @@ func TestDashboardLayoutRoundTrip(t *testing.T) {
 	}
 }
 
+func TestDashboardLayoutAcceptsTallSize(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "layout-tall.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	d := Deps{Settings: settings.New(db)}
+
+	payload := `{"version":1,"cards":[{"id":"network-quality","visible":true,"size":"tall"}]}`
+	w := httptest.NewRecorder()
+	d.handleUpdateDashboardLayout(w, httptest.NewRequest(http.MethodPut, "/api/v1/dashboard-layout", strings.NewReader(payload)))
+	if w.Code != http.StatusOK {
+		t.Fatalf("PUT tall size status=%d body=%s", w.Code, w.Body.String())
+	}
+}
+
 func TestDashboardLayoutRouteRequiresSession(t *testing.T) {
 	db, err := store.Open(filepath.Join(t.TempDir(), "layout-auth.db"))
 	if err != nil {
