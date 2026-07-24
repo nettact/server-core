@@ -91,22 +91,27 @@ func (s *Service) Snapshot(ctx context.Context, incidentID string) (SnapshotView
 // shared execution record's identity, status and reached verdict, plus how the
 // incident references it (via which alerts/conditions, and whether still active).
 type TraceSummary struct {
-	ReportID    string     `json:"report_id"`
-	AgentID     string     `json:"agent_id"`
-	AgentName   string     `json:"agent_name"`
-	Mode        string     `json:"mode"`
-	DestHost    string     `json:"dest_host"`
-	DestIP      string     `json:"dest_ip,omitempty"`
-	Port        int        `json:"port,omitempty"`
-	Status      string     `json:"status"`
-	Reason      string     `json:"reason,omitempty"`
-	Reached     bool       `json:"reached"`
-	ReachedTTL  int        `json:"reached_ttl,omitempty"`
-	ActiveRefs  int        `json:"active_refs"`
-	RequestedAt time.Time  `json:"requested_at"`
-	StartedAt   *time.Time `json:"started_at"`
-	CompletedAt *time.Time `json:"completed_at"`
-	DeadlineAt  time.Time  `json:"deadline_at"`
+	ReportID   string `json:"report_id"`
+	AgentID    string `json:"agent_id"`
+	AgentName  string `json:"agent_name"`
+	Mode       string `json:"mode"`
+	DestHost   string `json:"dest_host"`
+	DestIP     string `json:"dest_ip,omitempty"`
+	Port       int    `json:"port,omitempty"`
+	Status     string `json:"status"`
+	Reason     string `json:"reason,omitempty"`
+	Reached    bool   `json:"reached"`
+	ReachedTTL int    `json:"reached_ttl,omitempty"`
+	// FallbackFrom/FallbackReason surface a derivation-time permission fallback:
+	// the report ran in Mode after being downgraded from FallbackFrom ('' when
+	// it ran in its natural mode), because of FallbackReason.
+	FallbackFrom   string     `json:"fallback_from,omitempty"`   // ''|'tcp' — the mode this report fell back from
+	FallbackReason string     `json:"fallback_reason,omitempty"` // 'raw_socket_unavailable'|'permission_denied'
+	ActiveRefs     int        `json:"active_refs"`
+	RequestedAt    time.Time  `json:"requested_at"`
+	StartedAt      *time.Time `json:"started_at"`
+	CompletedAt    *time.Time `json:"completed_at"`
+	DeadlineAt     time.Time  `json:"deadline_at"`
 }
 
 // TracesForIncident returns the traceroute reports referenced by an incident,
@@ -115,6 +120,7 @@ func (s *Service) TracesForIncident(ctx context.Context, incidentID string) ([]T
 	rows, err := s.db.Read().QueryContext(ctx, `
 		SELECT tr.id, tr.agent_id, COALESCE(tr.agent_name,''), tr.mode, tr.dest_host, COALESCE(tr.dest_ip,''),
 		       tr.port, tr.status, COALESCE(tr.reason,''), tr.reached, tr.reached_ttl,
+		       COALESCE(tr.fallback_from,''), COALESCE(tr.fallback_reason,''),
 		       (SELECT COUNT(*) FROM trace_report_refs r2 WHERE r2.report_id=tr.id AND r2.incident_id=? AND r2.active=1),
 		       tr.requested_at, tr.started_at, tr.completed_at, tr.deadline_at
 		FROM trace_reports tr
@@ -140,8 +146,8 @@ func scanTraceSummary(rows *sql.Rows) (TraceSummary, error) {
 	var reached int
 	var started, completed sql.NullTime
 	if err := rows.Scan(&t.ReportID, &t.AgentID, &t.AgentName, &t.Mode, &t.DestHost, &t.DestIP,
-		&t.Port, &t.Status, &t.Reason, &reached, &t.ReachedTTL, &t.ActiveRefs,
-		&t.RequestedAt, &started, &completed, &t.DeadlineAt); err != nil {
+		&t.Port, &t.Status, &t.Reason, &reached, &t.ReachedTTL, &t.FallbackFrom, &t.FallbackReason,
+		&t.ActiveRefs, &t.RequestedAt, &started, &completed, &t.DeadlineAt); err != nil {
 		return TraceSummary{}, err
 	}
 	t.Reached = reached == 1
@@ -181,10 +187,12 @@ func (s *Service) TraceReport(ctx context.Context, reportID string) (TraceReport
 	var started, completed sql.NullTime
 	err := s.db.Read().QueryRowContext(ctx, `
 		SELECT id, site_id, agent_id, COALESCE(agent_name,''), mode, dest_host, COALESCE(dest_ip,''), port,
-		       status, COALESCE(reason,''), reached, reached_ttl, requested_at, started_at, completed_at, deadline_at
+		       status, COALESCE(reason,''), reached, reached_ttl, COALESCE(fallback_from,''), COALESCE(fallback_reason,''),
+		       requested_at, started_at, completed_at, deadline_at
 		FROM trace_reports WHERE id=?`, reportID).
 		Scan(&v.ReportID, &siteID, &v.AgentID, &v.AgentName, &v.Mode, &v.DestHost, &v.DestIP, &v.Port,
-			&v.Status, &v.Reason, &reached, &v.ReachedTTL, &v.RequestedAt, &started, &completed, &v.DeadlineAt)
+			&v.Status, &v.Reason, &reached, &v.ReachedTTL, &v.FallbackFrom, &v.FallbackReason,
+			&v.RequestedAt, &started, &completed, &v.DeadlineAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return TraceReportView{}, "", false, nil
 	}

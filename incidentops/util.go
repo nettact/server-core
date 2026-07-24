@@ -14,7 +14,8 @@ func mustJSON(v any) string {
 }
 
 // decodeStrings parses a JSON string array, tolerating "" / malformed input as an
-// empty slice (used for the agents.perm_effective column).
+// empty slice (used for the agents perm_supported/perm_granted/perm_effective
+// columns).
 func decodeStrings(raw string) []string {
 	if raw == "" {
 		return nil

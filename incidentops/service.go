@@ -120,15 +120,21 @@ func (s *Service) agentName(ctx context.Context, agentID string) string {
 	return name
 }
 
-// agentEffective returns an agent's effective permission set from its last
-// reported policy, for the traceroute permission gate. Empty on unknown agent.
-func (s *Service) agentEffective(ctx context.Context, agentID string) permission.Set {
-	var raw string
+// agentPermissions returns an agent's three reported permission views from its
+// last reported policy — supported (platform/runtime capability), granted
+// (policy) and effective (their intersection; the only view that authorizes
+// execution) — for the traceroute permission gate and its fallback/denial
+// classification. All empty on unknown agent.
+func (s *Service) agentPermissions(ctx context.Context, agentID string) (supported, granted, effective permission.Set) {
+	var supRaw, grantRaw, effRaw string
 	if err := s.db.Read().QueryRowContext(ctx,
-		`SELECT COALESCE(perm_effective,'[]') FROM agents WHERE id=?`, agentID).Scan(&raw); err != nil {
-		return permission.Set{}
+		`SELECT COALESCE(perm_supported,'[]'), COALESCE(perm_granted,'[]'), COALESCE(perm_effective,'[]')
+		 FROM agents WHERE id=?`, agentID).Scan(&supRaw, &grantRaw, &effRaw); err != nil {
+		return permission.Set{}, permission.Set{}, permission.Set{}
 	}
-	return permission.FromStrings(decodeStrings(raw))
+	return permission.FromStrings(decodeStrings(supRaw)),
+		permission.FromStrings(decodeStrings(grantRaw)),
+		permission.FromStrings(decodeStrings(effRaw))
 }
 
 // canonicalDest returns the single-flight destination key and the display host

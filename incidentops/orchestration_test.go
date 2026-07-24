@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	pcfg "github.com/nettact/protocol/config"
+	"github.com/nettact/protocol/permission"
 	"github.com/nettact/protocol/telemetry"
 	"github.com/nettact/server-core/eventbus"
 	"github.com/nettact/server-core/settings"
@@ -201,6 +203,169 @@ func TestSnapshotSizeCapIncludesBaseAndEntries(t *testing.T) {
 	}
 	if len(storedBase)+len(storedPayload) != total {
 		t.Fatalf("stored bytes=%d, reported total=%d", len(storedBase)+len(storedPayload), total)
+	}
+}
+
+// setAgentPerms writes an agent's three reported permission views (as their
+// JSON string-array column encodings).
+func setAgentPerms(t *testing.T, db *store.DB, agentID string, supported, granted, effective []permission.ID) {
+	t.Helper()
+	enc := func(ids []permission.ID) string {
+		return mustJSON(permission.NewSet(ids...).Strings())
+	}
+	if _, err := db.ExecContext(context.Background(),
+		`UPDATE agents SET perm_supported=?, perm_granted=?, perm_effective=? WHERE id=?`,
+		enc(supported), enc(granted), enc(effective), agentID); err != nil {
+		t.Fatalf("set agent perms: %v", err)
+	}
+}
+
+// seedEvidence freezes one alert_evidence row carrying trigger-time trace
+// inputs (probe kind, destination, TCP port).
+func seedEvidence(t *testing.T, db *store.DB, evidenceID, alertID, probeKind, targetAddr string, targetPort int, metricKind string) {
+	t.Helper()
+	if _, err := db.ExecContext(context.Background(), `
+		INSERT INTO alert_evidence(id,alert_id,condition_id,target_id,target_addr,target_port,probe_kind,metric_kind,comparator,threshold,value,observed_at)
+		VALUES(?,?,?,'target',?,?,?,?,'gt',0,1,?)`,
+		evidenceID, alertID, "cond_"+evidenceID, targetAddr, targetPort, probeKind, metricKind, time.Now().UTC()); err != nil {
+		t.Fatalf("seed evidence: %v", err)
+	}
+}
+
+// capturePusher accepts every push and records the trace requests it saw.
+type capturePusher struct {
+	mu     sync.Mutex
+	traces []pcfg.TraceRequest
+}
+
+func (p *capturePusher) PushIncidentSnapshotRequest(string, pcfg.IncidentSnapshotRequest) bool {
+	return true
+}
+
+func (p *capturePusher) PushTraceRequest(_ string, req pcfg.TraceRequest) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.traces = append(p.traces, req)
+	return true
+}
+
+// TestTraceFallsBackToICMPWhenTCPPermissionUnavailable covers the unprivileged-
+// Windows shape: the policy grants TCP traceroute but the runtime cannot open a
+// raw socket, so supported/effective carry only ICMP. A TCP-monitor fault must
+// then derive an ICMP-mode report that records the fallback, keeps the frozen
+// port, and dispatches normally with Mode=icmp on the wire.
+func TestTraceFallsBackToICMPWhenTCPPermissionUnavailable(t *testing.T) {
+	db, ctx := openIncidentOpsTest(t)
+	seedIncidentAlert(t, db, "inc_1", "alert_1", "agent_a", "firing")
+	setAgentPerms(t, db, "agent_a",
+		[]permission.ID{permission.DiagnosticTracerouteICMP},
+		[]permission.ID{permission.DiagnosticTracerouteICMP, permission.DiagnosticTracerouteTCP},
+		[]permission.ID{permission.DiagnosticTracerouteICMP})
+	seedEvidence(t, db, "ev_1", "alert_1", "tcp", "192.0.2.10", 443, "probe.tcp.rtt_ms")
+
+	svc := New(db, nil, settings.New(db), nil)
+	pusher := &capturePusher{}
+	svc.SetPusher(pusher)
+	if err := svc.OnEvidence(ctx, eventbus.EvidenceAdded{
+		EvidenceID: "ev_1", AlertID: "alert_1", IncidentID: "inc_1", AgentID: "agent_a", SiteID: "site_default",
+	}); err != nil {
+		t.Fatalf("on evidence: %v", err)
+	}
+
+	var mode, status, from, reason string
+	var port int
+	if err := db.QueryRowContext(ctx,
+		`SELECT mode, status, port, fallback_from, fallback_reason FROM trace_reports`).
+		Scan(&mode, &status, &port, &from, &reason); err != nil {
+		t.Fatalf("read report: %v", err)
+	}
+	if mode != "icmp" || from != "tcp" || reason != "raw_socket_unavailable" || port != 443 {
+		t.Fatalf("report mode=%s fallback_from=%s fallback_reason=%s port=%d, want icmp/tcp/raw_socket_unavailable/443",
+			mode, from, reason, port)
+	}
+	if status != "running" {
+		t.Fatalf("report status=%s, want running (queued report dispatched)", status)
+	}
+	if len(pusher.traces) != 1 || pusher.traces[0].Mode != pcfg.TraceModeICMP {
+		t.Fatalf("pushed requests=%+v, want exactly one with Mode=icmp", pusher.traces)
+	}
+}
+
+// TestTraceTerminalReasonDistinguishesPolicyFromCapability covers a TCP-monitor
+// fault on an agent with no traceroute permission at all: the report is
+// terminal unsupported and never dispatched, and the reason separates a
+// capability gap (granted but unsupported → raw_socket_unavailable) from a
+// policy denial (never granted → permission_denied).
+func TestTraceTerminalReasonDistinguishesPolicyFromCapability(t *testing.T) {
+	db, ctx := openIncidentOpsTest(t)
+	svc := New(db, nil, settings.New(db), nil)
+	pusher := &capturePusher{}
+	svc.SetPusher(pusher)
+
+	// agent_a: granted tcp, supported/effective empty → capability gap.
+	seedIncidentAlert(t, db, "inc_1", "alert_1", "agent_a", "firing")
+	setAgentPerms(t, db, "agent_a", nil, []permission.ID{permission.DiagnosticTracerouteTCP}, nil)
+	seedEvidence(t, db, "ev_1", "alert_1", "tcp", "192.0.2.10", 443, "probe.tcp.rtt_ms")
+	if err := svc.OnEvidence(ctx, eventbus.EvidenceAdded{
+		EvidenceID: "ev_1", AlertID: "alert_1", IncidentID: "inc_1", AgentID: "agent_a", SiteID: "site_default",
+	}); err != nil {
+		t.Fatalf("on evidence: %v", err)
+	}
+	var status, reason, from string
+	if err := db.QueryRowContext(ctx,
+		`SELECT status, reason, fallback_from FROM trace_reports WHERE agent_id='agent_a'`).
+		Scan(&status, &reason, &from); err != nil {
+		t.Fatalf("read agent_a report: %v", err)
+	}
+	if status != telemetry.TraceStatusUnsupported || reason != "raw_socket_unavailable" || from != "" {
+		t.Fatalf("agent_a report status=%s reason=%s fallback_from=%q, want unsupported/raw_socket_unavailable/''",
+			status, reason, from)
+	}
+	if len(pusher.traces) != 0 {
+		t.Fatalf("terminal report was dispatched: %+v", pusher.traces)
+	}
+
+	// agent_b: nothing granted → policy denial.
+	setAgentPerms(t, db, "agent_b", nil, nil, nil)
+	d, ok := svc.deriveTrace(ctx, "agent_b", "tcp", "192.0.2.10", 443)
+	if !ok || d.terminal != telemetry.TraceStatusUnsupported || d.reason != "permission_denied" {
+		t.Fatalf("ungranted plan = %+v ok=%v, want terminal unsupported/permission_denied", d, ok)
+	}
+}
+
+// TestTraceReadsIncludeFallbackFields verifies both read paths surface the
+// persisted fallback columns.
+func TestTraceReadsIncludeFallbackFields(t *testing.T) {
+	db, ctx := openIncidentOpsTest(t)
+	seedIncidentAlert(t, db, "inc_1", "alert_1", "agent_a", "firing")
+	now := time.Now().UTC()
+	if _, err := db.ExecContext(ctx, `
+		INSERT INTO trace_reports(id,site_id,agent_id,dest_key,dest_host,mode,port,fallback_from,fallback_reason,
+			status,max_hops,attempts,timeout_ms,requested_at,deadline_at)
+		VALUES('trace_fb','site_default','agent_a','ip:192.0.2.10','192.0.2.10','icmp',443,'tcp','raw_socket_unavailable',
+			'queued',30,3,30000,?,?)`, now, now.Add(time.Minute)); err != nil {
+		t.Fatalf("seed report: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `
+		INSERT INTO trace_report_refs(report_id,incident_id,alert_id,condition_id,active,created_at)
+		VALUES('trace_fb','inc_1','alert_1','cond_1',1,?)`, now); err != nil {
+		t.Fatalf("seed ref: %v", err)
+	}
+
+	svc := New(db, nil, nil, nil)
+	list, err := svc.TracesForIncident(ctx, "inc_1")
+	if err != nil {
+		t.Fatalf("traces for incident: %v", err)
+	}
+	if len(list) != 1 || list[0].FallbackFrom != "tcp" || list[0].FallbackReason != "raw_socket_unavailable" {
+		t.Fatalf("incident traces = %+v, want one with fallback tcp/raw_socket_unavailable", list)
+	}
+	view, siteID, ok, err := svc.TraceReport(ctx, "trace_fb")
+	if err != nil || !ok || siteID != "site_default" {
+		t.Fatalf("trace report: ok=%v site=%s err=%v", ok, siteID, err)
+	}
+	if view.FallbackFrom != "tcp" || view.FallbackReason != "raw_socket_unavailable" {
+		t.Fatalf("report view fallback = %s/%s, want tcp/raw_socket_unavailable", view.FallbackFrom, view.FallbackReason)
 	}
 }
 

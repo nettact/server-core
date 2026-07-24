@@ -47,9 +47,12 @@ func TraceEligibleMetric(probeKind, metricKind string) bool {
 	return false
 }
 
-// traceModeForKind maps an eligible probe kind to its traceroute mode. ICMP
-// monitors run ICMP traceroute; TCP and HTTP monitors run TCP traceroute (there
-// is no automatic mode fallback).
+// traceModeForKind maps an eligible probe kind to its natural traceroute mode.
+// ICMP monitors run ICMP traceroute; TCP and HTTP monitors run TCP traceroute.
+// The only automatic mode change happens later, in deriveTrace's permission
+// gate: a TCP plan whose agent lacks the TCP permission but holds the ICMP one
+// is downgraded to ICMP mode with the fallback recorded (fallbackFrom /
+// fallbackReason).
 func traceModeForKind(kind string) (string, bool) {
 	switch kind {
 	case "icmp":
@@ -60,6 +63,16 @@ func traceModeForKind(kind string) (string, bool) {
 	return "", false
 }
 
+// Stable denial reason codes shared with the agent traceroute engine's
+// capabilityReason, so server-derived and agent-reported outcomes speak one
+// vocabulary: permission_denied = the policy never granted the mode;
+// raw_socket_unavailable = granted but the runtime lacks the raw socket TCP
+// tracing needs (i.e. the agent needs Administrator privileges).
+const (
+	reasonPermissionDenied     = "permission_denied"
+	reasonRawSocketUnavailable = "raw_socket_unavailable"
+)
+
 // derivedTrace is the resolved traceroute plan for one eligible condition.
 type derivedTrace struct {
 	mode     string
@@ -67,6 +80,14 @@ type derivedTrace struct {
 	destHost string
 	destIP   string
 	port     int
+	// fallbackFrom/fallbackReason record an automatic mode downgrade: a TCP plan
+	// whose agent lacks the TCP permission but holds the ICMP one runs as ICMP
+	// with fallbackFrom="tcp" and the stable why-code (raw_socket_unavailable |
+	// permission_denied). The frozen port is kept — it is trigger-time fault
+	// evidence, and it keeps the fallback report's cohort key distinct from a
+	// pure ICMP monitor's.
+	fallbackFrom   string
+	fallbackReason string
 	// terminal/reason are set when the inputs are invalid, non-derivable or
 	// policy-ineligible: the report is created in that terminal state and never
 	// dispatched.
@@ -79,8 +100,11 @@ type derivedTrace struct {
 // the frozen TCP port (target_port) — gating on the detecting agent's effective
 // traceroute permission. It never reads live probe_tasks, so a target edited or
 // deleted between the fault and this derivation can never redirect the diagnostic
-// to a different endpoint or port. A non-derivable destination/port or a missing
-// permission yields a terminal failed/unsupported plan rather than a dispatch.
+// to a different endpoint or port. A TCP plan whose agent lacks the TCP
+// permission falls back to ICMP mode when the ICMP permission is held (recorded
+// via fallbackFrom/fallbackReason so the console can explain the downgrade); a
+// non-derivable destination/port or a fully missing permission yields a terminal
+// failed/unsupported plan rather than a dispatch. No auto-elevation, ever.
 func (s *Service) deriveTrace(ctx context.Context, agentID, probeKind, targetAddr string, targetPort int) (derivedTrace, bool) {
 	mode, ok := traceModeForKind(probeKind)
 	if !ok {
@@ -114,17 +138,41 @@ func (s *Service) deriveTrace(ctx context.Context, agentID, probeKind, targetAdd
 		d.port = hport
 	}
 
-	// Policy gate: the detecting agent must actually hold the mode's traceroute
-	// permission in its effective policy. No auto-elevation.
-	need := permission.DiagnosticTracerouteICMP
-	if mode == pcfg.TraceModeTCP {
-		need = permission.DiagnosticTracerouteTCP
-	}
-	if !s.agentEffective(ctx, agentID).Has(need) {
+	// Permission gate: the detecting agent must actually hold the mode's
+	// traceroute permission in its effective policy. A TCP plan is never
+	// elevated, but it MAY be downgraded: with the ICMP permission held the
+	// trace runs in ICMP mode and records the fallback; with neither permission
+	// it is terminal unsupported, with the denial reason distinguishing a policy
+	// denial from a capability gap (needs Administrator).
+	supported, granted, effective := s.agentPermissions(ctx, agentID)
+	switch {
+	case mode == pcfg.TraceModeTCP && !effective.Has(permission.DiagnosticTracerouteTCP):
+		if effective.Has(permission.DiagnosticTracerouteICMP) {
+			d.mode = pcfg.TraceModeICMP
+			d.fallbackFrom = pcfg.TraceModeTCP
+			d.fallbackReason = tcpTraceDenialReason(supported, granted)
+		} else {
+			d.terminal = telemetry.TraceStatusUnsupported
+			d.reason = tcpTraceDenialReason(supported, granted)
+		}
+	case mode == pcfg.TraceModeICMP && !effective.Has(permission.DiagnosticTracerouteICMP):
 		d.terminal = telemetry.TraceStatusUnsupported
-		d.reason = "permission_denied"
+		d.reason = reasonPermissionDenied
 	}
 	return d, true
+}
+
+// tcpTraceDenialReason classifies why an agent's effective set lacks the TCP
+// traceroute permission, using the same stable codes as the agent engine's
+// capabilityReason: granted by policy but absent from the supported view is a
+// runtime capability gap — the raw socket TCP tracing needs is unavailable
+// without Administrator privileges (raw_socket_unavailable); otherwise the
+// policy never granted the mode (permission_denied).
+func tcpTraceDenialReason(supported, granted permission.Set) string {
+	if granted.Has(permission.DiagnosticTracerouteTCP) && !supported.Has(permission.DiagnosticTracerouteTCP) {
+		return reasonRawSocketUnavailable
+	}
+	return reasonPermissionDenied
 }
 
 // hostPortFromURL extracts the host and the correct TCP port from an HTTP monitor
@@ -302,9 +350,11 @@ func (s *Service) insertReport(ctx context.Context, tx *sql.Tx, reportID string,
 	}
 	_, err := tx.ExecContext(ctx, `
 		INSERT INTO trace_reports(id, site_id, agent_id, agent_name, dest_key, dest_host, dest_ip, mode, port,
+			fallback_from, fallback_reason,
 			status, reason, max_hops, attempts, timeout_ms, resolve_hops, cohort_open, requested_at, completed_at, deadline_at)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		reportID, ev.SiteID, ev.AgentID, s.agentName(ctx, ev.AgentID), d.destKey, d.destHost, d.destIP, d.mode, d.port,
+		d.fallbackFrom, d.fallbackReason,
 		status, reason, s.diagMaxHops(ctx), s.diagAttempts(ctx), int(s.diagTotalTimeout(ctx).Milliseconds()),
 		boolInt(s.diagResolveHops(ctx)), cohortOpen, now, completed, deadline)
 	return err
