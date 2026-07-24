@@ -1379,6 +1379,8 @@ func detailFromAlert(a alert.Alert) notification.AlertDetail {
 		det.Value = e.Value
 		det.TargetName = e.TargetName
 		det.Target = e.TargetAddr
+		det.ReasonCode = e.ReasonCode
+		det.ReasonDetail = e.ReasonDetail
 	}
 	return det
 }

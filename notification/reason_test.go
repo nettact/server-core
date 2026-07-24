@@ -47,6 +47,80 @@ func TestReasonClause(t *testing.T) {
 	}
 }
 
+// TestReasonDetailRendering verifies the frozen raw detail is appended to the
+// localized class as "<label> · <detail>" — in the "（原因：…）"/" (reason: …)" clause
+// and inline in the error_class direct sentence — plus the HTTPStatus
+// double-statement suppression and the new code labels.
+func TestReasonDetailRendering(t *testing.T) {
+	// Reason clause carries the raw detail after the localized label.
+	loss := AlertDetail{
+		ProbeKind: "icmp", MetricKind: string(telemetry.ICMPLoss), Target: "1.1.1.1",
+		Comparator: "gte", Threshold: 50, Value: 100,
+		ReasonCode: telemetry.ProbeReasonUnreachable, ReasonDetail: "sendto: network is unreachable",
+	}
+	if got := DescribeDetail(loss, "zh"); !strings.Contains(got, "（原因：网络不可达 · sendto: network is unreachable）") {
+		t.Errorf("zh detail clause missing: %q", got)
+	}
+	if got := DescribeDetail(loss, "en"); !strings.Contains(got, "(reason: network unreachable · sendto: network is unreachable)") {
+		t.Errorf("en detail clause missing: %q", got)
+	}
+
+	// probe.http.status already states the code in its own sentence: an HTTPStatus
+	// reason on it must not double-state ("返回状态码 503（原因：状态码不符合预期 · HTTP 503）").
+	status := AlertDetail{
+		ProbeKind: "http", MetricKind: string(telemetry.HTTPStatus), Target: "https://example.com",
+		Comparator: "eq", Value: 503,
+		ReasonCode: telemetry.ProbeReasonHTTPStatus, ReasonDetail: "HTTP 503",
+	}
+	if got := DescribeDetail(status, "zh"); strings.Contains(got, "原因") || !strings.Contains(got, "返回状态码 503") {
+		t.Errorf("zh http.status detail = %q, want the status once, no reason clause", got)
+	}
+	if got := DescribeDetail(status, "en"); strings.Contains(got, "reason:") {
+		t.Errorf("en http.status detail = %q, want no reason clause", got)
+	}
+	// …but the same reason on a DIFFERENT metric (probe.http.ok) still renders it.
+	okDown := AlertDetail{
+		ProbeKind: "http", MetricKind: string(telemetry.HTTPOK), Target: "https://example.com",
+		Comparator: "lt", Threshold: 1, Value: 0,
+		ReasonCode: telemetry.ProbeReasonHTTPStatus, ReasonDetail: "HTTP 503",
+	}
+	if got := DescribeDetail(okDown, "zh"); !strings.Contains(got, "（原因：状态码不符合预期 · HTTP 503）") {
+		t.Errorf("zh http.ok detail clause missing: %q", got)
+	}
+
+	// A rule ON an error_class series carries the detail inline, exactly once.
+	onClass := AlertDetail{
+		ProbeKind: "tcp", MetricKind: string(telemetry.TCPErrorClass),
+		TargetName: "db", Target: "db.example.test:5432",
+		Value:      float64(telemetry.ProbeReasonRefused),
+		ReasonCode: telemetry.ProbeReasonRefused, ReasonDetail: "dial tcp 10.0.0.5:5432: connect: connection refused",
+	}
+	if got := DescribeDetail(onClass, "zh"); !strings.Contains(got, "连接错误：请求被拒绝 · dial tcp 10.0.0.5:5432: connect: connection refused") ||
+		strings.Contains(got, "（原因") {
+		t.Errorf("zh error_class detail = %q, want inline detail once", got)
+	}
+	if got := DescribeDetail(onClass, "en"); !strings.Contains(got, "connection error: refused by peer · dial tcp 10.0.0.5:5432: connect: connection refused") {
+		t.Errorf("en error_class detail = %q, want inline detail", got)
+	}
+
+	// New code labels (spot checks).
+	for _, tc := range []struct {
+		code   int
+		zh, en string
+	}{
+		{telemetry.ProbeReasonDNSNXDomain, "域名不存在", "domain does not exist (NXDOMAIN)"},
+		{telemetry.ProbeReasonTLSExpired, "证书已过期", "certificate expired"},
+		{telemetry.ProbeReasonHTTPStatus, "状态码不符合预期", "unexpected HTTP status"},
+	} {
+		if got := probeReasonZh(tc.code); got != tc.zh {
+			t.Errorf("probeReasonZh(%d) = %q, want %q", tc.code, got, tc.zh)
+		}
+		if got := probeReasonEn(tc.code); got != tc.en {
+			t.Errorf("probeReasonEn(%d) = %q, want %q", tc.code, got, tc.en)
+		}
+	}
+}
+
 // TestResolvedWithGroup verifies the recovery notice wording: a MERGED incident may
 // claim the whole group recovered and lists the recovered targets; an UNMERGED
 // (per-alert) incident names the group without a group-wide claim; and a payload

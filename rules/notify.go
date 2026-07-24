@@ -179,7 +179,7 @@ func (s *Service) incidentClosedTargets(ctx context.Context, incidentID, reason 
 // evidence, read on the read pool.
 func (s *Service) incidentDetails(ctx context.Context, incidentID string) []notification.AlertDetail {
 	rows, err := s.db.Read().QueryContext(ctx, `
-		SELECT e.probe_kind, e.metric_kind, e.comparator, e.threshold, e.value, e.reason_code, e.target_name, e.target_addr,
+		SELECT e.probe_kind, e.metric_kind, e.comparator, e.threshold, e.value, e.reason_code, e.reason_detail, e.target_name, e.target_addr,
 		       COALESCE(a.layer,''), a.severity, COALESCE(NULLIF(ag.display_name,''), ag.hostname,'')
 		FROM alert_evidence e
 		JOIN alerts a ON a.id = e.alert_id
@@ -195,7 +195,7 @@ func (s *Service) incidentDetails(ctx context.Context, incidentID string) []noti
 // evidence, inside the write tx.
 func renderIncidentSummary(ctx context.Context, tx *sql.Tx, incidentID string) string {
 	rows, err := tx.QueryContext(ctx, `
-		SELECT e.probe_kind, e.metric_kind, e.comparator, e.threshold, e.value, e.reason_code, e.target_name, e.target_addr,
+		SELECT e.probe_kind, e.metric_kind, e.comparator, e.threshold, e.value, e.reason_code, e.reason_detail, e.target_name, e.target_addr,
 		       COALESCE(a.layer,''), a.severity, COALESCE(NULLIF(ag.display_name,''), ag.hostname,'')
 		FROM alert_evidence e
 		JOIN alerts a ON a.id = e.alert_id
@@ -212,7 +212,7 @@ func renderIncidentSummary(ctx context.Context, tx *sql.Tx, incidentID string) s
 // frozen evidence, inside the write tx.
 func (s *Service) faultLine(ctx context.Context, tx *sql.Tx, alertID string) string {
 	rows, err := tx.QueryContext(ctx, `
-		SELECT e.probe_kind, e.metric_kind, e.comparator, e.threshold, e.value, e.reason_code, e.target_name, e.target_addr,
+		SELECT e.probe_kind, e.metric_kind, e.comparator, e.threshold, e.value, e.reason_code, e.reason_detail, e.target_name, e.target_addr,
 		       COALESCE(a.layer,''), a.severity, COALESCE(NULLIF(ag.display_name,''), ag.hostname,'')
 		FROM alert_evidence e
 		JOIN alerts a ON a.id = e.alert_id
@@ -234,7 +234,7 @@ func scanDetails(rows *sql.Rows) []notification.AlertDetail {
 	for rows.Next() {
 		var d notification.AlertDetail
 		if err := rows.Scan(&d.ProbeKind, &d.MetricKind, &d.Comparator, &d.Threshold, &d.Value,
-			&d.ReasonCode, &d.TargetName, &d.Target, &d.Layer, &d.Severity, &d.AgentHost); err != nil {
+			&d.ReasonCode, &d.ReasonDetail, &d.TargetName, &d.Target, &d.Layer, &d.Severity, &d.AgentHost); err != nil {
 			continue
 		}
 		out = append(out, d)
@@ -298,7 +298,7 @@ func (s *Service) incidentURL(ctx context.Context, incidentID string) string {
 // the headline and mislabel a later target as "N issues in total".
 func (s *Service) evidenceLine(ctx context.Context, tx *sql.Tx, alertID, conditionID string) string {
 	rows, err := tx.QueryContext(ctx, `
-		SELECT e.probe_kind, e.metric_kind, e.comparator, e.threshold, e.value, e.reason_code, e.target_name, e.target_addr,
+		SELECT e.probe_kind, e.metric_kind, e.comparator, e.threshold, e.value, e.reason_code, e.reason_detail, e.target_name, e.target_addr,
 		       COALESCE(a.layer,''), a.severity, COALESCE(NULLIF(ag.display_name,''), ag.hostname,'')
 		FROM alert_evidence e
 		JOIN alerts a ON a.id = e.alert_id

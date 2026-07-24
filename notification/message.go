@@ -31,6 +31,10 @@ type AlertDetail struct {
 	// underlying cause (unreachable / DNS-failed / timeout) rendered as "（原因：…）".
 	// 0 (ProbeReasonNone) ⇒ a pure threshold breach with no classified cause.
 	ReasonCode int `json:"reason_code"`
+	// ReasonDetail is the raw underlying error frozen next to ReasonCode (the
+	// agent's machine text, e.g. "dial tcp …: connect: connection refused", never
+	// localized); "" when the evaluation path had no detail to freeze.
+	ReasonDetail string `json:"reason_detail,omitempty"`
 }
 
 // AgentDetail is one agent's facts for a connectivity event (agent.offline /
@@ -444,11 +448,11 @@ func describeZh(d AlertDetail) string {
 	case telemetry.TCPTLSms:
 		s = fmt.Sprintf("%s TLS 握手耗时 %sms%s", subj, num(d.Value), thrZh(d, "ms"))
 	case telemetry.TCPErrorClass:
-		s = fmt.Sprintf("%s 连接错误：%s", subj, probeReasonZh(int(d.Value)))
+		s = fmt.Sprintf("%s 连接错误：%s", subj, reasonText(probeReasonZh(int(d.Value)), d.ReasonDetail))
 	case telemetry.ICMPErrorClass, telemetry.DNSErrorClass, telemetry.HTTPErrorClass:
 		// A rule placed directly on a reason series renders the class as its whole
 		// sentence (the appended "（原因：…）" clause is suppressed for these kinds).
-		s = fmt.Sprintf("%s 探测错误：%s", subj, probeReasonZh(int(d.Value)))
+		s = fmt.Sprintf("%s 探测错误：%s", subj, reasonText(probeReasonZh(int(d.Value)), d.ReasonDetail))
 	case telemetry.HostCPUPct:
 		s = fmt.Sprintf("%s CPU 使用率 %s%%%s", subj, num(d.Value), thrZh(d, "%"))
 	case telemetry.HostMemPct:
@@ -477,20 +481,38 @@ func describeZh(d AlertDetail) string {
 
 // reasonClause returns the localized failure reason to append as "（原因：…）", or ""
 // when there is no classified cause. It is suppressed for a rule placed directly on
-// an *.error_class metric — that sentence already states the class, so appending it
-// again would double-render.
+// an *.error_class metric — that sentence already states the class — and for an
+// HTTPStatus reason on the probe.http.status sentence, which already states the
+// status code, so appending "（原因：状态码不符合预期 · HTTP 503）" would double-state it.
 func reasonClause(d AlertDetail) string {
 	if d.ReasonCode == telemetry.ProbeReasonNone || isErrorClassKind(d.MetricKind) {
 		return ""
 	}
-	return probeReasonZh(d.ReasonCode)
+	if d.ReasonCode == telemetry.ProbeReasonHTTPStatus && telemetry.MetricKind(d.MetricKind) == telemetry.HTTPStatus {
+		return ""
+	}
+	return reasonText(probeReasonZh(d.ReasonCode), d.ReasonDetail)
 }
 
 func reasonClauseEn(d AlertDetail) string {
 	if d.ReasonCode == telemetry.ProbeReasonNone || isErrorClassKind(d.MetricKind) {
 		return ""
 	}
-	return probeReasonEn(d.ReasonCode)
+	if d.ReasonCode == telemetry.ProbeReasonHTTPStatus && telemetry.MetricKind(d.MetricKind) == telemetry.HTTPStatus {
+		return ""
+	}
+	return reasonText(probeReasonEn(d.ReasonCode), d.ReasonDetail)
+}
+
+// reasonText joins a localized reason label with the frozen raw detail as
+// "<label> · <detail>". The detail is machine text (never localized), so the same
+// join serves both languages; it is dropped when absent or when it merely repeats
+// the label.
+func reasonText(label, detail string) string {
+	if detail == "" || detail == label {
+		return label
+	}
+	return label + " · " + detail
 }
 
 // isErrorClassKind reports whether the metric is itself a probe failure-reason
@@ -562,11 +584,11 @@ func describeEn(d AlertDetail) string {
 	case telemetry.TCPTLSms:
 		s = fmt.Sprintf("%s TLS handshake in %sms%s", subj, num(d.Value), thrEn(d, "ms"))
 	case telemetry.TCPErrorClass:
-		s = fmt.Sprintf("%s connection error: %s", subj, probeReasonEn(int(d.Value)))
+		s = fmt.Sprintf("%s connection error: %s", subj, reasonText(probeReasonEn(int(d.Value)), d.ReasonDetail))
 	case telemetry.ICMPErrorClass, telemetry.DNSErrorClass, telemetry.HTTPErrorClass:
 		// A rule placed directly on a reason series renders the class as its whole
 		// sentence (the appended " (reason: …)" clause is suppressed for these kinds).
-		s = fmt.Sprintf("%s probe error: %s", subj, probeReasonEn(int(d.Value)))
+		s = fmt.Sprintf("%s probe error: %s", subj, reasonText(probeReasonEn(int(d.Value)), d.ReasonDetail))
 	case telemetry.HostCPUPct:
 		s = fmt.Sprintf("%s CPU usage is %s%%%s", subj, num(d.Value), thrEn(d, "%"))
 	case telemetry.HostMemPct:
@@ -628,8 +650,26 @@ func probeReasonZh(code int) string {
 		return "DNS 解析失败"
 	case telemetry.ProbeReasonTLS:
 		return "TLS 握手失败"
+	case telemetry.ProbeReasonReset:
+		return "连接被重置"
 	case telemetry.ProbeReasonOther:
 		return "其它错误"
+	case telemetry.ProbeReasonDNSNXDomain:
+		return "域名不存在"
+	case telemetry.ProbeReasonDNSServFail:
+		return "DNS 服务器故障"
+	case telemetry.ProbeReasonDNSNoRecord:
+		return "无匹配解析记录"
+	case telemetry.ProbeReasonTLSExpired:
+		return "证书已过期"
+	case telemetry.ProbeReasonTLSUntrusted:
+		return "证书不受信任"
+	case telemetry.ProbeReasonTLSHostname:
+		return "证书域名不匹配"
+	case telemetry.ProbeReasonHTTPStatus:
+		return "状态码不符合预期"
+	case telemetry.ProbeReasonHTTPKeyword:
+		return "响应内容不匹配"
 	}
 	return fmt.Sprintf("未知错误（%d）", code)
 }
@@ -648,8 +688,26 @@ func probeReasonEn(code int) string {
 		return "DNS resolution failed"
 	case telemetry.ProbeReasonTLS:
 		return "TLS handshake failed"
+	case telemetry.ProbeReasonReset:
+		return "connection reset"
 	case telemetry.ProbeReasonOther:
 		return "other error"
+	case telemetry.ProbeReasonDNSNXDomain:
+		return "domain does not exist (NXDOMAIN)"
+	case telemetry.ProbeReasonDNSServFail:
+		return "DNS server failure (SERVFAIL)"
+	case telemetry.ProbeReasonDNSNoRecord:
+		return "no matching DNS record"
+	case telemetry.ProbeReasonTLSExpired:
+		return "certificate expired"
+	case telemetry.ProbeReasonTLSUntrusted:
+		return "certificate not trusted"
+	case telemetry.ProbeReasonTLSHostname:
+		return "certificate hostname mismatch"
+	case telemetry.ProbeReasonHTTPStatus:
+		return "unexpected HTTP status"
+	case telemetry.ProbeReasonHTTPKeyword:
+		return "response content mismatch"
 	}
 	return fmt.Sprintf("unknown error (%d)", code)
 }
