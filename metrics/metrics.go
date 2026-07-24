@@ -18,6 +18,8 @@ package metrics
 import (
 	"context"
 	"database/sql"
+	"errors"
+	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -402,6 +404,229 @@ func (s *Store) Query(ctx context.Context, q Query) ([]Point, error) {
 		}
 		return out[i].TS.Before(out[j].TS)
 	})
+	return out, nil
+}
+
+// summaryDefaultWindowSec is Summarize's default window: the raw tier boundary
+// (pickTier's samples cutoff), matching the status page's 2h P95 cards.
+const summaryDefaultWindowSec = 2 * 3600
+
+// summaryMaxWindowSec caps Summarize at the raw retention default (2d):
+// percentiles are only meaningful over raw observations (rollups store bucket
+// averages, and a percentile of averages is not a percentile of observations),
+// so summaries always scan the samples table — unlike Query, which switches to
+// rollups past 2h to bound the point count of its response. An aggregate
+// response is a handful of numbers regardless of window, so the only cost is
+// the scan itself, bounded by retention.
+const summaryMaxWindowSec = 2 * 86400
+
+// ErrSummaryWindow is returned when a Summarize window exceeds raw retention.
+var ErrSummaryWindow = errors.New("metrics: summary window exceeds raw retention (2d)")
+
+// ErrSummaryReduce is returned for an unknown SummaryQuery.Reduce mode.
+var ErrSummaryReduce = errors.New("metrics: unknown summary reduce mode")
+
+// ReduceWorstByTS collapses the merged samples to one per timestamp, keeping
+// the worst (max) value across series — "how bad was the worst target each
+// second". Used by the dashboard quality cards.
+const ReduceWorstByTS = "worst"
+
+// SummaryQuery asks for per-kind aggregates over a raw window. The window is a
+// length, not an absolute timestamp, so validation can't race the caller's
+// clock against Summarize's own time.Now.
+type SummaryQuery struct {
+	AgentID        string
+	Kinds          []string
+	MonitorID      string   // optional; set = only that monitor's series
+	Target         string   // optional; set = only series for that target string
+	ExcludeTargets []string // optional; series with these target strings are skipped
+	Reduce         string   // "" = plain merge; ReduceWorstByTS = per-ts max across series
+	WindowSeconds  int64    // 0 => 2h; must fit raw retention (≤2d)
+}
+
+// LatestPoint is the newest observation inside the window.
+type LatestPoint struct {
+	TS    time.Time `json:"ts"`
+	Value float64   `json:"value"`
+}
+
+// KindSummary aggregates one kind's raw samples: newest value, nearest-rank
+// P95, mean, and the (post-reduce) sample count the aggregates were computed
+// from. LatestNonzero is the newest sample whose value rounds to a nonzero
+// integer — categorical code cards (NAT type etc.) use it to fall back past a
+// transient "unknown" (code 0) probe to the most recent determinate result.
+type KindSummary struct {
+	Latest        *LatestPoint `json:"latest"`         // nil when no samples in window
+	LatestNonzero *LatestPoint `json:"latest_nonzero"` // nil when no nonzero sample in window
+	P95           *float64     `json:"p95"`            // nil when no samples in window
+	Avg           *float64     `json:"avg"`            // nil when no samples in window
+	Count         int          `json:"count"`
+}
+
+// Summarize computes latest/P95 per kind server-side so status cards don't pull
+// the raw window into the browser. Series resolution mirrors Query — matched
+// across ALL generations, merged in (target, monitor, ts) order — so the numbers
+// equal what a client would compute from the same Query results. The result map
+// always carries every requested kind; kinds with no samples get a zero summary.
+func (s *Store) Summarize(ctx context.Context, q SummaryQuery) (map[string]KindSummary, error) {
+	rangeSec := q.WindowSeconds
+	if rangeSec == 0 {
+		rangeSec = summaryDefaultWindowSec
+	}
+	if rangeSec < 0 || rangeSec > summaryMaxWindowSec {
+		return nil, ErrSummaryWindow
+	}
+	if q.Reduce != "" && q.Reduce != ReduceWorstByTS {
+		return nil, ErrSummaryReduce
+	}
+	excluded := make(map[string]bool, len(q.ExcludeTargets))
+	for _, target := range q.ExcludeTargets {
+		excluded[target] = true
+	}
+	since := time.Now().Unix() - rangeSec
+	// The inclusive `ts >= since` predicate admits rangeSec+1 integer timestamps
+	// at the fastest supported probe interval (1s); a lower per-series cap would
+	// silently drop the NEWEST samples (ORDER BY ts keeps oldest) and skew both
+	// latest and P95.
+	perSeriesLimit := rangeSec + 1
+
+	out := make(map[string]KindSummary, len(q.Kinds))
+	for _, kind := range q.Kinds {
+		sqlSeries := `SELECT id, COALESCE(monitor_id,''), COALESCE(target,'') FROM series WHERE agent_id=? AND kind=?`
+		args := []any{q.AgentID, kind}
+		if q.Target != "" {
+			sqlSeries += ` AND target=?`
+			args = append(args, q.Target)
+		}
+		if q.MonitorID != "" {
+			sqlSeries += ` AND monitor_id=?`
+			args = append(args, q.MonitorID)
+		}
+		rows, err := s.db.Read().QueryContext(ctx, sqlSeries, args...)
+		if err != nil {
+			return nil, err
+		}
+		type seriesRef struct {
+			id                int64
+			monitorID, target string
+		}
+		var series []seriesRef
+		for rows.Next() {
+			var sr seriesRef
+			if err := rows.Scan(&sr.id, &sr.monitorID, &sr.target); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			if excluded[sr.target] {
+				continue
+			}
+			series = append(series, sr)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return nil, err
+		}
+
+		type sample struct {
+			ts                int64
+			value             float64
+			target, monitorID string
+		}
+		var merged []sample
+		// The worst reduction folds per-timestamp maxima WHILE scanning so memory
+		// scales with distinct timestamps, not series × timestamps: 50 one-second
+		// targets over 24h would otherwise materialize ~4.3M rows per kind before
+		// collapsing to at most 86401.
+		var worst map[int64]float64
+		if q.Reduce == ReduceWorstByTS {
+			worst = make(map[int64]float64)
+		}
+		for _, sr := range series {
+			prows, err := s.db.Read().QueryContext(ctx,
+				`SELECT ts, value FROM samples WHERE series_id=? AND ts>=? ORDER BY ts LIMIT ?`,
+				sr.id, since, perSeriesLimit)
+			if err != nil {
+				return nil, err
+			}
+			for prows.Next() {
+				var ts int64
+				var value float64
+				if err := prows.Scan(&ts, &value); err != nil {
+					prows.Close()
+					return nil, err
+				}
+				if worst != nil {
+					if prev, ok := worst[ts]; !ok || value > prev {
+						worst[ts] = value
+					}
+					continue
+				}
+				merged = append(merged, sample{ts: ts, value: value, target: sr.target, monitorID: sr.monitorID})
+			}
+			prows.Close()
+			if err := prows.Err(); err != nil {
+				return nil, err
+			}
+		}
+		if worst != nil {
+			merged = make([]sample, 0, len(worst))
+			for ts, value := range worst {
+				merged = append(merged, sample{ts: ts, value: value})
+			}
+		}
+		if len(merged) == 0 {
+			out[kind] = KindSummary{}
+			continue
+		}
+		if worst == nil {
+			// Query's merge order with kind fixed; on tied timestamps the latest
+			// scan below keeps the earlier entry, matching a strictly-greater
+			// reduce over Query output. The worst reduction needs no ordering:
+			// its timestamps are unique, so the aggregates below are order-free.
+			sort.SliceStable(merged, func(i, j int) bool {
+				if merged[i].target != merged[j].target {
+					return merged[i].target < merged[j].target
+				}
+				if merged[i].monitorID != merged[j].monitorID {
+					return merged[i].monitorID < merged[j].monitorID
+				}
+				return merged[i].ts < merged[j].ts
+			})
+		}
+
+		latest := merged[0]
+		var latestNonzero *sample
+		var sum float64
+		values := make([]float64, len(merged))
+		for i, sm := range merged {
+			values[i] = sm.value
+			sum += sm.value
+			if sm.ts > latest.ts {
+				latest = sm
+			}
+			if math.Round(sm.value) != 0 && (latestNonzero == nil || sm.ts > latestNonzero.ts) {
+				nz := sm
+				latestNonzero = &nz
+			}
+		}
+		sort.Float64s(values)
+		idx := int(math.Ceil(float64(len(values))*0.95)) - 1
+		if idx < 0 {
+			idx = 0
+		}
+		p95 := values[idx]
+		avg := sum / float64(len(merged))
+		ks := KindSummary{
+			Latest: &LatestPoint{TS: time.Unix(latest.ts, 0).UTC(), Value: latest.value},
+			P95:    &p95,
+			Avg:    &avg,
+			Count:  len(merged),
+		}
+		if latestNonzero != nil {
+			ks.LatestNonzero = &LatestPoint{TS: time.Unix(latestNonzero.ts, 0).UTC(), Value: latestNonzero.value}
+		}
+		out[kind] = ks
+	}
 	return out, nil
 }
 

@@ -131,6 +131,7 @@ func Router(d Deps) http.Handler {
 			r.Put("/agents/{id}", d.handleUpdateAgent)
 			r.Delete("/agents/{id}", d.handleDeleteAgent)
 			r.Get("/agents/{id}/metrics", d.handleAgentMetrics)
+			r.Get("/agents/{id}/metrics/summary", d.handleAgentMetricsSummary)
 			r.Get("/agents/{id}/latest", d.handleAgentLatest)
 			r.Get("/agents/{id}/interfaces", d.handleAgentInterfaces)
 			r.Get("/agents/{id}/series", d.handleAgentSeries)
@@ -622,6 +623,63 @@ func (d Deps) handleAgentMetrics(w http.ResponseWriter, r *http.Request) {
 		points = []metrics.Point{}
 	}
 	writeJSON(w, http.StatusOK, points)
+}
+
+// metricsSummaryResponse is the /metrics/summary payload: per-kind aggregates
+// plus the window they were computed over.
+type metricsSummaryResponse struct {
+	WindowSeconds int64                          `json:"window_seconds"`
+	Kinds         map[string]metrics.KindSummary `json:"kinds"`
+}
+
+// handleAgentMetricsSummary serves latest/P95/avg per kind so stat cards get
+// one small response instead of a raw sample window (PERF-001). Aggregates are
+// always computed from raw samples (percentiles of rollup bucket averages
+// would be wrong), so the window is capped at raw retention — wider requests
+// are a client bug and get a 400. Optional `reduce=worst` collapses to the
+// per-timestamp worst value across series (dashboard quality cards), and
+// `exclude_targets` drops series by target string (e.g. the gateway leg).
+func (d Deps) handleAgentMetricsSummary(w http.ResponseWriter, r *http.Request) {
+	var kinds []string
+	for _, k := range strings.Split(r.URL.Query().Get("kinds"), ",") {
+		if k = strings.TrimSpace(k); k != "" {
+			kinds = append(kinds, k)
+		}
+	}
+	if len(kinds) == 0 {
+		writeError(w, http.StatusBadRequest, "kinds required")
+		return
+	}
+	var exclude []string
+	for _, target := range strings.Split(r.URL.Query().Get("exclude_targets"), ",") {
+		if target = strings.TrimSpace(target); target != "" {
+			exclude = append(exclude, target)
+		}
+	}
+	q := metrics.SummaryQuery{
+		AgentID:        chi.URLParam(r, "id"),
+		Kinds:          kinds,
+		MonitorID:      r.URL.Query().Get("monitor"),
+		Target:         r.URL.Query().Get("target"),
+		ExcludeTargets: exclude,
+		Reduce:         r.URL.Query().Get("reduce"),
+		WindowSeconds:  2 * 3600,
+	}
+	if s := r.URL.Query().Get("since_seconds"); s != "" {
+		if n, err := strconv.Atoi(s); err == nil && n > 0 {
+			q.WindowSeconds = int64(n)
+		}
+	}
+	summary, err := d.Metrics.Summarize(r.Context(), q)
+	if err != nil {
+		if errors.Is(err, metrics.ErrSummaryWindow) || errors.Is(err, metrics.ErrSummaryReduce) {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, metricsSummaryResponse{WindowSeconds: q.WindowSeconds, Kinds: summary})
 }
 
 // handleAgentLatest returns the newest value per series (one point per target)
