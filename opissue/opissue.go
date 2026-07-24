@@ -117,11 +117,13 @@ type MonitorStatusRow struct {
 	// prediction, and which target material generation it attests, so a caller can
 	// tell predicted capability from confirmed execution and detect a row still on
 	// an obsolete generation. EffectiveIntervalSeconds/CycleDeadlineMs are the
-	// agent's reported effective schedule (nil on predicted rows / unset host rows).
+	// agent's reported effective schedule; UploadIntervalSeconds is its frame-level
+	// WAL batch-upload cadence (all nil on predicted rows / unset host rows).
 	Source                   string    `json:"source"`
 	TargetConfigSerial       int       `json:"target_config_serial"`
 	EffectiveIntervalSeconds *int      `json:"effective_interval_seconds,omitempty"`
 	CycleDeadlineMs          *int      `json:"cycle_deadline_ms,omitempty"`
+	UploadIntervalSeconds    *int      `json:"upload_interval_seconds,omitempty"`
 	UpdatedAt                time.Time `json:"updated_at"`
 }
 
@@ -226,7 +228,8 @@ func (s *Service) ApplyMonitorStatus(ctx context.Context, agentID, siteID string
 		}
 		wrote, err := upsertMonitorStatus(ctx, tx, agentID, e.MonitorID, e.Status,
 			e.MissingPermissions, e.MatchedSelector, e.Reason, ms.PolicyHash, ms.ConfigVersion,
-			serial, nullPosInt(e.EffectiveIntervalSeconds), nullPosInt(e.CycleDeadlineMs), now)
+			serial, nullPosInt(e.EffectiveIntervalSeconds), nullPosInt(e.CycleDeadlineMs),
+			nullPosInt(ms.UploadIntervalSeconds), now)
 		if err != nil {
 			return err
 		}
@@ -377,10 +380,10 @@ func (s *Service) ReevaluateHostMonitors(ctx context.Context, agentID string) er
 		}
 
 		// Host rows are server-authoritative reports at the target's own generation;
-		// they carry no agent-reported effective schedule.
+		// they carry no agent-reported effective schedule or upload cadence.
 		wrote, err := upsertMonitorStatus(ctx, tx, agentID, monitorID, status,
 			reasonList, "", "", policyHash, configVersion, hm.configSerial,
-			sql.NullInt64{}, sql.NullInt64{}, now)
+			sql.NullInt64{}, sql.NullInt64{}, sql.NullInt64{}, now)
 		if err != nil {
 			return err
 		}
@@ -962,7 +965,8 @@ func (s *Service) AgentStatuses(ctx context.Context, agentID string) ([]MonitorS
 	rows, err := s.db.Read().QueryContext(ctx, `
 		SELECT ms.agent_id, ms.monitor_id, COALESCE(pt.name,''), COALESCE(pt.kind,''), COALESCE(pt.target,''),
 		       ms.status, ms.missing_permissions, ms.matched_selector, ms.reason, ms.policy_hash, ms.config_version,
-		       ms.source, ms.target_config_serial, ms.effective_interval_seconds, ms.cycle_deadline_ms, ms.updated_at
+		       ms.source, ms.target_config_serial, ms.effective_interval_seconds, ms.cycle_deadline_ms,
+		       ms.upload_interval_seconds, ms.updated_at
 		FROM monitor_status ms LEFT JOIN probe_tasks pt ON pt.id = ms.monitor_id
 		WHERE ms.agent_id=? ORDER BY pt.kind, pt.target`, agentID)
 	if err != nil {
@@ -977,10 +981,10 @@ func scanMonitorRows(rows *sql.Rows) ([]MonitorStatusRow, error) {
 	for rows.Next() {
 		var m MonitorStatusRow
 		var missing string
-		var effIv, cycleMs sql.NullInt64
+		var effIv, cycleMs, uploadIv sql.NullInt64
 		if err := rows.Scan(&m.AgentID, &m.MonitorID, &m.MonitorName, &m.Kind, &m.Target, &m.Status,
 			&missing, &m.MatchedSelector, &m.Reason, &m.PolicyHash, &m.ConfigVersion,
-			&m.Source, &m.TargetConfigSerial, &effIv, &cycleMs, &m.UpdatedAt); err != nil {
+			&m.Source, &m.TargetConfigSerial, &effIv, &cycleMs, &uploadIv, &m.UpdatedAt); err != nil {
 			return nil, err
 		}
 		m.MissingPermissions = decodeStrings(missing)
@@ -991,6 +995,10 @@ func scanMonitorRows(rows *sql.Rows) ([]MonitorStatusRow, error) {
 		if cycleMs.Valid {
 			v := int(cycleMs.Int64)
 			m.CycleDeadlineMs = &v
+		}
+		if uploadIv.Valid {
+			v := int(uploadIv.Int64)
+			m.UploadIntervalSeconds = &v
 		}
 		out = append(out, m)
 	}
@@ -1098,12 +1106,13 @@ func (s *Service) resolveIssuesNotIn(ctx context.Context, tx *sql.Tx, selectSQL 
 // a row was written (always true for a matching call — a report is a change).
 func upsertMonitorStatus(ctx context.Context, tx *sql.Tx, agentID, monitorID, status string,
 	missing []string, matchedSelector, reason, policyHash string, configVersion, targetConfigSerial int,
-	effInterval, cycleDeadline sql.NullInt64, now time.Time) (bool, error) {
+	effInterval, cycleDeadline, uploadInterval sql.NullInt64, now time.Time) (bool, error) {
 	res, err := tx.ExecContext(ctx, `
 		INSERT INTO monitor_status(agent_id, monitor_id, status, missing_permissions, matched_selector,
 		                           reason, policy_hash, config_version, source, target_config_serial,
-		                           assigned_at, effective_interval_seconds, cycle_deadline_ms, updated_at)
-		VALUES(?,?,?,?,?,?,?,?, 'reported', ?, ?, ?, ?, ?)
+		                           assigned_at, effective_interval_seconds, cycle_deadline_ms,
+		                           upload_interval_seconds, updated_at)
+		VALUES(?,?,?,?,?,?,?,?, 'reported', ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(agent_id, monitor_id) DO UPDATE SET
 		  status=excluded.status, missing_permissions=excluded.missing_permissions,
 		  matched_selector=excluded.matched_selector, reason=excluded.reason,
@@ -1112,9 +1121,10 @@ func upsertMonitorStatus(ctx context.Context, tx *sql.Tx, agentID, monitorID, st
 		  assigned_at=CASE WHEN excluded.target_config_serial > monitor_status.target_config_serial
 		                   THEN excluded.updated_at ELSE monitor_status.assigned_at END,
 		  effective_interval_seconds=excluded.effective_interval_seconds,
-		  cycle_deadline_ms=excluded.cycle_deadline_ms, updated_at=excluded.updated_at`,
+		  cycle_deadline_ms=excluded.cycle_deadline_ms,
+		  upload_interval_seconds=excluded.upload_interval_seconds, updated_at=excluded.updated_at`,
 		agentID, monitorID, status, marshalStrings(missing), matchedSelector, reason, policyHash,
-		configVersion, targetConfigSerial, now, effInterval, cycleDeadline, now)
+		configVersion, targetConfigSerial, now, effInterval, cycleDeadline, uploadInterval, now)
 	if err != nil {
 		return false, err
 	}
@@ -1134,8 +1144,8 @@ func upsertPredictedStatus(ctx context.Context, tx *sql.Tx, agentID, monitorID, 
 	res, err := tx.ExecContext(ctx, `
 		INSERT INTO monitor_status(agent_id, monitor_id, status, missing_permissions, matched_selector,
 		    reason, policy_hash, config_version, target_config_serial, source, assigned_at,
-		    effective_interval_seconds, cycle_deadline_ms, updated_at)
-		VALUES(?,?,?,?, '','', ?, ?, ?, 'predicted', ?, NULL, NULL, ?)
+		    effective_interval_seconds, cycle_deadline_ms, upload_interval_seconds, updated_at)
+		VALUES(?,?,?,?, '','', ?, ?, ?, 'predicted', ?, NULL, NULL, NULL, ?)
 		ON CONFLICT(agent_id, monitor_id) DO UPDATE SET
 		  status=excluded.status, missing_permissions=excluded.missing_permissions,
 		  matched_selector='', reason='', policy_hash=excluded.policy_hash,
@@ -1144,7 +1154,7 @@ func upsertPredictedStatus(ctx context.Context, tx *sql.Tx, agentID, monitorID, 
 		  source='predicted',
 		  assigned_at=CASE WHEN excluded.target_config_serial > monitor_status.target_config_serial
 		                   THEN excluded.assigned_at ELSE monitor_status.assigned_at END,
-		  effective_interval_seconds=NULL, cycle_deadline_ms=NULL,
+		  effective_interval_seconds=NULL, cycle_deadline_ms=NULL, upload_interval_seconds=NULL,
 		  updated_at=excluded.updated_at
 		WHERE monitor_status.target_config_serial < excluded.target_config_serial
 		   OR (monitor_status.target_config_serial = excluded.target_config_serial

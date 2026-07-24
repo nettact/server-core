@@ -114,8 +114,8 @@ func TestAgentStatusesExposeExecutionProvenanceAndSchedule(t *testing.T) {
 		VALUES('monitor','site_default','group','http','https://example.test','{}',1,17)`)
 	exec(`INSERT INTO monitor_status(
 		agent_id,monitor_id,status,config_version,updated_at,source,target_config_serial,
-		effective_interval_seconds,cycle_deadline_ms)
-		VALUES('agent','monitor','active',23,CURRENT_TIMESTAMP,'reported',17,45,10000)`)
+		effective_interval_seconds,cycle_deadline_ms,upload_interval_seconds)
+		VALUES('agent','monitor','active',23,CURRENT_TIMESTAMP,'reported',17,45,10000,5)`)
 
 	rows, err := New(db, nil).AgentStatuses(ctx, "agent")
 	if err != nil {
@@ -129,7 +129,8 @@ func TestAgentStatusesExposeExecutionProvenanceAndSchedule(t *testing.T) {
 		t.Fatalf("provenance = %+v", got)
 	}
 	if got.EffectiveIntervalSeconds == nil || *got.EffectiveIntervalSeconds != 45 ||
-		got.CycleDeadlineMs == nil || *got.CycleDeadlineMs != 10000 {
+		got.CycleDeadlineMs == nil || *got.CycleDeadlineMs != 10000 ||
+		got.UploadIntervalSeconds == nil || *got.UploadIntervalSeconds != 5 {
 		t.Fatalf("schedule = %+v", got)
 	}
 }

@@ -1,0 +1,14 @@
+-- Agent upload-link slack in the freshness window (STATUS-003).
+--
+-- A probe sample's timestamp is the probe instant, but it does not reach the
+-- server store then: the agent buffers results in its WAL and flushes them on a
+-- batch-upload cadence, then the server drains and ingests. monitor_status now
+-- records the agent's frame-level upload interval so the server-side StaleAfter
+-- window folds in that probe->arrival link (+2x upload) and short-interval
+-- targets are not marked stale on ordinary batching jitter.
+--
+-- Nullable: predicted/host rows and any frame that reports no upload interval
+-- leave it NULL, and StaleAfter falls back to DefaultUploadInterval.
+--
+-- Pre-release, zero users: direct schema edit, no rollback/compat path.
+ALTER TABLE monitor_status ADD COLUMN upload_interval_seconds INTEGER;

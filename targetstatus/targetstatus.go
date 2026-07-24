@@ -205,6 +205,7 @@ type msRow struct {
 	reason             string
 	effInterval        sql.NullInt64
 	cycleDeadline      sql.NullInt64
+	uploadInterval     sql.NullInt64
 }
 
 type sampleVal struct {
@@ -394,13 +395,21 @@ func (s *Service) deriveAgent(t *targetRow, p applicablePair, now time.Time,
 	cutoff := pendingSince(t, ms)
 
 	// Freshness window (per pair). Desired-config fallback is used until the agent
-	// reports its actual effective schedule for the current generation.
-	graceWindow := pcfg.StaleAfter(pcfg.EffectiveInterval(t.kind, t.params), pcfg.CycleDeadline(t.kind, t.params))
+	// reports its actual effective schedule for the current generation; it folds in
+	// the default upload cadence since no reported upload interval exists yet.
+	graceWindow := pcfg.StaleAfter(pcfg.EffectiveInterval(t.kind, t.params), pcfg.CycleDeadline(t.kind, t.params), pcfg.DefaultUploadInterval)
 	staleAfter := graceWindow
 	if confirmed && ms.effInterval.Valid && ms.effInterval.Int64 > 0 && ms.cycleDeadline.Valid && ms.cycleDeadline.Int64 > 0 {
+		// Reported upload interval folds the probe→arrival link into the window; a
+		// NULL/0 value passes 0 so StaleAfter falls back to the default internally.
+		var upload time.Duration
+		if ms.uploadInterval.Valid && ms.uploadInterval.Int64 > 0 {
+			upload = time.Duration(ms.uploadInterval.Int64) * time.Second
+		}
 		staleAfter = pcfg.StaleAfter(
 			time.Duration(ms.effInterval.Int64)*time.Second,
-			time.Duration(ms.cycleDeadline.Int64)*time.Millisecond)
+			time.Duration(ms.cycleDeadline.Int64)*time.Millisecond,
+			upload)
 	}
 	if t.kind != "host" {
 		secs := int(staleAfter / time.Second)
@@ -724,7 +733,8 @@ func (s *Service) loadMonitorStatus(ctx context.Context, tx *sql.Tx, siteID stri
 	rows, err := tx.QueryContext(ctx, `
 		SELECT ms.monitor_id, ms.agent_id, ms.status, ms.source, ms.target_config_serial,
 		       ms.assigned_at, ms.missing_permissions, COALESCE(ms.matched_selector,''),
-		       COALESCE(ms.reason,''), ms.effective_interval_seconds, ms.cycle_deadline_ms
+		       COALESCE(ms.reason,''), ms.effective_interval_seconds, ms.cycle_deadline_ms,
+		       ms.upload_interval_seconds
 		FROM monitor_status ms JOIN probe_tasks pt ON pt.id = ms.monitor_id
 		WHERE pt.site_id=?`, siteID)
 	if err != nil {
@@ -736,7 +746,8 @@ func (s *Service) loadMonitorStatus(ctx context.Context, tx *sql.Tx, siteID stri
 		var monitorID, agentID, missing string
 		m := &msRow{}
 		if err := rows.Scan(&monitorID, &agentID, &m.status, &m.source, &m.targetConfigSerial,
-			&m.assignedAt, &missing, &m.matchedSelector, &m.reason, &m.effInterval, &m.cycleDeadline); err != nil {
+			&m.assignedAt, &missing, &m.matchedSelector, &m.reason, &m.effInterval, &m.cycleDeadline,
+			&m.uploadInterval); err != nil {
 			return nil, err
 		}
 		m.missing = decodeStrings(missing)

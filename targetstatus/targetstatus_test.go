@@ -73,19 +73,67 @@ func TestAssignmentCutoffAdmitsSameSecondPostAssignmentSample(t *testing.T) {
 	}
 }
 
+func TestStaleWindowFoldsReportedUploadInterval(t *testing.T) {
+	now := time.Unix(100_000, 0).UTC()
+	target := &targetRow{id: "target", kind: "http", enabled: true, configSerial: 2}
+	pair := applicablePair{agentID: "agent", online: true}
+	svc := &Service{}
+
+	windowFor := func(ms *msRow) int {
+		t.Helper()
+		as, _ := svc.deriveAgent(target, pair, now, map[string]*msRow{"target\x00agent": ms}, nil, nil, nil, nil, nil)
+		if as.StaleAfterSeconds == nil {
+			t.Fatalf("stale_after_seconds unset for %+v", ms)
+		}
+		return *as.StaleAfterSeconds
+	}
+	confirmed := func(upload sql.NullInt64) *msRow {
+		return &msRow{
+			status: wire.MonitorStatusActive, source: "reported", targetConfigSerial: 2,
+			effInterval:    sql.NullInt64{Int64: 15, Valid: true},
+			cycleDeadline:  sql.NullInt64{Int64: 5800, Valid: true},
+			uploadInterval: upload,
+		}
+	}
+
+	// Reported schedule base = max(3×15, 15 + 2×5.8) = 45s. Folding the reported
+	// upload (5s) adds 2×5 = 10s: the old two-arg window + 10s = 55s.
+	if got := windowFor(confirmed(sql.NullInt64{Int64: 5, Valid: true})); got != 55 {
+		t.Fatalf("reported upload=5s window = %ds, want 55", got)
+	}
+	// A different reported upload flows through (2×8 = 16s → 61s), proving the
+	// stored value is used, not a constant.
+	if got := windowFor(confirmed(sql.NullInt64{Int64: 8, Valid: true})); got != 61 {
+		t.Fatalf("reported upload=8s window = %ds, want 61", got)
+	}
+	// NULL upload (a pre-STATUS-003 agent, or a frame that reported none) falls back
+	// to DefaultUploadInterval (5s) inside StaleAfter → 55s.
+	if got := windowFor(confirmed(sql.NullInt64{})); got != 55 {
+		t.Fatalf("null upload window = %ds, want 55 (default fallback)", got)
+	}
+	// Unconfirmed (predicted) uses the desired-config fallback with the default
+	// upload: StaleAfter(30s, 10s, 5s) = max(90, 50) + 10 = 100s.
+	predicted := &msRow{status: wire.MonitorStatusActive, source: "predicted", targetConfigSerial: 2}
+	if got := windowFor(predicted); got != 100 {
+		t.Fatalf("desired-config fallback window = %ds, want 100", got)
+	}
+}
+
 func TestPendingGraceExpiresToNoDataWithoutChangingExecution(t *testing.T) {
 	now := time.Unix(10_000, 0).UTC()
 	target := &targetRow{id: "target", kind: "http", enabled: true, configSerial: 2}
 	pair := applicablePair{agentID: "agent", online: true}
 	svc := &Service{}
 
+	// http target, desired-config fallback window = StaleAfter(30s, 10s, default 5s)
+	// = max(90, 50) + 2×5 = 100s, so the pending grace boundary sits at 100s.
 	for _, tt := range []struct {
 		name     string
 		assigned time.Time
 		display  string
 	}{
-		{"within grace", now.Add(-89 * time.Second), displayPending},
-		{"expired", now.Add(-91 * time.Second), displayNoData},
+		{"within grace", now.Add(-99 * time.Second), displayPending},
+		{"expired", now.Add(-101 * time.Second), displayNoData},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			ms := &msRow{status: wire.MonitorStatusActive, source: "predicted", targetConfigSerial: 2,
