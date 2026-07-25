@@ -61,7 +61,7 @@ func seedMonitorSample(t *testing.T, db *store.DB, agentID, monitorID, kind, tar
 
 func TestRuleEvaluationIsPerAgentAndSupportsAND(t *testing.T) {
 	db, ctx, cfg, groupID := openRulesTest(t)
-	if err := cfg.SetSiteTargets(ctx, "site_default", []config.ProbeTarget{
+	if _, err := cfg.SetSiteTargets(ctx, "site_default", []config.ProbeTarget{
 		{ID: "ping-a", GroupID: groupID, Kind: "icmp", Target: "1.1.1.1", Enabled: true},
 		{ID: "ping-b", GroupID: groupID, Kind: "icmp", Target: "9.9.9.9", Enabled: true},
 	}); err != nil {
@@ -104,7 +104,7 @@ func TestRuleEvaluationIsPerAgentAndSupportsAND(t *testing.T) {
 
 func TestEvidenceAndNotificationRoutingAreFrozenAndCosmeticUpdatePreservesLifecycle(t *testing.T) {
 	db, ctx, cfg, groupID := openRulesTest(t)
-	if err := cfg.SetSiteTargets(ctx, "site_default", []config.ProbeTarget{{
+	if _, err := cfg.SetSiteTargets(ctx, "site_default", []config.ProbeTarget{{
 		ID: "tcp", GroupID: groupID, Kind: "tcp", Target: "db.example.test", Enabled: true,
 		Params: pcfg.ProbeParams{Port: 5432},
 	}}); err != nil {
@@ -171,7 +171,7 @@ func TestEvidenceAndNotificationRoutingAreFrozenAndCosmeticUpdatePreservesLifecy
 
 func TestRuleDisableClearsLiveConditionStateAndSeverityIsValidated(t *testing.T) {
 	db, ctx, cfg, groupID := openRulesTest(t)
-	if err := cfg.SetSiteTargets(ctx, "site_default", []config.ProbeTarget{{
+	if _, err := cfg.SetSiteTargets(ctx, "site_default", []config.ProbeTarget{{
 		ID: "http", GroupID: groupID, Kind: "http", Target: "https://example.test", Enabled: true,
 	}}); err != nil {
 		t.Fatal(err)

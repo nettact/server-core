@@ -280,6 +280,55 @@ func TestCurrentSnapshotUsesOnlyAuthoritativeGeneration(t *testing.T) {
 	}
 }
 
+// A monitor re-typed in place (dns → http) keeps its old kind's series in the
+// dictionary forever. ListSeries must not offer them: a consumer picking the dead
+// probe.dns.ok as the monitor's availability band would report a healthy 100% for
+// a target whose HTTP probe fails every cycle.
+func TestListSeriesHidesSeriesTheCurrentKindCannotEmit(t *testing.T) {
+	db, s := openStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Second)
+	if _, err := db.ExecContext(ctx, `INSERT INTO sites(id,name) VALUES('site_default','Default')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO monitor_groups(id,site_id,name,all_agents) VALUES('group','site_default','All',1)`); err != nil {
+		t.Fatal(err)
+	}
+	// The monitor was a DNS probe first, then re-typed to HTTP.
+	if _, err := db.ExecContext(ctx, `INSERT INTO probe_tasks(id,site_id,group_id,kind,target,params,enabled,config_serial,config_changed_at)
+		VALUES('monitor','site_default','group','dns','www.yahoo.co.jp','{}',1,1,?)`, now); err != nil {
+		t.Fatal(err)
+	}
+	ingestBatch(t, db, s, "agent", []telemetry.Metric{
+		{TS: now, Kind: telemetry.DNSOK, Target: "www.yahoo.co.jp", Layer: telemetry.LayerService,
+			Value: 1, Unit: telemetry.UnitBool, MonitorID: "monitor", ConfigSerial: 1},
+		// A system series has no owning monitor and must always survive.
+		{TS: now, Kind: telemetry.HostCPUPct, Target: "host", Layer: telemetry.LayerLocal, Value: 12, Unit: telemetry.UnitPct},
+	})
+	if _, err := db.ExecContext(ctx, `UPDATE probe_tasks SET kind='http', target='https://www.yahoo.co.jp', config_serial=2 WHERE id='monitor'`); err != nil {
+		t.Fatal(err)
+	}
+	ingestBatch(t, db, s, "agent", []telemetry.Metric{
+		{TS: now.Add(time.Second), Kind: telemetry.HTTPOK, Target: "https://www.yahoo.co.jp", Layer: telemetry.LayerService,
+			Value: 0, Unit: telemetry.UnitBool, MonitorID: "monitor", ConfigSerial: 2},
+	})
+
+	series, err := s.ListSeries(ctx, "agent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	kinds := map[string]bool{}
+	for _, si := range series {
+		kinds[si.Kind] = true
+	}
+	if kinds[string(telemetry.DNSOK)] {
+		t.Fatalf("stale dns series still listed for an http monitor: %+v", series)
+	}
+	if !kinds[string(telemetry.HTTPOK)] || !kinds[string(telemetry.HostCPUPct)] {
+		t.Fatalf("series = %+v, want the current http series and the system series", series)
+	}
+}
+
 // TestSummarize pins the server aggregates to what the status page's browser
 // code computed from Query results before PERF-001: latest = strictly-newest
 // sample, P95 = nearest-rank over the merged raw window, matched across all

@@ -9,7 +9,7 @@ import (
 
 func TestAddChannelToAllRules(t *testing.T) {
 	db, ctx, cfg, groupID := openRulesTest(t)
-	if err := cfg.SetSiteTargets(ctx, "site_default", []config.ProbeTarget{
+	if _, err := cfg.SetSiteTargets(ctx, "site_default", []config.ProbeTarget{
 		{ID: "ping", GroupID: groupID, Kind: "icmp", Target: "1.1.1.1", Enabled: true},
 	}); err != nil {
 		t.Fatalf("set targets: %v", err)

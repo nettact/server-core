@@ -518,12 +518,16 @@ func (s *Service) ListSiteTargets(ctx context.Context, siteID string) ([]ProbeTa
 // idempotent no-op (no bump, no announce, no status event). A name-only edit keeps
 // the target's generation and does NOT bump/announce either, but still publishes a
 // precise target.status.changed so the batch exposes the new user-visible name.
-func (s *Service) SetSiteTargets(ctx context.Context, siteID string, targets []ProbeTarget) error {
+//
+// A KEPT target whose kind changed (dns → http, …) additionally has the alert
+// conditions its new kind can never satisfy dropped; the returned RuleCleanup
+// list names them so the caller can tell the user which alarms to reconfigure.
+func (s *Service) SetSiteTargets(ctx context.Context, siteID string, targets []ProbeTarget) ([]RuleCleanup, error) {
 	// Resolve/assign the default group so a target may omit group_id (it lands in
 	// the default group) — used by lenient API callers.
 	defaultID, err := s.defaultGroupID(ctx, siteID)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	keep := make(map[string]bool, len(targets))
 	for i := range targets {
@@ -533,12 +537,21 @@ func (s *Service) SetSiteTargets(ctx context.Context, siteID string, targets []P
 		if targets[i].GroupID == "" {
 			targets[i].GroupID = defaultID
 		}
+		// A repeated id makes the reconcile incoherent: the LAST entry wins the
+		// upsert, but every classification below (kind change, material change,
+		// name-only) reads whichever entry it happens to visit — so a payload that
+		// re-types an id and then restores it would persist the original kind while
+		// still deleting the alert conditions valid for it. There is no defensible
+		// "merge" of two rows claiming one identity, so reject the request.
+		if keep[targets[i].ID] {
+			return nil, fmt.Errorf("%w: %q", ErrDuplicateTargetID, targets[i].ID)
+		}
 		keep[targets[i].ID] = true
 	}
 
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	committed := false
 	defer func() {
@@ -551,10 +564,10 @@ func (s *Service) SetSiteTargets(ctx context.Context, siteID string, targets []P
 	// before any mutation, so a bad group id or a cross-site id rolls the whole
 	// reconcile back with nothing terminated or written.
 	if err := validateTargetGroups(ctx, tx, siteID, targets); err != nil {
-		return err
+		return nil, err
 	}
 	if err := validateTargetOwnership(ctx, tx, siteID, targets); err != nil {
-		return err
+		return nil, err
 	}
 
 	// Current targets and their facts, read in-tx to classify removed/moved/
@@ -564,12 +577,17 @@ func (s *Service) SetSiteTargets(ctx context.Context, siteID string, targets []P
 	// edits keep everything but still publish a status event.
 	oldFacts, err := currentTargetFacts(ctx, tx, siteID)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	removedOrMoved := map[string]bool{}
 	material := map[string]bool{}
 	newTargets := map[string]bool{}
 	nameOnly := map[string]bool{}
+	// kindChanged: targets re-typed in place (dns → http, …). Their alert conditions
+	// may now reference a metric family the target can never emit again, which the
+	// engine reads as "no data this pass" — a verdict it preserves forever, so the
+	// rule silently stops firing. Collected here and reconciled below.
+	kindChanged := map[string]retypedTarget{}
 	for id := range oldFacts {
 		if !keep[id] {
 			removedOrMoved[id] = true // removed
@@ -585,6 +603,11 @@ func (s *Service) SetSiteTargets(ctx context.Context, siteID string, targets []P
 		moved := of.groupID != t.GroupID
 		if moved {
 			removedOrMoved[t.ID] = true // moved to another group
+		}
+		// A removed/moved target has every referencing rule deleted outright, so only
+		// a KEPT target's re-typing needs the finer per-condition reconcile.
+		if of.kind != t.Kind && !moved {
+			kindChanged[t.ID] = retypedTarget{target: t, oldKind: of.kind}
 		}
 		params, _ := json.Marshal(t.Params)
 		mat := materialTargetChange(of, t, string(params))
@@ -626,7 +649,7 @@ func (s *Service) SetSiteTargets(ctx context.Context, siteID string, targets []P
 	if s.term != nil && len(terminateSet) > 0 {
 		termAffected, termPub, err = s.term.TerminateForTargetsTx(ctx, tx, terminateSet)
 		if err != nil {
-			return err
+			return nil, err
 		}
 	}
 
@@ -636,10 +659,10 @@ func (s *Service) SetSiteTargets(ctx context.Context, siteID string, targets []P
 	if len(rmList) > 0 {
 		ruleIDs, err := rulesReferencingTargets(ctx, tx, rmList)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		if err := deleteRulesCascade(ctx, tx, ruleIDs); err != nil {
-			return err
+			return nil, err
 		}
 	}
 	// Reset current condition state for materially-changed (kept) targets so an old
@@ -653,8 +676,15 @@ func (s *Service) SetSiteTargets(ctx context.Context, siteID string, targets []P
 		if _, err := tx.ExecContext(ctx,
 			`DELETE FROM rule_condition_state WHERE condition_id IN (
 				SELECT id FROM group_rule_conditions WHERE target_id IN (`+placeholders(len(matList))+`))`, args...); err != nil {
-			return err
+			return nil, err
 		}
+	}
+	// Drop the alert conditions a re-typed target can no longer satisfy. Runs AFTER
+	// the state reset above so that reset's subselect still sees them (their own
+	// state rows go with them via ON DELETE CASCADE).
+	cleanups, err := dropStaleConditions(ctx, tx, kindChanged)
+	if err != nil {
+		return nil, err
 	}
 	// Delete removed targets (their monitor_status/operational_issues cascade).
 	for id := range oldFacts {
@@ -662,7 +692,7 @@ func (s *Service) SetSiteTargets(ctx context.Context, siteID string, targets []P
 			continue
 		}
 		if _, err := tx.ExecContext(ctx, `DELETE FROM probe_tasks WHERE id=?`, id); err != nil {
-			return err
+			return nil, err
 		}
 	}
 
@@ -673,12 +703,12 @@ func (s *Service) SetSiteTargets(ctx context.Context, siteID string, targets []P
 	// to stamp created/materially-changed targets below).
 	if hasGenerationChange {
 		if _, err := tx.ExecContext(ctx, `UPDATE sites SET config_serial=config_serial+1 WHERE id=?`, siteID); err != nil {
-			return err
+			return nil, err
 		}
 	}
 	var newSerial int
 	if err := tx.QueryRowContext(ctx, `SELECT config_serial FROM sites WHERE id=?`, siteID).Scan(&newSerial); err != nil {
-		return err
+		return nil, err
 	}
 	now := time.Now().UTC()
 
@@ -698,11 +728,11 @@ func (s *Service) SetSiteTargets(ctx context.Context, siteID string, targets []P
 			   target=excluded.target, params=excluded.params, enabled=excluded.enabled,
 			   config_serial=excluded.config_serial, config_changed_at=excluded.config_changed_at`,
 			t.ID, siteID, t.GroupID, t.Kind, t.Name, t.Target, string(params), boolInt(t.Enabled), serial, changedAt); err != nil {
-			return err
+			return nil, err
 		}
 	}
 	if err := tx.Commit(); err != nil {
-		return err
+		return nil, err
 	}
 	committed = true
 	// Post-commit: publish the terminator's captured lifecycle events, push the new
@@ -725,7 +755,7 @@ func (s *Service) SetSiteTargets(ctx context.Context, siteID string, targets []P
 	}
 	eventTargets = append(eventTargets, termAffected...)
 	s.publishTargetStatus(siteID, eventTargets)
-	return nil
+	return cleanups, nil
 }
 
 // keysOf returns the keys of a string-set map.

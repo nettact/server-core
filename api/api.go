@@ -13,6 +13,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"regexp"
 	"runtime"
 	"strconv"
@@ -868,14 +869,45 @@ func (d Deps) handleSetTargets(w http.ResponseWriter, r *http.Request) {
 	}
 	for i := range body.Targets {
 		if err := validateTarget(&body.Targets[i]); err != nil {
-			writeError(w, http.StatusBadRequest, err.Error())
+			// This endpoint reconciles the WHOLE set, so a rejection can come from a
+			// monitor the user is not editing (e.g. one saved before a rule tightened).
+			// Name it, or the console reports an error the user cannot locate.
+			name := body.Targets[i].Name
+			if name == "" {
+				name = body.Targets[i].Target
+			}
+			writeError(w, http.StatusBadRequest, "monitor "+strconv.Quote(name)+": "+err.Error())
 			return
 		}
 	}
 	siteID := chi.URLParam(r, "id")
-	if err := d.Config.SetSiteTargets(r.Context(), siteID, body.Targets); err != nil {
+	// ruleCleanups: alert conditions dropped because a kept monitor's kind changed
+	// and its new kind can never emit the metric they watched. Surfaced on the
+	// response so the console can tell the user which alarms to reconfigure.
+	ruleCleanups, err := d.Config.SetSiteTargets(r.Context(), siteID, body.Targets)
+	if err != nil {
+		// A repeated target id is a malformed payload, not a server fault: answering
+		// 500 would tell the client to retry something that can never succeed.
+		if errors.Is(err, config.ErrDuplicateTargetID) {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
+	}
+	// The save has COMMITTED — those alarm deletions are permanent. Every step
+	// below can still fail with a 500 that carries no body of ours, and the cleanup
+	// report exists only in this variable, so record it durably HERE. Otherwise a
+	// failing reconcile would silently swallow the one notice telling the user
+	// which alarms they must rebuild (a re-save reports nothing: the conditions are
+	// already gone).
+	for _, c := range ruleCleanups {
+		detail := c.MonitorName + " (" + c.OldKind + "→" + c.NewKind + "): rule " + c.RuleName +
+			" lost " + strings.Join(c.Metrics, ", ")
+		if c.RuleDeleted {
+			detail += "; rule deleted (no conditions left)"
+		}
+		d.Audit.Log(r.Context(), "admin", "monitoring.rule_cleanup", c.MonitorID, detail)
 	}
 	// Narrowing a target's scope can strand alerts already firing for agents that
 	// just left it; resolve them so they don't stay firing forever.
@@ -907,11 +939,18 @@ func (d Deps) handleSetTargets(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	d.Audit.Log(r.Context(), "admin", "monitoring.set_targets", siteID, strconv.Itoa(len(body.Targets))+" targets")
+	audited := strconv.Itoa(len(body.Targets)) + " targets"
+	if len(ruleCleanups) > 0 {
+		audited += "; " + strconv.Itoa(len(ruleCleanups)) + " rule(s) pruned after a monitor kind change"
+	}
+	d.Audit.Log(r.Context(), "admin", "monitoring.set_targets", siteID, audited)
 	if warnings == nil {
 		warnings = []opissue.SaveWarning{}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "warnings": warnings})
+	if ruleCleanups == nil {
+		ruleCleanups = []config.RuleCleanup{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "warnings": warnings, "rule_cleanups": ruleCleanups})
 }
 
 func (d Deps) handleListAgentGroups(w http.ResponseWriter, r *http.Request) {
@@ -1055,6 +1094,24 @@ func (d Deps) handleDeleteAgentGroup(w http.ResponseWriter, r *http.Request) {
 // validKinds is the whitelist of monitoring-target kinds the server accepts.
 var validKinds = map[string]bool{"icmp": true, "dns": true, "http": true, "tcp": true, "nat": true, "gateway": true, "host": true}
 
+// leadingSchemeRE matches a URL that OPENS with a scheme (RFC 3986 §3.1). It is
+// deliberately anchored: a "://" anywhere else belongs to the path or query
+// ("example.com/login?next=https://idp"), and treating that as "already schemed"
+// would leave the URL scheme-less for the agent.
+var leadingSchemeRE = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9+.-]*://`)
+
+// opaqueSchemeRE matches a leading scheme whose delimiter is a bare ":" instead
+// of "://" — "mailto:user@example.com", "ssh:user@host". These must be rejected
+// explicitly: prefixing one with "https://" yields a URL that PARSES, with the
+// original scheme swallowed as userinfo ("https://mailto:user@example.com" has
+// host "example.com"), so the save would succeed and silently probe a host the
+// user never named.
+//
+// The class after the colon is what keeps a scheme-less authority out: a digit
+// means "host:port", and an empty remainder ("host:") is left to the clearer
+// trailing-colon check downstream.
+var opaqueSchemeRE = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9+.-]*:[^0-9/?#]`)
+
 // validateTarget checks a single monitoring target before it is persisted and
 // pushed to agents. It normalizes trivial fields and rejects malformed configs
 // with a user-facing message (mirrors the decodeRule validation style).
@@ -1092,6 +1149,63 @@ func validateTarget(t *config.ProbeTarget) error {
 	if t.Target == "" {
 		return errors.New("target is required")
 	}
+	if t.Kind == "http" {
+		// A scheme-less address ("www.example.com") is what a browser address bar
+		// accepts, but Go's HTTP client refuses it outright ("unsupported protocol
+		// scheme"), so the probe would fail every single cycle and classify as a
+		// generic "other" error with nothing pointing at the real cause. Normalize
+		// to https:// — the same default a browser applies — and store the
+		// normalized form, so the console, the agent, and the alert notice all name
+		// the exact URL that is probed.
+		lower := strings.ToLower(t.Target)
+		if !strings.HasPrefix(lower, "http://") && !strings.HasPrefix(lower, "https://") {
+			// Any OTHER explicit scheme is a real mistake, not an omission — the agent
+			// can only speak http/https, so never paper over it with a prefix. Only a
+			// LEADING scheme counts: "example.com/login?next=https://idp" is a
+			// scheme-less URL that happens to carry one in its query. Both delimiter
+			// forms are checked: "ftp://x" and the opaque "mailto:x".
+			if leadingSchemeRE.MatchString(t.Target) || opaqueSchemeRE.MatchString(t.Target) {
+				return errors.New("http monitor url must start with http:// or https://")
+			}
+			t.Target = "https://" + t.Target
+		}
+		u, err := url.Parse(t.Target)
+		if err != nil {
+			return errors.New("invalid http monitor url: " + t.Target)
+		}
+		if u.Hostname() == "" {
+			return errors.New("http monitor url must include a host")
+		}
+		if err := validateURLPort(u, "http monitor url", t.Target); err != nil {
+			return err
+		}
+	}
+	// Every dialing/querying kind takes a BARE host — a URL or "host:port" pasted
+	// here can never succeed, and the agent can only report it as a generic probe
+	// failure, so reject the shape now instead of letting it fail forever. gateway
+	// (server-normalized to "gateway") and host (a metric-series anchor such as
+	// "host", "*" or a mount point like "C:") are not addresses and are exempt.
+	switch t.Kind {
+	case "dns":
+		// The port belongs to resolver_port, so a colon here is a mistake.
+		if err := validateBareHost("dns monitor target", t.Target, hostRule{}); err != nil {
+			return err
+		}
+	case "icmp":
+		if err := validateBareHost("icmp monitor target", t.Target, hostRule{}); err != nil {
+			return err
+		}
+	case "tcp":
+		if err := validateBareHost("tcp monitor target", t.Target, hostRule{}); err != nil {
+			return err
+		}
+	case "nat":
+		// STUN endpoints are host[:port] — the agent applies the per-transport
+		// default port when none is given.
+		if err := validateBareHost("nat monitor target", t.Target, hostRule{allowPort: true}); err != nil {
+			return err
+		}
+	}
 	if t.Kind == "tcp" {
 		if t.Params.Port < 1 || t.Params.Port > 65535 {
 			return errors.New("tcp monitor requires a port in 1-65535")
@@ -1107,18 +1221,15 @@ func validateTarget(t *config.ProbeTarget) error {
 			return errors.New("nat monitor port out of range (0-65535)")
 		}
 		// stun_server2 is host[:port] (the agent applies the default STUN port when
-		// none is given, like the primary target), so a bare host is valid. A value
-		// containing a colon must parse cleanly as host:port with an in-range port —
-		// this rejects malformed forms like "host:3478:extra" or "host:abc" rather than
-		// silently accepting them as a bare host.
-		if s := t.Params.STUNServer2; s != "" && strings.ContainsRune(s, ':') {
-			host, port, err := net.SplitHostPort(s)
-			if err != nil || host == "" {
-				return errors.New("stun_server2 must be host or host:port")
+		// none is given, like the primary target). Optional, but once given it must
+		// be a real endpoint — the same shape rules as the primary target. The
+		// trimmed value is stored: the agent passes it straight to net.JoinHostPort,
+		// where surrounding whitespace fails every probe.
+		if s := strings.TrimSpace(t.Params.STUNServer2); s != "" {
+			if err := validateBareHost("stun_server2", s, hostRule{allowPort: true}); err != nil {
+				return err
 			}
-			if p, perr := strconv.Atoi(port); perr != nil || p < 1 || p > 65535 {
-				return errors.New("stun_server2 port out of range (1-65535)")
-			}
+			t.Params.STUNServer2 = s
 		}
 	}
 	if t.Params.IntervalSeconds < 0 || t.Params.IntervalSeconds > 86400 {
@@ -1145,7 +1256,11 @@ func validateTarget(t *config.ProbeTarget) error {
 			return err
 		}
 	}
-	return nil
+	// Remaining per-kind param bounds (ICMP cycle shape, DNS record type/resolver
+	// endpoint, HTTP method/status/keyword/headers/body/redirect/read caps). Each is
+	// checked only for the kind that consumes it, so a param left over from a
+	// previous kind — which that kind's collector ignores — never blocks a save.
+	return validateProbeParams(t.Kind, &t.Params)
 }
 
 // validateAcceptedStatuses parses a CSV of HTTP status codes / ranges

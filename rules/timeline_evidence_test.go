@@ -10,7 +10,7 @@ import (
 
 func TestAppendedEvidenceTimelineNamesOnlyTheNewTarget(t *testing.T) {
 	db, ctx, cfg, groupID := openRulesTest(t)
-	if err := cfg.SetSiteTargets(ctx, "site_default", []config.ProbeTarget{
+	if _, err := cfg.SetSiteTargets(ctx, "site_default", []config.ProbeTarget{
 		{ID: "cf", GroupID: groupID, Kind: "icmp", Name: "cf", Target: "1.1.1.1", Enabled: true},
 		{ID: "google", GroupID: groupID, Kind: "icmp", Name: "google", Target: "8.8.8.8", Enabled: true},
 	}); err != nil {

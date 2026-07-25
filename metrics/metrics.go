@@ -670,10 +670,21 @@ type SeriesInfo struct {
 // A monitor may now have several stored generations (config_serial) of the same
 // (monitor, kind, target); the selector is generation-neutral, so those collapse
 // to one row via DISTINCT — the console picks a logical series, not a generation.
+//
+// A monitor-bound series is listed only when the monitor's CURRENT kind can still
+// emit it. Re-typing a monitor in place (dns → http) leaves the old kind's series
+// in the dictionary forever; listing them would let a consumer pick a dead
+// probe.dns.ok as the monitor's availability band and report a healthy 100% for a
+// target whose HTTP probe is failing every cycle. The samples stay in the store —
+// they are simply no longer "this monitor's series". A deleted monitor's leftover
+// series drop out for the same reason (no owner, no current kind). System series
+// (monitor_id='') have no owning kind and always pass.
 func (s *Store) ListSeries(ctx context.Context, agentID string) ([]SeriesInfo, error) {
 	rows, err := s.db.Read().QueryContext(ctx, `
-		SELECT DISTINCT kind, COALESCE(target,''), COALESCE(layer,''), COALESCE(unit,''), COALESCE(monitor_id,'')
-		FROM series WHERE agent_id=? ORDER BY kind, target`, agentID)
+		SELECT DISTINCT s.kind, COALESCE(s.target,''), COALESCE(s.layer,''), COALESCE(s.unit,''),
+		       COALESCE(s.monitor_id,''), COALESCE(pt.kind,'')
+		FROM series s LEFT JOIN probe_tasks pt ON pt.id = s.monitor_id
+		WHERE s.agent_id=? ORDER BY s.kind, s.target`, agentID)
 	if err != nil {
 		return nil, err
 	}
@@ -681,8 +692,12 @@ func (s *Store) ListSeries(ctx context.Context, agentID string) ([]SeriesInfo, e
 	var out []SeriesInfo
 	for rows.Next() {
 		var si SeriesInfo
-		if err := rows.Scan(&si.Kind, &si.Target, &si.Layer, &si.Unit, &si.MonitorID); err != nil {
+		var probeKind string
+		if err := rows.Scan(&si.Kind, &si.Target, &si.Layer, &si.Unit, &si.MonitorID, &probeKind); err != nil {
 			return nil, err
+		}
+		if si.MonitorID != "" && !telemetry.MetricAllowedForProbeKind(probeKind, si.Kind) {
+			continue
 		}
 		out = append(out, si)
 	}

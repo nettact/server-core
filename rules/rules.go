@@ -20,6 +20,7 @@ import (
 	"github.com/google/uuid"
 
 	pcfg "github.com/nettact/protocol/config"
+	"github.com/nettact/protocol/telemetry"
 	"github.com/nettact/server-core/eventbus"
 	"github.com/nettact/server-core/metrics"
 	"github.com/nettact/server-core/notification"
@@ -590,7 +591,7 @@ func (s *Service) validate(ctx context.Context, r GroupRule) error {
 		if strings.TrimSpace(c.MetricKind) == "" {
 			return errors.New("condition metric_kind is required")
 		}
-		if !metricAllowedForKind(kind, c.MetricKind) {
+		if !telemetry.MetricAllowedForProbeKind(kind, c.MetricKind) {
 			return fmt.Errorf("metric %q is not valid for a %q target", c.MetricKind, kind)
 		}
 		if !validComparators[c.Comparator] {
@@ -630,28 +631,6 @@ func (s *Service) groupTargetKinds(ctx context.Context, groupID string) (map[str
 		out[id] = kind
 	}
 	return out, rows.Err()
-}
-
-// metricAllowedForKind reports whether a metric kind can be produced by a target
-// of the given probe kind (the gateway probe emits probe.icmp.* metrics; host
-// anchors carry host.*/iface.up/wifi.*/agent.* series).
-func metricAllowedForKind(kind, metric string) bool {
-	switch kind {
-	case "icmp", "gateway":
-		return strings.HasPrefix(metric, "probe.icmp.")
-	case "dns":
-		return strings.HasPrefix(metric, "probe.dns.")
-	case "http":
-		return strings.HasPrefix(metric, "probe.http.")
-	case "tcp":
-		return strings.HasPrefix(metric, "probe.tcp.")
-	case "nat":
-		return strings.HasPrefix(metric, "probe.nat.")
-	case "host":
-		return strings.HasPrefix(metric, "host.") || metric == "iface.up" ||
-			strings.HasPrefix(metric, "wifi.") || strings.HasPrefix(metric, "agent.")
-	}
-	return false
 }
 
 func defSeverity(s string) string {

@@ -47,7 +47,7 @@ func TestFreezeReasonCode(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			db, ctx, cfg, groupID := openRulesTest(t)
-			if err := cfg.SetSiteTargets(ctx, "site_default", []config.ProbeTarget{
+			if _, err := cfg.SetSiteTargets(ctx, "site_default", []config.ProbeTarget{
 				{ID: "cf", GroupID: groupID, Kind: "icmp", Name: "cf", Target: "1.1.1.1", Enabled: true},
 			}); err != nil {
 				t.Fatalf("set targets: %v", err)
@@ -100,7 +100,7 @@ func TestFreezeReasonDetailFromOverlay(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			db, ctx, cfg, groupID := openRulesTest(t)
-			if err := cfg.SetSiteTargets(ctx, "site_default", []config.ProbeTarget{
+			if _, err := cfg.SetSiteTargets(ctx, "site_default", []config.ProbeTarget{
 				{ID: "cf", GroupID: groupID, Kind: "icmp", Name: "cf", Target: "1.1.1.1", Enabled: true},
 			}); err != nil {
 				t.Fatalf("set targets: %v", err)

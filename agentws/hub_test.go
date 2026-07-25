@@ -84,7 +84,7 @@ func (e *testEnv) setTargets(t *testing.T, targets ...string) {
 	for _, tgt := range targets {
 		pts = append(pts, config.ProbeTarget{GroupID: e.groupID, Kind: "icmp", Target: tgt, Enabled: true})
 	}
-	if err := e.cfg.SetSiteTargets(context.Background(), site.DefaultSiteID, pts); err != nil {
+	if _, err := e.cfg.SetSiteTargets(context.Background(), site.DefaultSiteID, pts); err != nil {
 		t.Fatalf("set targets: %v", err)
 	}
 }
