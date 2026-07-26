@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -574,6 +575,66 @@ func TestDialLocal(t *testing.T) {
 	defer gcancel()
 	if _, err := c2.ReadFrame(gctx); wire.CloseStatus(err) != wire.CloseGoingAway {
 		t.Fatalf("CloseAll close = %v, want CloseGoingAway", err)
+	}
+}
+
+// TestDialLocalRefusedAfterCloseAll pins the shutdown gate: once CloseAll has
+// swept the hub, a dial must fail instead of registering a session the sweep
+// already passed. On the desktop a listen-address restart shuts the old server
+// down while the bundled agent is reconnecting on its backoff, so without this
+// the agent would latch onto the outgoing server (whose DB is about to close)
+// and never reach its replacement.
+func TestDialLocalRefusedAfterCloseAll(t *testing.T) {
+	e := newTestEnv(t)
+	e.seedAgent(t, "agent_a", "tok_a")
+	ctx := context.Background()
+
+	e.hub.CloseAll("shutting down")
+
+	c, err := e.hub.DialLocal(ctx, "tok_a")
+	if !errors.Is(err, ErrClosed) {
+		t.Fatalf("DialLocal after CloseAll = %v, want ErrClosed", err)
+	}
+	if c != nil {
+		t.Fatal("DialLocal returned a connection after CloseAll")
+	}
+	if e.hub.IsConnected("agent_a") {
+		t.Fatal("hub registered a session after CloseAll")
+	}
+}
+
+// TestCloseAllCutsPreHelloHandshake pins the handshake half of the shutdown
+// gate: a dial that was admitted but has not sent its Hello yet must neither
+// survive CloseAll (its serve would write registry state after the DB closes)
+// nor stall it for the whole helloTimeout — CloseAll closes the connection out
+// from under the parked Hello read and waits for the serve to return.
+func TestCloseAllCutsPreHelloHandshake(t *testing.T) {
+	e := newTestEnv(t)
+	e.seedAgent(t, "agent_a", "tok_a")
+	ctx := context.Background()
+
+	c, err := e.hub.DialLocal(ctx, "tok_a")
+	if err != nil {
+		t.Fatalf("DialLocal: %v", err)
+	}
+	// No Hello is sent: the serve goroutine parks in its Hello read.
+
+	done := make(chan struct{})
+	go func() { e.hub.CloseAll("shutting down"); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		// helloTimeout is 10s: finishing well under it proves the cut, not a wait.
+		t.Fatal("CloseAll stalled behind a handshake that never sent its Hello")
+	}
+
+	rctx, rcancel := context.WithTimeout(ctx, 2*time.Second)
+	defer rcancel()
+	if _, err := c.ReadFrame(rctx); err == nil {
+		t.Fatal("pre-Hello connection still alive after CloseAll")
+	}
+	if e.hub.IsConnected("agent_a") {
+		t.Fatal("pre-Hello handshake registered a session after CloseAll")
 	}
 }
 

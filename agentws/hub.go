@@ -10,6 +10,7 @@ package agentws
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -40,6 +41,10 @@ const maxFrameBytes = 8 << 20
 // it must have sent its Hello.
 const helloTimeout = 10 * time.Second
 
+// ErrClosed is returned by DialLocal after CloseAll: the hub is shutting down
+// and accepts no further sessions.
+var ErrClosed = errors.New("agentws: hub closed")
+
 // Deps are the services the hub drives on behalf of connected agents.
 type Deps struct {
 	Registry *registry.Service
@@ -69,14 +74,17 @@ type IncidentOps interface {
 type Hub struct {
 	deps Deps
 
-	mu    sync.Mutex
-	conns map[string]*session // agentID -> its single live session
+	mu          sync.Mutex
+	conns       map[string]*session    // agentID -> its single live session
+	closed      bool                   // set by CloseAll; refuses further sessions
+	handshaking map[wire.Conn]struct{} // admitted conns not yet registered; CloseAll cuts them loose
+	serving     sync.WaitGroup         // one per admitted serve; CloseAll waits for all of them
 }
 
 // New constructs the hub and subscribes it to config changes so edited targets
 // reach connected agents without waiting for anything agent-initiated.
 func New(d Deps) *Hub {
-	h := &Hub{deps: d, conns: make(map[string]*session)}
+	h := &Hub{deps: d, conns: make(map[string]*session), handshaking: make(map[wire.Conn]struct{})}
 	if d.Bus != nil {
 		d.Bus.Subscribe(eventbus.TopicConfigChanged, func(m eventbus.Message) {
 			ev, ok := m.Payload.(eventbus.ConfigChanged)
@@ -139,11 +147,41 @@ func (h *Hub) HandleUpgrade(w http.ResponseWriter, r *http.Request) {
 // DesiredState, and loops until the link dies. It blocks for the session's life.
 // Transport-agnostic: HandleUpgrade wraps a WebSocket, DialLocal wraps a pipe.
 func (h *Hub) serve(ctx context.Context, agentID, siteID string, c wire.Conn) {
+	// Admission: a hub CloseAll has swept accepts no further connections, and one
+	// it HAS admitted must be awaited — the Hello side effects below write through
+	// the registry, so CloseAll must not return (its caller closes the DB) while a
+	// handshake is mid-write. The conn is tracked until registration so CloseAll
+	// can cut a parked Hello read loose instead of stalling shutdown for up to
+	// helloTimeout.
+	h.mu.Lock()
+	if h.closed {
+		h.mu.Unlock()
+		_ = c.Close(wire.CloseGoingAway, "server shutting down")
+		return
+	}
+	h.serving.Add(1)
+	h.handshaking[c] = struct{}{}
+	h.mu.Unlock()
+	defer h.serving.Done()
+	defer func() {
+		// Idempotent with the delete at registration; covers every earlier return.
+		h.mu.Lock()
+		delete(h.handshaking, c)
+		h.mu.Unlock()
+	}()
+
 	// The first frame MUST be a Hello, promptly.
 	helloCtx, cancel := context.WithTimeout(ctx, helloTimeout)
 	frame, err := c.ReadFrame(helloCtx)
 	cancel()
 	if err != nil || frame.Hello == nil {
+		if h.isClosed() {
+			// CloseAll cut this handshake off mid-read; that is a shutdown, not a
+			// peer protocol error, and must be recorded as one.
+			_ = h.deps.Registry.RecordDisconnect(ctx, agentID, "server_shutdown")
+			_ = c.Close(wire.CloseGoingAway, "server shutting down")
+			return
+		}
 		_ = h.deps.Registry.RecordDisconnect(ctx, agentID, "error")
 		_ = c.Close(wire.CloseProtocolError, "first frame must be hello")
 		return
@@ -200,7 +238,27 @@ func (h *Hub) serve(ctx context.Context, agentID, siteID string, c wire.Conn) {
 	// kick runs on its own goroutine because Close performs the WebSocket close
 	// handshake (it can block seconds on an unresponsive peer) and must not
 	// stall this handler or anyone else waiting on the hub mutex.
+	//
+	// A hub that CloseAll already swept must never gain a session: absent from
+	// the sweep's snapshot, it would outlive the shutdown and keep writing
+	// through services the caller is about to stop (on the desktop, a
+	// reconnecting bundled agent would latch onto the outgoing server instead of
+	// its replacement). This closes the window between admission and
+	// registration: the Hello above just marked the agent online, so the refusal
+	// also records the cutoff — the DB is still open, because CloseAll is
+	// waiting on h.serving. Registration also ends the handshake phase: from
+	// here the conn is owned by the registered session and CloseAll closes it
+	// through s.shutdown, not the handshake sweep.
 	h.mu.Lock()
+	delete(h.handshaking, c)
+	if h.closed {
+		h.mu.Unlock()
+		tctx, tcancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_ = h.deps.Registry.RecordDisconnect(tctx, agentID, "server_shutdown")
+		tcancel()
+		_ = c.Close(wire.CloseGoingAway, "server shutting down")
+		return
+	}
 	old := h.conns[agentID]
 	h.conns[agentID] = s
 	h.mu.Unlock()
@@ -308,7 +366,18 @@ func classifyDisconnect(readErr error, s *session) string {
 // kicked on supersede, closed by CloseAll), and returns the agent end. The
 // desktop's bundled agent connects through this instead of a loopback
 // WebSocket, so telemetry never leaves the process.
+//
+// It returns ErrClosed once CloseAll has run: the server is shutting down and
+// its DB is about to close, so failing fast lets the bundled agent's reconnect
+// loop reach the replacement server instead of latching onto this one.
 func (h *Hub) DialLocal(ctx context.Context, token string) (wire.Conn, error) {
+	h.mu.Lock()
+	closed := h.closed
+	h.mu.Unlock()
+	if closed {
+		return nil, ErrClosed
+	}
+
 	agentID, siteID, err := h.deps.Registry.AuthenticateAgent(ctx, token)
 	if err != nil {
 		return nil, fmt.Errorf("authenticate agent: %w", err)
@@ -405,6 +474,13 @@ func (h *Hub) IsConnected(agentID string) bool {
 	return h.conns[agentID] != nil
 }
 
+// isClosed reports whether CloseAll has latched the hub shut.
+func (h *Hub) isClosed() bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.closed
+}
+
 // ConnectedIDs returns the agent IDs with a live session, for the offline
 // sweeper's exclusion list.
 func (h *Hub) ConnectedIDs() []string {
@@ -424,13 +500,32 @@ func (h *Hub) ConnectedIDs() []string {
 // dead peer), so they run in parallel and CloseAll waits for every session to
 // fully tear down — including any in-flight ingest — before returning, so the
 // caller's later db.Close cannot race a live writer.
+//
+// It also latches the hub closed in the same critical section that snapshots the
+// sessions, so a connection racing the sweep is refused rather than surviving it
+// (see serve and DialLocal). Connections still mid-handshake — admitted but not
+// yet registered — are cut loose (unblocking a parked Hello read immediately
+// instead of at helloTimeout) and then awaited via h.serving, so no Hello side
+// effect can write through a DB the caller closes after CloseAll returns. The
+// latch is permanent: a Hub is never reused.
 func (h *Hub) CloseAll(reason string) {
 	h.mu.Lock()
+	h.closed = true
 	sessions := make([]*session, 0, len(h.conns))
 	for _, s := range h.conns {
 		sessions = append(sessions, s)
 	}
+	handshakes := make([]wire.Conn, 0, len(h.handshaking))
+	for c := range h.handshaking {
+		handshakes = append(handshakes, c)
+	}
 	h.mu.Unlock()
+	// Fire-and-forget: Close can block on a dead peer's close handshake, and the
+	// h.serving wait below already guarantees the serve goroutines (the only DB
+	// writers among them) have returned before CloseAll does.
+	for _, c := range handshakes {
+		go func(c wire.Conn) { _ = c.Close(wire.CloseGoingAway, reason) }(c)
+	}
 	var wg sync.WaitGroup
 	for _, s := range sessions {
 		wg.Add(1)
@@ -441,6 +536,7 @@ func (h *Hub) CloseAll(reason string) {
 		}(s)
 	}
 	wg.Wait()
+	h.serving.Wait()
 }
 
 // bearer extracts the Authorization bearer token (same shape as the api
