@@ -2152,10 +2152,8 @@ var knownSettingKeys = buildKnownSettingKeys()
 
 func buildKnownSettingKeys() map[string]bool {
 	m := map[string]bool{
-		settings.KeyConsoleBaseURL:       true,
-		settings.KeyListenAddr:           true,
-		settings.KeyAgentAlertSeverity:   true, // string; validated explicitly below
-		settings.KeyAgentAlertChannelIDs: true, // string (JSON array); validated explicitly below
+		settings.KeyConsoleBaseURL: true,
+		settings.KeyListenAddr:     true,
 	}
 	for k := range settings.IntKeys {
 		m[k] = true
@@ -2213,36 +2211,6 @@ func (d Deps) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		}
 		listenChanged = v != cur
 		listenNew = v
-	}
-	// Agent connectivity-alert severity: a fixed enum, or "" to clear (= warn).
-	if v, ok := body[settings.KeyAgentAlertSeverity]; ok {
-		v = strings.TrimSpace(v)
-		switch v {
-		case "", "info", "warn", "error", "critical":
-		default:
-			writeError(w, http.StatusBadRequest, "agent_alert_severity must be one of info|warn|error|critical")
-			return
-		}
-		body[settings.KeyAgentAlertSeverity] = v
-	}
-	// Agent connectivity-alert channel IDs: a JSON array of non-empty strings, or
-	// "" to clear (= all enabled channels).
-	if v, ok := body[settings.KeyAgentAlertChannelIDs]; ok {
-		v = strings.TrimSpace(v)
-		if v != "" {
-			var ids []string
-			if json.Unmarshal([]byte(v), &ids) != nil || len(ids) > 64 {
-				writeError(w, http.StatusBadRequest, "agent_alert_channel_ids must be a JSON array of up to 64 channel ids")
-				return
-			}
-			for _, id := range ids {
-				if strings.TrimSpace(id) == "" {
-					writeError(w, http.StatusBadRequest, "agent_alert_channel_ids must not contain empty ids")
-					return
-				}
-			}
-		}
-		body[settings.KeyAgentAlertChannelIDs] = v
 	}
 	// Range-check the integer knobs against their registered bounds; normalize the
 	// stored form to the parsed integer.

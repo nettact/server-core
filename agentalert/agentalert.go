@@ -85,9 +85,9 @@ func (e *Engine) Tick(ctx context.Context, connectedIDs []string) error {
 		return nil
 	}
 	now := e.now()
-	enabled := e.set == nil || e.set.Bool(ctx, settings.KeyAgentAlertEnabled)
-	graceSec, _ := e.set.Int(ctx, settings.KeyAgentAlertGraceSeconds)
-	recoverSec, _ := e.set.Int(ctx, settings.KeyAgentAlertRecoverSeconds)
+	enabled := e.set == nil || e.set.Bool(ctx, settings.KeyAgentConnectivityEnabled)
+	graceSec, _ := e.set.Int(ctx, settings.KeyAgentConnectivityGraceSeconds)
+	recoverSec, _ := e.set.Int(ctx, settings.KeyAgentConnectivityRecoverSeconds)
 	grace := time.Duration(graceSec) * time.Second
 	recover := time.Duration(recoverSec) * time.Second
 

@@ -31,9 +31,12 @@ func openStatusDB(t *testing.T) *store.DB {
 	return db
 }
 
-// TestUpdateSettingsAgentAlertValidation covers the two free-form string keys
-// (severity enum + channel-ids JSON) and one int knob's bounds.
-func TestUpdateSettingsAgentAlertValidation(t *testing.T) {
+// TestUpdateSettingsAgentConnectivityValidation pins the connectivity detector's
+// settable surface: the int knobs are bounds-checked, and the alert-era routing
+// keys are gone for good. Routing lives in notification policies now, so an
+// accepted write to agent_alert_severity/channel_ids would be a value nothing
+// reads — config that looks applied and silently does nothing.
+func TestUpdateSettingsAgentConnectivityValidation(t *testing.T) {
 	db := openStatusDB(t)
 	d := Deps{Settings: settings.New(db), Audit: audit.New(db)}
 
@@ -45,26 +48,29 @@ func TestUpdateSettingsAgentAlertValidation(t *testing.T) {
 		return w
 	}
 
-	if w := put(`{"agent_alert_severity":"bogus"}`); w.Code != http.StatusBadRequest {
-		t.Fatalf("bad severity: status=%d body=%s", w.Code, w.Body.String())
+	for _, gone := range []string{
+		`{"agent_alert_severity":"critical"}`,
+		`{"agent_alert_channel_ids":"[\"chan_1\"]"}`,
+		`{"agent_alert_enabled":"1"}`,
+		`{"agent_alert_grace_seconds":"90"}`,
+	} {
+		if w := put(gone); w.Code != http.StatusBadRequest {
+			t.Fatalf("alert-era key must be rejected outright: body=%s status=%d resp=%s",
+				gone, w.Code, w.Body.String())
+		}
 	}
-	if w := put(`{"agent_alert_severity":"critical"}`); w.Code != http.StatusOK {
-		t.Fatalf("good severity: status=%d body=%s", w.Code, w.Body.String())
-	}
-	if w := put(`{"agent_alert_channel_ids":"not-json"}`); w.Code != http.StatusBadRequest {
-		t.Fatalf("bad channel ids: status=%d body=%s", w.Code, w.Body.String())
-	}
-	if w := put(`{"agent_alert_channel_ids":"[\"chan_1\",\"chan_2\"]"}`); w.Code != http.StatusOK {
-		t.Fatalf("good channel ids: status=%d body=%s", w.Code, w.Body.String())
-	}
-	if w := put(`{"agent_alert_grace_seconds":"5"}`); w.Code != http.StatusBadRequest {
+
+	if w := put(`{"agent_connectivity_grace_seconds":"5"}`); w.Code != http.StatusBadRequest {
 		t.Fatalf("grace below min should fail: status=%d body=%s", w.Code, w.Body.String())
 	}
-	if w := put(`{"agent_alert_grace_seconds":"90"}`); w.Code != http.StatusOK {
+	if w := put(`{"agent_connectivity_grace_seconds":"90"}`); w.Code != http.StatusOK {
 		t.Fatalf("valid grace: status=%d body=%s", w.Code, w.Body.String())
 	}
-	if got, _ := settings.New(db).Get(context.Background(), settings.KeyAgentAlertGraceSeconds); got != "90" {
+	if got, _ := settings.New(db).Get(context.Background(), settings.KeyAgentConnectivityGraceSeconds); got != "90" {
 		t.Fatalf("grace not persisted, got %q", got)
+	}
+	if w := put(`{"agent_connectivity_enabled":"0"}`); w.Code != http.StatusOK {
+		t.Fatalf("disabling detection: status=%d body=%s", w.Code, w.Body.String())
 	}
 }
 

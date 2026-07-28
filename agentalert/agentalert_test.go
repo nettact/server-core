@@ -102,8 +102,8 @@ func newHarness(t *testing.T) *harness {
 	h.eng.now = func() time.Time { return h.clock }
 	// Short, clear timings; the machine is clock-driven so absolute values only
 	// need to be internally consistent.
-	h.setInt(settings.KeyAgentAlertGraceSeconds, 30)
-	h.setInt(settings.KeyAgentAlertRecoverSeconds, 10)
+	h.setInt(settings.KeyAgentConnectivityGraceSeconds, 30)
+	h.setInt(settings.KeyAgentConnectivityRecoverSeconds, 10)
 	return h
 }
 
@@ -346,7 +346,7 @@ func TestDisableMidFlightResolves(t *testing.T) {
 	h.seedAgent("agent_a", ptr(base), ptr(base), false, "error")
 	h.takeAgentOffline("agent_a")
 
-	h.setInt(settings.KeyAgentAlertEnabled, 0)
+	h.setInt(settings.KeyAgentConnectivityEnabled, 0)
 	h.tick()
 	if h.firing("agent_a") || h.faults.lastResolve("agent_a") != fault.ReasonDisabled {
 		t.Fatalf("expected disabled, firing=%v reason=%q", h.firing("agent_a"), h.faults.lastResolve("agent_a"))
