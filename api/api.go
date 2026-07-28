@@ -128,6 +128,9 @@ func Router(d Deps) http.Handler {
 			r.Get("/quota", d.handleQuota)
 			r.Get("/stats", d.handleStats)
 			r.Get("/sites", d.handleListSites)
+			// Permission catalog + enrollment presets. Agent-independent: the
+			// enrollment screen needs it before any agent exists.
+			r.Get("/permissions", d.handlePermissionCatalog)
 			r.Get("/agents", d.handleListAgents)
 			r.Get("/agents/{id}", d.handleGetAgent)
 			r.Put("/agents/{id}", d.handleUpdateAgent)
@@ -138,6 +141,9 @@ func Router(d Deps) http.Handler {
 			r.Get("/agents/{id}/interfaces", d.handleAgentInterfaces)
 			r.Get("/agents/{id}/series", d.handleAgentSeries)
 			r.Get("/agents/{id}/status-history", d.handleAgentStatusHistory)
+			// Full permission catalog for one agent (granted AND not granted),
+			// each with the policy line that would grant it.
+			r.Get("/agents/{id}/permissions", d.handleAgentPermissions)
 			r.Get("/agents/{id}/issues", d.handleAgentIssues)
 			r.Get("/agents/{id}/monitor-status", d.handleAgentMonitorStatus)
 			// Live host snapshot (ephemeral process/connection lists): POST asks the
