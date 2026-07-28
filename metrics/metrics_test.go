@@ -4,21 +4,17 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/nettact/protocol/telemetry"
 	"github.com/nettact/server-core/store"
+	"github.com/nettact/server-core/store/storetest"
 )
 
 func openStore(t testing.TB) (*store.DB, *Store) {
 	t.Helper()
-	db, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
-	if err != nil {
-		t.Fatalf("open db: %v", err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
+	db := storetest.Open(t)
 	return db, New(db)
 }
 

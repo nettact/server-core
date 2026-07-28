@@ -26,10 +26,15 @@ const (
 	EventIssues              = "issues"
 	EventTargetStatusChanged = "target.status.changed"
 	// EventAgentStatusChanged (Data set: {"site_id":...}) signals that a site's
-	// agent-status list changed (liveness flip, connectivity alert, or a rule
-	// alert/issue affecting an agent). Written verbatim; the console coalesces and
+	// agent-status list changed (liveness flip, connectivity fault, or a target
+	// fault/issue affecting an agent). Written verbatim; the console coalesces and
 	// refetches the whole agent-status list.
 	EventAgentStatusChanged = "agent.status.changed"
+	// EventIncidentChanged (Data set: {"site_id":…,"incident_id":…}) signals that
+	// one incident opened, changed or resolved. The console refetches the fault
+	// centre view it is showing rather than patching a row, so the id is a hint for
+	// the open detail drawer, not a delta.
+	EventIncidentChanged = "incident.changed"
 )
 
 // Event is one server-sent event to fan out to a site's subscribers. Name is the

@@ -2,13 +2,13 @@ package cleanup
 
 import (
 	"context"
-	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/nettact/protocol/telemetry"
 	"github.com/nettact/server-core/metrics"
 	"github.com/nettact/server-core/store"
+	"github.com/nettact/server-core/store/storetest"
 )
 
 // newTestService opens a fresh DB with the minimal fixtures a cleanup job needs
@@ -16,11 +16,7 @@ import (
 // a live monitor, an orphaned (deleted-monitor) series, and a system series.
 func newTestService(t *testing.T) (*store.DB, *metrics.Store, *Service) {
 	t.Helper()
-	db, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
-	if err != nil {
-		t.Fatalf("open db: %v", err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
+	db := storetest.Open(t)
 	ctx := context.Background()
 	exec := func(q string, args ...any) {
 		if _, err := db.ExecContext(ctx, q, args...); err != nil {

@@ -2,18 +2,13 @@ package settings
 
 import (
 	"context"
-	"path/filepath"
 	"testing"
 
-	"github.com/nettact/server-core/store"
+	"github.com/nettact/server-core/store/storetest"
 )
 
 func TestSettingsRoundTrip(t *testing.T) {
-	db, err := store.Open(filepath.Join(t.TempDir(), "s.db"))
-	if err != nil {
-		t.Fatalf("open db: %v", err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
+	db := storetest.Open(t)
 	ctx := context.Background()
 	s := New(db)
 

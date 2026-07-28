@@ -2,7 +2,6 @@ package agentstatus
 
 import (
 	"context"
-	"path/filepath"
 	"testing"
 	"time"
 
@@ -10,6 +9,7 @@ import (
 	"github.com/nettact/server-core/metrics"
 	"github.com/nettact/server-core/settings"
 	"github.com/nettact/server-core/store"
+	"github.com/nettact/server-core/store/storetest"
 )
 
 // fakeMetrics returns canned latest points per agent.
@@ -28,11 +28,7 @@ func mustExec(t *testing.T, db *store.DB, q string, args ...any) {
 
 func openDB(t *testing.T) *store.DB {
 	t.Helper()
-	db, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
-	if err != nil {
-		t.Fatalf("open db: %v", err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
+	db := storetest.Open(t)
 	mustExec(t, db, `INSERT INTO sites(id,name,created_at) VALUES('site_default','def',?)`, time.Now().UTC())
 	return db
 }
@@ -42,6 +38,29 @@ func seedAgent(t *testing.T, db *store.DB, id, status string, firstConn *time.Ti
 	mustExec(t, db, `INSERT INTO agents(id, site_id, public_key, token_hash, status, hostname, first_connected_at, last_seen_at, created_at)
 		VALUES(?, 'site_default', x'00', ?, ?, ?, ?, ?, ?)`,
 		id, "h_"+id, status, id+"-host", firstConn, time.Now().UTC(), time.Now().UTC())
+}
+
+// seedFault inserts a firing target-availability fault for an agent, with the
+// incident row its foreign key requires.
+func seedFault(t *testing.T, db *store.DB, id, agentID, targetID string, now time.Time) {
+	t.Helper()
+	inc := "inc_" + id
+	mustExec(t, db, `INSERT INTO incidents(id,site_id,group_id,open_key,state,severity,opened_at)
+		VALUES(?,'site_default','mg',?, 'open','warn',?)`, inc, "sig:"+id, now)
+	mustExec(t, db, `INSERT INTO fault_signals(id,site_id,agent_id,target_id,detector_key,state,observed_at,confirmed_at,incident_id)
+		VALUES(?,'site_default',?,?,'availability','firing',?,?,?)`, id, agentID, targetID, now, now, inc)
+}
+
+// seedAgentFault inserts a firing agent-connectivity fault (no target).
+func seedAgentFault(t *testing.T, db *store.DB, id, agentID, reason string, now time.Time) {
+	t.Helper()
+	inc := "inc_" + id
+	mustExec(t, db, `INSERT INTO incidents(id,site_id,group_id,open_key,state,severity,opened_at)
+		VALUES(?,'site_default','',?, 'open','critical',?)`, inc, "agent:"+agentID, now)
+	mustExec(t, db, `INSERT INTO fault_signals(id,site_id,agent_id,target_id,detector_key,severity,state,
+		reason_detail,observed_at,confirmed_at,incident_id)
+		VALUES(?,'site_default',?,'','agent_connectivity','critical','firing',?,?,?,?)`,
+		id, agentID, reason, now, now, inc)
 }
 
 func find(rows []AgentStatusRow, id string) AgentStatusRow {
@@ -63,12 +82,12 @@ func TestStatusPriority(t *testing.T) {
 	seedAgent(t, db, "agent_ok", "online", &now)
 	seedAgent(t, db, "agent_new", "offline", nil) // never connected
 
-	// agent_abn is online but has a firing rule alert and an active issue.
+	// agent_abn is online but has a firing target fault and an active issue.
 	mustExec(t, db, `INSERT INTO monitor_groups(id,site_id,name,all_agents) VALUES('mg','site_default','all',1)`)
-	mustExec(t, db, `INSERT INTO alerts(id,agent_id,site_id,group_id,state,started_at) VALUES('al1','agent_abn','site_default','mg','firing',?)`, now)
+	seedFault(t, db, "sig1", "agent_abn", "probe_a", now)
 	mustExec(t, db, `INSERT INTO operational_issues(id,site_id,agent_id,reason,dedupe_key,state,first_seen_at,last_seen_at) VALUES('oi1','site_default','agent_abn','permission_blocked','k1','active',?,?)`, now, now)
-	// A firing alert on the OFFLINE agent must not demote it to abnormal.
-	mustExec(t, db, `INSERT INTO alerts(id,agent_id,site_id,group_id,state,started_at) VALUES('al2','agent_off','site_default','mg','firing',?)`, now)
+	// A firing fault on the OFFLINE agent must not demote it to abnormal.
+	seedFault(t, db, "sig2", "agent_off", "probe_b", now)
 
 	svc := New(db, nil, settings.New(db))
 	got, err := svc.SiteAgentStatuses(ctx, "site_default")
@@ -87,8 +106,8 @@ func TestStatusPriority(t *testing.T) {
 		}
 	}
 	// The offline agent still reports its firing count as a reason.
-	if r := find(got.Agents, "agent_off"); r.FiringAlerts != 1 {
-		t.Fatalf("expected offline agent to report firing_alerts=1, got %d", r.FiringAlerts)
+	if r := find(got.Agents, "agent_off"); r.FiringFaults != 1 {
+		t.Fatalf("expected offline agent to report firing_faults=1, got %d", r.FiringFaults)
 	}
 }
 
@@ -211,8 +230,7 @@ func TestConnectivityAlertAndGroups(t *testing.T) {
 
 	mustExec(t, db, `INSERT INTO agent_groups(id,site_id,name) VALUES('g1','site_default','Living Room')`)
 	mustExec(t, db, `INSERT INTO agent_group_members(group_id,agent_id) VALUES('g1','agent_a')`)
-	mustExec(t, db, `INSERT INTO agent_alerts(id,site_id,agent_id,status,reason,severity,offline_since,opened_at)
-		VALUES('aa1','site_default','agent_a','firing','clean_shutdown','warn',?,?)`, now, now)
+	seedAgentFault(t, db, "aa1", "agent_a", "clean_shutdown", now)
 
 	svc := New(db, nil, settings.New(db))
 	got, err := svc.SiteAgentStatuses(ctx, "site_default")

@@ -163,7 +163,7 @@ func (s *Service) reconcileTraceRefs(ctx context.Context) error {
 	_, err := s.db.ExecContext(ctx, `
 		UPDATE trace_report_refs SET active=0
 		WHERE active=1
-		  AND alert_id NOT IN (SELECT id FROM alerts WHERE state='firing')`)
+		  AND signal_id NOT IN (SELECT id FROM fault_signals WHERE state='firing')`)
 	return err
 }
 

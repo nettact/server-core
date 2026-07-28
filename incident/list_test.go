@@ -3,20 +3,15 @@ package incident
 import (
 	"context"
 	"fmt"
-	"path/filepath"
 	"testing"
 	"time"
 
-	"github.com/nettact/server-core/store"
+	"github.com/nettact/server-core/store/storetest"
 )
 
 // TestListPagination verifies Count + List(limit, offset) page newest-first.
 func TestListPagination(t *testing.T) {
-	db, err := store.Open(filepath.Join(t.TempDir(), "p.db"))
-	if err != nil {
-		t.Fatalf("open db: %v", err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
+	db := storetest.Open(t)
 	ctx := context.Background()
 	if _, err := db.ExecContext(ctx, `INSERT INTO sites(id,name) VALUES('site_default','H')`); err != nil {
 		t.Fatalf("seed site: %v", err)
@@ -34,13 +29,13 @@ func TestListPagination(t *testing.T) {
 
 	svc := New(db)
 
-	total, err := svc.Count(ctx, "site_default")
+	total, err := svc.Count(ctx, "site_default", Filter{})
 	if err != nil || total != 25 {
 		t.Fatalf("Count = %d (err %v), want 25", total, err)
 	}
 
 	// Page 1, size 15: newest 15 (inc_24 .. inc_10).
-	p1, err := svc.List(ctx, "site_default", 15, 0)
+	p1, err := svc.List(ctx, "site_default", Filter{}, 15, 0)
 	if err != nil {
 		t.Fatalf("List p1: %v", err)
 	}
@@ -49,7 +44,7 @@ func TestListPagination(t *testing.T) {
 	}
 
 	// Page 2, size 15: remaining 10 (inc_09 .. inc_00).
-	p2, err := svc.List(ctx, "site_default", 15, 15)
+	p2, err := svc.List(ctx, "site_default", Filter{}, 15, 15)
 	if err != nil {
 		t.Fatalf("List p2: %v", err)
 	}
@@ -59,11 +54,7 @@ func TestListPagination(t *testing.T) {
 }
 
 func TestOverviewStatsAreIndependentOfPagination(t *testing.T) {
-	db, err := store.Open(filepath.Join(t.TempDir(), "stats.db"))
-	if err != nil {
-		t.Fatalf("open db: %v", err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
+	db := storetest.Open(t)
 	ctx := context.Background()
 	if _, err := db.ExecContext(ctx, `INSERT INTO sites(id,name) VALUES('site_default','H')`); err != nil {
 		t.Fatalf("seed site: %v", err)

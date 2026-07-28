@@ -5,22 +5,17 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/nettact/server-core/audit"
 	"github.com/nettact/server-core/identity"
-	"github.com/nettact/server-core/store"
+	"github.com/nettact/server-core/store/storetest"
 )
 
 func passwordTestDeps(t *testing.T) (Deps, *identity.Service) {
 	t.Helper()
-	db, err := store.Open(filepath.Join(t.TempDir(), "auth.db"))
-	if err != nil {
-		t.Fatalf("store.Open: %v", err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
+	db := storetest.Open(t)
 	id := identity.New(db)
 	return Deps{Identity: id, Audit: audit.New(db)}, id
 }

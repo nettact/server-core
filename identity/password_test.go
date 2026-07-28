@@ -19,8 +19,8 @@ func TestValidatePassword(t *testing.T) {
 		{"exactly-8", "12345678", true},
 		{"long-ok", strings.Repeat("a", 72), true},
 		{"too-long-73-bytes", strings.Repeat("a", 73), false},
-		{"multibyte-min-runes", "密码密码密码密码", true},          // 8 runes, 24 bytes
-		{"multibyte-7-runes", "密码密码密码密", false},            // 7 runes → below the 8-codepoint floor
+		{"multibyte-min-runes", "密码密码密码密码", true},                   // 8 runes, 24 bytes
+		{"multibyte-7-runes", "密码密码密码密", false},                     // 7 runes → below the 8-codepoint floor
 		{"multibyte-over-72-bytes", strings.Repeat("密", 25), false}, // 25 runes but 75 bytes → over bcrypt's 72-byte cap
 	} {
 		t.Run(tc.name, func(t *testing.T) {

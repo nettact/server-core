@@ -6,22 +6,17 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/nettact/server-core/audit"
 	"github.com/nettact/server-core/settings"
-	"github.com/nettact/server-core/store"
+	"github.com/nettact/server-core/store/storetest"
 )
 
 func listenTestDeps(t *testing.T) Deps {
 	t.Helper()
-	db, err := store.Open(filepath.Join(t.TempDir(), "listen.db"))
-	if err != nil {
-		t.Fatalf("store.Open: %v", err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
+	db := storetest.Open(t)
 	return Deps{Settings: settings.New(db), Audit: audit.New(db)}
 }
 

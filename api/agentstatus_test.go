@@ -4,7 +4,6 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -18,15 +17,12 @@ import (
 	"github.com/nettact/server-core/registry"
 	"github.com/nettact/server-core/settings"
 	"github.com/nettact/server-core/store"
+	"github.com/nettact/server-core/store/storetest"
 )
 
 func openStatusDB(t *testing.T) *store.DB {
 	t.Helper()
-	db, err := store.Open(filepath.Join(t.TempDir(), "as.db"))
-	if err != nil {
-		t.Fatalf("store.Open: %v", err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
+	db := storetest.Open(t)
 	now := time.Now().UTC()
 	if _, err := db.ExecContext(context.Background(),
 		`INSERT INTO sites(id,name,created_at) VALUES('site_default','Default',?)`, now); err != nil {

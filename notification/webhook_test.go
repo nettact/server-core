@@ -25,7 +25,7 @@ func webhookSamplePayload() Payload {
 		Scope:          "single",
 		AgentCount:     1,
 		SuspectedLayer: "service",
-		Details: []AlertDetail{{
+		Details: []FaultDetail{{
 			ProbeKind: "http", MetricKind: "probe.http.status", Comparator: "eq",
 			Threshold: 200, Value: 503, TargetName: "Shop", Target: "https://shop.example.com",
 			Layer: "service", Severity: "critical", AgentHost: "living-room",
@@ -99,7 +99,7 @@ func TestDeliverWebhookCustomTemplate(t *testing.T) {
 	if err := json.Unmarshal(gotBody, &parsed); err != nil {
 		t.Fatalf("template body not valid JSON: %v (%s)", err, gotBody)
 	}
-	if !strings.Contains(string(gotBody), "Network alert") {
+	if !strings.Contains(string(gotBody), "Network fault") {
 		t.Fatalf("title not substituted into body: %s", gotBody)
 	}
 }

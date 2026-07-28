@@ -2,24 +2,21 @@ package ingest
 
 import (
 	"context"
-	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/nettact/protocol"
 	"github.com/nettact/protocol/telemetry"
+	"github.com/nettact/server-core/fault"
 	"github.com/nettact/server-core/inventory"
 	"github.com/nettact/server-core/metrics"
 	"github.com/nettact/server-core/store"
+	"github.com/nettact/server-core/store/storetest"
 )
 
 func openWiFiIngest(t *testing.T) (*store.DB, *Service, *inventory.Service, *metrics.Store) {
 	t.Helper()
-	db, err := store.Open(filepath.Join(t.TempDir(), "wifi.db"))
-	if err != nil {
-		t.Fatalf("store.Open: %v", err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
+	db := storetest.Open(t)
 	ctx := context.Background()
 	now := time.Now().UTC()
 	if _, err := db.ExecContext(ctx, `INSERT INTO sites(id,name,created_at) VALUES('site_default','Default',?)`, now); err != nil {
@@ -142,8 +139,10 @@ func TestProbeMetricsRequireExactTargetGeneration(t *testing.T) {
 		{Kind: telemetry.HTTPOK, MonitorID: "future", ConfigSerial: 6},
 		{Kind: telemetry.HTTPOK, MonitorID: "deleted", ConfigSerial: 5},
 	}
-	accepted, dropped := filterByGeneration(metrics, map[string]int{
-		"current": 5, "stale": 5, "future": 5,
+	accepted, dropped := filterByGeneration(metrics, map[string]fault.TargetMeta{
+		"current": {ID: "current", Kind: "http", Enabled: true, ConfigSerial: 5},
+		"stale":   {ID: "stale", Kind: "http", Enabled: true, ConfigSerial: 5},
+		"future":  {ID: "future", Kind: "http", Enabled: true, ConfigSerial: 5},
 	})
 	if dropped != 3 {
 		t.Fatalf("dropped = %d, want stale + future + deleted", dropped)

@@ -2,18 +2,13 @@ package opissue
 
 import (
 	"context"
-	"path/filepath"
 	"testing"
 
-	"github.com/nettact/server-core/store"
+	"github.com/nettact/server-core/store/storetest"
 )
 
 func TestPredictProbeMonitorsClassifiesAgentsAndIncludesOfflineGroupMembers(t *testing.T) {
-	db, err := store.Open(filepath.Join(t.TempDir(), "opissue.db"))
-	if err != nil {
-		t.Fatalf("open db: %v", err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
+	db := storetest.Open(t)
 	ctx := context.Background()
 	exec := func(query string, args ...any) {
 		t.Helper()
@@ -95,11 +90,7 @@ func TestPredictProbeMonitorsClassifiesAgentsAndIncludesOfflineGroupMembers(t *t
 }
 
 func TestAgentStatusesExposeExecutionProvenanceAndSchedule(t *testing.T) {
-	db, err := store.Open(filepath.Join(t.TempDir(), "status.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
+	db := storetest.Open(t)
 	ctx := context.Background()
 	exec := func(q string, args ...any) {
 		t.Helper()

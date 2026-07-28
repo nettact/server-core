@@ -1,7 +1,7 @@
 // Package agentstatus is the read-time aggregation behind the Agent status list
-// (AGENT-001). It fuses per-agent identity, group membership, liveness, firing
-// rule alerts / operational issues (the "abnormal" reasons), the firing
-// connectivity alert, and the latest host resource samples into one per-agent
+// (AGENT-001). It fuses per-agent identity, group membership, liveness, the
+// agent's firing target faults / operational issues (the "abnormal" reasons), its
+// own connectivity fault, and the latest host resource samples into one per-agent
 // rollup, computing the single authoritative overall status so the API and UI
 // can never drift. It is a pure reader: it never mutates state.
 package agentstatus
@@ -55,6 +55,10 @@ type GroupRef struct {
 	Name string `json:"name"`
 }
 
+// ConnAlertRef links an agent row to its firing connectivity fault. Reason is
+// the offline cause frozen on the signal (unexpected | clean_shutdown |
+// version_incompatible); OfflineSince is the fault's observed_at (when the agent
+// was last seen) and OpenedAt its confirmed_at (when grace expired).
 type ConnAlertRef struct {
 	ID           string    `json:"id"`
 	Reason       string    `json:"reason"`
@@ -129,7 +133,7 @@ type AgentStatusRow struct {
 	LastDisconnectKind      string        `json:"last_disconnect_kind"`
 	ConnectivityAlertsMuted bool          `json:"connectivity_alerts_muted"`
 	Groups                  []GroupRef    `json:"groups"`
-	FiringAlerts            int           `json:"firing_alerts"`
+	FiringFaults            int           `json:"firing_faults"`
 	ActiveIssues            int           `json:"active_issues"`
 	ConnectivityAlert       *ConnAlertRef `json:"connectivity_alert"`
 	Resources               Resources     `json:"resources"`
@@ -151,7 +155,7 @@ func (s *Service) SiteAgentStatuses(ctx context.Context, siteID string) (SiteAge
 	if err != nil {
 		return SiteAgentStatuses{}, err
 	}
-	firing, err := s.countByAgent(ctx, `SELECT agent_id, COUNT(*) FROM alerts WHERE site_id=? AND state='firing' GROUP BY agent_id`, siteID)
+	firing, err := s.countByAgent(ctx, `SELECT agent_id, COUNT(*) FROM fault_signals WHERE site_id=? AND state='firing' AND target_id <> '' GROUP BY agent_id`, siteID)
 	if err != nil {
 		return SiteAgentStatuses{}, err
 	}
@@ -175,7 +179,7 @@ func (s *Service) SiteAgentStatuses(ctx context.Context, siteID string) (SiteAge
 		if row.Groups == nil {
 			row.Groups = []GroupRef{}
 		}
-		row.FiringAlerts = firing[a.ID]
+		row.FiringFaults = firing[a.ID]
 		row.ActiveIssues = issues[a.ID]
 		if ca, ok := connAlerts[a.ID]; ok {
 			row.ConnectivityAlert = &ca
@@ -209,7 +213,7 @@ func overallStatus(r AgentStatusRow) string {
 		return StatusNeverConnected
 	case r.Presence == "offline":
 		return StatusOffline
-	case r.FiringAlerts > 0 || r.ActiveIssues > 0:
+	case r.FiringFaults > 0 || r.ActiveIssues > 0:
 		return StatusAbnormal
 	default:
 		return StatusOK
@@ -289,7 +293,8 @@ func (s *Service) countByAgent(ctx context.Context, query, siteID string) (map[s
 
 func (s *Service) loadConnAlerts(ctx context.Context, siteID string) (map[string]ConnAlertRef, error) {
 	rows, err := s.db.Read().QueryContext(ctx,
-		`SELECT agent_id, id, reason, opened_at, offline_since FROM agent_alerts WHERE site_id=? AND status='firing'`, siteID)
+		`SELECT agent_id, id, COALESCE(reason_detail,''), confirmed_at, observed_at FROM fault_signals
+		 WHERE site_id=? AND detector_key='agent_connectivity' AND state='firing'`, siteID)
 	if err != nil {
 		return nil, err
 	}

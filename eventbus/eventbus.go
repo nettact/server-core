@@ -8,10 +8,9 @@ import "sync"
 
 // Well-known topics.
 const (
-	TopicThresholdBreached    = "metric.threshold.breached"
-	TopicAlertRaised          = "alert.raised"
-	TopicAlertResolved        = "alert.resolved"
-	TopicEvidenceAdded        = "alert.evidence.added"
+	// Fault-signal lifecycle, published post-commit by the built-in detectors.
+	TopicFaultConfirmed       = "fault.confirmed"
+	TopicFaultResolved        = "fault.resolved"
 	TopicIncidentOpened       = "incident.opened"
 	TopicIncidentUpdated      = "incident.updated"
 	TopicIncidentResolved     = "incident.resolved"
@@ -34,19 +33,6 @@ type IncidentEvent struct {
 	GroupID    string
 	Severity   string
 	Escalated  bool
-}
-
-// EvidenceAdded is the payload for TopicEvidenceAdded, published post-commit
-// once per newly-frozen alert_evidence row (at alert fire time and whenever an
-// additional condition becomes satisfied on an already-firing alert). The
-// diagnostic trigger reads the evidence row by EvidenceID to derive its trace;
-// the id-only shape keeps the bus decoupled from trace specifics.
-type EvidenceAdded struct {
-	EvidenceID string
-	AlertID    string
-	IncidentID string
-	AgentID    string
-	SiteID     string
 }
 
 // TargetStatusChanged is the payload for TopicTargetStatusChanged, published

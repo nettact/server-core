@@ -10,50 +10,50 @@ import (
 // languages.
 func TestDescribeDetail(t *testing.T) {
 	cases := []struct {
-		name    string
-		d       AlertDetail
-		wantZh  []string // all must be substrings
-		wantEn  []string
+		name   string
+		d      FaultDetail
+		wantZh []string // all must be substrings
+		wantEn []string
 	}{
 		{
-			name: "icmp total loss",
-			d:    AlertDetail{ProbeKind: "icmp", MetricKind: "probe.icmp.loss_pct", Comparator: "gte", Threshold: 50, Value: 100, Target: "1.1.1.1"},
+			name:   "icmp total loss",
+			d:      FaultDetail{ProbeKind: "icmp", MetricKind: "probe.icmp.loss_pct", Comparator: "gte", Threshold: 50, Value: 100, Target: "1.1.1.1"},
 			wantZh: []string{"目标 1.1.1.1", "完全不可达", "100%"},
 			wantEn: []string{"target 1.1.1.1", "completely unreachable"},
 		},
 		{
-			name: "icmp partial loss",
-			d:    AlertDetail{ProbeKind: "icmp", MetricKind: "probe.icmp.loss_pct", Comparator: "gte", Threshold: 50, Value: 70, Target: "8.8.8.8"},
+			name:   "icmp partial loss",
+			d:      FaultDetail{ProbeKind: "icmp", MetricKind: "probe.icmp.loss_pct", Comparator: "gte", Threshold: 50, Value: 70, Target: "8.8.8.8"},
 			wantZh: []string{"目标 8.8.8.8", "丢包率 70%", "阈值 ≥ 50%"},
 			wantEn: []string{"target 8.8.8.8", "70% packet loss", "threshold ≥ 50%"},
 		},
 		{
-			name: "icmp rtt",
-			d:    AlertDetail{ProbeKind: "icmp", MetricKind: "probe.icmp.rtt_ms", Comparator: "gt", Threshold: 200, Value: 250, Target: "gateway", TargetName: "网关"},
+			name:   "icmp rtt",
+			d:      FaultDetail{ProbeKind: "icmp", MetricKind: "probe.icmp.rtt_ms", Comparator: "gt", Threshold: 200, Value: 250, Target: "gateway", TargetName: "网关"},
 			wantZh: []string{"目标 网关（gateway）", "延迟 250ms", "阈值 > 200ms"},
 			wantEn: []string{"target 网关 (gateway)", "latency is 250ms", "threshold > 200ms"},
 		},
 		{
-			name: "dns fail",
-			d:    AlertDetail{ProbeKind: "dns", MetricKind: "probe.dns.ok", Comparator: "lt", Threshold: 1, Value: 0, Target: "example.com"},
+			name:   "dns fail",
+			d:      FaultDetail{ProbeKind: "dns", MetricKind: "probe.dns.ok", Comparator: "lt", Threshold: 1, Value: 0, Target: "example.com"},
 			wantZh: []string{"域名 example.com", "解析失败"},
 			wantEn: []string{"domain example.com", "failed to resolve"},
 		},
 		{
-			name: "http status",
-			d:    AlertDetail{ProbeKind: "http", MetricKind: "probe.http.status", Comparator: "eq", Threshold: 200, Value: 503, Target: "https://a.test", AgentHost: "node-1"},
+			name:   "http status",
+			d:      FaultDetail{ProbeKind: "http", MetricKind: "probe.http.status", Comparator: "eq", Threshold: 200, Value: 503, Target: "https://a.test", AgentHost: "node-1"},
 			wantZh: []string{"网站 https://a.test", "返回状态码 503", "来自 node-1"},
 			wantEn: []string{"site https://a.test", "returned HTTP 503", "on node-1"},
 		},
 		{
-			name: "tcp fail",
-			d:    AlertDetail{ProbeKind: "tcp", MetricKind: "probe.tcp.ok", Comparator: "lt", Threshold: 1, Value: 0, Target: "db:5432"},
+			name:   "tcp fail",
+			d:      FaultDetail{ProbeKind: "tcp", MetricKind: "probe.tcp.ok", Comparator: "lt", Threshold: 1, Value: 0, Target: "db:5432"},
 			wantZh: []string{"服务 db:5432", "端口连接失败"},
 			wantEn: []string{"service db:5432", "port connection failed"},
 		},
 		{
-			name: "host cpu",
-			d:    AlertDetail{ProbeKind: "host", MetricKind: "host.cpu.pct", Comparator: "gt", Threshold: 90, Value: 95, Target: "host", TargetName: "web01"},
+			name:   "host cpu",
+			d:      FaultDetail{ProbeKind: "host", MetricKind: "host.cpu.pct", Comparator: "gt", Threshold: 90, Value: 95, Target: "host", TargetName: "web01"},
 			wantZh: []string{"主机 web01（host）", "CPU 使用率 95%", "阈值 > 90%"},
 			wantEn: []string{"host web01 (host)", "CPU usage is 95%", "threshold > 90%"},
 		},
@@ -79,15 +79,15 @@ func TestDescribeDetail(t *testing.T) {
 // TestRenderDetailsTruncation checks the "top N + more" behavior and worst-first
 // ordering.
 func TestRenderDetailsTruncation(t *testing.T) {
-	var details []AlertDetail
+	var details []FaultDetail
 	for i := 0; i < 7; i++ {
-		details = append(details, AlertDetail{
+		details = append(details, FaultDetail{
 			ProbeKind: "tcp", MetricKind: "probe.tcp.ok", Comparator: "lt", Threshold: 1,
 			Target: "svc" + string(rune('0'+i)), Layer: "service", Severity: "warn",
 		})
 	}
 	// A single critical alert must sort to the front.
-	details = append(details, AlertDetail{
+	details = append(details, FaultDetail{
 		ProbeKind: "http", MetricKind: "probe.http.ok", Comparator: "lt", Threshold: 1,
 		Target: "critical.test", Layer: "service", Severity: "critical",
 	})
@@ -113,17 +113,17 @@ func TestRenderDetailsTruncation(t *testing.T) {
 // TestRenderSummary checks the stored/console summary leads with the concrete
 // top fault, counts extras, and falls back to the scope line when empty.
 func TestRenderSummary(t *testing.T) {
-	http503 := AlertDetail{ProbeKind: "http", MetricKind: "probe.http.status", Comparator: "eq", Threshold: 200, Value: 503, Target: "https://a.test", Severity: "critical", Layer: "service"}
-	tcpDown := AlertDetail{ProbeKind: "tcp", MetricKind: "probe.tcp.ok", Comparator: "lt", Threshold: 1, Value: 0, Target: "db:5432", Severity: "warn", Layer: "service"}
+	http503 := FaultDetail{ProbeKind: "http", MetricKind: "probe.http.status", Comparator: "eq", Threshold: 200, Value: 503, Target: "https://a.test", Severity: "critical", Layer: "service"}
+	tcpDown := FaultDetail{ProbeKind: "tcp", MetricKind: "probe.tcp.ok", Comparator: "lt", Threshold: 1, Value: 0, Target: "db:5432", Severity: "warn", Layer: "service"}
 
 	// Single fault: summary is exactly that fault line.
-	one := Payload{Event: "incident.opened", State: "open", Scope: "single", Details: []AlertDetail{http503}}
+	one := Payload{Event: "incident.opened", State: "open", Scope: "single", Details: []FaultDetail{http503}}
 	if got := RenderSummary(one, "zh"); !strings.Contains(got, "返回状态码 503") || strings.Contains(got, "共") {
 		t.Errorf("single summary = %q", got)
 	}
 
 	// Multiple: leads with worst (critical http) and counts the total.
-	many := Payload{Event: "incident.opened", State: "open", Scope: "site", Details: []AlertDetail{tcpDown, http503}}
+	many := Payload{Event: "incident.opened", State: "open", Scope: "site", Details: []FaultDetail{tcpDown, http503}}
 	got := RenderSummary(many, "zh")
 	if !strings.Contains(got, "返回状态码 503") || !strings.Contains(got, "共 2 项") {
 		t.Errorf("multi summary = %q, want top fault + count", got)
@@ -139,10 +139,10 @@ func TestRenderSummary(t *testing.T) {
 // TestRenderTitleAndScope checks headline + diagnosis wording, including resolved.
 func TestRenderTitleAndScope(t *testing.T) {
 	open := Payload{Event: "incident.opened", State: "open", Scope: "site", AgentCount: 3, SuspectedLayer: "internet"}
-	if got := RenderTitle(open, "zh"); got != "网络告警" {
+	if got := RenderTitle(open, "zh"); got != "网络故障" {
 		t.Errorf("zh title = %q", got)
 	}
-	if got := RenderTitle(open, "en"); got != "Network alert" {
+	if got := RenderTitle(open, "en"); got != "Network fault" {
 		t.Errorf("en title = %q", got)
 	}
 	if got := RenderScope(open, "zh"); !strings.Contains(got, "站点级") || !strings.Contains(got, "3 个节点") || !strings.Contains(got, "互联网") {
@@ -153,10 +153,10 @@ func TestRenderTitleAndScope(t *testing.T) {
 	}
 
 	resolved := Payload{Event: "incident.resolved", State: "resolved"}
-	if got := RenderTitle(resolved, "zh"); got != "告警已恢复" {
+	if got := RenderTitle(resolved, "zh"); got != "故障已恢复" {
 		t.Errorf("zh resolved title = %q", got)
 	}
-	if got := RenderScope(resolved, "en"); !strings.Contains(got, "resolved") {
+	if got := RenderScope(resolved, "en"); !strings.Contains(got, "recovered") {
 		t.Errorf("en resolved scope = %q", got)
 	}
 }

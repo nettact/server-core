@@ -456,32 +456,19 @@ func (s *Service) ReevaluateHostMonitorsForSite(ctx context.Context, siteID stri
 	return nil
 }
 
-// hostRequired returns the closure of host permissions required by a host
-// monitor's enabled group-rule conditions. No conditions ⇒ empty set (always
-// active).
+// hostRequired returns the closure of host permissions a host monitor requires.
+//
+// The requirement used to be derived from the monitor's threshold rules — the
+// metrics they watched named the permissions needed to read them. Built-in
+// detection covers network availability only (a machine may legitimately have an
+// idle NIC or an unreadable sensor, so no host metric is auto-faulted), which
+// leaves a host monitor with no server-side metric requirement at all. Returning
+// an empty set keeps it unconditionally active; claiming a requirement nothing
+// actually has would raise permission issues for permissions no evaluation reads.
+// A genuinely missing host permission still surfaces through the Agent's own
+// per-metric permission reporting.
 func hostRequired(ctx context.Context, tx *sql.Tx, monitorID string) (permission.Set, error) {
-	rows, err := tx.QueryContext(ctx, `
-		SELECT c.metric_kind FROM group_rule_conditions c
-		JOIN group_rules gr ON gr.id = c.rule_id
-		WHERE c.target_id=? AND gr.enabled=1`, monitorID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	req := permission.Set{}
-	for rows.Next() {
-		var mk string
-		if err := rows.Scan(&mk); err != nil {
-			return nil, err
-		}
-		for _, id := range permission.RequiredForHostMetric(mk) {
-			req.Add(id)
-		}
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return permission.Closure(req), nil
+	return permission.Set{}, nil
 }
 
 // ---- scope reconciliation ----
@@ -549,15 +536,14 @@ func (s *Service) ReconcileScope(ctx context.Context, siteID string) error {
 		if n, _ := res.RowsAffected(); n > 0 {
 			statusChanged = append(statusChanged, r.monitorID)
 		}
-		// Clear this pair's per-Agent rule condition state as it leaves scope. Its
-		// rules stop being evaluated for the agent once out of scope, so a retained
-		// satisfied=1 row would resurface as a current breach if the pair later
-		// re-enters scope without a material target edit (the generation, and thus its
-		// samples/series, are unchanged). Historical alert evidence is immutable and
-		// untouched; this is live condition state only.
+		// Clear this pair's detector counters as it leaves scope. The target stops
+		// being evaluated for the agent once out of scope, so a retained failing streak
+		// would resume counting if the pair later re-enters scope without a material
+		// target edit (the generation, and thus its samples/series, are unchanged).
+		// Recorded fault signals are immutable history and untouched; this is live
+		// detector state only.
 		res, err = tx.ExecContext(ctx,
-			`DELETE FROM rule_condition_state WHERE agent_id=? AND condition_id IN (
-				SELECT id FROM group_rule_conditions WHERE target_id=?)`, r.agentID, r.monitorID)
+			`DELETE FROM detector_state WHERE agent_id=? AND target_id=?`, r.agentID, r.monitorID)
 		if err != nil {
 			return err
 		}

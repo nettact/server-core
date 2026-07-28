@@ -2,6 +2,7 @@ package store
 
 import (
 	"database/sql"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -9,8 +10,31 @@ import (
 	"time"
 )
 
+// tempDBPath returns a database path in its own directory, removed on a
+// best-effort basis when the test ends. It does NOT use t.TempDir: that fails
+// the test when RemoveAll errors, and on Windows the database file can still be
+// locked for a moment after Close, which would turn an OS timing detail into a
+// spurious test failure. (Other packages get this from store/storetest, which
+// cannot be imported here without an import cycle.)
+func tempDBPath(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "nettact-store-test-")
+	if err != nil {
+		t.Fatalf("temp dir: %v", err)
+	}
+	t.Cleanup(func() {
+		for i := 0; i < 20; i++ {
+			if os.RemoveAll(dir) == nil {
+				return
+			}
+			time.Sleep(25 * time.Millisecond)
+		}
+	})
+	return filepath.Join(dir, "upgrade.db")
+}
+
 func TestStatusMigrationSeedsMonotonicSerialAndDropsLegacyTable(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "upgrade.db")
+	path := tempDBPath(t)
 	raw, err := sql.Open("sqlite", path+dsnPragmas)
 	if err != nil {
 		t.Fatal(err)

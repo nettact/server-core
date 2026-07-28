@@ -10,13 +10,12 @@ import (
 	"github.com/nettact/protocol/telemetry"
 )
 
-// AlertDetail is one firing alert's structured facts — enough to render a
-// human sentence ("website example.com returned HTTP 503") in any supported
-// language at delivery time. The incident layer collects these from the frozen
-// per-condition evidence (alert_evidence ⨝ alerts ⨝ agents) and hands them to
-// Notify, so the language decision stays at the channel boundary rather than
-// being baked into a pre-rendered string.
-type AlertDetail struct {
+// FaultDetail is one fault signal's structured facts — enough to render a human
+// sentence ("website example.com returned HTTP 503") in any supported language
+// at delivery time. The notification layer reads these from the signal's frozen
+// evidence and hands them to Notify, so the language decision stays at the
+// channel boundary rather than being baked into a pre-rendered string.
+type FaultDetail struct {
 	ProbeKind  string  `json:"probe_kind"`  // "icmp" | "dns" | "http" | "tcp" | "host" | ""
 	MetricKind string  `json:"metric_kind"` // telemetry.MetricKind, e.g. "probe.http.status"
 	Comparator string  `json:"comparator"`  // gt | gte | lt | lte | eq
@@ -85,44 +84,35 @@ func RenderTitle(p Payload, lang string) string {
 		}
 		return "Agent 已恢复连接"
 	}
-	terminated := p.Event == "incident.terminated" || p.State == "terminated"
 	resolved := p.Event == "incident.resolved" || p.State == "resolved"
 	if normLang(lang) == "en" {
 		switch {
-		case terminated:
-			return "Monitored object removed"
 		case resolved:
 			// A group-wide claim is only honest for a merged incident (one incident =
-			// the whole group). An unmerged group's incident is a single alert, whose
+			// the whole group). An unmerged group's incident is a single fault, whose
 			// siblings may still be firing — name the group without speaking for it.
 			switch {
 			case p.GroupName != "" && p.GroupMerged:
-				return fmt.Sprintf("Alert group %q recovered", p.GroupName)
+				return fmt.Sprintf("Fault group %q recovered", p.GroupName)
 			case p.GroupName != "":
-				return fmt.Sprintf("Alert recovered (%s)", p.GroupName)
+				return fmt.Sprintf("Fault recovered (%s)", p.GroupName)
 			}
-			return "Alert resolved"
-		case p.Event == "incident.opened":
-			return "Network alert"
+			return "Fault recovered"
 		default:
-			return "Network alert (updated)"
+			return "Network fault"
 		}
 	}
 	switch {
-	case terminated:
-		return "监控对象已删除"
 	case resolved:
 		switch {
 		case p.GroupName != "" && p.GroupMerged:
-			return fmt.Sprintf("告警组「%s」已恢复", p.GroupName)
+			return fmt.Sprintf("监控组「%s」故障已恢复", p.GroupName)
 		case p.GroupName != "":
-			return fmt.Sprintf("告警已恢复（%s）", p.GroupName)
+			return fmt.Sprintf("故障已恢复（%s）", p.GroupName)
 		}
-		return "告警已恢复"
-	case p.Event == "incident.opened":
-		return "网络告警"
+		return "故障已恢复"
 	default:
-		return "网络告警更新"
+		return "网络故障"
 	}
 }
 
@@ -162,32 +152,26 @@ func RenderScope(p Payload, lang string) string {
 		}
 		return fmt.Sprintf("%d 个 Agent 已恢复连接。", n)
 	}
-	if p.Event == "incident.terminated" || p.State == "terminated" {
-		if en {
-			return "Monitored object removed; incident terminated."
-		}
-		return "监控对象已删除，事故终止。"
-	}
 	if p.Event == "incident.resolved" || p.State == "resolved" {
 		// Only a merged incident spans the whole group; an unmerged group's incident
-		// is one alert, so "all alerts recovered" would be a false group-wide claim
+		// is one fault, so "all faults recovered" would be a false group-wide claim
 		// while sibling incidents may still be firing.
 		switch {
 		case p.GroupName != "" && p.GroupMerged:
 			if en {
-				return fmt.Sprintf("All alerts in group %q have recovered.", p.GroupName)
+				return fmt.Sprintf("All faults in group %q have recovered.", p.GroupName)
 			}
-			return fmt.Sprintf("告警组「%s」的告警已全部恢复。", p.GroupName)
+			return fmt.Sprintf("监控组「%s」的故障已全部恢复。", p.GroupName)
 		case p.GroupName != "":
 			if en {
-				return fmt.Sprintf("An alert in group %q has recovered.", p.GroupName)
+				return fmt.Sprintf("A fault in group %q has recovered.", p.GroupName)
 			}
-			return fmt.Sprintf("告警组「%s」的一项告警已恢复。", p.GroupName)
+			return fmt.Sprintf("监控组「%s」的一项故障已恢复。", p.GroupName)
 		}
 		if en {
-			return "All alerts resolved."
+			return "All faults recovered."
 		}
-		return "所有告警已恢复。"
+		return "所有故障已恢复。"
 	}
 	layer := layerLabel(p.SuspectedLayer, lang)
 	if p.Scope == "site" {
@@ -216,8 +200,8 @@ func LinkLine(url, lang string) string {
 
 // sortedDetails returns a copy of details ordered worst-first: higher severity
 // first, then more fundamental layer.
-func sortedDetails(details []AlertDetail) []AlertDetail {
-	sorted := make([]AlertDetail, len(details))
+func sortedDetails(details []FaultDetail) []FaultDetail {
+	sorted := make([]FaultDetail, len(details))
 	copy(sorted, details)
 	sort.SliceStable(sorted, func(i, j int) bool {
 		if a, b := severityRank[sorted[i].Severity], severityRank[sorted[j].Severity]; a != b {
@@ -230,7 +214,7 @@ func sortedDetails(details []AlertDetail) []AlertDetail {
 
 // RenderDetails sorts the firing alerts worst-first, renders up to maxDetailLines
 // human sentences, and appends a "+N more" line when truncated.
-func RenderDetails(details []AlertDetail, lang string) []string {
+func RenderDetails(details []FaultDetail, lang string) []string {
 	sorted := sortedDetails(details)
 	limit := len(sorted)
 	if limit > maxDetailLines {
@@ -258,21 +242,22 @@ func RenderLines(p Payload, lang string) []string {
 	switch p.Event {
 	case "agent.offline", "agent.recovered":
 		return RenderAgentLines(p, lang)
-	case "incident.resolved", "incident.terminated":
+	case "incident.resolved":
 		return RenderRecoveredLines(p, lang)
 	default:
 		return RenderDetails(p.Details, lang)
 	}
 }
 
-// RenderRecoveredLines renders one line per target in a resolved/terminated
-// notice, up to maxDetailLines with a "+N more" tail — so the terminal notice
-// names the group AND the affected targets, instead of a bare "所有告警已恢复".
-// A terminated close is a configuration removal, not a recovery, so its lines say
-// the monitoring stopped rather than claiming the target came back healthy.
+// RenderRecoveredLines renders one line per target in a recovery notice, up to
+// maxDetailLines with a "+N more" tail — so the notice names the group AND what
+// actually came back, instead of a bare "所有故障已恢复".
+//
+// Only a genuine recovery reaches here: a fault ended by a configuration change
+// is never announced at all, so there is no "no longer monitored" wording to
+// render and no way to mistake a deletion for a recovery.
 func RenderRecoveredLines(p Payload, lang string) []string {
 	en := normLang(lang) == "en"
-	terminated := p.Event == "incident.terminated"
 	limit := len(p.RecoveredTargets)
 	if limit > maxDetailLines {
 		limit = maxDetailLines
@@ -280,14 +265,9 @@ func RenderRecoveredLines(p Payload, lang string) []string {
 	out := make([]string, 0, limit+1)
 	for _, rt := range p.RecoveredTargets[:limit] {
 		subj := recoveredSubject(rt, lang)
-		switch {
-		case terminated && en:
-			out = append(out, subj+" is no longer monitored")
-		case terminated:
-			out = append(out, subj+" 已停止监控")
-		case en:
+		if en {
 			out = append(out, subj+" recovered")
-		default:
+		} else {
 			out = append(out, subj+" 已恢复")
 		}
 	}
@@ -400,7 +380,7 @@ func RenderSummary(p Payload, lang string) string {
 
 // DescribeDetail turns one alert's facts into a single human sentence stating
 // which target, what failed, and the measured value vs threshold.
-func DescribeDetail(d AlertDetail, lang string) string {
+func DescribeDetail(d FaultDetail, lang string) string {
 	if normLang(lang) == "en" {
 		return describeEn(d)
 	}
@@ -409,7 +389,7 @@ func DescribeDetail(d AlertDetail, lang string) string {
 
 // --- Chinese ---
 
-func describeZh(d AlertDetail) string {
+func describeZh(d FaultDetail) string {
 	subj := subjectZh(d)
 	var s string
 	switch telemetry.MetricKind(d.MetricKind) {
@@ -484,7 +464,7 @@ func describeZh(d AlertDetail) string {
 // an *.error_class metric — that sentence already states the class — and for an
 // HTTPStatus reason on the probe.http.status sentence, which already states the
 // status code, so appending "（原因：状态码不符合预期 · HTTP 503）" would double-state it.
-func reasonClause(d AlertDetail) string {
+func reasonClause(d FaultDetail) string {
 	if d.ReasonCode == telemetry.ProbeReasonNone || isErrorClassKind(d.MetricKind) {
 		return ""
 	}
@@ -494,7 +474,7 @@ func reasonClause(d AlertDetail) string {
 	return reasonText(probeReasonZh(d.ReasonCode), d.ReasonDetail)
 }
 
-func reasonClauseEn(d AlertDetail) string {
+func reasonClauseEn(d FaultDetail) string {
 	if d.ReasonCode == telemetry.ProbeReasonNone || isErrorClassKind(d.MetricKind) {
 		return ""
 	}
@@ -525,7 +505,7 @@ func isErrorClassKind(metricKind string) bool {
 	return false
 }
 
-func subjectZh(d AlertDetail) string {
+func subjectZh(d FaultDetail) string {
 	name := d.Target
 	if d.TargetName != "" && d.TargetName != d.Target {
 		name = fmt.Sprintf("%s（%s）", d.TargetName, d.Target)
@@ -535,7 +515,7 @@ func subjectZh(d AlertDetail) string {
 
 // thrZh renders the threshold clause "（阈值 ≥ 50%）", or "" when there is no
 // meaningful numeric threshold to show.
-func thrZh(d AlertDetail, unit string) string {
+func thrZh(d FaultDetail, unit string) string {
 	sym := cmpSymbol(d.Comparator)
 	if sym == "" {
 		return ""
@@ -545,7 +525,7 @@ func thrZh(d AlertDetail, unit string) string {
 
 // --- English ---
 
-func describeEn(d AlertDetail) string {
+func describeEn(d FaultDetail) string {
 	subj := subjectEn(d)
 	var s string
 	switch telemetry.MetricKind(d.MetricKind) {
@@ -615,7 +595,7 @@ func describeEn(d AlertDetail) string {
 	return s
 }
 
-func subjectEn(d AlertDetail) string {
+func subjectEn(d FaultDetail) string {
 	name := d.Target
 	if d.TargetName != "" && d.TargetName != d.Target {
 		name = fmt.Sprintf("%s (%s)", d.TargetName, d.Target)
@@ -623,7 +603,7 @@ func subjectEn(d AlertDetail) string {
 	return kindNoun(d.ProbeKind, "en") + " " + name
 }
 
-func thrEn(d AlertDetail, unit string) string {
+func thrEn(d FaultDetail, unit string) string {
 	sym := cmpSymbol(d.Comparator)
 	if sym == "" {
 		return ""

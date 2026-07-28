@@ -40,7 +40,7 @@ type Payload struct {
 	// ("all alerts recovered"). False ⇒ a per-alert incident: sibling alerts in the
 	// same group may still be firing, and the wording must stay per-alert.
 	GroupMerged      bool              `json:"group_merged,omitempty"`
-	Details          []AlertDetail     `json:"details,omitempty"`           // per-target firing facts (incident events)
+	Details          []FaultDetail     `json:"details,omitempty"`           // per-target firing facts (incident events)
 	RecoveredTargets []RecoveredTarget `json:"recovered_targets,omitempty"` // targets that came back (resolved/terminated events)
 	Agents           []AgentDetail     `json:"agents,omitempty"`            // per-agent facts (agent.offline / agent.recovered events)
 	URL              string            `json:"url,omitempty"`               // deep link to the incident/agents view in the console
@@ -144,22 +144,26 @@ func (s *Service) Delete(ctx context.Context, id string) error {
 }
 
 // Notify delivers p to the given enabled channels (best-effort, logged on
-// failure). When channelIDs is empty it falls back to ALL enabled channels, so
-// callers with no routing configured keep the original global fan-out behavior.
+// failure).
+//
+// An empty channel list sends NOTHING. Under the notification-policy model an
+// empty list is a deliberate, meaningful configuration — "record every fault,
+// send nothing" — so the old fall-back-to-all-channels behaviour would invert the
+// operator's intent and page everyone precisely when they asked for silence.
 func (s *Service) Notify(ctx context.Context, channelIDs []string, p Payload) {
-	q := `SELECT type, config FROM notification_channels WHERE enabled=1`
-	var args []any
-	if len(channelIDs) > 0 {
-		placeholders := make([]byte, 0, len(channelIDs)*2)
-		for i, id := range channelIDs {
-			if i > 0 {
-				placeholders = append(placeholders, ',')
-			}
-			placeholders = append(placeholders, '?')
-			args = append(args, id)
-		}
-		q += " AND id IN (" + string(placeholders) + ")"
+	if len(channelIDs) == 0 {
+		return
 	}
+	placeholders := make([]byte, 0, len(channelIDs)*2)
+	args := make([]any, 0, len(channelIDs))
+	for i, id := range channelIDs {
+		if i > 0 {
+			placeholders = append(placeholders, ',')
+		}
+		placeholders = append(placeholders, '?')
+		args = append(args, id)
+	}
+	q := `SELECT type, config FROM notification_channels WHERE enabled=1 AND id IN (` + string(placeholders) + `)`
 	rows, err := s.db.QueryContext(ctx, q, args...)
 	if err != nil {
 		log.Printf("notify: list channels: %v", err)
@@ -299,7 +303,7 @@ func SampleWebhookPayload(consoleBase string) Payload {
 		Scope:          "single",
 		AgentCount:     1,
 		SuspectedLayer: "service",
-		Details: []AlertDetail{{
+		Details: []FaultDetail{{
 			ProbeKind:  "http",
 			MetricKind: "probe.http.status",
 			Comparator: "eq",

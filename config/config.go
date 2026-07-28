@@ -53,35 +53,55 @@ const AgentScopePredicate = `EXISTS(
 
 // PostCommit is a publisher the tx owner MUST invoke after a successful commit
 // (and discard on rollback). The terminator returns one capturing its accumulated
-// alert/incident lifecycle events, so config can close alerts inside its own write
-// transaction yet still keep event publication off the write path — without
-// importing the fault engine.
-type PostCommit func(ctx context.Context)
+// fault/incident lifecycle events, so config can close signals inside its own
+// write transaction yet still keep event publication off the write path.
+//
+// It is an ALIAS rather than a defined type so the fault engine can satisfy
+// FaultTerminator without importing config — config already imports fault for the
+// detector-sensitivity domain type, and a defined type here would close that
+// dependency into a cycle.
+type PostCommit = func(ctx context.Context)
 
-// AlertTerminator is the fault-engine surface config needs to force-resolve
-// alerts (and close their incidents) as `configuration_changed` INSIDE config's
-// own write transaction, before its owning targets/rules are removed or changed.
-// It is injected (satisfied by *rules.Service) so config does not import the fault
-// engine — keeping the dependency one-way and cycle-free. Each method runs in the
-// caller's open tx and returns the affected target ids (for the status event) plus
-// a PostCommit publisher. Nil-safe callers guard for a nil terminator (tests).
-type AlertTerminator interface {
-	// TerminateForTargetsTx force-resolves, inside tx, the firing alerts of every
-	// rule referencing any of the given targets.
-	TerminateForTargetsTx(ctx context.Context, tx *sql.Tx, targetIDs []string) ([]string, PostCommit, error)
-	// TerminateForGroupTx force-resolves, inside tx, the firing alerts of every rule
-	// in a monitor group (group deletion or merge-policy flip).
+// Termination reasons config passes to the fault terminator. They are distinct
+// from a recovery on purpose: when the operator deletes, disables, re-points or
+// re-scopes a failing target, the fault did not go away — it stopped being
+// observable. Announcing "recovered" there would be a lie the product tells at
+// exactly the moment the operator is changing things, so each cause is recorded
+// under its own name and none of them sends a recovery notification.
+const (
+	ReasonConfigChanged    = "configuration_changed"
+	ReasonTargetDisabled   = "target_disabled"
+	ReasonTargetDeleted    = "target_deleted"
+	ReasonAgentScopeChange = "agent_scope_changed"
+)
+
+// FaultTerminator is the fault-engine surface config needs to force-resolve
+// firing signals (and close their incidents) INSIDE config's own write
+// transaction, before the owning targets are removed or changed. It is injected
+// (satisfied by *fault.Service) so config does not import the fault engine —
+// keeping the dependency one-way and cycle-free. Each method runs in the caller's
+// open tx and returns the affected target ids (for the status event) plus a
+// PostCommit publisher. Nil-safe callers guard for a nil terminator (tests).
+type FaultTerminator interface {
+	// TerminateForTargetsTx force-resolves, inside tx, the firing signals of the
+	// given targets with the given reason, and clears their detector counters.
+	TerminateForTargetsTx(ctx context.Context, tx *sql.Tx, targetIDs []string, reason string) ([]string, PostCommit, error)
+	// TerminateForGroupTx force-resolves, inside tx, the firing signals of every
+	// target in a monitor group (group deletion or merge-policy flip).
 	TerminateForGroupTx(ctx context.Context, tx *sql.Tx, groupID string) ([]string, PostCommit, error)
+	// ClearDetectorStateTx drops the detector counters of the given targets without
+	// touching signals, for a generation change that had nothing firing.
+	ClearDetectorStateTx(ctx context.Context, tx *sql.Tx, targetIDs []string) error
 }
 
 type Service struct {
 	db   *store.DB
 	reg  *registry.Service
 	bus  *eventbus.Bus
-	term AlertTerminator // force-resolves alerts of removed targets/rules (nil-safe)
+	term FaultTerminator // force-resolves signals of removed/changed targets (nil-safe)
 }
 
-func New(db *store.DB, reg *registry.Service, bus *eventbus.Bus, term AlertTerminator) *Service {
+func New(db *store.DB, reg *registry.Service, bus *eventbus.Bus, term FaultTerminator) *Service {
 	return &Service{db: db, reg: reg, bus: bus, term: term}
 }
 
@@ -359,17 +379,16 @@ func (s *Service) DeleteGroup(ctx context.Context, groupID string) (string, erro
 	if err != nil {
 		return "", err
 	}
-	// Delete the group's rules (and their now-resolved alerts/evidence/conditions).
-	ruleIDs, err := groupRuleIDs(ctx, tx, groupID)
-	if err != nil {
-		return "", err
-	}
-	if err := deleteRulesCascade(ctx, tx, ruleIDs); err != nil {
-		return "", err
-	}
 	// Move the group's targets to the default group (never delete them).
 	if _, err := tx.ExecContext(ctx,
 		`UPDATE probe_tasks SET group_id=? WHERE group_id=?`, defaultID, groupID); err != nil {
+		return "", err
+	}
+	// The group's notification-policy override goes with it, so its targets fall
+	// back to the site default rather than pointing at a policy that no longer has
+	// a scope.
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM notification_policies WHERE scope_kind='group' AND scope_id=?`, groupID); err != nil {
 		return "", err
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM monitor_group_agent_groups WHERE monitor_group_id=?`, groupID); err != nil {
@@ -519,15 +538,17 @@ func (s *Service) ListSiteTargets(ctx context.Context, siteID string) ([]ProbeTa
 // the target's generation and does NOT bump/announce either, but still publishes a
 // precise target.status.changed so the batch exposes the new user-visible name.
 //
-// A KEPT target whose kind changed (dns → http, …) additionally has the alert
-// conditions its new kind can never satisfy dropped; the returned RuleCleanup
-// list names them so the caller can tell the user which alarms to reconfigure.
-func (s *Service) SetSiteTargets(ctx context.Context, siteID string, targets []ProbeTarget) ([]RuleCleanup, error) {
+// Every affected target's firing fault signals are force-resolved with the
+// reason that actually applies (deleted / moved out of scope / disabled /
+// reconfigured) and its detector counters are cleared, so a streak measured
+// against the old configuration never carries into the new one and no
+// configuration edit is ever announced as a recovery.
+func (s *Service) SetSiteTargets(ctx context.Context, siteID string, targets []ProbeTarget) error {
 	// Resolve/assign the default group so a target may omit group_id (it lands in
 	// the default group) — used by lenient API callers.
 	defaultID, err := s.defaultGroupID(ctx, siteID)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	keep := make(map[string]bool, len(targets))
 	for i := range targets {
@@ -538,20 +559,20 @@ func (s *Service) SetSiteTargets(ctx context.Context, siteID string, targets []P
 			targets[i].GroupID = defaultID
 		}
 		// A repeated id makes the reconcile incoherent: the LAST entry wins the
-		// upsert, but every classification below (kind change, material change,
-		// name-only) reads whichever entry it happens to visit — so a payload that
-		// re-types an id and then restores it would persist the original kind while
-		// still deleting the alert conditions valid for it. There is no defensible
-		// "merge" of two rows claiming one identity, so reject the request.
+		// upsert, but every classification below (material change, move, name-only)
+		// reads whichever entry it happens to visit — so a payload that re-types an id
+		// and then restores it would persist one kind while classifying against the
+		// other. There is no defensible "merge" of two rows claiming one identity, so
+		// reject the request.
 		if keep[targets[i].ID] {
-			return nil, fmt.Errorf("%w: %q", ErrDuplicateTargetID, targets[i].ID)
+			return fmt.Errorf("%w: %q", ErrDuplicateTargetID, targets[i].ID)
 		}
 		keep[targets[i].ID] = true
 	}
 
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	committed := false
 	defer func() {
@@ -564,33 +585,29 @@ func (s *Service) SetSiteTargets(ctx context.Context, siteID string, targets []P
 	// before any mutation, so a bad group id or a cross-site id rolls the whole
 	// reconcile back with nothing terminated or written.
 	if err := validateTargetGroups(ctx, tx, siteID, targets); err != nil {
-		return nil, err
+		return err
 	}
 	if err := validateTargetOwnership(ctx, tx, siteID, targets); err != nil {
-		return nil, err
+		return err
 	}
 
-	// Current targets and their facts, read in-tx to classify removed/moved/
-	// materially-changed/name-only targets. Removed/moved targets have their
-	// referencing rules deleted; materially changed targets keep their rules but
-	// reset their current condition state and advance their generation; name-only
-	// edits keep everything but still publish a status event.
+	// Current targets and their facts, read in-tx to classify what each target's
+	// edit actually was. The classification matters beyond bookkeeping: it decides
+	// the reason a firing fault is terminated with, and a wrong reason is a wrong
+	// story told to the operator.
 	oldFacts, err := currentTargetFacts(ctx, tx, siteID)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	removedOrMoved := map[string]bool{}
+	removed := map[string]bool{}
+	moved := map[string]bool{}
+	disabled := map[string]bool{}
 	material := map[string]bool{}
 	newTargets := map[string]bool{}
 	nameOnly := map[string]bool{}
-	// kindChanged: targets re-typed in place (dns → http, …). Their alert conditions
-	// may now reference a metric family the target can never emit again, which the
-	// engine reads as "no data this pass" — a verdict it preserves forever, so the
-	// rule silently stops firing. Collected here and reconciled below.
-	kindChanged := map[string]retypedTarget{}
 	for id := range oldFacts {
 		if !keep[id] {
-			removedOrMoved[id] = true // removed
+			removed[id] = true
 		}
 	}
 	for i := range targets {
@@ -600,14 +617,11 @@ func (s *Service) SetSiteTargets(ctx context.Context, siteID string, targets []P
 			newTargets[t.ID] = true
 			continue
 		}
-		moved := of.groupID != t.GroupID
-		if moved {
-			removedOrMoved[t.ID] = true // moved to another group
+		if of.groupID != t.GroupID {
+			moved[t.ID] = true // a group move changes the Agent scope
 		}
-		// A removed/moved target has every referencing rule deleted outright, so only
-		// a KEPT target's re-typing needs the finer per-condition reconcile.
-		if of.kind != t.Kind && !moved {
-			kindChanged[t.ID] = retypedTarget{target: t, oldKind: of.kind}
+		if of.enabled && !t.Enabled {
+			disabled[t.ID] = true
 		}
 		params, _ := json.Marshal(t.Params)
 		mat := materialTargetChange(of, t, string(params))
@@ -617,82 +631,75 @@ func (s *Service) SetSiteTargets(ctx context.Context, siteID string, targets []P
 		// A pure name edit (unchanged group + no material change) still alters a
 		// user-visible batch field, so it must publish a status event — but it is
 		// not a material generation change and must not bump/announce.
-		if !moved && !mat && of.name != t.Name {
+		if !moved[t.ID] && !mat && of.name != t.Name {
 			nameOnly[t.ID] = true
 		}
 	}
-	// terminateSet: every target whose firing alerts must close (removed ∪ moved ∪
-	// materially changed). Deduped, deterministic order not required.
-	terminateSet := make([]string, 0, len(removedOrMoved)+len(material))
-	inTerm := map[string]bool{}
-	for id := range removedOrMoved {
-		inTerm[id] = true
-		terminateSet = append(terminateSet, id)
-	}
-	for id := range material {
-		if !inTerm[id] {
-			inTerm[id] = true
-			terminateSet = append(terminateSet, id)
+	// One reason per target, most specific first: a deleted target is not "moved",
+	// and a disabled one is not merely "reconfigured".
+	byReason := map[string][]string{}
+	assigned := map[string]bool{}
+	assign := func(ids map[string]bool, reason string) {
+		for id := range ids {
+			if assigned[id] {
+				continue
+			}
+			assigned[id] = true
+			byReason[reason] = append(byReason[reason], id)
 		}
+	}
+	assign(removed, ReasonTargetDeleted)
+	assign(moved, ReasonAgentScopeChange)
+	assign(disabled, ReasonTargetDisabled)
+	assign(material, ReasonConfigChanged)
+	terminateSet := make([]string, 0, len(assigned))
+	for id := range assigned {
+		terminateSet = append(terminateSet, id)
 	}
 
 	// hasGenerationChange: does anything alter the desired/probed generation? New,
 	// removed, moved, or materially-changed targets all require a site serial bump
 	// and a DesiredState re-announce. An identical or name-only save does not.
-	hasGenerationChange := len(newTargets) > 0 || len(removedOrMoved) > 0 || len(material) > 0
+	hasGenerationChange := len(newTargets) > 0 || len(removed) > 0 || len(moved) > 0 || len(material) > 0
 
-	// Force-resolve firing alerts of rules referencing an affected target INSIDE the
-	// write tx, so a status reader never sees a terminated alert alongside surviving
-	// old-target condition state.
-	var termPub PostCommit
+	// Force-resolve the affected targets' firing fault signals INSIDE the write tx,
+	// each under its own reason, so a status reader never sees a terminated signal
+	// alongside surviving old-generation detector counters.
+	var termPubs []PostCommit
 	var termAffected []string
-	if s.term != nil && len(terminateSet) > 0 {
-		termAffected, termPub, err = s.term.TerminateForTargetsTx(ctx, tx, terminateSet)
-		if err != nil {
-			return nil, err
+	if s.term != nil {
+		for reason, ids := range byReason {
+			affected, pub, err := s.term.TerminateForTargetsTx(ctx, tx, ids, reason)
+			if err != nil {
+				return err
+			}
+			termAffected = append(termAffected, affected...)
+			if pub != nil {
+				termPubs = append(termPubs, pub)
+			}
+		}
+		// Targets whose generation advanced without anything firing still need their
+		// counters cleared, or a streak measured under the old configuration would
+		// continue under the new one.
+		if err := s.term.ClearDetectorStateTx(ctx, tx, terminateSet); err != nil {
+			return err
 		}
 	}
 
-	// Delete rules referencing any removed/moved target (and their now-resolved
-	// alerts), so a moved target can never leave a rule pointing outside its group.
-	rmList := keysOf(removedOrMoved)
-	if len(rmList) > 0 {
-		ruleIDs, err := rulesReferencingTargets(ctx, tx, rmList)
-		if err != nil {
-			return nil, err
-		}
-		if err := deleteRulesCascade(ctx, tx, ruleIDs); err != nil {
-			return nil, err
-		}
-	}
-	// Reset current condition state for materially-changed (kept) targets so an old
-	// satisfied verdict never transfers to the new generation.
-	matList := keysOf(material)
-	if len(matList) > 0 {
-		args := make([]any, len(matList))
-		for i, id := range matList {
-			args[i] = id
-		}
-		if _, err := tx.ExecContext(ctx,
-			`DELETE FROM rule_condition_state WHERE condition_id IN (
-				SELECT id FROM group_rule_conditions WHERE target_id IN (`+placeholders(len(matList))+`))`, args...); err != nil {
-			return nil, err
-		}
-	}
-	// Drop the alert conditions a re-typed target can no longer satisfy. Runs AFTER
-	// the state reset above so that reset's subselect still sees them (their own
-	// state rows go with them via ON DELETE CASCADE).
-	cleanups, err := dropStaleConditions(ctx, tx, kindChanged)
-	if err != nil {
-		return nil, err
-	}
-	// Delete removed targets (their monitor_status/operational_issues cascade).
+	// Delete removed targets. Their monitor_status / operational_issues /
+	// probe_detection_settings / detector_state rows cascade; their fault signals do
+	// NOT — those are history, and they carry frozen names precisely so they stay
+	// readable after the target is gone.
 	for id := range oldFacts {
 		if keep[id] {
 			continue
 		}
 		if _, err := tx.ExecContext(ctx, `DELETE FROM probe_tasks WHERE id=?`, id); err != nil {
-			return nil, err
+			return err
+		}
+		if _, err := tx.ExecContext(ctx,
+			`DELETE FROM notification_policies WHERE scope_kind='target' AND scope_id=?`, id); err != nil {
+			return err
 		}
 	}
 
@@ -703,12 +710,12 @@ func (s *Service) SetSiteTargets(ctx context.Context, siteID string, targets []P
 	// to stamp created/materially-changed targets below).
 	if hasGenerationChange {
 		if _, err := tx.ExecContext(ctx, `UPDATE sites SET config_serial=config_serial+1 WHERE id=?`, siteID); err != nil {
-			return nil, err
+			return err
 		}
 	}
 	var newSerial int
 	if err := tx.QueryRowContext(ctx, `SELECT config_serial FROM sites WHERE id=?`, siteID).Scan(&newSerial); err != nil {
-		return nil, err
+		return err
 	}
 	now := time.Now().UTC()
 
@@ -728,19 +735,18 @@ func (s *Service) SetSiteTargets(ctx context.Context, siteID string, targets []P
 			   target=excluded.target, params=excluded.params, enabled=excluded.enabled,
 			   config_serial=excluded.config_serial, config_changed_at=excluded.config_changed_at`,
 			t.ID, siteID, t.GroupID, t.Kind, t.Name, t.Target, string(params), boolInt(t.Enabled), serial, changedAt); err != nil {
-			return nil, err
+			return err
 		}
 	}
 	if err := tx.Commit(); err != nil {
-		return nil, err
+		return err
 	}
 	committed = true
 	// Post-commit: publish the terminator's captured lifecycle events, push the new
 	// DesiredState only when the generation changed, then one precise status event
-	// over the affected targets (new ∪ removed/moved ∪ materially changed ∪
-	// name-only ∪ terminator-affected).
-	if termPub != nil {
-		termPub(ctx)
+	// over the affected targets (new ∪ terminated ∪ name-only ∪ terminator-affected).
+	for _, pub := range termPubs {
+		pub(ctx)
 	}
 	if hasGenerationChange {
 		s.announce(siteID)
@@ -755,7 +761,7 @@ func (s *Service) SetSiteTargets(ctx context.Context, siteID string, targets []P
 	}
 	eventTargets = append(eventTargets, termAffected...)
 	s.publishTargetStatus(siteID, eventTargets)
-	return cleanups, nil
+	return nil
 }
 
 // keysOf returns the keys of a string-set map.

@@ -12,7 +12,7 @@ import (
 // no reason and when the metric is itself an error_class series (no double-render).
 func TestReasonClause(t *testing.T) {
 	// ICMP 100% loss with a frozen "unreachable" reason.
-	loss := AlertDetail{
+	loss := FaultDetail{
 		ProbeKind: "icmp", MetricKind: string(telemetry.ICMPLoss), Target: "1.1.1.1",
 		Comparator: "gte", Threshold: 50, Value: 100, ReasonCode: telemetry.ProbeReasonUnreachable,
 	}
@@ -24,13 +24,13 @@ func TestReasonClause(t *testing.T) {
 	}
 
 	// No reason (pure threshold breach) → no suffix.
-	noReason := AlertDetail{ProbeKind: "icmp", MetricKind: string(telemetry.ICMPRTTms), Target: "1.1.1.1", Value: 40, ReasonCode: telemetry.ProbeReasonNone}
+	noReason := FaultDetail{ProbeKind: "icmp", MetricKind: string(telemetry.ICMPRTTms), Target: "1.1.1.1", Value: 40, ReasonCode: telemetry.ProbeReasonNone}
 	if got := DescribeDetail(noReason, "zh"); strings.Contains(got, "原因") {
 		t.Errorf("unexpected reason suffix: %q", got)
 	}
 
 	// A rule ON an error_class metric already states the class → must not double-render.
-	onClass := AlertDetail{
+	onClass := FaultDetail{
 		ProbeKind: "tcp", MetricKind: string(telemetry.TCPErrorClass), Target: "host:443",
 		Value: float64(telemetry.ProbeReasonRefused), ReasonCode: telemetry.ProbeReasonRefused,
 	}
@@ -38,7 +38,7 @@ func TestReasonClause(t *testing.T) {
 		t.Errorf("error_class detail = %q, want the class once, no reason suffix", got)
 	}
 	// The non-TCP error_class kinds render the class too instead of a raw "kind = 3".
-	onICMPClass := AlertDetail{
+	onICMPClass := FaultDetail{
 		ProbeKind: "icmp", MetricKind: string(telemetry.ICMPErrorClass), Target: "1.1.1.1",
 		Value: float64(telemetry.ProbeReasonUnreachable), ReasonCode: telemetry.ProbeReasonUnreachable,
 	}
@@ -53,7 +53,7 @@ func TestReasonClause(t *testing.T) {
 // double-statement suppression and the new code labels.
 func TestReasonDetailRendering(t *testing.T) {
 	// Reason clause carries the raw detail after the localized label.
-	loss := AlertDetail{
+	loss := FaultDetail{
 		ProbeKind: "icmp", MetricKind: string(telemetry.ICMPLoss), Target: "1.1.1.1",
 		Comparator: "gte", Threshold: 50, Value: 100,
 		ReasonCode: telemetry.ProbeReasonUnreachable, ReasonDetail: "sendto: network is unreachable",
@@ -67,7 +67,7 @@ func TestReasonDetailRendering(t *testing.T) {
 
 	// probe.http.status already states the code in its own sentence: an HTTPStatus
 	// reason on it must not double-state ("返回状态码 503（原因：状态码不符合预期 · HTTP 503）").
-	status := AlertDetail{
+	status := FaultDetail{
 		ProbeKind: "http", MetricKind: string(telemetry.HTTPStatus), Target: "https://example.com",
 		Comparator: "eq", Value: 503,
 		ReasonCode: telemetry.ProbeReasonHTTPStatus, ReasonDetail: "HTTP 503",
@@ -79,7 +79,7 @@ func TestReasonDetailRendering(t *testing.T) {
 		t.Errorf("en http.status detail = %q, want no reason clause", got)
 	}
 	// …but the same reason on a DIFFERENT metric (probe.http.ok) still renders it.
-	okDown := AlertDetail{
+	okDown := FaultDetail{
 		ProbeKind: "http", MetricKind: string(telemetry.HTTPOK), Target: "https://example.com",
 		Comparator: "lt", Threshold: 1, Value: 0,
 		ReasonCode: telemetry.ProbeReasonHTTPStatus, ReasonDetail: "HTTP 503",
@@ -89,7 +89,7 @@ func TestReasonDetailRendering(t *testing.T) {
 	}
 
 	// A rule ON an error_class series carries the detail inline, exactly once.
-	onClass := AlertDetail{
+	onClass := FaultDetail{
 		ProbeKind: "tcp", MetricKind: string(telemetry.TCPErrorClass),
 		TargetName: "db", Target: "db.example.test:5432",
 		Value:      float64(telemetry.ProbeReasonRefused),
@@ -133,10 +133,10 @@ func TestResolvedWithGroup(t *testing.T) {
 			{Addr: "1.1.1.1", ProbeKind: "icmp"},
 		},
 	}
-	if got := RenderTitle(merged, "zh"); got != "告警组「客厅网络」已恢复" {
+	if got := RenderTitle(merged, "zh"); got != "监控组「客厅网络」故障已恢复" {
 		t.Errorf("zh merged title = %q", got)
 	}
-	if got := RenderTitle(merged, "en"); got != `Alert group "客厅网络" recovered` {
+	if got := RenderTitle(merged, "en"); got != `Fault group "客厅网络" recovered` {
 		t.Errorf("en merged title = %q", got)
 	}
 	if got := RenderScope(merged, "zh"); !strings.Contains(got, "客厅网络") || !strings.Contains(got, "已全部恢复") {
@@ -150,46 +150,44 @@ func TestResolvedWithGroup(t *testing.T) {
 		t.Errorf("recovered line = %q", lines[0])
 	}
 
-	// Unmerged: each alert has its own incident, so no "all recovered" claim.
+	// Unmerged: each fault has its own incident, so no "all recovered" claim.
 	unmerged := Payload{Event: "incident.resolved", State: "resolved", GroupName: "客厅网络"}
-	if got := RenderTitle(unmerged, "zh"); got != "告警已恢复（客厅网络）" {
+	if got := RenderTitle(unmerged, "zh"); got != "故障已恢复（客厅网络）" {
 		t.Errorf("zh unmerged title = %q", got)
 	}
-	if got := RenderScope(unmerged, "zh"); !strings.Contains(got, "一项告警已恢复") || strings.Contains(got, "全部") {
+	if got := RenderScope(unmerged, "zh"); !strings.Contains(got, "一项故障已恢复") || strings.Contains(got, "全部") {
 		t.Errorf("zh unmerged scope = %q", got)
 	}
-	if got := RenderScope(unmerged, "en"); !strings.Contains(got, "An alert in group") {
+	if got := RenderScope(unmerged, "en"); !strings.Contains(got, "A fault in group") {
 		t.Errorf("en unmerged scope = %q", got)
 	}
 
 	// No group name → falls back to the original anonymous wording.
 	bare := Payload{Event: "incident.resolved", State: "resolved"}
-	if got := RenderTitle(bare, "zh"); got != "告警已恢复" {
+	if got := RenderTitle(bare, "zh"); got != "故障已恢复" {
 		t.Errorf("bare title = %q", got)
 	}
-	if got := RenderScope(bare, "zh"); got != "所有告警已恢复。" {
+	if got := RenderScope(bare, "zh"); got != "所有故障已恢复。" {
 		t.Errorf("bare scope = %q", got)
 	}
 }
 
-// TestTerminatedLinesAreNotRecovered verifies a configuration-termination notice
-// never describes its targets as "recovered" — the monitoring stopped, nothing
-// came back healthy.
-func TestTerminatedLinesAreNotRecovered(t *testing.T) {
+// TestRecoveryNoticeOnlyClaimsRecovery pins the wording contract that survives
+// the termination path being removed entirely: a recovery notice is the only
+// terminal notice the system sends, and every line it renders must describe a
+// target that actually came back. A configuration termination sends nothing, so
+// there is no path by which "已恢复" can be attached to a deleted monitor.
+func TestRecoveryNoticeOnlyClaimsRecovery(t *testing.T) {
 	p := Payload{
-		Event: "incident.terminated", State: "terminated", GroupName: "客厅网络", GroupMerged: true,
+		Event: "incident.resolved", State: "resolved", GroupName: "客厅网络", GroupMerged: true,
 		RecoveredTargets: []RecoveredTarget{{Name: "商城", Addr: "https://example.com", ProbeKind: "http"}},
 	}
 	zh := RenderLines(p, "zh")
-	if len(zh) != 1 || strings.Contains(zh[0], "已恢复") || !strings.Contains(zh[0], "已停止监控") {
-		t.Errorf("zh terminated lines = %v, want 已停止监控 and no 已恢复", zh)
+	if len(zh) != 1 || !strings.Contains(zh[0], "已恢复") || !strings.Contains(zh[0], "商城") {
+		t.Errorf("zh recovery lines = %v, want the recovered target named", zh)
 	}
 	en := RenderLines(p, "en")
-	if len(en) != 1 || strings.Contains(en[0], "recovered") || !strings.Contains(en[0], "no longer monitored") {
-		t.Errorf("en terminated lines = %v, want 'no longer monitored' and no 'recovered'", en)
-	}
-	// Title/scope keep the termination wording, never recovery.
-	if got := RenderTitle(p, "zh"); got != "监控对象已删除" {
-		t.Errorf("terminated title = %q", got)
+	if len(en) != 1 || !strings.Contains(en[0], "recovered") {
+		t.Errorf("en recovery lines = %v, want 'recovered'", en)
 	}
 }

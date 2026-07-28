@@ -14,7 +14,7 @@ import (
 	pcfg "github.com/nettact/protocol/config"
 	"github.com/nettact/protocol/permission"
 	"github.com/nettact/protocol/telemetry"
-	"github.com/nettact/server-core/eventbus"
+	"github.com/nettact/server-core/fault"
 )
 
 // Server-side pre-terminal trace statuses (never sent by an agent — the agent
@@ -205,23 +205,27 @@ func hostPortFromURL(raw string) (string, int, error) {
 
 // ---- trigger (single-flight create / attach), post-commit ----
 
-// OnEvidence reacts to one newly-frozen alert_evidence row (wired onto
-// TopicEvidenceAdded, post-commit). When the evidence is an eligible network
-// fault it single-flights a traceroute report for the detecting agent: if an open
+// OnSignalConfirmed reacts to one newly-confirmed fault signal (wired onto
+// TopicFaultConfirmed, post-commit). When the fault is an eligible network fault
+// it single-flights a traceroute report for the detecting agent: if an open
 // cohort already exists for the (agent, destination, mode, port) key it attaches
 // an active reference and shares that in-flight/final report, otherwise it
 // creates a fresh queued report and reference and dispatches it. Non-eligible
-// evidence is ignored; non-derivable/policy-ineligible inputs produce a terminal
+// faults are ignored; non-derivable/policy-ineligible inputs produce a terminal
 // report with no dispatch.
-func (s *Service) OnEvidence(ctx context.Context, ev eventbus.EvidenceAdded) error {
+//
+// It reads the signal's FROZEN address and port rather than live probe_tasks, so
+// a target edited after the fault is still traced to where the fault actually
+// happened.
+func (s *Service) OnSignalConfirmed(ctx context.Context, ev fault.SignalEvent) error {
 	if !s.diagEnabled(ctx) {
 		return nil
 	}
-	var conditionID, targetID, probeKind, targetAddr, metricKind string
+	var probeKind, targetAddr, metricKind string
 	var targetPort int
 	err := s.db.Read().QueryRowContext(ctx,
-		`SELECT condition_id, target_id, COALESCE(probe_kind,''), COALESCE(target_addr,''), target_port, metric_kind
-		 FROM alert_evidence WHERE id=?`, ev.EvidenceID).Scan(&conditionID, &targetID, &probeKind, &targetAddr, &targetPort, &metricKind)
+		`SELECT COALESCE(probe_kind,''), COALESCE(target_addr,''), target_port, COALESCE(metric_kind,'')
+		 FROM fault_signals WHERE id=?`, ev.SignalID).Scan(&probeKind, &targetAddr, &targetPort, &metricKind)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil
 	}
@@ -236,7 +240,7 @@ func (s *Service) OnEvidence(ctx context.Context, ev eventbus.EvidenceAdded) err
 		return nil
 	}
 
-	reportID, created, dispatchable, err := s.singleFlight(ctx, ev, conditionID, d)
+	reportID, created, dispatchable, err := s.singleFlight(ctx, ev, d)
 	if err != nil {
 		return err
 	}
@@ -260,7 +264,7 @@ func (s *Service) OnEvidence(ctx context.Context, ev eventbus.EvidenceAdded) err
 // or creates a fresh report (queued, or terminal when the plan is terminal) and
 // reference in one transaction. It returns the report id, whether a new report
 // was created, and whether the report is dispatchable (a fresh non-terminal one).
-func (s *Service) singleFlight(ctx context.Context, ev eventbus.EvidenceAdded, conditionID string, d derivedTrace) (reportID string, created, dispatchable bool, err error) {
+func (s *Service) singleFlight(ctx context.Context, ev fault.SignalEvent, d derivedTrace) (reportID string, created, dispatchable bool, err error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return "", false, false, err
@@ -280,7 +284,7 @@ func (s *Service) singleFlight(ctx context.Context, ev eventbus.EvidenceAdded, c
 		if err = s.insertReport(ctx, tx, reportID, ev, d, d.terminal, d.reason, 0, now); err != nil {
 			return "", false, false, err
 		}
-		if err = insertRef(ctx, tx, reportID, ev, conditionID, now); err != nil {
+		if err = insertRef(ctx, tx, reportID, ev, now); err != nil {
 			return "", false, false, err
 		}
 		if err = tx.Commit(); err != nil {
@@ -295,7 +299,7 @@ func (s *Service) singleFlight(ctx context.Context, ev eventbus.EvidenceAdded, c
 		`SELECT id FROM trace_reports WHERE agent_id=? AND dest_key=? AND mode=? AND port=? AND cohort_open=1`,
 		ev.AgentID, d.destKey, d.mode, d.port).Scan(&reportID)
 	if err == nil {
-		if err = insertRef(ctx, tx, reportID, ev, conditionID, now); err != nil {
+		if err = insertRef(ctx, tx, reportID, ev, now); err != nil {
 			return "", false, false, err
 		}
 		if err = tx.Commit(); err != nil {
@@ -317,7 +321,7 @@ func (s *Service) singleFlight(ctx context.Context, ev eventbus.EvidenceAdded, c
 		if e2 := tx.QueryRowContext(ctx,
 			`SELECT id FROM trace_reports WHERE agent_id=? AND dest_key=? AND mode=? AND port=? AND cohort_open=1`,
 			ev.AgentID, d.destKey, d.mode, d.port).Scan(&winner); e2 == nil {
-			if err = insertRef(ctx, tx, winner, ev, conditionID, now); err != nil {
+			if err = insertRef(ctx, tx, winner, ev, now); err != nil {
 				return "", false, false, err
 			}
 			if err = tx.Commit(); err != nil {
@@ -328,7 +332,7 @@ func (s *Service) singleFlight(ctx context.Context, ev eventbus.EvidenceAdded, c
 		}
 		return "", false, false, err
 	}
-	if err = insertRef(ctx, tx, reportID, ev, conditionID, now); err != nil {
+	if err = insertRef(ctx, tx, reportID, ev, now); err != nil {
 		return "", false, false, err
 	}
 	if err = tx.Commit(); err != nil {
@@ -342,7 +346,7 @@ func (s *Service) newReportID() string { return "trace_" + uuid.NewString() }
 
 // insertReport persists a trace report row (queued/terminal). The deadline is
 // exactly requested_at + diag_total_timeout_ms — the only validity bound.
-func (s *Service) insertReport(ctx context.Context, tx *sql.Tx, reportID string, ev eventbus.EvidenceAdded, d derivedTrace, status, reason string, cohortOpen int, now time.Time) error {
+func (s *Service) insertReport(ctx context.Context, tx *sql.Tx, reportID string, ev fault.SignalEvent, d derivedTrace, status, reason string, cohortOpen int, now time.Time) error {
 	deadline := now.Add(s.diagTotalTimeout(ctx))
 	var completed any
 	if !nonterminalTrace(status) {
@@ -360,14 +364,14 @@ func (s *Service) insertReport(ctx context.Context, tx *sql.Tx, reportID string,
 	return err
 }
 
-// insertRef attaches an active reference from an incident/alert/condition to a
+// insertRef attaches an active reference from an incident's fault signal to a
 // report (idempotent via the composite primary key).
-func insertRef(ctx context.Context, tx *sql.Tx, reportID string, ev eventbus.EvidenceAdded, conditionID string, now time.Time) error {
+func insertRef(ctx context.Context, tx *sql.Tx, reportID string, ev fault.SignalEvent, now time.Time) error {
 	_, err := tx.ExecContext(ctx, `
-		INSERT INTO trace_report_refs(report_id, incident_id, alert_id, condition_id, active, created_at)
-		VALUES(?,?,?,?,1,?)
-		ON CONFLICT(report_id, incident_id, alert_id, condition_id) DO UPDATE SET active=1`,
-		reportID, ev.IncidentID, ev.AlertID, conditionID, now)
+		INSERT INTO trace_report_refs(report_id, incident_id, signal_id, active, created_at)
+		VALUES(?,?,?,1,?)
+		ON CONFLICT(report_id, incident_id, signal_id) DO UPDATE SET active=1`,
+		reportID, ev.IncidentID, ev.SignalID, now)
 	return err
 }
 
@@ -453,8 +457,10 @@ func (s *Service) claimNextTrace(ctx context.Context, agentID string, agentLimit
 }
 
 // pushClaimed builds and pushes a just-promoted report's request to its agent. If
-// the agent is offline/vanished the promotion is reverted to queued (so a reconnect
-// re-dispatches it) and false is returned to stop this agent's dispatch loop.
+// the agent is offline/vanished — or the report's window expired between the claim
+// and the push — the promotion is reverted to queued (so a reconnect re-dispatches
+// it, or the deadline sweep times it out) and false is returned to stop this
+// agent's dispatch loop.
 func (s *Service) pushClaimed(ctx context.Context, agentID, reportID string) bool {
 	req, ok := s.buildTraceRequest(ctx, reportID)
 	if !ok || !s.pusher.PushTraceRequest(agentID, req) {
@@ -466,6 +472,11 @@ func (s *Service) pushClaimed(ctx context.Context, agentID, reportID string) boo
 }
 
 // buildTraceRequest reads a report into the wire TraceRequest pushed to the agent.
+// The validity window travels as the remaining budget at push time rather than
+// this server's deadline_at, so clock skew between server and agent cannot expire
+// the request on arrival (see config.BudgetWindow). ok is false for a report whose
+// window is already spent; the caller leaves it for the trace deadline sweep to
+// terminalize instead of pushing a trace the agent can only report as timed out.
 func (s *Service) buildTraceRequest(ctx context.Context, reportID string) (pcfg.TraceRequest, bool) {
 	var req pcfg.TraceRequest
 	var resolve int
@@ -478,8 +489,11 @@ func (s *Service) buildTraceRequest(ctx context.Context, reportID string) (pcfg.
 	if err != nil {
 		return pcfg.TraceRequest{}, false
 	}
+	req.BudgetMs = int(time.Until(deadline).Milliseconds())
+	if req.BudgetMs <= 0 {
+		return pcfg.TraceRequest{}, false
+	}
 	req.ResolveHopHostnames = resolve == 1
-	req.Deadline = deadline
 	return req, true
 }
 
@@ -640,14 +654,14 @@ func (s *Service) addTraceTimeline(ctx context.Context, incidentID, kind, report
 		"tl_"+uuid.NewString(), incidentID, time.Now().UTC(), kind, "", reportID)
 }
 
-// ---- reference deactivation (post-commit, on alert resolution) ----
+// ---- reference deactivation (post-commit, on fault resolution) ----
 
-// OnAlertResolved deactivates the trace references an alert held and closes any
-// cohort whose active reference count has fallen to zero. It never cancels or
-// deletes a queued/running execution — a closed cohort only means the next alert
-// on the same key will create a fresh report. Wired onto TopicAlertResolved,
-// post-commit. Idempotent.
-func (s *Service) OnAlertResolved(ctx context.Context, alertID string) error {
+// OnSignalResolved deactivates the trace references a fault signal held and
+// closes any cohort whose active reference count has fallen to zero. It never
+// cancels or deletes a queued/running execution — a closed cohort only means the
+// next fault on the same key will create a fresh report. Wired onto
+// TopicFaultResolved, post-commit. Idempotent.
+func (s *Service) OnSignalResolved(ctx context.Context, signalID string) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -659,17 +673,17 @@ func (s *Service) OnAlertResolved(ctx context.Context, alertID string) error {
 		}
 	}()
 	if _, err := tx.ExecContext(ctx,
-		`UPDATE trace_report_refs SET active=0 WHERE alert_id=? AND active=1`, alertID); err != nil {
+		`UPDATE trace_report_refs SET active=0 WHERE signal_id=? AND active=1`, signalID); err != nil {
 		return err
 	}
-	// Close the cohort of any report this alert referenced that now has zero active
+	// Close the cohort of any report this fault referenced that now has zero active
 	// references. The execution itself is untouched.
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE trace_reports SET cohort_open=0
 		WHERE cohort_open=1
-		  AND id IN (SELECT report_id FROM trace_report_refs WHERE alert_id=?)
+		  AND id IN (SELECT report_id FROM trace_report_refs WHERE signal_id=?)
 		  AND NOT EXISTS(SELECT 1 FROM trace_report_refs r WHERE r.report_id=trace_reports.id AND r.active=1)`,
-		alertID); err != nil {
+		signalID); err != nil {
 		return err
 	}
 	if err := tx.Commit(); err != nil {

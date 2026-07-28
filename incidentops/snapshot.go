@@ -41,29 +41,32 @@ type baseGroup struct {
 	Name string `json:"name"`
 }
 
+// baseMember is one fault signal frozen into the snapshot. A built-in detector
+// reaches its verdict from a single metric, so the evidence is one-to-one with
+// the member rather than a list of conditions.
 type baseMember struct {
-	AlertID   string         `json:"alert_id"`
-	RuleID    string         `json:"rule_id"`
-	RuleName  string         `json:"rule_name"`
-	AgentID   string         `json:"agent_id"`
-	AgentName string         `json:"agent_name"`
-	Severity  string         `json:"severity"`
-	Layer     string         `json:"layer,omitempty"`
-	StartedAt time.Time      `json:"started_at"`
-	Evidence  []baseEvidence `json:"evidence"`
+	SignalID    string       `json:"signal_id"`
+	DetectorKey string       `json:"detector_key"`
+	AgentID     string       `json:"agent_id"`
+	AgentName   string       `json:"agent_name,omitempty"`
+	Severity    string       `json:"severity"`
+	Layer       string       `json:"layer,omitempty"`
+	ObservedAt  time.Time    `json:"observed_at"`
+	ConfirmedAt time.Time    `json:"confirmed_at"`
+	Evidence    baseEvidence `json:"evidence"`
 }
 
 type baseEvidence struct {
-	ConditionID   string       `json:"condition_id"`
-	TargetID      string       `json:"target_id"`
+	TargetID      string       `json:"target_id,omitempty"`
 	TargetName    string       `json:"target_name,omitempty"`
 	TargetAddr    string       `json:"target_addr,omitempty"`
 	ProbeKind     string       `json:"probe_kind,omitempty"`
-	MetricKind    string       `json:"metric_kind"`
-	Comparator    string       `json:"comparator"`
+	MetricKind    string       `json:"metric_kind,omitempty"`
+	Comparator    string       `json:"comparator,omitempty"`
 	Threshold     float64      `json:"threshold"`
 	Value         float64      `json:"value"`
-	ObservedAt    time.Time    `json:"observed_at"`
+	ReasonCode    int          `json:"reason_code,omitempty"`
+	ReasonDetail  string       `json:"reason_detail,omitempty"`
 	RecentSamples []baseSample `json:"recent_samples,omitempty"`
 }
 
@@ -150,28 +153,42 @@ func (s *Service) buildBase(ctx context.Context, tx *sql.Tx, incidentID string, 
 	return base, statusCollecting, nil
 }
 
-// baseMembers reads the incident's member alerts and their frozen evidence,
-// attaching a bounded recent-sample summary per condition. It also returns the
-// distinct agent ids and target ids referenced, for the agent/target sections.
+// baseMembers reads the incident's member fault signals with their frozen
+// evidence, attaching a bounded recent-sample summary per member. It also returns
+// the distinct agent ids and target ids referenced, for the agent/target sections.
 func (s *Service) baseMembers(ctx context.Context, tx *sql.Tx, incidentID string) ([]baseMember, []string, []string, error) {
-	rows, err := tx.QueryContext(ctx,
-		`SELECT id, COALESCE(rule_id,''), COALESCE(rule_name,''), agent_id, severity, COALESCE(layer,''), started_at
-		 FROM alerts WHERE incident_id=? ORDER BY started_at`, incidentID)
+	rows, err := tx.QueryContext(ctx, `
+		SELECT id, detector_key, agent_id, COALESCE(agent_name,''), severity, COALESCE(layer,''),
+		       observed_at, confirmed_at,
+		       COALESCE(target_id,''), COALESCE(target_name,''), COALESCE(target_addr,''),
+		       COALESCE(probe_kind,''), COALESCE(metric_kind,''), COALESCE(comparator,''),
+		       threshold, value, reason_code, COALESCE(reason_detail,'')
+		FROM fault_signals WHERE incident_id=? ORDER BY confirmed_at`, incidentID)
 	if err != nil {
 		return nil, nil, nil, err
 	}
 	var members []baseMember
 	agentSeen := map[string]bool{}
-	var agentIDs []string
+	targetSeen := map[string]bool{}
+	var agentIDs, targetIDs []string
 	for rows.Next() {
 		var m baseMember
-		if err := rows.Scan(&m.AlertID, &m.RuleID, &m.RuleName, &m.AgentID, &m.Severity, &m.Layer, &m.StartedAt); err != nil {
+		var e baseEvidence
+		if err := rows.Scan(&m.SignalID, &m.DetectorKey, &m.AgentID, &m.AgentName, &m.Severity, &m.Layer,
+			&m.ObservedAt, &m.ConfirmedAt,
+			&e.TargetID, &e.TargetName, &e.TargetAddr, &e.ProbeKind, &e.MetricKind, &e.Comparator,
+			&e.Threshold, &e.Value, &e.ReasonCode, &e.ReasonDetail); err != nil {
 			rows.Close()
 			return nil, nil, nil, err
 		}
+		m.Evidence = e
 		if !agentSeen[m.AgentID] {
 			agentSeen[m.AgentID] = true
 			agentIDs = append(agentIDs, m.AgentID)
+		}
+		if e.TargetID != "" && !targetSeen[e.TargetID] {
+			targetSeen[e.TargetID] = true
+			targetIDs = append(targetIDs, e.TargetID)
 		}
 		members = append(members, m)
 	}
@@ -179,71 +196,22 @@ func (s *Service) baseMembers(ctx context.Context, tx *sql.Tx, incidentID string
 	if err := rows.Err(); err != nil {
 		return nil, nil, nil, err
 	}
-
-	targetSeen := map[string]bool{}
-	var targetIDs []string
 	for i := range members {
-		ev, tids, err := s.baseEvidence(ctx, tx, members[i].AlertID, members[i].AgentID)
-		if err != nil {
-			return nil, nil, nil, err
-		}
-		members[i].Evidence = ev
-		for _, tid := range tids {
-			if tid != "" && !targetSeen[tid] {
-				targetSeen[tid] = true
-				targetIDs = append(targetIDs, tid)
-			}
-		}
+		members[i].Evidence.RecentSamples = s.recentSamples(ctx, members[i].AgentID, members[i].Evidence)
 	}
 	return members, agentIDs, targetIDs, nil
 }
 
-// baseEvidence reads one alert's frozen evidence and folds in a bounded recent-
-// sample summary per condition (read pool). Returns the referenced target ids.
-func (s *Service) baseEvidence(ctx context.Context, tx *sql.Tx, alertID, agentID string) ([]baseEvidence, []string, error) {
-	rows, err := tx.QueryContext(ctx,
-		`SELECT condition_id, target_id, COALESCE(target_name,''), COALESCE(target_addr,''), COALESCE(probe_kind,''),
-		        metric_kind, comparator, threshold, value, observed_at
-		 FROM alert_evidence WHERE alert_id=? ORDER BY observed_at`, alertID)
-	if err != nil {
-		return nil, nil, err
-	}
-	var out []baseEvidence
-	var targetIDs []string
-	for rows.Next() {
-		var e baseEvidence
-		if err := rows.Scan(&e.ConditionID, &e.TargetID, &e.TargetName, &e.TargetAddr, &e.ProbeKind,
-			&e.MetricKind, &e.Comparator, &e.Threshold, &e.Value, &e.ObservedAt); err != nil {
-			rows.Close()
-			return nil, nil, err
-		}
-		out = append(out, e)
-		targetIDs = append(targetIDs, e.TargetID)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return nil, nil, err
-	}
-	for i := range out {
-		out[i].RecentSamples = s.recentSamples(ctx, agentID, out[i])
-	}
-	return out, targetIDs, nil
-}
-
-// recentSamples returns a bounded recent-sample summary for one condition from
-// the read pool. Best-effort: on any error or missing metrics store it returns
-// nil so a snapshot never fails on a chart read.
+// recentSamples returns a bounded recent-sample summary for one member's metric
+// from the read pool. Best-effort: on any error, a missing metrics store, or a
+// member with no metric (Agent connectivity) it returns nil, so a snapshot never
+// fails on a chart read.
 func (s *Service) recentSamples(ctx context.Context, agentID string, e baseEvidence) []baseSample {
-	if s.metrics == nil {
+	if s.metrics == nil || e.MetricKind == "" || e.TargetID == "" {
 		return nil
 	}
-	q := metrics.Query{AgentID: agentID, Kind: e.MetricKind, Limit: recentSampleLimit,
-		SinceUnix: time.Now().Add(-5 * time.Minute).Unix()}
-	if e.ProbeKind == "host" {
-		q.Target = e.TargetAddr
-	} else {
-		q.MonitorID = e.TargetID
-	}
+	q := metrics.Query{AgentID: agentID, Kind: e.MetricKind, MonitorID: e.TargetID,
+		Limit: recentSampleLimit, SinceUnix: time.Now().Add(-5 * time.Minute).Unix()}
 	pts, err := s.metrics.Query(ctx, q)
 	if err != nil || len(pts) == 0 {
 		return nil
@@ -319,7 +287,7 @@ func (s *Service) OnIncidentOpened(ctx context.Context, ev eventbus.IncidentEven
 	}
 	// Distinct member agents of the incident (at open there is at least one).
 	rows, err := s.db.Read().QueryContext(ctx,
-		`SELECT DISTINCT agent_id FROM alerts WHERE incident_id=?`, ev.IncidentID)
+		`SELECT DISTINCT agent_id FROM fault_signals WHERE incident_id=?`, ev.IncidentID)
 	if err != nil {
 		return err
 	}
@@ -390,28 +358,42 @@ func (s *Service) ensureSnapshot(ctx context.Context, incidentID string) (string
 // dispatchSnapshot builds and pushes one agent's IncidentSnapshotRequest. Offline
 // agents simply do not receive it (the entry stays collecting until the deadline
 // or a reconnect re-push).
+//
+// The collection window travels as the remaining budget at push time, never as
+// this server's absolute deadline: the agent's clock is independent of ours and
+// skew larger than the window would expire the request on arrival, making the
+// agent report timeouts for work it was never given time to attempt. We keep the
+// absolute deadline_at for our own reaping, so the only slack the agent gains is
+// the push latency. An already-spent window is not pushed at all — finalize's
+// deadline sweep terminalizes the entry.
 func (s *Service) dispatchSnapshot(ctx context.Context, agentID, incidentID, reqID string, deadline time.Time) {
 	if s.pusher == nil {
 		return
 	}
-	req := pcfg.IncidentSnapshotRequest{
+	// Targets first: that query is what makes the budget worth measuring late, and
+	// computing the budget before it would push a window the query itself had
+	// already consumed.
+	targets := s.snapshotTargets(ctx, incidentID, agentID)
+	budgetMs := int(time.Until(deadline).Milliseconds())
+	if budgetMs <= 0 {
+		return
+	}
+	s.pusher.PushIncidentSnapshotRequest(agentID, pcfg.IncidentSnapshotRequest{
 		RequestID:  reqID,
 		IncidentID: incidentID,
-		Deadline:   deadline,
-		Targets:    s.snapshotTargets(ctx, incidentID, agentID),
-	}
-	s.pusher.PushIncidentSnapshotRequest(agentID, req)
+		BudgetMs:   budgetMs,
+		Targets:    targets,
+	})
 }
 
 // snapshotTargets returns the monitor targets one agent should resolve for the
 // scene, derived from the incident's frozen evidence for that agent.
 func (s *Service) snapshotTargets(ctx context.Context, incidentID, agentID string) []pcfg.SnapshotTargetRef {
 	rows, err := s.db.Read().QueryContext(ctx, `
-		SELECT DISTINCT e.target_id, COALESCE(pt.kind, e.probe_kind), COALESCE(pt.target, e.target_addr), COALESCE(pt.params,'')
-		FROM alert_evidence e
-		JOIN alerts a ON a.id = e.alert_id
-		LEFT JOIN probe_tasks pt ON pt.id = e.target_id
-		WHERE a.incident_id=? AND a.agent_id=?`, incidentID, agentID)
+		SELECT DISTINCT s.target_id, COALESCE(pt.kind, s.probe_kind), COALESCE(pt.target, s.target_addr), COALESCE(pt.params,'')
+		FROM fault_signals s
+		LEFT JOIN probe_tasks pt ON pt.id = s.target_id
+		WHERE s.incident_id=? AND s.agent_id=? AND s.target_id <> ''`, incidentID, agentID)
 	if err != nil {
 		return nil
 	}
@@ -721,7 +703,7 @@ func (s *Service) enforceSizeCap(ctx context.Context, snapshotID string) (int, b
 
 // truncateBase deterministically reduces a serialized SnapshotBase to at most
 // budget bytes, preserving the incident's core identifiers and status. Optional
-// detail is dropped in a fixed priority: per-condition recent samples first, then
+// detail is dropped in a fixed priority: per-member recent samples first, then
 // the supplementary agent/target sections (their identity survives on the members
 // and their evidence), and finally trailing members as a guaranteed floor. Returns
 // the re-serialized base and whether anything was dropped; valid JSON and field
@@ -740,13 +722,11 @@ func truncateBase(payload string, budget int) (string, bool) {
 	changed := false
 	fits := func() bool { return len(mustJSON(b)) <= budget }
 
-	// Tier 1: drop per-condition recent samples (the largest optional detail).
+	// Tier 1: drop per-member recent samples (the largest optional detail).
 	for i := range b.Members {
-		for j := range b.Members[i].Evidence {
-			if len(b.Members[i].Evidence[j].RecentSamples) > 0 {
-				b.Members[i].Evidence[j].RecentSamples = nil
-				changed = true
-			}
+		if len(b.Members[i].Evidence.RecentSamples) > 0 {
+			b.Members[i].Evidence.RecentSamples = nil
+			changed = true
 		}
 	}
 	if fits() {

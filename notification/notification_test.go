@@ -2,11 +2,10 @@ package notification
 
 import (
 	"context"
-	"path/filepath"
 	"runtime"
 	"testing"
 
-	"github.com/nettact/server-core/store"
+	"github.com/nettact/server-core/store/storetest"
 )
 
 // TestSystemChannelCRUD verifies a "system" channel round-trips through the
@@ -14,11 +13,7 @@ import (
 // unsupported platforms nativeNotify is a no-op; on Windows/macOS it fires a
 // bounded, best-effort desktop notification.
 func TestSystemChannelCRUD(t *testing.T) {
-	db, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
-	if err != nil {
-		t.Fatalf("open db: %v", err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
+	db := storetest.Open(t)
 	ctx := context.Background()
 	svc := New(db)
 
@@ -52,7 +47,7 @@ func TestSystemChannelCRUD(t *testing.T) {
 		AgentCount:     2,
 		SuspectedLayer: "wan",
 		Severity:       "critical",
-		Details: []AlertDetail{{
+		Details: []FaultDetail{{
 			ProbeKind: "http", MetricKind: "probe.http.status", Comparator: "eq",
 			Threshold: 200, Value: 503, Target: `http://x <test>`, Layer: "service",
 			Severity: "critical", AgentHost: "node-1",

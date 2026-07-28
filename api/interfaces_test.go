@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"net/http/httptest"
-	"path/filepath"
 	"testing"
 	"time"
 
@@ -12,15 +11,11 @@ import (
 	"github.com/nettact/server-core/config"
 	"github.com/nettact/server-core/inventory"
 	"github.com/nettact/server-core/registry"
-	"github.com/nettact/server-core/store"
+	"github.com/nettact/server-core/store/storetest"
 )
 
 func TestHandleAgentInterfacesFreshnessAndShape(t *testing.T) {
-	db, err := store.Open(filepath.Join(t.TempDir(), "api.db"))
-	if err != nil {
-		t.Fatalf("store.Open: %v", err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
+	db := storetest.Open(t)
 	ctx := context.Background()
 	now := time.Now().UTC()
 	if _, err := db.ExecContext(ctx, `INSERT INTO sites(id,name,created_at) VALUES('site_default','Default',?)`, now); err != nil {

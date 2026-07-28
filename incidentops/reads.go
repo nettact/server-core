@@ -89,7 +89,7 @@ func (s *Service) Snapshot(ctx context.Context, incidentID string) (SnapshotView
 
 // TraceSummary is one traceroute report as referenced from an incident: the
 // shared execution record's identity, status and reached verdict, plus how the
-// incident references it (via which alerts/conditions, and whether still active).
+// incident references it (via which fault signals, and whether still active).
 type TraceSummary struct {
 	ReportID   string `json:"report_id"`
 	AgentID    string `json:"agent_id"`

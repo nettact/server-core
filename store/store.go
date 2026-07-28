@@ -74,9 +74,20 @@ func (d *DB) Read() *sql.DB {
 }
 
 // Close closes both handles.
+//
+// Each connection drops its memory map first. Both pools are opened with a
+// 256 MiB mmap_size, and on Windows a mapped file stays locked until the mapping
+// is released — which the OS may do a little after the handle closes. Without
+// this the database file can still be locked immediately after Close returns,
+// which shows up as a failure to delete the directory holding it (and, for a
+// desktop user, as an "in use" error when relocating or removing the data
+// directory right after shutdown). Setting mmap_size to 0 unmaps synchronously,
+// so Close returning really does mean the file is free.
 func (d *DB) Close() error {
 	if d.read != nil {
+		_, _ = d.read.Exec(`PRAGMA mmap_size=0`)
 		_ = d.read.Close()
 	}
+	_, _ = d.DB.Exec(`PRAGMA mmap_size=0`)
 	return d.DB.Close()
 }

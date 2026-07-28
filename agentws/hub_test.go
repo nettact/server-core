@@ -7,7 +7,6 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
 	"testing"
 	"time"
 
@@ -26,6 +25,7 @@ import (
 	"github.com/nettact/server-core/registry"
 	"github.com/nettact/server-core/site"
 	"github.com/nettact/server-core/store"
+	"github.com/nettact/server-core/store/storetest"
 )
 
 // testEnv wires the real services the hub needs against a throwaway SQLite DB
@@ -44,11 +44,7 @@ type testEnv struct {
 
 func newTestEnv(t *testing.T) *testEnv {
 	t.Helper()
-	db, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
-	if err != nil {
-		t.Fatalf("open db: %v", err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
+	db := storetest.Open(t)
 
 	ctx := context.Background()
 	if err := site.New(db).EnsureDefault(ctx); err != nil {
@@ -85,7 +81,7 @@ func (e *testEnv) setTargets(t *testing.T, targets ...string) {
 	for _, tgt := range targets {
 		pts = append(pts, config.ProbeTarget{GroupID: e.groupID, Kind: "icmp", Target: tgt, Enabled: true})
 	}
-	if _, err := e.cfg.SetSiteTargets(context.Background(), site.DefaultSiteID, pts); err != nil {
+	if err := e.cfg.SetSiteTargets(context.Background(), site.DefaultSiteID, pts); err != nil {
 		t.Fatalf("set targets: %v", err)
 	}
 }

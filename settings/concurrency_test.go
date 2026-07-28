@@ -2,19 +2,14 @@ package settings
 
 import (
 	"context"
-	"path/filepath"
 	"testing"
 	"time"
 
-	"github.com/nettact/server-core/store"
+	"github.com/nettact/server-core/store/storetest"
 )
 
 func TestReadsStayResponsiveWhileWriterTransactionIsOpen(t *testing.T) {
-	db, err := store.Open(filepath.Join(t.TempDir(), "settings-read.db"))
-	if err != nil {
-		t.Fatalf("open db: %v", err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
+	db := storetest.Open(t)
 	ctx := context.Background()
 	s := New(db)
 	if err := s.Set(ctx, KeyDiagEnabled, "1"); err != nil {

@@ -5,22 +5,17 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/nettact/server-core/identity"
 	"github.com/nettact/server-core/settings"
-	"github.com/nettact/server-core/store"
+	"github.com/nettact/server-core/store/storetest"
 )
 
 func TestOnboardingStateRoundTrip(t *testing.T) {
-	db, err := store.Open(filepath.Join(t.TempDir(), "onboarding.db"))
-	if err != nil {
-		t.Fatalf("store.Open: %v", err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
+	db := storetest.Open(t)
 	d := Deps{Settings: settings.New(db)}
 
 	get := httptest.NewRecorder()
@@ -66,11 +61,7 @@ func TestOnboardingStateRoundTrip(t *testing.T) {
 }
 
 func TestOnboardingStateAcceptsEmptyRegions(t *testing.T) {
-	db, err := store.Open(filepath.Join(t.TempDir(), "onboarding-empty.db"))
-	if err != nil {
-		t.Fatalf("store.Open: %v", err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
+	db := storetest.Open(t)
 	d := Deps{Settings: settings.New(db)}
 
 	// A null regions field must round-trip as an empty array, not null, so the
@@ -94,11 +85,7 @@ func TestOnboardingStateAcceptsEmptyRegions(t *testing.T) {
 }
 
 func TestOnboardingStateRouteRequiresSession(t *testing.T) {
-	db, err := store.Open(filepath.Join(t.TempDir(), "onboarding-auth.db"))
-	if err != nil {
-		t.Fatalf("store.Open: %v", err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
+	db := storetest.Open(t)
 	d := Deps{Identity: identity.New(db), Settings: settings.New(db)}
 
 	w := httptest.NewRecorder()
@@ -109,11 +96,7 @@ func TestOnboardingStateRouteRequiresSession(t *testing.T) {
 }
 
 func TestUpdateOnboardingStateRejectsInvalidPayloads(t *testing.T) {
-	db, err := store.Open(filepath.Join(t.TempDir(), "onboarding-invalid.db"))
-	if err != nil {
-		t.Fatalf("store.Open: %v", err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
+	db := storetest.Open(t)
 	d := Deps{Settings: settings.New(db)}
 
 	cases := map[string]string{

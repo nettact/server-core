@@ -2,22 +2,18 @@ package config
 
 import (
 	"context"
-	"path/filepath"
 	"sync"
 	"testing"
 
 	"github.com/nettact/server-core/eventbus"
 	"github.com/nettact/server-core/registry"
 	"github.com/nettact/server-core/store"
+	"github.com/nettact/server-core/store/storetest"
 )
 
 func openConfigTestDB(t *testing.T) (*store.DB, context.Context) {
 	t.Helper()
-	db, err := store.Open(filepath.Join(t.TempDir(), "config.db"))
-	if err != nil {
-		t.Fatalf("open db: %v", err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
+	db := storetest.Open(t)
 	ctx := context.Background()
 	for _, siteID := range []string{"site_default", "site_other"} {
 		if _, err := db.ExecContext(ctx, `INSERT INTO sites(id,name) VALUES(?,?)`, siteID, siteID); err != nil {
@@ -53,10 +49,10 @@ func TestSetSiteTargetsIsIdempotentAndSiteSafe(t *testing.T) {
 		t.Fatal(err)
 	}
 	local := ProbeTarget{ID: "local", GroupID: localGroup, Kind: "http", Name: "Before", Target: "https://local.test", Enabled: true}
-	if _, err := svc.SetSiteTargets(ctx, "site_default", []ProbeTarget{local}); err != nil {
+	if err := svc.SetSiteTargets(ctx, "site_default", []ProbeTarget{local}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := svc.SetSiteTargets(ctx, "site_other", []ProbeTarget{{ID: "foreign", GroupID: otherGroup, Kind: "dns", Target: "example.test", Enabled: true}}); err != nil {
+	if err := svc.SetSiteTargets(ctx, "site_other", []ProbeTarget{{ID: "foreign", GroupID: otherGroup, Kind: "dns", Target: "example.test", Enabled: true}}); err != nil {
 		t.Fatal(err)
 	}
 	configEvents = 0
@@ -65,7 +61,7 @@ func TestSetSiteTargetsIsIdempotentAndSiteSafe(t *testing.T) {
 	if err := db.QueryRowContext(ctx, `SELECT config_serial FROM sites WHERE id='site_default'`).Scan(&before); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := svc.SetSiteTargets(ctx, "site_default", []ProbeTarget{local}); err != nil {
+	if err := svc.SetSiteTargets(ctx, "site_default", []ProbeTarget{local}); err != nil {
 		t.Fatal(err)
 	}
 	var after int
@@ -78,7 +74,7 @@ func TestSetSiteTargetsIsIdempotentAndSiteSafe(t *testing.T) {
 	}
 
 	local.Name = "After"
-	if _, err := svc.SetSiteTargets(ctx, "site_default", []ProbeTarget{local}); err != nil {
+	if err := svc.SetSiteTargets(ctx, "site_default", []ProbeTarget{local}); err != nil {
 		t.Fatal(err)
 	}
 	_ = db.QueryRowContext(ctx, `SELECT config_serial FROM sites WHERE id='site_default'`).Scan(&after)
@@ -94,7 +90,7 @@ func TestSetSiteTargetsIsIdempotentAndSiteSafe(t *testing.T) {
 		t.Fatalf("name-only events = config:%d status:%+v", configEvents, statusEvents)
 	}
 
-	if _, err := svc.SetSiteTargets(ctx, "site_default", []ProbeTarget{{ID: "foreign", GroupID: localGroup, Kind: "dns", Target: "changed.test", Enabled: true}}); err == nil {
+	if err := svc.SetSiteTargets(ctx, "site_default", []ProbeTarget{{ID: "foreign", GroupID: localGroup, Kind: "dns", Target: "changed.test", Enabled: true}}); err == nil {
 		t.Fatal("cross-site target id was accepted")
 	}
 	var foreignSite, foreignTarget string
@@ -129,7 +125,7 @@ func TestConcurrentTargetReplacementNeverMergesSets(t *testing.T) {
 			go func() {
 				defer wg.Done()
 				<-start
-				_, err := svc.SetSiteTargets(ctx, "site_default", []ProbeTarget{{ID: id, GroupID: groupID, Kind: "icmp", Target: id, Enabled: true}})
+				err := svc.SetSiteTargets(ctx, "site_default", []ProbeTarget{{ID: id, GroupID: groupID, Kind: "icmp", Target: id, Enabled: true}})
 				errCh <- err
 			}()
 		}
@@ -171,7 +167,7 @@ func TestDesiredStateUsesMonitorGroupScope(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create scoped monitor group: %v", err)
 	}
-	if _, err := svc.SetSiteTargets(ctx, "site_default", []ProbeTarget{
+	if err := svc.SetSiteTargets(ctx, "site_default", []ProbeTarget{
 		{ID: "target_all", GroupID: allID, Kind: "icmp", Target: "1.1.1.1", Enabled: true},
 		{ID: "target_scoped", GroupID: scopedID, Kind: "icmp", Target: "9.9.9.9", Enabled: true},
 	}); err != nil {
@@ -235,7 +231,7 @@ func TestHostAnchorIsStoredButNotPushed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create monitor group: %v", err)
 	}
-	if _, err := svc.SetSiteTargets(ctx, "site_default", []ProbeTarget{
+	if err := svc.SetSiteTargets(ctx, "site_default", []ProbeTarget{
 		{ID: "icmp", GroupID: groupID, Kind: "icmp", Target: "1.1.1.1", Enabled: true},
 		{ID: "wifi-anchor", GroupID: groupID, Kind: "host", Target: "*", Enabled: true},
 	}); err != nil {

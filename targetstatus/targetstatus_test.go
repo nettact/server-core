@@ -9,8 +9,8 @@ import (
 )
 
 func TestAggregateDecisionTable(t *testing.T) {
-	online := func(exec, probe, rule string) agentAgg {
-		return agentAgg{exec: exec, probe: probe, rule: rule, online: true}
+	online := func(exec, probe, flt string) agentAgg {
+		return agentAgg{exec: exec, probe: probe, fault: flt, online: true}
 	}
 	tests := []struct {
 		name     string
@@ -19,20 +19,20 @@ func TestAggregateDecisionTable(t *testing.T) {
 		display  string
 		affected int
 	}{
-		{"disabled", false, []agentAgg{online(execCollecting, probeHealthy, ruleNormal)}, displayDisabled, 0},
+		{"disabled", false, []agentAgg{online(execCollecting, probeHealthy, faultNormal)}, displayDisabled, 0},
 		{"unassigned", true, nil, displayUnassigned, 0},
-		{"alerting wins", true, []agentAgg{online(execCollecting, probeHealthy, ruleAlerting)}, displayAlerting, 1},
-		{"breaching wins", true, []agentAgg{online(execCollecting, probeHealthy, ruleBreaching)}, displayBreaching, 1},
-		{"all probes failed", true, []agentAgg{online(execCollecting, probeFailed, ruleNormal)}, displayProbeFailed, 1},
-		{"partial failure", true, []agentAgg{online(execCollecting, probeFailed, ruleNormal), online(execCollecting, probeHealthy, ruleNormal)}, displayPartialFailure, 1},
-		{"all blocked", true, []agentAgg{online(execPermissionBlocked, probeNoData, ruleNormal), online(execUnsupported, probeNoData, ruleNormal)}, displayBlocked, 2},
+		{"faulted wins", true, []agentAgg{online(execCollecting, probeHealthy, faultFaulted)}, displayFaulted, 1},
+		{"confirming wins", true, []agentAgg{online(execCollecting, probeHealthy, faultConfirming)}, displayConfirming, 1},
+		{"all probes failed", true, []agentAgg{online(execCollecting, probeFailed, faultNormal)}, displayProbeFailed, 1},
+		{"partial failure", true, []agentAgg{online(execCollecting, probeFailed, faultNormal), online(execCollecting, probeHealthy, faultNormal)}, displayPartialFailure, 1},
+		{"all blocked", true, []agentAgg{online(execPermissionBlocked, probeNoData, faultNormal), online(execUnsupported, probeNoData, faultNormal)}, displayBlocked, 2},
 		{"all offline", true, []agentAgg{{exec: execAgentOffline, online: false}, {exec: execAgentOffline, online: false}}, displayAgentOffline, 2},
 		{"fresh pending", true, []agentAgg{{exec: execPending, online: true}}, displayPending, 1},
 		{"expired pending", true, []agentAgg{{exec: execPending, online: true, pendingExpired: true}}, displayNoData, 1},
-		{"healthy with stale minority", true, []agentAgg{online(execCollecting, probeHealthy, ruleNormal), online(execCollecting, probeStale, ruleNormal)}, displayHealthy, 0},
-		{"stale", true, []agentAgg{online(execCollecting, probeStale, ruleNormal)}, displayStale, 1},
-		{"no data", true, []agentAgg{online(execCollecting, probeNoData, ruleNormal)}, displayNoData, 1},
-		{"host not applicable", true, []agentAgg{online(execCollecting, probeNotApplicable, ruleNormal)}, displayHealthy, 0},
+		{"healthy with stale minority", true, []agentAgg{online(execCollecting, probeHealthy, faultNormal), online(execCollecting, probeStale, faultNormal)}, displayHealthy, 0},
+		{"stale", true, []agentAgg{online(execCollecting, probeStale, faultNormal)}, displayStale, 1},
+		{"no data", true, []agentAgg{online(execCollecting, probeNoData, faultNormal)}, displayNoData, 1},
+		{"host not applicable", true, []agentAgg{online(execCollecting, probeNotApplicable, faultNormal)}, displayHealthy, 0},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -60,14 +60,14 @@ func TestAssignmentCutoffAdmitsSameSecondPostAssignmentSample(t *testing.T) {
 	// must be retained because it may have been observed after the assignment.
 	as, _ := svc.deriveAgent(target, pair, cutoff.Add(time.Second), statusByKey,
 		map[string]*sampleVal{sampleKey: {kind: "probe.http.ok", unit: "bool", ts: cutoff.Unix(), value: 1}},
-		nil, nil, nil, nil)
+		nil, nil)
 	if as.ProbeState != probeHealthy {
 		t.Fatalf("same-second sample probe_state = %q, want healthy", as.ProbeState)
 	}
 
 	as, _ = svc.deriveAgent(target, pair, cutoff.Add(time.Second), statusByKey,
 		map[string]*sampleVal{sampleKey: {kind: "probe.http.ok", unit: "bool", ts: cutoff.Unix() - 1, value: 1}},
-		nil, nil, nil, nil)
+		nil, nil)
 	if as.ProbeState != probeNoData {
 		t.Fatalf("pre-assignment sample probe_state = %q, want no_data", as.ProbeState)
 	}
@@ -81,7 +81,7 @@ func TestStaleWindowFoldsReportedUploadInterval(t *testing.T) {
 
 	windowFor := func(ms *msRow) int {
 		t.Helper()
-		as, _ := svc.deriveAgent(target, pair, now, map[string]*msRow{"target\x00agent": ms}, nil, nil, nil, nil, nil)
+		as, _ := svc.deriveAgent(target, pair, now, map[string]*msRow{"target\x00agent": ms}, nil, nil, nil)
 		if as.StaleAfterSeconds == nil {
 			t.Fatalf("stale_after_seconds unset for %+v", ms)
 		}
@@ -138,7 +138,7 @@ func TestPendingGraceExpiresToNoDataWithoutChangingExecution(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			ms := &msRow{status: wire.MonitorStatusActive, source: "predicted", targetConfigSerial: 2,
 				assignedAt: sql.NullTime{Time: tt.assigned, Valid: true}}
-			as, agg := svc.deriveAgent(target, pair, now, map[string]*msRow{"target\x00agent": ms}, nil, nil, nil, nil, nil)
+			as, agg := svc.deriveAgent(target, pair, now, map[string]*msRow{"target\x00agent": ms}, nil, nil, nil)
 			if as.ExecutionState != execPending || as.PendingSince == nil {
 				t.Fatalf("execution = %+v, want pending with timestamp", as)
 			}

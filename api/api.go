@@ -31,11 +31,11 @@ import (
 	"github.com/nettact/server-core/agentalert"
 	"github.com/nettact/server-core/agentstatus"
 	"github.com/nettact/server-core/agentws"
-	"github.com/nettact/server-core/alert"
 	"github.com/nettact/server-core/audit"
 	"github.com/nettact/server-core/cleanup"
 	"github.com/nettact/server-core/config"
 	"github.com/nettact/server-core/eventbus"
+	"github.com/nettact/server-core/fault"
 	"github.com/nettact/server-core/hostlive"
 	"github.com/nettact/server-core/identity"
 	"github.com/nettact/server-core/incident"
@@ -43,9 +43,9 @@ import (
 	"github.com/nettact/server-core/inventory"
 	"github.com/nettact/server-core/metrics"
 	"github.com/nettact/server-core/notification"
+	"github.com/nettact/server-core/notifypolicy"
 	"github.com/nettact/server-core/opissue"
 	"github.com/nettact/server-core/registry"
-	"github.com/nettact/server-core/rules"
 	"github.com/nettact/server-core/settings"
 	"github.com/nettact/server-core/site"
 	"github.com/nettact/server-core/sse"
@@ -65,8 +65,8 @@ type Deps struct {
 	Config       *config.Service
 	Site         *site.Service
 	Inventory    *inventory.Service
-	Rules        *rules.Service
-	Alert        *alert.Service
+	Fault        *fault.Service
+	NotifyPolicy *notifypolicy.Service
 	Incident     *incident.Service
 	IncidentOps  *incidentops.Service // incident snapshot + traceroute orchestration reads
 	Notification *notification.Service
@@ -138,7 +138,6 @@ func Router(d Deps) http.Handler {
 			r.Get("/agents/{id}/interfaces", d.handleAgentInterfaces)
 			r.Get("/agents/{id}/series", d.handleAgentSeries)
 			r.Get("/agents/{id}/status-history", d.handleAgentStatusHistory)
-			r.Get("/agents/{id}/alerts", d.handleAgentAlerts)
 			r.Get("/agents/{id}/issues", d.handleAgentIssues)
 			r.Get("/agents/{id}/monitor-status", d.handleAgentMonitorStatus)
 			// Live host snapshot (ephemeral process/connection lists): POST asks the
@@ -168,12 +167,13 @@ func Router(d Deps) http.Handler {
 			r.Get("/issues", d.handleListIssues)
 			r.Post("/issues/mark-read", d.handleMarkIssuesRead)
 			r.Get("/issues/unread-count", d.handleIssuesUnreadCount)
-			// Authoritative current status for every target of a site, in one batch.
+			// Authoritative current status for every target of a site, in one batch,
+			// plus the availability ratios the status page shows alongside it.
 			r.Get("/sites/{id}/target-statuses", d.handleTargetStatuses)
-			// Per-agent health + resource rollup for the Agent status list (AGENT-001),
-			// and the agent connectivity alert history (AGENT-002).
+			r.Get("/sites/{id}/availability", d.handleSiteAvailability)
+			r.Get("/targets/{id}/availability", d.handleTargetAvailability)
+			// Per-agent health + resource rollup for the Agent status list (AGENT-001).
 			r.Get("/sites/{id}/agent-statuses", d.handleAgentStatuses)
-			r.Get("/agent-alerts", d.handleListConnAlerts)
 			// Server-Sent Events stream for live issue + target-status updates.
 			r.Get("/events", d.handleEvents)
 			// Agent groups: named sets of agents that scope monitoring targets.
@@ -188,19 +188,26 @@ func Router(d Deps) http.Handler {
 			// full shared trace report hops (site-owned, session-protected).
 			r.Get("/incidents/{id}/snapshot", d.handleIncidentSnapshot)
 			r.Get("/incidents/{id}/traces", d.handleIncidentTraces)
+			r.Get("/incidents/{id}/notifications", d.handleIncidentNotifications)
 			r.Get("/trace-reports/{id}", d.handleTraceReport)
-			r.Get("/alerts", d.handleListAlerts)
-			// Group-level one-layer AND/OR alert rules (configured on a monitor group).
-			r.Get("/monitor-groups/{id}/rules", d.handleListGroupRules)
-			r.Post("/monitor-groups/{id}/rules", d.handleCreateGroupRule)
-			r.Put("/group-rules/{id}", d.handleUpdateGroupRule)
-			r.Delete("/group-rules/{id}", d.handleDeleteGroupRule)
+			// Fault signals: the single history surface for confirmed faults, filtered
+			// by agent / target / detector / state.
+			r.Get("/fault-signals", d.handleListFaultSignals)
+			// Built-in detector sensitivity, per target.
+			r.Get("/targets/{id}/detection-settings", d.handleGetDetectionSettings)
+			r.Patch("/targets/{id}/detection-settings", d.handleUpdateDetectionSettings)
+			// Notification policies decide whether/when/where a recorded fault is
+			// announced. Exactly one applies per incident (target > group > site).
+			r.Get("/sites/{id}/notification-policies", d.handleListNotificationPolicies)
+			r.Post("/sites/{id}/notification-policies", d.handleCreateNotificationPolicy)
+			r.Patch("/notification-policies/{id}", d.handleUpdateNotificationPolicy)
+			r.Delete("/notification-policies/{id}", d.handleDeleteNotificationPolicy)
+			r.Get("/targets/{id}/effective-notification-policy", d.handleEffectiveNotificationPolicy)
 			r.Get("/channels", d.handleListChannels)
 			r.Post("/channels", d.handleCreateChannel)
 			r.Post("/channels/test", d.handleTestChannel)
 			r.Put("/channels/{id}", d.handleUpdateChannel)
 			r.Delete("/channels/{id}", d.handleDeleteChannel)
-			r.Post("/channels/{id}/apply-to-all", d.handleApplyChannelToAllRules)
 			// Global server settings (e.g. console_base_url for notification links).
 			r.Get("/settings", d.handleGetSettings)
 			r.Put("/settings", d.handleUpdateSettings)
@@ -620,13 +627,13 @@ func (d Deps) handleDeleteAgent(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	// Force-resolve any alert this agent has firing BEFORE its rows are purged, so
-	// deleting an agent mid-alarm closes the incident as a termination rather than
+	// Force-resolve any fault this agent has firing BEFORE its rows are purged, so
+	// deleting an agent mid-fault closes the incident as a termination rather than
 	// stranding it open or letting an unrelated later recovery false-close it. Runs
 	// outside DeleteAgent's transaction (the resolve event's incident handler writes
 	// to the DB and SQLite has a single writer); DeleteAgent then removes the rows.
-	if d.Alert != nil {
-		if err := d.Rules.TerminateForAgent(r.Context(), id); err != nil {
+	if d.Fault != nil {
+		if err := d.Fault.TerminateForAgent(r.Context(), id); err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
@@ -881,11 +888,7 @@ func (d Deps) handleSetTargets(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	siteID := chi.URLParam(r, "id")
-	// ruleCleanups: alert conditions dropped because a kept monitor's kind changed
-	// and its new kind can never emit the metric they watched. Surfaced on the
-	// response so the console can tell the user which alarms to reconfigure.
-	ruleCleanups, err := d.Config.SetSiteTargets(r.Context(), siteID, body.Targets)
-	if err != nil {
+	if err := d.Config.SetSiteTargets(r.Context(), siteID, body.Targets); err != nil {
 		// A repeated target id is a malformed payload, not a server fault: answering
 		// 500 would tell the client to retry something that can never succeed.
 		if errors.Is(err, config.ErrDuplicateTargetID) {
@@ -895,23 +898,9 @@ func (d Deps) handleSetTargets(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	// The save has COMMITTED — those alarm deletions are permanent. Every step
-	// below can still fail with a 500 that carries no body of ours, and the cleanup
-	// report exists only in this variable, so record it durably HERE. Otherwise a
-	// failing reconcile would silently swallow the one notice telling the user
-	// which alarms they must rebuild (a re-save reports nothing: the conditions are
-	// already gone).
-	for _, c := range ruleCleanups {
-		detail := c.MonitorName + " (" + c.OldKind + "→" + c.NewKind + "): rule " + c.RuleName +
-			" lost " + strings.Join(c.Metrics, ", ")
-		if c.RuleDeleted {
-			detail += "; rule deleted (no conditions left)"
-		}
-		d.Audit.Log(r.Context(), "admin", "monitoring.rule_cleanup", c.MonitorID, detail)
-	}
-	// Narrowing a target's scope can strand alerts already firing for agents that
+	// Narrowing a target's scope can strand faults already firing for agents that
 	// just left it; resolve them so they don't stay firing forever.
-	if err := d.Rules.ResolveOutOfScope(r.Context(), siteID); err != nil {
+	if err := d.Fault.ResolveOutOfScope(r.Context(), siteID); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -939,18 +928,12 @@ func (d Deps) handleSetTargets(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	audited := strconv.Itoa(len(body.Targets)) + " targets"
-	if len(ruleCleanups) > 0 {
-		audited += "; " + strconv.Itoa(len(ruleCleanups)) + " rule(s) pruned after a monitor kind change"
-	}
-	d.Audit.Log(r.Context(), "admin", "monitoring.set_targets", siteID, audited)
+	d.Audit.Log(r.Context(), "admin", "monitoring.set_targets", siteID,
+		strconv.Itoa(len(body.Targets))+" targets")
 	if warnings == nil {
 		warnings = []opissue.SaveWarning{}
 	}
-	if ruleCleanups == nil {
-		ruleCleanups = []config.RuleCleanup{}
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "warnings": warnings, "rule_cleanups": ruleCleanups})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "warnings": warnings})
 }
 
 func (d Deps) handleListAgentGroups(w http.ResponseWriter, r *http.Request) {
@@ -1014,7 +997,7 @@ func (d Deps) handleUpdateAgentGroup(w http.ResponseWriter, r *http.Request) {
 	}
 	// Agents removed from the group may have alerts still firing for targets scoped
 	// to it; resolve any that just went out of scope.
-	if err := d.Rules.ResolveOutOfScope(r.Context(), siteID); err != nil {
+	if err := d.Fault.ResolveOutOfScope(r.Context(), siteID); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -1060,7 +1043,7 @@ func (d Deps) handleDeleteAgentGroup(w http.ResponseWriter, r *http.Request) {
 	}
 	// Deleting the group drops its target bindings, so targets scoped only to it now
 	// reach nobody; resolve any alerts left firing for those targets.
-	if err := d.Rules.ResolveOutOfScope(r.Context(), siteID); err != nil {
+	if err := d.Fault.ResolveOutOfScope(r.Context(), siteID); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -1307,19 +1290,22 @@ func (d Deps) handleListIncidents(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	siteID := siteParam(r)
 	page, pageSize := pageParams(r, 15, 100)
-	total, err := d.Incident.Count(ctx, siteID)
+	f, ok := incidentFilter(w, r)
+	if !ok {
+		return
+	}
+	total, err := d.Incident.Count(ctx, siteID, f)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	incs, err := d.Incident.List(ctx, siteID, pageSize, (page-1)*pageSize)
+	incs, err := d.Incident.List(ctx, siteID, f, pageSize, (page-1)*pageSize)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	if incs == nil {
-		incs = []incident.Incident{}
-	}
+	// The summary is deliberately UNFILTERED: it answers "how is the site doing",
+	// which must not change because the user narrowed the list they are reading.
 	stats, err := d.Incident.OverviewStats(ctx, siteID, time.Now().Add(-24*time.Hour))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -1328,6 +1314,35 @@ func (d Deps) handleListIncidents(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"items": incs, "total": total, "page": page, "page_size": pageSize, "summary": stats,
 	})
+}
+
+// incidentFilter parses the fault centre's filter query parameters, writing a
+// 400 itself for an unparseable timestamp.
+func incidentFilter(w http.ResponseWriter, r *http.Request) (incident.Filter, bool) {
+	q := r.URL.Query()
+	f := incident.Filter{
+		State:     q.Get("state"),
+		Severity:  q.Get("severity"),
+		GroupID:   q.Get("group"),
+		AgentID:   q.Get("agent"),
+		TargetID:  q.Get("target"),
+		ProbeKind: q.Get("kind"),
+		Query:     q.Get("q"),
+	}
+	for name, dst := range map[string]**time.Time{"since": &f.Since, "until": &f.Until} {
+		v := q.Get(name)
+		if v == "" {
+			continue
+		}
+		t, err := time.Parse(time.RFC3339, v)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, name+" must be an RFC3339 timestamp")
+			return incident.Filter{}, false
+		}
+		u := t.UTC()
+		*dst = &u
+	}
+	return f, true
 }
 
 // pageParams parses ?page and ?page_size, applying a default size and a hard cap.
@@ -1376,19 +1391,37 @@ func (d Deps) handleGetIncident(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "incident not found")
 		return
 	}
-	members, abnormalTargetCount, err := d.Alert.IncidentDetail(r.Context(), id)
+	members, err := d.Fault.IncidentSignals(r.Context(), id)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	if members == nil {
-		members = []alert.Alert{}
+	abnormalTargetCount, err := d.Fault.CountAbnormalTargets(r.Context(), id)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"incident":              inc,
-		"members":               members,
+		"members":               describeSignals(members),
 		"abnormal_target_count": abnormalTargetCount,
 	})
+}
+
+// handleIncidentNotifications returns an incident's notification records, so the
+// console can show whether it was announced, is still waiting out its delay, or
+// was deliberately not sent. Site-owned.
+func (d Deps) handleIncidentNotifications(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	if !d.incidentOwned(w, r, id) {
+		return
+	}
+	out, err := d.NotifyPolicy.ListForIncident(r.Context(), id)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 // incidentOwned resolves an incident and enforces site ownership, writing the 404
@@ -1472,80 +1505,75 @@ func (d Deps) handleTraceReport(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, view)
 }
 
-// alertView is an active alert instance plus a human description of its top
-// fault, rendered in both languages so the console can show "who fired and why"
-// without re-implementing the wording client-side.
-type alertView struct {
-	alert.Alert
+// signalView is a fault signal plus a human description of what failed, rendered
+// in both languages so the console can show "what broke and why" without
+// re-implementing the wording client-side.
+type signalView struct {
+	fault.Signal
 	DescZh string `json:"desc_zh"`
 	DescEn string `json:"desc_en"`
 }
 
-// detailFromAlert builds a notification.AlertDetail from an alert instance's
-// first (worst) frozen evidence row, used only to render its description.
-func detailFromAlert(a alert.Alert) notification.AlertDetail {
-	det := notification.AlertDetail{Layer: a.Layer, Severity: a.Severity}
-	if len(a.Evidence) > 0 {
-		e := a.Evidence[0]
-		det.ProbeKind = e.ProbeKind
-		det.MetricKind = e.MetricKind
-		det.Comparator = e.Comparator
-		det.Threshold = e.Threshold
-		det.Value = e.Value
-		det.TargetName = e.TargetName
-		det.Target = e.TargetAddr
-		det.ReasonCode = e.ReasonCode
-		det.ReasonDetail = e.ReasonDetail
+// detailFromSignal builds the renderer's detail from a signal's frozen evidence.
+func detailFromSignal(s fault.Signal) notification.FaultDetail {
+	return notification.FaultDetail{
+		ProbeKind:    s.ProbeKind,
+		MetricKind:   s.MetricKind,
+		Comparator:   s.Comparator,
+		Threshold:    s.Threshold,
+		Value:        s.Value,
+		TargetName:   s.TargetName,
+		Target:       s.TargetAddr,
+		Layer:        s.Layer,
+		Severity:     s.Severity,
+		AgentHost:    s.AgentName,
+		ReasonCode:   s.ReasonCode,
+		ReasonDetail: s.ReasonDetail,
 	}
-	return det
 }
 
-func (d Deps) handleListAlerts(w http.ResponseWriter, r *http.Request) {
-	alerts, err := d.Alert.ListActive(r.Context(), siteParam(r))
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	views := make([]alertView, 0, len(alerts))
-	for _, a := range alerts {
-		det := detailFromAlert(a)
-		views = append(views, alertView{
-			Alert:  a,
-			DescZh: notification.DescribeDetail(det, "zh"),
-			DescEn: notification.DescribeDetail(det, "en"),
-		})
-	}
-	writeJSON(w, http.StatusOK, views)
-}
-
-// handleAgentAlerts returns one target's alert-instance history (firing +
-// resolved) for one Agent, newest first. Exactly one stable monitor id or system
-// target address is required; an unscoped Agent-wide history is not exposed.
-func (d Deps) handleAgentAlerts(w http.ResponseWriter, r *http.Request) {
-	limit := 10
-	if s := r.URL.Query().Get("limit"); s != "" {
-		if n, err := strconv.Atoi(s); err == nil && n > 0 {
-			limit = n
+func describeSignals(sigs []fault.Signal) []signalView {
+	out := make([]signalView, 0, len(sigs))
+	for _, s := range sigs {
+		v := signalView{Signal: s}
+		if s.DetectorKey == fault.DetectorAgentConnectivity {
+			// An Agent-connectivity fault has no metric, comparator or target, so the
+			// metric-threshold renderer would produce a sentence with holes in it
+			// ("target : = 0"). Its standard statement already says the whole truth.
+			v.DescZh = fault.SignalTitleLang(s, "zh")
+			v.DescEn = fault.SignalTitleLang(s, "en")
+		} else {
+			det := detailFromSignal(s)
+			v.DescZh = notification.DescribeDetail(det, "zh")
+			v.DescEn = notification.DescribeDetail(det, "en")
 		}
+		out = append(out, v)
 	}
-	monitorID := r.URL.Query().Get("monitor")
-	targetAddr := r.URL.Query().Get("target")
-	if (monitorID == "") == (targetAddr == "") {
-		writeError(w, http.StatusBadRequest, "exactly one of monitor or target is required")
-		return
+	return out
+}
+
+// handleListFaultSignals returns fault signals filtered by agent, target,
+// detector and state — the single history endpoint behind every "what has gone
+// wrong here" view (a target's history, an Agent's connectivity history, the
+// site's current faults).
+func (d Deps) handleListFaultSignals(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	f := fault.SignalFilter{
+		SiteID:   siteParam(r),
+		AgentID:  q.Get("agent"),
+		TargetID: q.Get("target"),
+		Detector: q.Get("detector"),
+		State:    q.Get("state"),
 	}
-	alerts, err := d.Alert.ListForAgent(r.Context(), chi.URLParam(r, "id"), alert.TargetScope{
-		MonitorID: monitorID,
-		Address:   targetAddr,
-	}, limit)
+	if n, err := strconv.Atoi(q.Get("limit")); err == nil && n > 0 {
+		f.Limit = n
+	}
+	sigs, err := d.Fault.ListSignals(r.Context(), f)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	if alerts == nil {
-		alerts = []alert.Alert{}
-	}
-	writeJSON(w, http.StatusOK, alerts)
+	writeJSON(w, http.StatusOK, describeSignals(sigs))
 }
 
 // ---- monitor groups ----
@@ -1633,7 +1661,7 @@ func (d Deps) handleUpdateMonitorGroup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// A scope narrowing can strand alerts for agents that just left scope.
-	if err := d.Rules.ResolveOutOfScope(r.Context(), siteID); err != nil {
+	if err := d.Fault.ResolveOutOfScope(r.Context(), siteID); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -1665,7 +1693,7 @@ func (d Deps) handleDeleteMonitorGroup(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	if err := d.Rules.ResolveOutOfScope(r.Context(), siteID); err != nil {
+	if err := d.Fault.ResolveOutOfScope(r.Context(), siteID); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -1695,132 +1723,284 @@ func (d Deps) reconcileScope(ctx context.Context, siteID string) error {
 	return d.OpIssue.ReevaluateHostMonitorsForSite(ctx, siteID)
 }
 
-// ---- group rules (one-layer AND/OR, configured on a monitor group) ----
+// ---- notification policies ----
 
-func (d Deps) handleListGroupRules(w http.ResponseWriter, r *http.Request) {
-	groupID := chi.URLParam(r, "id")
-	g, err := d.Config.GetGroup(r.Context(), groupID)
-	if err != nil || g.SiteID != siteParam(r) {
-		writeError(w, http.StatusNotFound, "monitor group not found")
+func (d Deps) handleListNotificationPolicies(w http.ResponseWriter, r *http.Request) {
+	siteID := chi.URLParam(r, "id")
+	// Reading the list is also where a site's default policy first materializes, so
+	// the console never has to special-case a site that has never opened this page.
+	if _, err := d.NotifyPolicy.EnsureDefault(r.Context(), siteID); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	rs, err := d.Rules.ListForGroup(r.Context(), groupID)
+	ps, err := d.NotifyPolicy.List(r.Context(), siteID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	if rs == nil {
-		rs = []rules.GroupRule{}
-	}
-	writeJSON(w, http.StatusOK, rs)
+	writeJSON(w, http.StatusOK, ps)
 }
 
-func (d Deps) handleCreateGroupRule(w http.ResponseWriter, r *http.Request) {
-	groupID := chi.URLParam(r, "id")
-	g, err := d.Config.GetGroup(r.Context(), groupID)
-	if err != nil || g.SiteID != siteParam(r) {
-		writeError(w, http.StatusNotFound, "monitor group not found")
+func (d Deps) handleCreateNotificationPolicy(w http.ResponseWriter, r *http.Request) {
+	siteID := chi.URLParam(r, "id")
+	var body notifypolicy.Policy
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid policy body")
 		return
 	}
-	rule, ok := decodeGroupRule(w, r)
-	if !ok {
-		return
-	}
-	id, err := d.Rules.Create(r.Context(), g.SiteID, groupID, rule)
+	p, err := d.NotifyPolicy.Create(r.Context(), siteID, body)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	// A host-target condition defines a host monitor's required permissions.
-	if d.OpIssue != nil {
-		if err := d.OpIssue.ReevaluateHostMonitorsForSite(r.Context(), g.SiteID); err != nil {
-			writeError(w, http.StatusInternalServerError, err.Error())
-			return
-		}
-	}
-	d.Audit.Log(r.Context(), "admin", "group_rule.create", id, groupID)
-	writeJSON(w, http.StatusOK, map[string]string{"id": id})
+	d.Audit.Log(r.Context(), "admin", "notification_policy.create", p.ID, p.ScopeKind+":"+p.ScopeID)
+	writeJSON(w, http.StatusOK, p)
 }
 
-func (d Deps) handleUpdateGroupRule(w http.ResponseWriter, r *http.Request) {
+// policyPatch is a PATCH body: every field is optional and an omitted one keeps
+// its current value. Pointers are what make that possible — a plain struct could
+// not tell "notify_recovery: false" from "notify_recovery not sent", so a caller
+// editing only the name would silently switch recovery notices off. Scope and the
+// default flag are absent on purpose: neither may be moved by an edit.
+type policyPatch struct {
+	Name             *string   `json:"name"`
+	Enabled          *bool     `json:"enabled"`
+	MinSeverity      *string   `json:"min_severity"`
+	WarnDelaySec     *int      `json:"warn_delay_sec"`
+	CriticalDelaySec *int      `json:"critical_delay_sec"`
+	NotifyRecovery   *bool     `json:"notify_recovery"`
+	ChannelIDs       *[]string `json:"channel_ids"`
+}
+
+// apply overlays the patch onto the stored policy.
+func (p policyPatch) apply(cur notifypolicy.Policy) notifypolicy.Policy {
+	if p.Name != nil {
+		cur.Name = *p.Name
+	}
+	if p.Enabled != nil {
+		cur.Enabled = *p.Enabled
+	}
+	if p.MinSeverity != nil {
+		cur.MinSeverity = *p.MinSeverity
+	}
+	if p.WarnDelaySec != nil {
+		cur.WarnDelaySec = *p.WarnDelaySec
+	}
+	if p.CriticalDelaySec != nil {
+		cur.CriticalDelaySec = *p.CriticalDelaySec
+	}
+	if p.NotifyRecovery != nil {
+		cur.NotifyRecovery = *p.NotifyRecovery
+	}
+	if p.ChannelIDs != nil {
+		cur.ChannelIDs = *p.ChannelIDs
+	}
+	return cur
+}
+
+func (d Deps) handleUpdateNotificationPolicy(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
-	cur, err := d.Rules.GetRule(r.Context(), id)
-	if errors.Is(err, rules.ErrNotFound) {
-		writeError(w, http.StatusNotFound, "rule not found")
+	cur, err := d.NotifyPolicy.Get(r.Context(), id)
+	if errors.Is(err, notifypolicy.ErrNotFound) || (err == nil && cur.SiteID != siteParam(r)) {
+		writeError(w, http.StatusNotFound, "notification policy not found")
 		return
 	}
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	if cur.SiteID != siteParam(r) {
-		writeError(w, http.StatusNotFound, "rule not found")
+	var patch policyPatch
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&patch); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid policy body")
 		return
 	}
-	rule, ok := decodeGroupRule(w, r)
-	if !ok {
-		return
-	}
-	rule.ID = id
-	if err := d.Rules.Update(r.Context(), rule); err != nil {
+	p, err := d.NotifyPolicy.Update(r.Context(), id, patch.apply(cur))
+	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if d.OpIssue != nil {
-		if err := d.OpIssue.ReevaluateHostMonitorsForSite(r.Context(), cur.SiteID); err != nil {
-			writeError(w, http.StatusInternalServerError, err.Error())
-			return
-		}
-	}
-	d.Audit.Log(r.Context(), "admin", "group_rule.update", id, "")
-	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+	d.Audit.Log(r.Context(), "admin", "notification_policy.update", id, "")
+	writeJSON(w, http.StatusOK, p)
 }
 
-func (d Deps) handleDeleteGroupRule(w http.ResponseWriter, r *http.Request) {
+func (d Deps) handleDeleteNotificationPolicy(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
-	cur, err := d.Rules.GetRule(r.Context(), id)
-	if errors.Is(err, rules.ErrNotFound) {
-		writeError(w, http.StatusNotFound, "rule not found")
+	cur, err := d.NotifyPolicy.Get(r.Context(), id)
+	if errors.Is(err, notifypolicy.ErrNotFound) || (err == nil && cur.SiteID != siteParam(r)) {
+		writeError(w, http.StatusNotFound, "notification policy not found")
 		return
 	}
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	if cur.SiteID != siteParam(r) {
-		writeError(w, http.StatusNotFound, "rule not found")
-		return
-	}
-	if err := d.Rules.Delete(r.Context(), id); err != nil {
+	if err := d.NotifyPolicy.Delete(r.Context(), id); err != nil {
+		if errors.Is(err, notifypolicy.ErrDefaultPolicy) {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	if d.OpIssue != nil {
-		if err := d.OpIssue.ReevaluateHostMonitorsForSite(r.Context(), cur.SiteID); err != nil {
-			writeError(w, http.StatusInternalServerError, err.Error())
-			return
-		}
-	}
-	d.Audit.Log(r.Context(), "admin", "group_rule.delete", id, "")
+	d.Audit.Log(r.Context(), "admin", "notification_policy.delete", id, "")
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
-// decodeGroupRule parses a rules.GroupRule from the request body with light
-// structural checks; the full condition validation runs in rules.Create/Update.
-func decodeGroupRule(w http.ResponseWriter, r *http.Request) (rules.GroupRule, bool) {
-	var rule rules.GroupRule
-	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&rule); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid rule body")
-		return rules.GroupRule{}, false
+// handleEffectiveNotificationPolicy previews which single policy governs a
+// target, and through which scope, so the console's preview and the delivery
+// planner can never disagree — both call the same resolver.
+func (d Deps) handleEffectiveNotificationPolicy(w http.ResponseWriter, r *http.Request) {
+	eff, err := d.NotifyPolicy.ResolveForTarget(r.Context(), chi.URLParam(r, "id"))
+	if errors.Is(err, sql.ErrNoRows) {
+		writeError(w, http.StatusNotFound, "target not found")
+		return
 	}
-	if strings.TrimSpace(rule.Name) == "" || (rule.Op != "and" && rule.Op != "or") {
-		writeError(w, http.StatusBadRequest, "name and op ('and'|'or') are required")
-		return rules.GroupRule{}, false
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
 	}
-	if rule.Severity == "" {
-		rule.Severity = "warn"
+	writeJSON(w, http.StatusOK, eff)
+}
+
+// ---- built-in detection sensitivity ----
+
+// handleGetDetectionSettings returns a target's detector sensitivity, falling
+// back to the balanced defaults for a target that was never tuned. There is no
+// "off" here by design: fault recording is a product guarantee, so the only
+// choices are how quickly it confirms and, for ICMP, how much loss counts.
+func (d Deps) handleGetDetectionSettings(w http.ResponseWriter, r *http.Request) {
+	ds, err := d.Config.GetDetectionSettings(r.Context(), chi.URLParam(r, "id"))
+	if errors.Is(err, sql.ErrNoRows) {
+		writeError(w, http.StatusNotFound, "target not found")
+		return
 	}
-	return rule, true
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, ds)
+}
+
+// detectionPatch is a PATCH body: every field is optional and an omitted one
+// keeps its current value. Pointers are what make that possible — a plain struct
+// could not tell "recover_rounds: 0" from "recover_rounds not sent", and would
+// silently rewrite a field the caller never mentioned.
+type detectionPatch struct {
+	Profile       *string  `json:"profile"`
+	FailRounds    *int     `json:"fail_rounds"`
+	RecoverRounds *int     `json:"recover_rounds"`
+	ICMPLossPct   *float64 `json:"icmp_loss_pct"`
+}
+
+func (d Deps) handleUpdateDetectionSettings(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	var patch detectionPatch
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&patch); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid detection settings body")
+		return
+	}
+	cur, err := d.Config.GetDetectionSettings(r.Context(), id)
+	if errors.Is(err, sql.ErrNoRows) {
+		writeError(w, http.StatusNotFound, "target not found")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	body := cur.DetectionSettings
+	if patch.Profile != nil {
+		body.Profile = *patch.Profile
+	}
+	if patch.FailRounds != nil {
+		body.FailRounds = *patch.FailRounds
+	}
+	if patch.RecoverRounds != nil {
+		body.RecoverRounds = *patch.RecoverRounds
+	}
+	if patch.ICMPLossPct != nil {
+		body.ICMPLossPct = *patch.ICMPLossPct
+	}
+	ds, err := d.Config.UpdateDetectionSettings(r.Context(), id, body)
+	if errors.Is(err, sql.ErrNoRows) {
+		writeError(w, http.StatusNotFound, "target not found")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	d.Audit.Log(r.Context(), "admin", "detection_settings.update", id, ds.Profile)
+	writeJSON(w, http.StatusOK, ds)
+}
+
+// ---- availability ----
+
+// availabilityWindow parses ?window= (24h | 7d | 30d), defaulting to 24h. The
+// window set is fixed rather than free-form: availability is summed from minute
+// rollup buckets, which are retained for 30 days, so a longer window would
+// silently answer from an incomplete range.
+func availabilityWindow(r *http.Request) (time.Duration, bool) {
+	switch r.URL.Query().Get("window") {
+	case "", "24h":
+		return 24 * time.Hour, true
+	case "7d":
+		return 7 * 24 * time.Hour, true
+	case "30d":
+		return 30 * 24 * time.Hour, true
+	}
+	return 0, false
+}
+
+// handleSiteAvailability returns every target's availability over one window,
+// batched for the target-status page.
+func (d Deps) handleSiteAvailability(w http.ResponseWriter, r *http.Request) {
+	win, ok := availabilityWindow(r)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "window must be 24h, 7d or 30d")
+		return
+	}
+	now := time.Now().UTC()
+	out, err := d.Metrics.AvailabilityForSite(r.Context(), chi.URLParam(r, "id"), now.Add(-win).Unix(), now.Unix())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"window": r.URL.Query().Get("window"), "targets": out})
+}
+
+// handleTargetAvailability returns one target's availability over each requested
+// window, in total and per Agent — so a target only one Agent cannot reach reads
+// as a path problem rather than a target problem.
+func (d Deps) handleTargetAvailability(w http.ResponseWriter, r *http.Request) {
+	targetID := chi.URLParam(r, "id")
+	windows := strings.Split(r.URL.Query().Get("windows"), ",")
+	if len(windows) == 1 && windows[0] == "" {
+		windows = []string{"24h", "7d", "30d"}
+	}
+	now := time.Now().UTC()
+	out := make([]map[string]any, 0, len(windows))
+	for _, wname := range windows {
+		var win time.Duration
+		switch strings.TrimSpace(wname) {
+		case "24h":
+			win = 24 * time.Hour
+		case "7d":
+			win = 7 * 24 * time.Hour
+		case "30d":
+			win = 30 * 24 * time.Hour
+		default:
+			writeError(w, http.StatusBadRequest, "windows must be a comma-separated subset of 24h,7d,30d")
+			return
+		}
+		total, perAgent, err := d.Metrics.AvailabilityForTarget(r.Context(), targetID, now.Add(-win).Unix(), now.Unix())
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		out = append(out, map[string]any{"window": strings.TrimSpace(wname), "total": total, "agents": perAgent})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"target_id": targetID, "windows": out})
 }
 
 // ---- notification channels ----
@@ -2185,29 +2365,6 @@ func (d Deps) handleDeleteChannel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
-}
-
-// handleApplyChannelToAllRules adds this channel to every alert rule's channel
-// set — a convenience so an operator doesn't have to tick it on each rule. Only
-// future firings pick it up; open incidents keep their frozen routing. Returns
-// the number of rules changed.
-func (d Deps) handleApplyChannelToAllRules(w http.ResponseWriter, r *http.Request) {
-	id := chi.URLParam(r, "id")
-	switch _, err := d.Notification.Get(r.Context(), id); {
-	case errors.Is(err, sql.ErrNoRows):
-		writeError(w, http.StatusNotFound, "channel not found")
-		return
-	case err != nil:
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	n, err := d.Rules.AddChannelToAllRules(r.Context(), id)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	d.Audit.Log(r.Context(), "admin", "channel.apply_all", id, strconv.Itoa(n))
-	writeJSON(w, http.StatusOK, map[string]int{"updated": n})
 }
 
 func (d Deps) handleAgentStatusHistory(w http.ResponseWriter, r *http.Request) {

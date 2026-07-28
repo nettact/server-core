@@ -2,55 +2,103 @@ package agentalert
 
 import (
 	"context"
-	"path/filepath"
 	"strconv"
 	"testing"
 	"time"
 
 	"github.com/nettact/server-core/eventbus"
-	"github.com/nettact/server-core/notification"
+	"github.com/nettact/server-core/fault"
 	"github.com/nettact/server-core/settings"
 	"github.com/nettact/server-core/store"
+	"github.com/nettact/server-core/store/storetest"
 )
 
-// fakeNotifier captures dispatched notifications (channel selection + payload) on
-// a buffered channel so tests can deterministically wait for (or assert the
-// absence of) a notification even though the engine dispatches on a goroutine.
-type dispatch struct {
-	channels []string
-	p        notification.Payload
+// fakeRecorder stands in for the fault engine, recording what the liveness state
+// machine decided without a database. These tests are about the state machine —
+// when a fault is confirmed, when it resolves, and under which reason — not about
+// how the fault is stored or whether anything is notified (the policy layer owns
+// that and has its own coverage).
+type fakeRecorder struct {
+	firing   map[string]string // agentID -> signal id
+	opened   []fault.AgentSignalInput
+	resolved []resolveCall
+	seq      int
 }
-type fakeNotifier struct{ ch chan dispatch }
 
-func newFakeNotifier() *fakeNotifier { return &fakeNotifier{ch: make(chan dispatch, 32)} }
+type resolveCall struct {
+	agentID string
+	reason  string
+}
 
-func (f *fakeNotifier) Notify(_ context.Context, channels []string, p notification.Payload) {
-	f.ch <- dispatch{channels: channels, p: p}
+func newFakeRecorder() *fakeRecorder { return &fakeRecorder{firing: map[string]string{}} }
+
+func (f *fakeRecorder) OpenAgentSignal(_ context.Context, in fault.AgentSignalInput, _ time.Time) (string, error) {
+	if _, ok := f.firing[in.AgentID]; ok {
+		return "", nil // already firing; the unique index makes this a no-op
+	}
+	f.seq++
+	id := "sig_" + strconv.Itoa(f.seq)
+	f.firing[in.AgentID] = id
+	f.opened = append(f.opened, in)
+	return id, nil
+}
+
+func (f *fakeRecorder) ResolveAgentSignal(_ context.Context, agentID, reason string, _ time.Time) error {
+	if _, ok := f.firing[agentID]; !ok {
+		return nil
+	}
+	delete(f.firing, agentID)
+	f.resolved = append(f.resolved, resolveCall{agentID: agentID, reason: reason})
+	return nil
+}
+
+func (f *fakeRecorder) FiringAgentSignals(context.Context) (map[string]string, error) {
+	out := make(map[string]string, len(f.firing))
+	for k, v := range f.firing {
+		out[k] = v
+	}
+	return out, nil
+}
+
+// lastResolve returns the most recent resolve reason for an agent, or "".
+func (f *fakeRecorder) lastResolve(agentID string) string {
+	for i := len(f.resolved) - 1; i >= 0; i-- {
+		if f.resolved[i].agentID == agentID {
+			return f.resolved[i].reason
+		}
+	}
+	return ""
+}
+
+// lastOpen returns the most recent open input for an agent.
+func (f *fakeRecorder) lastOpen(agentID string) (fault.AgentSignalInput, bool) {
+	for i := len(f.opened) - 1; i >= 0; i-- {
+		if f.opened[i].AgentID == agentID {
+			return f.opened[i], true
+		}
+	}
+	return fault.AgentSignalInput{}, false
 }
 
 type harness struct {
-	t     *testing.T
-	db    *store.DB
-	set   *settings.Service
-	notif *fakeNotifier
-	eng   *Engine
-	clock time.Time
-	ctx   context.Context
+	t      *testing.T
+	db     *store.DB
+	set    *settings.Service
+	faults *fakeRecorder
+	eng    *Engine
+	clock  time.Time
+	ctx    context.Context
 }
 
 func newHarness(t *testing.T) *harness {
 	t.Helper()
-	db, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
-	if err != nil {
-		t.Fatalf("open db: %v", err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
+	db := storetest.Open(t)
 	ctx := context.Background()
 	mustExec(t, db, `INSERT INTO sites(id,name,created_at) VALUES('site_default','def',?)`, time.Now().UTC())
 	set := settings.New(db)
-	notif := newFakeNotifier()
-	h := &harness{t: t, db: db, set: set, notif: notif, ctx: ctx, clock: time.Date(2026, 7, 24, 12, 0, 0, 0, time.UTC)}
-	h.eng = New(db, set, notif, eventbus.New())
+	rec := newFakeRecorder()
+	h := &harness{t: t, db: db, set: set, faults: rec, ctx: ctx, clock: time.Date(2026, 7, 24, 12, 0, 0, 0, time.UTC)}
+	h.eng = New(db, set, rec, eventbus.New())
 	h.eng.now = func() time.Time { return h.clock }
 	// Short, clear timings; the machine is clock-driven so absolute values only
 	// need to be internally consistent.
@@ -95,73 +143,40 @@ func (h *harness) tick(connected ...string) {
 	}
 }
 
-func (h *harness) firingCount(agentID string) int {
-	h.t.Helper()
-	var n int
-	if err := h.db.QueryRowContext(h.ctx,
-		`SELECT COUNT(*) FROM agent_alerts WHERE agent_id=? AND status='firing'`, agentID).Scan(&n); err != nil {
-		h.t.Fatalf("count firing: %v", err)
+// firing reports whether the agent currently has a confirmed connectivity fault.
+func (h *harness) firing(agentID string) bool {
+	_, ok := h.faults.firing[agentID]
+	return ok
+}
+
+// openCount counts how many times a fault was confirmed for an agent, so a
+// duplicate confirmation is visible even after the first one resolved.
+func (h *harness) openCount(agentID string) int {
+	n := 0
+	for _, in := range h.faults.opened {
+		if in.AgentID == agentID {
+			n++
+		}
 	}
 	return n
 }
 
-func (h *harness) alertRow(agentID string) (status, reason, resolveReason string) {
-	h.t.Helper()
-	err := h.db.QueryRowContext(h.ctx,
-		`SELECT status, reason, COALESCE(resolve_reason,'') FROM agent_alerts WHERE agent_id=? ORDER BY opened_at DESC LIMIT 1`,
-		agentID).Scan(&status, &reason, &resolveReason)
-	if err != nil {
-		h.t.Fatalf("alert row: %v", err)
-	}
-	return
-}
-
-func (h *harness) expectPayloads(n int) []dispatch {
-	h.t.Helper()
-	var got []dispatch
-	for i := 0; i < n; i++ {
-		select {
-		case d := <-h.notif.ch:
-			got = append(got, d)
-		case <-time.After(2 * time.Second):
-			h.t.Fatalf("timed out waiting for payload %d of %d", i+1, n)
-		}
-	}
-	return got
-}
-
-func (h *harness) expectNoPayload() {
-	h.t.Helper()
-	select {
-	case p := <-h.notif.ch:
-		h.t.Fatalf("unexpected payload: %+v", p)
-	case <-time.After(100 * time.Millisecond):
-	}
-}
-
-// takeAgentOffline drives an agent from connected to a fired offline alert and
-// returns after the offline notification has been dispatched and drained.
+// takeAgentOffline drives an agent from connected to a confirmed offline fault.
 func (h *harness) takeAgentOffline(id string) {
 	h.t.Helper()
 	h.tick(id) // connected
 	h.advance(1 * time.Second)
 	h.tick() // absent: absentSince set
 	h.advance(30 * time.Second)
-	h.tick() // offline >= grace: open + queue
-	if h.firingCount(id) != 1 {
-		h.t.Fatalf("expected 1 firing after grace, got %d", h.firingCount(id))
-	}
-	h.advance(15 * time.Second)
-	h.tick() // batch window elapsed: flush
-	ps := h.expectPayloads(1)
-	if ps[0].p.Event != "agent.offline" {
-		h.t.Fatalf("expected agent.offline, got %s", ps[0].p.Event)
+	h.tick() // offline >= grace: confirm
+	if !h.firing(id) {
+		h.t.Fatalf("expected a confirmed fault after grace")
 	}
 }
 
 func ptr(t time.Time) *time.Time { return &t }
 
-func TestGraceThenFireOnceWithNotification(t *testing.T) {
+func TestGraceThenConfirmOnce(t *testing.T) {
 	h := newHarness(t)
 	base := h.clock
 	h.seedAgent("agent_a", ptr(base), ptr(base), false, "error")
@@ -170,35 +185,37 @@ func TestGraceThenFireOnceWithNotification(t *testing.T) {
 	h.advance(1 * time.Second)
 	h.tick() // first absent tick: establishes the monotonic baseline
 	h.advance(28 * time.Second)
-	h.tick() // 28s < grace 30: no alert yet
-	if got := h.firingCount("agent_a"); got != 0 {
-		t.Fatalf("expected no alert before grace, got %d", got)
+	h.tick() // 28s < grace 30: not yet
+	if h.firing("agent_a") {
+		t.Fatal("expected no fault before grace")
 	}
 	h.advance(2 * time.Second)
-	h.tick() // 30s >= grace: fires
-	if got := h.firingCount("agent_a"); got != 1 {
-		t.Fatalf("expected 1 firing at grace, got %d", got)
+	h.tick() // 30s >= grace: confirms
+	if !h.firing("agent_a") {
+		t.Fatal("expected a fault at grace")
 	}
-	// Dedup: another tick while absent must not open a second alert.
+	// Dedup: another tick while absent must not confirm a second fault.
 	h.advance(1 * time.Second)
 	h.tick()
-	if got := h.firingCount("agent_a"); got != 1 {
-		t.Fatalf("expected still 1 firing (dedup), got %d", got)
+	if n := h.openCount("agent_a"); n != 1 {
+		t.Fatalf("expected exactly 1 confirmation (dedup), got %d", n)
 	}
-	// Flush the notification and assert its shape.
-	h.advance(15 * time.Second)
-	h.tick()
-	ps := h.expectPayloads(1)
-	if ps[0].p.Event != "agent.offline" || ps[0].p.AgentCount != 1 || len(ps[0].p.Agents) != 1 {
-		t.Fatalf("bad offline payload: %+v", ps[0])
+	in, ok := h.lastOpenOf("agent_a")
+	if !ok || in.Reason != "unexpected" {
+		t.Fatalf("expected reason unexpected, got %+v", in)
 	}
-	if ps[0].p.Agents[0].Reason != "unexpected" {
-		t.Fatalf("expected reason unexpected, got %q", ps[0].p.Agents[0].Reason)
+	// observed_at is when the agent was last seen, not when grace expired, so the
+	// recorded outage covers the whole gap.
+	if !in.OfflineSince.Equal(base) {
+		t.Fatalf("offline_since = %v, want the agent's last-seen time %v", in.OfflineSince, base)
 	}
-	h.expectNoPayload()
 }
 
-func TestRecoveryWithinGraceNoAlert(t *testing.T) {
+func (h *harness) lastOpenOf(agentID string) (fault.AgentSignalInput, bool) {
+	return h.faults.lastOpen(agentID)
+}
+
+func TestRecoveryWithinGraceNoFault(t *testing.T) {
 	h := newHarness(t)
 	base := h.clock
 	h.seedAgent("agent_a", ptr(base), ptr(base), false, "error")
@@ -208,12 +225,14 @@ func TestRecoveryWithinGraceNoAlert(t *testing.T) {
 	h.tick()                    // absent
 	h.advance(20 * time.Second) // < grace 30
 	h.tick("agent_a")           // reconnects before grace
-	if got := h.firingCount("agent_a"); got != 0 {
-		t.Fatalf("expected no alert on early recovery, got %d firing", got)
+	if h.firing("agent_a") {
+		t.Fatal("expected no fault on early recovery")
 	}
 	h.advance(20 * time.Second)
 	h.tick("agent_a")
-	h.expectNoPayload()
+	if n := h.openCount("agent_a"); n != 0 {
+		t.Fatalf("expected no confirmation at all, got %d", n)
+	}
 }
 
 func TestRecoveryConfirmation(t *testing.T) {
@@ -224,29 +243,25 @@ func TestRecoveryConfirmation(t *testing.T) {
 
 	// Reconnect: not resolved until sustained >= recover (10s).
 	h.tick("agent_a")
-	if st, _, _ := h.alertRow("agent_a"); st != "firing" {
-		t.Fatalf("expected still firing right after reconnect, got %s", st)
+	if !h.firing("agent_a") {
+		t.Fatal("expected still firing right after reconnect")
 	}
 	h.advance(9 * time.Second)
 	h.tick("agent_a")
-	if st, _, _ := h.alertRow("agent_a"); st != "firing" {
-		t.Fatalf("expected still firing before confirm, got %s", st)
+	if !h.firing("agent_a") {
+		t.Fatal("expected still firing before the recovery window closed")
 	}
 	h.advance(1 * time.Second) // now 10s connected
 	h.tick("agent_a")
-	if st, _, rr := h.alertRow("agent_a"); st != "resolved" || rr != "recovered" {
-		t.Fatalf("expected resolved/recovered, got %s/%s", st, rr)
+	if h.firing("agent_a") {
+		t.Fatal("expected resolved after sustained reconnection")
 	}
-	// Recovery notification flushes after the batch window.
-	h.advance(15 * time.Second)
-	h.tick("agent_a")
-	ps := h.expectPayloads(1)
-	if ps[0].p.Event != "agent.recovered" {
-		t.Fatalf("expected agent.recovered, got %s", ps[0].p.Event)
+	if got := h.faults.lastResolve("agent_a"); got != fault.ReasonRecovered {
+		t.Fatalf("resolve reason = %q, want recovered", got)
 	}
 }
 
-func TestFlapNoDuplicateOrRecovery(t *testing.T) {
+func TestFlapDoesNotDuplicateOrResolve(t *testing.T) {
 	h := newHarness(t)
 	base := h.clock
 	h.seedAgent("agent_a", ptr(base), ptr(base), false, "error")
@@ -255,35 +270,35 @@ func TestFlapNoDuplicateOrRecovery(t *testing.T) {
 	h.tick("agent_a")          // reconnect
 	h.advance(5 * time.Second) // < recover 10
 	h.tick()                   // drops again before confirm
-	if got := h.firingCount("agent_a"); got != 1 {
-		t.Fatalf("expected still exactly 1 firing (no dup, no resolve), got %d", got)
+	if !h.firing("agent_a") || h.openCount("agent_a") != 1 {
+		t.Fatalf("expected exactly one still-firing fault, firing=%v opens=%d", h.firing("agent_a"), h.openCount("agent_a"))
 	}
-	if st, _, _ := h.alertRow("agent_a"); st != "firing" {
-		t.Fatalf("expected still firing after flap, got %s", st)
+	if len(h.faults.resolved) != 0 {
+		t.Fatalf("a flap must not resolve the fault: %+v", h.faults.resolved)
 	}
-	h.expectNoPayload()
 }
 
-func TestRestartSettleNoImmediateAlert(t *testing.T) {
+func TestRestartSettleNoImmediateFault(t *testing.T) {
 	h := newHarness(t)
-	// Agent connected a day ago and has been offline since — a naive last_seen
-	// based engine would fire immediately; the monotonic baseline must not.
+	// Agent connected a day ago and has been offline since — an engine measuring
+	// grace from last_seen would confirm immediately; the monotonic baseline must
+	// not, or every restart would fire the whole fleet at once.
 	dayAgo := h.clock.Add(-24 * time.Hour)
 	h.seedAgent("agent_a", ptr(dayAgo), ptr(dayAgo), false, "error")
 
 	h.tick() // first observed absence: baseline = now, not last_seen
-	if got := h.firingCount("agent_a"); got != 0 {
-		t.Fatalf("expected no alert on first tick after restart, got %d", got)
+	if h.firing("agent_a") {
+		t.Fatal("expected no fault on the first tick after a restart")
 	}
 	h.advance(29 * time.Second)
 	h.tick()
-	if got := h.firingCount("agent_a"); got != 0 {
-		t.Fatalf("expected no alert before grace from startup, got %d", got)
+	if h.firing("agent_a") {
+		t.Fatal("expected no fault before grace measured from startup")
 	}
 	h.advance(1 * time.Second)
 	h.tick()
-	if got := h.firingCount("agent_a"); got != 1 {
-		t.Fatalf("expected alert at startup+grace, got %d", got)
+	if !h.firing("agent_a") {
+		t.Fatal("expected a fault at startup + grace")
 	}
 }
 
@@ -293,25 +308,22 @@ func TestMuteMidFlightThenUnmuteReopens(t *testing.T) {
 	h.seedAgent("agent_a", ptr(base), ptr(base), false, "error")
 	h.takeAgentOffline("agent_a")
 
-	// Mute: resolve firing as 'muted', no notification.
+	// Mute: end the fault as 'muted' — the operator silenced the detector, the
+	// agent did not come back, so this must never read as a recovery.
 	mustExec(t, h.db, `UPDATE agents SET connectivity_alerts_muted=1 WHERE id='agent_a'`)
 	h.tick()
-	if st, _, rr := h.alertRow("agent_a"); st != "resolved" || rr != "muted" {
-		t.Fatalf("expected resolved/muted, got %s/%s", st, rr)
+	if h.firing("agent_a") {
+		t.Fatal("expected the fault to end on mute")
 	}
-	h.expectNoPayload()
+	if got := h.faults.lastResolve("agent_a"); got != fault.ReasonMuted {
+		t.Fatalf("resolve reason = %q, want muted", got)
+	}
 
-	// Unmute while still offline past grace: a fresh alert opens + notifies.
+	// Unmute while still offline past grace: a fresh fault confirms.
 	mustExec(t, h.db, `UPDATE agents SET connectivity_alerts_muted=0 WHERE id='agent_a'`)
 	h.tick()
-	if got := h.firingCount("agent_a"); got != 1 {
-		t.Fatalf("expected fresh firing after unmute, got %d", got)
-	}
-	h.advance(15 * time.Second)
-	h.tick()
-	ps := h.expectPayloads(1)
-	if ps[0].p.Event != "agent.offline" {
-		t.Fatalf("expected agent.offline after unmute, got %s", ps[0].p.Event)
+	if !h.firing("agent_a") || h.openCount("agent_a") != 2 {
+		t.Fatalf("expected a fresh confirmation after unmute, firing=%v opens=%d", h.firing("agent_a"), h.openCount("agent_a"))
 	}
 }
 
@@ -323,10 +335,9 @@ func TestOnMuteChangedResolvesFiring(t *testing.T) {
 
 	mustExec(t, h.db, `UPDATE agents SET connectivity_alerts_muted=1 WHERE id='agent_a'`)
 	h.eng.OnMuteChanged(h.ctx, "agent_a", true)
-	if st, _, rr := h.alertRow("agent_a"); st != "resolved" || rr != "muted" {
-		t.Fatalf("expected resolved/muted via OnMuteChanged, got %s/%s", st, rr)
+	if h.firing("agent_a") || h.faults.lastResolve("agent_a") != fault.ReasonMuted {
+		t.Fatalf("expected muted via OnMuteChanged, firing=%v reason=%q", h.firing("agent_a"), h.faults.lastResolve("agent_a"))
 	}
-	h.expectNoPayload()
 }
 
 func TestDisableMidFlightResolves(t *testing.T) {
@@ -337,10 +348,9 @@ func TestDisableMidFlightResolves(t *testing.T) {
 
 	h.setInt(settings.KeyAgentAlertEnabled, 0)
 	h.tick()
-	if st, _, rr := h.alertRow("agent_a"); st != "resolved" || rr != "disabled" {
-		t.Fatalf("expected resolved/disabled, got %s/%s", st, rr)
+	if h.firing("agent_a") || h.faults.lastResolve("agent_a") != fault.ReasonDisabled {
+		t.Fatalf("expected disabled, firing=%v reason=%q", h.firing("agent_a"), h.faults.lastResolve("agent_a"))
 	}
-	h.expectNoPayload()
 }
 
 func TestNeverConnectedExcluded(t *testing.T) {
@@ -352,10 +362,10 @@ func TestNeverConnectedExcluded(t *testing.T) {
 	h.tick()
 	h.advance(60 * time.Second)
 	h.tick()
-	if got := h.firingCount("agent_a"); got != 0 {
-		t.Fatalf("expected never-connected agent to raise no alert, got %d", got)
+	// Nothing was ever lost, so there is no outage to report.
+	if h.openCount("agent_a") != 0 {
+		t.Fatalf("expected a never-connected agent to raise no fault, got %d", h.openCount("agent_a"))
 	}
-	h.expectNoPayload()
 }
 
 func TestReasonMapping(t *testing.T) {
@@ -377,102 +387,22 @@ func TestReasonMapping(t *testing.T) {
 		"agent_err":    "unexpected",
 	}
 	for id, reason := range want {
-		if _, r, _ := h.alertRow(id); r != reason {
-			t.Fatalf("agent %s: expected reason %s, got %s", id, reason, r)
+		in, ok := h.lastOpenOf(id)
+		if !ok || in.Reason != reason {
+			t.Fatalf("agent %s: expected reason %s, got %+v", id, reason, in)
 		}
 	}
 }
 
-func TestMultiAgentMergedNotification(t *testing.T) {
+func TestFrozenDisplayName(t *testing.T) {
 	h := newHarness(t)
 	base := h.clock
 	h.seedAgent("agent_a", ptr(base), ptr(base), false, "error")
-	h.seedAgent("agent_b", ptr(base), ptr(base), false, "error")
-
-	h.tick("agent_a", "agent_b")
-	h.advance(1 * time.Second)
-	h.tick() // both absent
-	h.advance(30 * time.Second)
-	h.tick() // both open + queue in the same window
-	h.advance(15 * time.Second)
-	h.tick() // flush merged
-	ps := h.expectPayloads(1)
-	if ps[0].p.AgentCount != 2 || len(ps[0].p.Agents) != 2 {
-		t.Fatalf("expected one merged payload with 2 agents, got count=%d agents=%d", ps[0].p.AgentCount, len(ps[0].p.Agents))
-	}
-	h.expectNoPayload()
-}
-
-// TestMuteDuringBatchWindowDropsNotice verifies that muting an agent while its
-// offline notice is still buffered (inside the 15s batch window) drops the notice
-// so no agent.offline notification is ever sent.
-func TestMuteDuringBatchWindowDropsNotice(t *testing.T) {
-	h := newHarness(t)
-	base := h.clock
-	h.seedAgent("agent_a", ptr(base), ptr(base), false, "error")
-
-	h.tick("agent_a")
-	h.advance(1 * time.Second)
-	h.tick() // absent baseline
-	h.advance(30 * time.Second)
-	h.tick() // open + queue offline notice (pendingSince = now, not yet flushed)
-	if h.firingCount("agent_a") != 1 {
-		t.Fatalf("expected 1 firing before mute")
-	}
-
-	// Mute inside the batch window and tick: the alert resolves 'muted' and the
-	// queued offline notice must be dropped.
-	mustExec(t, h.db, `UPDATE agents SET connectivity_alerts_muted=1 WHERE id='agent_a'`)
-	h.tick()
-	if st, _, rr := h.alertRow("agent_a"); st != "resolved" || rr != "muted" {
-		t.Fatalf("expected resolved/muted, got %s/%s", st, rr)
-	}
-	// Advance past the batch window and tick: nothing must flush.
-	h.advance(15 * time.Second)
-	h.tick()
-	h.expectNoPayload()
-}
-
-// TestRecoveryUsesFrozenSettings verifies the recovery notification routes through
-// the severity + channels frozen when the alert opened, not the current settings.
-func TestRecoveryUsesFrozenSettings(t *testing.T) {
-	h := newHarness(t)
-	base := h.clock
-	h.seedAgent("agent_a", ptr(base), ptr(base), false, "error")
-
-	// Freeze severity=error + channels=[chan_A] at open.
-	if err := h.set.Set(h.ctx, settings.KeyAgentAlertSeverity, "error"); err != nil {
-		t.Fatal(err)
-	}
-	if err := h.set.Set(h.ctx, settings.KeyAgentAlertChannelIDs, `["chan_A"]`); err != nil {
-		t.Fatal(err)
-	}
+	mustExec(t, h.db, `UPDATE agents SET display_name='Living Room' WHERE id='agent_a'`)
 	h.takeAgentOffline("agent_a")
-	// The offline notice used the frozen selection.
-	// (takeAgentOffline already drained it; re-open would double count — assert on recovery.)
 
-	// Operator changes the settings while the agent is down.
-	if err := h.set.Set(h.ctx, settings.KeyAgentAlertSeverity, "info"); err != nil {
-		t.Fatal(err)
-	}
-	if err := h.set.Set(h.ctx, settings.KeyAgentAlertChannelIDs, `["chan_B"]`); err != nil {
-		t.Fatal(err)
-	}
-
-	// Reconnect + confirm recovery.
-	h.tick("agent_a")
-	h.advance(10 * time.Second)
-	h.tick("agent_a") // resolve recovered + queue
-	h.advance(15 * time.Second)
-	h.tick("agent_a") // flush
-	ps := h.expectPayloads(1)
-	if ps[0].p.Event != "agent.recovered" {
-		t.Fatalf("expected agent.recovered, got %s", ps[0].p.Event)
-	}
-	if ps[0].p.Severity != "error" {
-		t.Fatalf("recovery severity = %q, want frozen 'error'", ps[0].p.Severity)
-	}
-	if len(ps[0].channels) != 1 || ps[0].channels[0] != "chan_A" {
-		t.Fatalf("recovery channels = %v, want frozen [chan_A]", ps[0].channels)
+	in, ok := h.lastOpenOf("agent_a")
+	if !ok || in.Name != "Living Room" {
+		t.Fatalf("expected the display name frozen onto the fault, got %+v", in)
 	}
 }

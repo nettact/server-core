@@ -6,7 +6,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
 	"strings"
 	"testing"
 
@@ -15,16 +14,12 @@ import (
 	"github.com/nettact/server-core/audit"
 	"github.com/nettact/server-core/notification"
 	"github.com/nettact/server-core/settings"
-	"github.com/nettact/server-core/store"
+	"github.com/nettact/server-core/store/storetest"
 )
 
 func channelTestDeps(t *testing.T) Deps {
 	t.Helper()
-	db, err := store.Open(filepath.Join(t.TempDir(), "channels.db"))
-	if err != nil {
-		t.Fatalf("store.Open: %v", err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
+	db := storetest.Open(t)
 	return Deps{Notification: notification.New(db), Settings: settings.New(db), Audit: audit.New(db)}
 }
 
@@ -143,19 +138,6 @@ func TestTestChannelEndpoint(t *testing.T) {
 	}
 	if !strings.Contains(string(gotBody), `"event":"test"`) {
 		t.Fatalf("sample payload not marked as a test: %s", gotBody)
-	}
-}
-
-func TestApplyChannelToAllRulesNotFound(t *testing.T) {
-	d := channelTestDeps(t)
-	rctx := chi.NewRouteContext()
-	rctx.URLParams.Add("id", "chan_missing")
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/channels/chan_missing/apply-to-all", nil)
-	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
-	w := httptest.NewRecorder()
-	d.handleApplyChannelToAllRules(w, req)
-	if w.Code != http.StatusNotFound {
-		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
 	}
 }
 

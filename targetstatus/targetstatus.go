@@ -4,8 +4,8 @@
 // persisted current-status table: every fact is derived at read time from the
 // authoritative sources — site targets and their applicable Agents, reported vs
 // predicted MonitorStatus (execution eligibility + Agent liveness), the latest
-// EXACT-generation probe samples (probe result + freshness), the current
-// rule_condition_state (rule breaching), and firing alerts/incidents (alerting).
+// EXACT-generation probe samples (probe result + freshness), and the built-in
+// detectors' live state (confirming / faulted).
 //
 // The three per-Agent dimensions are independent and all reported:
 //
@@ -14,12 +14,14 @@
 //     target_blocked | unsupported);
 //   - probe_state — the freshness/result verdict of the latest current-generation
 //     sample (no_data | healthy | failed | stale | not_applicable);
-//   - rule_state — whether a current rule condition is breaching / firing
-//     (normal | breaching | alerting).
+//   - fault_state — where the built-in detector stands (normal | confirming |
+//     faulted). "confirming" is the honest middle answer the old model could not
+//     give: the target is failing right now but has not yet met its confirmation
+//     threshold, so it is neither healthy nor a recorded fault.
 //
 // A target-level display_state rolls the per-Agent facts up through the fixed
 // display-priority decision table. Reads run in one read-pool snapshot
-// transaction so alerts and condition state — which the fault engine commits
+// transaction so signals and detector counters — which the fault engine commits
 // together — can never be observed inconsistently.
 package targetstatus
 
@@ -33,6 +35,8 @@ import (
 
 	pcfg "github.com/nettact/protocol/config"
 	"github.com/nettact/protocol/wire"
+	"github.com/nettact/server-core/fault"
+	"github.com/nettact/server-core/metrics"
 	"github.com/nettact/server-core/store"
 )
 
@@ -59,14 +63,14 @@ const (
 	probeStale         = "stale"
 	probeNotApplicable = "not_applicable"
 
-	ruleNormal    = "normal"
-	ruleBreaching = "breaching"
-	ruleAlerting  = "alerting"
+	faultNormal     = "normal"
+	faultConfirming = "confirming"
+	faultFaulted    = "faulted"
 
 	displayDisabled       = "disabled"
 	displayUnassigned     = "unassigned"
-	displayAlerting       = "alerting"
-	displayBreaching      = "breaching"
+	displayFaulted        = "faulted"
+	displayConfirming     = "confirming"
 	displayPartialFailure = "partial_failure"
 	displayProbeFailed    = "probe_failed"
 	displayBlocked        = "blocked"
@@ -83,8 +87,8 @@ const (
 	reasonTargetBlocked     = "target_blocked"
 	reasonUnsupported       = "unsupported"
 	reasonAwaitingStatus    = "awaiting_status_report"
-	reasonAlertFiring       = "alert_firing"
-	reasonRuleBreaching     = "rule_breaching"
+	reasonFaultConfirmed    = "fault_confirmed"
+	reasonFaultConfirming   = "fault_confirming"
 	reasonProbeFailed       = "probe_failed"
 	reasonProbeStale        = "probe_stale"
 	reasonProbeNoData       = "probe_no_data"
@@ -110,22 +114,24 @@ type SiteStatuses struct {
 // Agent. worst_severity is present only for alerting/breaching targets;
 // last_observed_at is omitted when no current-generation sample exists anywhere.
 type TargetStatus struct {
-	TargetID             string        `json:"target_id"`
-	GroupID              string        `json:"group_id"`
-	Name                 string        `json:"name"`
-	Kind                 string        `json:"kind"`
-	Target               string        `json:"target"`
-	Enabled              bool          `json:"enabled"`
-	DisplayState         string        `json:"display_state"`
-	ApplicableAgents     int           `json:"applicable_agents"`
-	AffectedAgents       int           `json:"affected_agents"`
-	WorstSeverity        string        `json:"worst_severity,omitempty"`
-	LastObservedAt       *time.Time    `json:"last_observed_at,omitempty"`
-	ActiveConditionCount int           `json:"active_condition_count"`
-	RuleIDs              []string      `json:"rule_ids"`
-	AlertIDs             []string      `json:"alert_ids"`
-	IncidentIDs          []string      `json:"incident_ids"`
-	Agents               []AgentStatus `json:"agents"`
+	TargetID         string     `json:"target_id"`
+	GroupID          string     `json:"group_id"`
+	Name             string     `json:"name"`
+	Kind             string     `json:"kind"`
+	Target           string     `json:"target"`
+	Enabled          bool       `json:"enabled"`
+	DisplayState     string     `json:"display_state"`
+	ApplicableAgents int        `json:"applicable_agents"`
+	AffectedAgents   int        `json:"affected_agents"`
+	WorstSeverity    string     `json:"worst_severity,omitempty"`
+	LastObservedAt   *time.Time `json:"last_observed_at,omitempty"`
+	// Availability24h is the share of verdict-reaching probe rounds in the last 24
+	// hours that succeeded, across every Agent. Nil when the window holds no
+	// verdict at all — "unknown" and "0%" are different answers and must look it.
+	Availability24h *float64      `json:"availability_24h,omitempty"`
+	SignalIDs       []string      `json:"signal_ids"`
+	IncidentIDs     []string      `json:"incident_ids"`
+	Agents          []AgentStatus `json:"agents"`
 }
 
 // AgentStatus is one target's status as seen from one applicable Agent. The three
@@ -133,51 +139,61 @@ type TargetStatus struct {
 // effective schedule when confirmed, else the desired-config fallback) and is
 // omitted for host targets; pending_since is present iff execution_state=pending.
 type AgentStatus struct {
-	AgentID            string            `json:"agent_id"`
-	AgentName          string            `json:"agent_name"`
-	AgentOnline        bool              `json:"agent_online"`
-	ExecutionState     string            `json:"execution_state"`
-	ProbeState         string            `json:"probe_state"`
-	RuleState          string            `json:"rule_state"`
-	ReasonCode         string            `json:"reason_code"`
-	StaleAfterSeconds  *int              `json:"stale_after_seconds,omitempty"`
-	PendingSince       *time.Time        `json:"pending_since,omitempty"`
-	MissingPermissions []string          `json:"missing_permissions"`
-	MatchedSelector    string            `json:"matched_selector"`
-	BlockReason        string            `json:"block_reason"`
-	LastValue          *float64          `json:"last_value,omitempty"`
-	LastMetricKind     string            `json:"last_metric_kind,omitempty"`
-	LastUnit           string            `json:"last_unit,omitempty"`
-	LastObservedAt     *time.Time        `json:"last_observed_at,omitempty"`
-	ActiveConditions   []ActiveCondition `json:"active_conditions"`
+	AgentID            string     `json:"agent_id"`
+	AgentName          string     `json:"agent_name"`
+	AgentOnline        bool       `json:"agent_online"`
+	ExecutionState     string     `json:"execution_state"`
+	ProbeState         string     `json:"probe_state"`
+	FaultState         string     `json:"fault_state"`
+	ReasonCode         string     `json:"reason_code"`
+	StaleAfterSeconds  *int       `json:"stale_after_seconds,omitempty"`
+	PendingSince       *time.Time `json:"pending_since,omitempty"`
+	MissingPermissions []string   `json:"missing_permissions"`
+	MatchedSelector    string     `json:"matched_selector"`
+	BlockReason        string     `json:"block_reason"`
+	LastValue          *float64   `json:"last_value,omitempty"`
+	LastMetricKind     string     `json:"last_metric_kind,omitempty"`
+	LastUnit           string     `json:"last_unit,omitempty"`
+	LastObservedAt     *time.Time `json:"last_observed_at,omitempty"`
+	// Confirm reports how far the built-in detector is from confirming a fault.
+	// Present whenever a failing streak is in progress, including after a fault is
+	// already confirmed (where it shows the streak is unbroken).
+	Confirm *ConfirmProgress `json:"confirm,omitempty"`
+	// Fault links to the confirmed fault when fault_state is faulted.
+	Fault *FaultRef `json:"fault,omitempty"`
+	// Availability24h is this pair's 24-hour probe-round success ratio.
+	Availability24h *float64 `json:"availability_24h,omitempty"`
 }
 
-// ActiveCondition is one currently-satisfied rule condition on a target×Agent
-// pair. The display label is derived by the frontend from metric_kind +
-// comparator; the server never invents display text. alert_id/incident_id are
-// present only when the condition's rule has a firing alert for the agent.
-type ActiveCondition struct {
-	ConditionID   string     `json:"condition_id"`
-	RuleID        string     `json:"rule_id"`
-	RuleName      string     `json:"rule_name"`
-	Severity      string     `json:"severity"`
-	MetricKind    string     `json:"metric_kind"`
-	Comparator    string     `json:"comparator"`
-	Threshold     float64    `json:"threshold"`
-	LastValue     *float64   `json:"last_value,omitempty"`
-	Unit          string     `json:"unit,omitempty"`
-	FirstBreachAt *time.Time `json:"first_breach_at,omitempty"`
-	AlertID       string     `json:"alert_id,omitempty"`
-	IncidentID    string     `json:"incident_id,omitempty"`
+// ConfirmProgress is a detector's live confirmation streak: how many consecutive
+// failing rounds have accumulated against how many are needed. It exists so the
+// console can say "failing, 2 of 3" instead of showing a failing target as
+// simply healthy until the threshold trips.
+type ConfirmProgress struct {
+	FailRounds  int        `json:"fail_rounds"`
+	NeedRounds  int        `json:"need_rounds"`
+	FirstFailAt *time.Time `json:"first_fail_at,omitempty"`
+}
+
+// FaultRef links a target×Agent pair to its confirmed fault and the incident
+// that owns it, so every status row can deep-link into the fault centre.
+type FaultRef struct {
+	SignalID    string    `json:"signal_id"`
+	IncidentID  string    `json:"incident_id"`
+	Severity    string    `json:"severity"`
+	Title       string    `json:"title"`
+	ObservedAt  time.Time `json:"observed_at"`
+	ConfirmedAt time.Time `json:"confirmed_at"`
 }
 
 // Service reads the authoritative current status. It owns no persisted state.
 type Service struct {
-	db *store.DB
+	db      *store.DB
+	metrics *metrics.Store // nil-safe: availability is then simply omitted
 }
 
 // New constructs the service over the shared store.
-func New(db *store.DB) *Service { return &Service{db: db} }
+func New(db *store.DB, m *metrics.Store) *Service { return &Service{db: db, metrics: m} }
 
 // ---- internal read models ----
 
@@ -187,6 +203,7 @@ type targetRow struct {
 	configSerial                    int
 	configChangedAt                 sql.NullTime
 	params                          pcfg.ProbeParams
+	detection                       fault.DetectionSettings
 	groupIsDefault                  bool
 	groupName                       string
 }
@@ -214,28 +231,25 @@ type sampleVal struct {
 	value      float64
 }
 
-type condMeta struct {
-	ruleID, targetID, metricKind, comparator string
-	ruleName, severity                       string
-	threshold                                float64
+// detState is one (target, agent) built-in detector's live counters.
+type detState struct {
+	failRounds  int
+	needRounds  int
+	firstFailTS sql.NullInt64
+	updatedAt   sql.NullTime
 }
 
-type condState struct {
-	satisfied     bool
-	lastValue     sql.NullFloat64
-	firstBreachAt sql.NullTime
-	lastEvalAt    sql.NullTime
-}
-
-type firingAlert struct {
-	alertID, incidentID string
+// firingSignal is one (target, agent) confirmed fault.
+type firingSignal struct {
+	signalID, incidentID, severity, title string
+	observedAt, confirmedAt               time.Time
 }
 
 // agentAgg is the per-agent classification fed to the target-level decision table.
 type agentAgg struct {
-	exec, probe, rule string
-	online            bool
-	pendingExpired    bool
+	exec, probe, fault string
+	online             bool
+	pendingExpired     bool
 }
 
 // SiteStatuses computes the whole site's current target status in one read-pool
@@ -245,9 +259,9 @@ type agentAgg struct {
 func (s *Service) SiteStatuses(ctx context.Context, siteID string) (SiteStatuses, error) {
 	now := time.Now().UTC()
 	// One read snapshot: WAL isolation holds for the life of a single read
-	// transaction, so alerts and condition state (committed together by the fault
-	// engine) can never be observed torn across the queries below. The read pool
-	// is already query_only; ReadOnly is belt-and-braces.
+	// transaction, so fault signals and detector counters (committed together by
+	// the fault engine) can never be observed torn across the queries below. The
+	// read pool is already query_only; ReadOnly is belt-and-braces.
 	tx, err := s.db.Read().BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		return SiteStatuses{}, err
@@ -279,20 +293,31 @@ func (s *Service) SiteStatuses(ctx context.Context, siteID string) (SiteStatuses
 	if err != nil {
 		return SiteStatuses{}, err
 	}
-	condMetaByID, condStateByKey, condIDsByTarget, err := s.loadConditions(ctx, tx, siteID)
+	detectors, err := s.loadDetectorState(ctx, tx, siteID)
 	if err != nil {
 		return SiteStatuses{}, err
 	}
-	firing, err := s.loadFiringAlerts(ctx, tx, siteID)
+	signals, err := s.loadFiringSignals(ctx, tx, siteID)
 	if err != nil {
 		return SiteStatuses{}, err
+	}
+	// Availability is read outside the snapshot: it aggregates rollup buckets that
+	// no other dimension depends on, so an extra query on the read pool is cheaper
+	// than widening the snapshot, and a one-round skew in a 24-hour ratio is not
+	// observable.
+	avail := map[string]metrics.AvailabilityRatio{}
+	if s.metrics != nil {
+		avail, err = s.metrics.AvailabilityForSite(ctx, siteID, now.Add(-24*time.Hour).Unix(), now.Unix())
+		if err != nil {
+			return SiteStatuses{}, err
+		}
 	}
 
 	out := SiteStatuses{GeneratedAt: now, SiteID: siteID, Targets: make([]TargetStatus, 0, len(targets))}
 	for i := range targets {
 		t := &targets[i]
 		out.Targets = append(out.Targets, s.assembleTarget(t, pairs[t.id], now,
-			msByKey, samples, condMetaByID, condStateByKey, condIDsByTarget[t.id], firing))
+			msByKey, samples, detectors, signals, avail[t.id]))
 	}
 	sortTargets(out.Targets, targets)
 	return out, nil
@@ -300,17 +325,21 @@ func (s *Service) SiteStatuses(ctx context.Context, siteID string) (SiteStatuses
 
 // assembleTarget builds one target's status: derive each applicable Agent's three
 // dimensions, then roll them up through the decision table and collect the
-// target-level linkage (rules / alerts / incidents / worst severity).
+// target-level linkage (signals / incidents / worst severity / availability).
 func (s *Service) assembleTarget(t *targetRow, pairs []applicablePair, now time.Time,
 	msByKey map[string]*msRow, samples map[string]*sampleVal,
-	condMetaByID map[string]condMeta, condStateByKey map[string]condState,
-	condIDs []string, firing map[string]firingAlert) TargetStatus {
+	detectors map[string]detState, signals map[string]firingSignal,
+	avail metrics.AvailabilityRatio) TargetStatus {
 
 	ts := TargetStatus{
 		TargetID: t.id, GroupID: t.groupID, Name: t.name, Kind: t.kind, Target: t.target,
 		Enabled: t.enabled, ApplicableAgents: len(pairs),
-		RuleIDs: []string{}, AlertIDs: []string{}, IncidentIDs: []string{},
+		SignalIDs: []string{}, IncidentIDs: []string{},
 		Agents: make([]AgentStatus, 0, len(pairs)),
+	}
+	if avail.Rounds > 0 {
+		r := avail.Ratio
+		ts.Availability24h = &r
 	}
 
 	// Deterministic per-agent order: agent_name, agent_id.
@@ -322,28 +351,22 @@ func (s *Service) assembleTarget(t *targetRow, pairs []applicablePair, now time.
 	})
 
 	aggs := make([]agentAgg, 0, len(pairs))
-	ruleSet := map[string]bool{}
-	alertSet := map[string]bool{}
+	signalSet := map[string]bool{}
 	incidentSet := map[string]bool{}
 	worstRank := -1
 	var lastObserved *time.Time
-	condCount := 0
 
 	for _, p := range pairs {
-		as, agg := s.deriveAgent(t, p, now, msByKey, samples, condIDs, condMetaByID, condStateByKey, firing)
+		as, agg := s.deriveAgent(t, p, now, msByKey, samples, detectors, signals)
 		ts.Agents = append(ts.Agents, as)
 		aggs = append(aggs, agg)
 
-		condCount += len(as.ActiveConditions)
-		for _, ac := range as.ActiveConditions {
-			ruleSet[ac.RuleID] = true
-			if ac.AlertID != "" {
-				alertSet[ac.AlertID] = true
+		if as.Fault != nil {
+			signalSet[as.Fault.SignalID] = true
+			if as.Fault.IncidentID != "" {
+				incidentSet[as.Fault.IncidentID] = true
 			}
-			if ac.IncidentID != "" {
-				incidentSet[ac.IncidentID] = true
-			}
-			if r, ok := severityRank[ac.Severity]; ok && r > worstRank {
+			if r, ok := severityRank[as.Fault.Severity]; ok && r > worstRank {
 				worstRank = r
 			}
 		}
@@ -356,28 +379,25 @@ func (s *Service) assembleTarget(t *targetRow, pairs []applicablePair, now time.
 	display, affected := aggregate(t, aggs)
 	ts.DisplayState = display
 	ts.AffectedAgents = affected
-	ts.ActiveConditionCount = condCount
-	ts.RuleIDs = sortedKeys(ruleSet)
-	ts.AlertIDs = sortedKeys(alertSet)
+	ts.SignalIDs = sortedKeys(signalSet)
 	ts.IncidentIDs = sortedKeys(incidentSet)
 	ts.LastObservedAt = lastObserved
-	if (display == displayAlerting || display == displayBreaching) && worstRank >= 0 {
+	if display == displayFaulted && worstRank >= 0 {
 		ts.WorstSeverity = severityName(worstRank)
 	}
 	return ts
 }
 
 // deriveAgent computes one (target, agent) pair's three independent dimensions,
-// reason code, freshness window, pending clock and active conditions, plus the
+// reason code, freshness window, pending clock and fault linkage, plus the
 // aggregation classification fed to the decision table.
 func (s *Service) deriveAgent(t *targetRow, p applicablePair, now time.Time,
 	msByKey map[string]*msRow, samples map[string]*sampleVal,
-	condIDs []string, condMetaByID map[string]condMeta, condStateByKey map[string]condState,
-	firing map[string]firingAlert) (AgentStatus, agentAgg) {
+	detectors map[string]detState, signals map[string]firingSignal) (AgentStatus, agentAgg) {
 
 	as := AgentStatus{
 		AgentID: p.agentID, AgentName: p.agentName, AgentOnline: p.online,
-		MissingPermissions: []string{}, ActiveConditions: []ActiveCondition{},
+		MissingPermissions: []string{},
 	}
 
 	pairKey := t.id + "\x00" + p.agentID
@@ -387,9 +407,9 @@ func (s *Service) deriveAgent(t *targetRow, p applicablePair, now time.Time,
 	// Assignment cutoff for current-state reads (SRV-007): the later of the target's
 	// material-generation time and this pair's assigned_at. A pair that left a
 	// target's scope and re-entered without a material edit keeps the same generation
-	// (and thus its stored samples/series and any surviving condition state), so the
+	// (and thus its stored samples/series and any surviving detector state), so the
 	// generation join alone cannot exclude pre-assignment facts. assigned_at is reset
-	// to the re-entry time, so any sample or condition verdict observed before it is
+	// to the re-entry time, so any sample or detector verdict observed before it is
 	// pre-assignment history and must not surface as current. Historical storage is
 	// untouched — only these reads exclude it.
 	cutoff := pendingSince(t, ms)
@@ -456,9 +476,14 @@ func (s *Service) deriveAgent(t *targetRow, p applicablePair, now time.Time,
 	}
 
 	// probe_state (independent of execution). host / disabled → not_applicable.
+	// The success verdict comes from fault.Classify, the same function the detector
+	// and the availability counter use, so this dimension can never disagree with
+	// the fault it is displayed next to — including on a target whose ICMP loss
+	// threshold has been tuned below 100%.
+	det := detectors[pairKey]
 	if t.kind == "host" || !t.enabled {
 		as.ProbeState = probeNotApplicable
-	} else if sk := successKind(t.kind); sk == "" {
+	} else if sk := fault.SuccessMetricKind(t.kind); sk == "" {
 		as.ProbeState = probeNotApplicable
 	} else if sv := samples[pairKey+"\x00"+sk]; sv == nil || sampleBeforeCutoff(sv.ts, cutoff) {
 		// No current-generation sample, or the only one predates this pair's assignment
@@ -474,87 +499,46 @@ func (s *Service) deriveAgent(t *targetRow, p applicablePair, now time.Time,
 		switch {
 		case now.Sub(lo) > staleAfter:
 			as.ProbeState = probeStale
-		case t.kind == "icmp" || t.kind == "gateway":
-			if sv.value >= 100 {
-				as.ProbeState = probeFailed
-			} else {
-				as.ProbeState = probeHealthy
-			}
+		case fault.Classify(t.kind, sv.value, t.detection) == fault.RoundFail:
+			as.ProbeState = probeFailed
 		default:
-			if sv.value >= 0.5 {
-				as.ProbeState = probeHealthy
-			} else {
-				as.ProbeState = probeFailed
-			}
+			as.ProbeState = probeHealthy
 		}
 	}
 
-	// rule_state + active conditions (from current condition state / firing alerts;
-	// never from frozen evidence).
-	anySatisfied, anyAlerting := false, false
-	for _, cid := range condIDs {
-		st, ok := condStateByKey[cid+"\x00"+p.agentID]
-		if !ok || !st.satisfied {
-			continue
+	// fault_state: confirmed fault, an in-progress confirmation streak, or normal.
+	// Both come from live detector state, never from frozen signal evidence.
+	if det.failRounds > 0 && !detectorBeforeCutoff(det, cutoff) {
+		need := det.needRounds
+		if need <= 0 {
+			need = t.detection.FailRounds
 		}
-		// Ignore a satisfied verdict last evaluated before this pair's assignment
-		// cutoff: it is pre-assignment condition state (SRV-007) and must not read as a
-		// current breach after scope re-entry. Post-reassignment evaluations refresh
-		// last_eval_at past the cutoff and are kept.
-		if st.lastEvalAt.Valid && beforeCutoff(st.lastEvalAt.Time.UTC(), cutoff) {
-			continue
+		cp := ConfirmProgress{FailRounds: det.failRounds, NeedRounds: need}
+		if det.firstFailTS.Valid {
+			ff := time.Unix(det.firstFailTS.Int64, 0).UTC()
+			cp.FirstFailAt = &ff
 		}
-		anySatisfied = true
-		meta := condMetaByID[cid]
-		ac := ActiveCondition{
-			ConditionID: cid, RuleID: meta.ruleID, RuleName: meta.ruleName,
-			Severity: meta.severity, MetricKind: meta.metricKind,
-			Comparator: meta.comparator, Threshold: meta.threshold,
-		}
-		if st.lastValue.Valid {
-			lv := st.lastValue.Float64
-			ac.LastValue = &lv
-		}
-		if u := samples[pairKey+"\x00"+meta.metricKind]; u != nil {
-			ac.Unit = u.unit
-		}
-		if st.firstBreachAt.Valid {
-			fb := st.firstBreachAt.Time.UTC()
-			ac.FirstBreachAt = &fb
-		}
-		if al, ok := firing[meta.ruleID+"\x00"+p.agentID]; ok {
-			ac.AlertID = al.alertID
-			ac.IncidentID = al.incidentID
-			anyAlerting = true
-		}
-		as.ActiveConditions = append(as.ActiveConditions, ac)
+		as.Confirm = &cp
 	}
-	sort.Slice(as.ActiveConditions, func(i, j int) bool {
-		a, b := as.ActiveConditions[i], as.ActiveConditions[j]
-		if ra, rb := severityRank[a.Severity], severityRank[b.Severity]; ra != rb {
-			return ra > rb // severity rank DESC
+	if sig, ok := signals[pairKey]; ok {
+		as.FaultState = faultFaulted
+		as.Fault = &FaultRef{
+			SignalID: sig.signalID, IncidentID: sig.incidentID, Severity: sig.severity,
+			Title: sig.title, ObservedAt: sig.observedAt, ConfirmedAt: sig.confirmedAt,
 		}
-		if a.RuleID != b.RuleID {
-			return a.RuleID < b.RuleID
-		}
-		return a.ConditionID < b.ConditionID
-	})
-	switch {
-	case anyAlerting:
-		as.RuleState = ruleAlerting
-	case anySatisfied:
-		as.RuleState = ruleBreaching
-	default:
-		as.RuleState = ruleNormal
+	} else if as.Confirm != nil {
+		as.FaultState = faultConfirming
+	} else {
+		as.FaultState = faultNormal
 	}
 
 	// Reason code for a collecting pair reflects the most significant live signal.
 	if as.ExecutionState == execCollecting {
 		switch {
-		case as.RuleState == ruleAlerting:
-			as.ReasonCode = reasonAlertFiring
-		case as.RuleState == ruleBreaching:
-			as.ReasonCode = reasonRuleBreaching
+		case as.FaultState == faultFaulted:
+			as.ReasonCode = reasonFaultConfirmed
+		case as.FaultState == faultConfirming:
+			as.ReasonCode = reasonFaultConfirming
 		case as.ProbeState == probeFailed:
 			as.ReasonCode = reasonProbeFailed
 		case as.ProbeState == probeStale:
@@ -568,7 +552,7 @@ func (s *Service) deriveAgent(t *targetRow, p applicablePair, now time.Time,
 		}
 	}
 
-	agg := agentAgg{exec: as.ExecutionState, probe: as.ProbeState, rule: as.RuleState, online: p.online}
+	agg := agentAgg{exec: as.ExecutionState, probe: as.ProbeState, fault: as.FaultState, online: p.online}
 	if as.ExecutionState == execPending && as.PendingSince != nil {
 		agg.pendingExpired = now.Sub(*as.PendingSince) > graceWindow
 	}
@@ -591,17 +575,17 @@ func aggregate(t *targetRow, agents []agentAgg) (string, int) {
 
 	var collecting, healthy, failed, stale, nodata, notappl int
 	var blocked, offline, pendingFresh, pendingExpired int
-	var alerting, breaching int
+	var faulted, confirming int
 	onlineAny := false
 	for _, a := range agents {
 		if a.online {
 			onlineAny = true
 		}
-		switch a.rule {
-		case ruleAlerting:
-			alerting++
-		case ruleBreaching:
-			breaching++
+		switch a.fault {
+		case faultFaulted:
+			faulted++
+		case faultConfirming:
+			confirming++
 		}
 		switch a.exec {
 		case execCollecting:
@@ -634,10 +618,10 @@ func aggregate(t *targetRow, agents []agentAgg) (string, int) {
 	xMinusA := x - notappl // collecting, probe-applicable agents
 
 	switch {
-	case alerting > 0:
-		return displayAlerting, alerting
-	case breaching > 0:
-		return displayBreaching, breaching
+	case faulted > 0:
+		return displayFaulted, faulted
+	case confirming > 0:
+		return displayConfirming, confirming
 	case failed > 0 && failed == xMinusA && xMinusA > 0:
 		return displayProbeFailed, failed
 	case failed > 0:
@@ -667,12 +651,16 @@ func aggregate(t *targetRow, agents []agentAgg) (string, int) {
 // ---- queries (all inside the read snapshot tx; no per-target loop) ----
 
 func (s *Service) loadTargets(ctx context.Context, tx *sql.Tx, siteID string) ([]targetRow, error) {
+	def := fault.DefaultDetection()
 	rows, err := tx.QueryContext(ctx, `
 		SELECT pt.id, pt.group_id, COALESCE(pt.name,''), pt.kind, COALESCE(pt.target,''),
 		       pt.enabled, pt.config_serial, pt.config_changed_at, COALESCE(pt.params,''),
-		       mg.is_default, mg.name
-		FROM probe_tasks pt JOIN monitor_groups mg ON mg.id = pt.group_id
-		WHERE pt.site_id=?`, siteID)
+		       mg.is_default, mg.name,
+		       COALESCE(ds.fail_rounds, ?), COALESCE(ds.recover_rounds, ?), COALESCE(ds.icmp_loss_pct, ?)
+		FROM probe_tasks pt
+		JOIN monitor_groups mg ON mg.id = pt.group_id
+		LEFT JOIN probe_detection_settings ds ON ds.target_id = pt.id
+		WHERE pt.site_id=?`, def.FailRounds, def.RecoverRounds, def.ICMPLossPct, siteID)
 	if err != nil {
 		return nil, err
 	}
@@ -683,11 +671,13 @@ func (s *Service) loadTargets(ctx context.Context, tx *sql.Tx, siteID string) ([
 		var enabled, isDefault int
 		var params string
 		if err := rows.Scan(&t.id, &t.groupID, &t.name, &t.kind, &t.target,
-			&enabled, &t.configSerial, &t.configChangedAt, &params, &isDefault, &t.groupName); err != nil {
+			&enabled, &t.configSerial, &t.configChangedAt, &params, &isDefault, &t.groupName,
+			&t.detection.FailRounds, &t.detection.RecoverRounds, &t.detection.ICMPLossPct); err != nil {
 			return nil, err
 		}
 		t.enabled = enabled == 1
 		t.groupIsDefault = isDefault == 1
+		t.detection = t.detection.Normalize()
 		if params != "" {
 			_ = json.Unmarshal([]byte(params), &t.params)
 		}
@@ -793,99 +783,73 @@ func (s *Service) loadLatestSamples(ctx context.Context, tx *sql.Tx, siteID stri
 	return out, rows.Err()
 }
 
-// loadConditions returns the site's enabled group-rule conditions (meta by id,
-// per-(condition,agent) current state, and condition ids grouped by target). Rule
-// state is derived from these, never from frozen alert_evidence.
-func (s *Service) loadConditions(ctx context.Context, tx *sql.Tx, siteID string) (
-	map[string]condMeta, map[string]condState, map[string][]string, error) {
-
+// loadDetectorState returns the site's built-in availability detector counters,
+// keyed (target, agent). The needed threshold is joined from the target's own
+// sensitivity so the console can render "2 of 5" for a target tuned to stable.
+func (s *Service) loadDetectorState(ctx context.Context, tx *sql.Tx, siteID string) (map[string]detState, error) {
+	def := fault.DefaultDetection()
 	rows, err := tx.QueryContext(ctx, `
-		SELECT c.id, c.rule_id, c.target_id, c.metric_kind, c.comparator, c.threshold,
-		       gr.name, gr.severity,
-		       rcs.agent_id, rcs.satisfied, rcs.last_value, rcs.first_breach_at, rcs.last_eval_at
-		FROM group_rule_conditions c
-		JOIN group_rules gr ON gr.id = c.rule_id
-		LEFT JOIN rule_condition_state rcs ON rcs.condition_id = c.id
-		WHERE gr.site_id=? AND gr.enabled=1`, siteID)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	defer rows.Close()
-	metaByID := map[string]condMeta{}
-	stateByKey := map[string]condState{}
-	for rows.Next() {
-		var cid string
-		var m condMeta
-		var agentID sql.NullString
-		var satisfied sql.NullInt64
-		var lastValue sql.NullFloat64
-		var firstBreach sql.NullTime
-		var lastEval sql.NullTime
-		if err := rows.Scan(&cid, &m.ruleID, &m.targetID, &m.metricKind, &m.comparator, &m.threshold,
-			&m.ruleName, &m.severity, &agentID, &satisfied, &lastValue, &firstBreach, &lastEval); err != nil {
-			return nil, nil, nil, err
-		}
-		metaByID[cid] = m
-		if agentID.Valid {
-			stateByKey[cid+"\x00"+agentID.String] = condState{
-				satisfied:     satisfied.Valid && satisfied.Int64 == 1,
-				lastValue:     lastValue,
-				firstBreachAt: firstBreach,
-				lastEvalAt:    lastEval,
-			}
-		}
-	}
-	if err := rows.Err(); err != nil {
-		return nil, nil, nil, err
-	}
-	idsByTarget := map[string][]string{}
-	for cid, m := range metaByID {
-		idsByTarget[m.targetID] = append(idsByTarget[m.targetID], cid)
-	}
-	return metaByID, stateByKey, idsByTarget, nil
-}
-
-func (s *Service) loadFiringAlerts(ctx context.Context, tx *sql.Tx, siteID string) (map[string]firingAlert, error) {
-	rows, err := tx.QueryContext(ctx, `
-		SELECT COALESCE(rule_id,''), agent_id, id, COALESCE(incident_id,'')
-		FROM alerts WHERE site_id=? AND state='firing'`, siteID)
+		SELECT ds.target_id, ds.agent_id, ds.fail_rounds, ds.first_fail_ts, ds.updated_at,
+		       COALESCE(pds.fail_rounds, ?)
+		FROM detector_state ds
+		JOIN probe_tasks pt ON pt.id = ds.target_id
+		LEFT JOIN probe_detection_settings pds ON pds.target_id = ds.target_id
+		WHERE pt.site_id=? AND ds.detector_key=?`, def.FailRounds, siteID, fault.DetectorAvailability)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	out := map[string]firingAlert{}
+	out := map[string]detState{}
 	for rows.Next() {
-		var ruleID, agentID, alertID, incidentID string
-		if err := rows.Scan(&ruleID, &agentID, &alertID, &incidentID); err != nil {
+		var targetID, agentID string
+		var d detState
+		if err := rows.Scan(&targetID, &agentID, &d.failRounds, &d.firstFailTS, &d.updatedAt, &d.needRounds); err != nil {
 			return nil, err
 		}
-		if ruleID == "" {
-			continue // a firing alert always has a live rule; defensive
+		out[targetID+"\x00"+agentID] = d
+	}
+	return out, rows.Err()
+}
+
+// loadFiringSignals returns the site's confirmed target faults, keyed
+// (target, agent). Agent-connectivity signals carry no target and are excluded:
+// an offline Agent is its own fault, not every target's.
+func (s *Service) loadFiringSignals(ctx context.Context, tx *sql.Tx, siteID string) (map[string]firingSignal, error) {
+	rows, err := tx.QueryContext(ctx, `
+		SELECT target_id, agent_id, id, incident_id, severity, target_name, target_addr,
+		       target_port, probe_kind, detector_key, agent_name, observed_at, confirmed_at
+		FROM fault_signals
+		WHERE site_id=? AND state='firing' AND target_id <> ''`, siteID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]firingSignal{}
+	for rows.Next() {
+		var targetID, agentID string
+		var sig fault.Signal
+		if err := rows.Scan(&targetID, &agentID, &sig.ID, &sig.IncidentID, &sig.Severity,
+			&sig.TargetName, &sig.TargetAddr, &sig.Port, &sig.ProbeKind, &sig.DetectorKey,
+			&sig.AgentName, &sig.ObservedAt, &sig.ConfirmedAt); err != nil {
+			return nil, err
 		}
-		out[ruleID+"\x00"+agentID] = firingAlert{alertID: alertID, incidentID: incidentID}
+		out[targetID+"\x00"+agentID] = firingSignal{
+			signalID: sig.ID, incidentID: sig.IncidentID, severity: sig.Severity,
+			title:       fault.SignalTitle(sig),
+			observedAt:  sig.ObservedAt.UTC(),
+			confirmedAt: sig.ConfirmedAt.UTC(),
+		}
 	}
 	return out, rows.Err()
 }
 
 // ---- helpers ----
 
-// successKind maps a probe target kind to the metric kind whose latest value
-// decides probe success/failure. host (and any kind without a universal success
-// metric) returns "" → not_applicable.
-func successKind(kind string) string {
-	switch kind {
-	case "icmp", "gateway":
-		return "probe.icmp.loss_pct"
-	case "tcp":
-		return "probe.tcp.ok"
-	case "http":
-		return "probe.http.ok"
-	case "dns":
-		return "probe.dns.ok"
-	case "nat":
-		return "probe.nat.ok"
-	}
-	return ""
+// detectorBeforeCutoff reports whether a detector's counters were last touched
+// before this pair's assignment cutoff — pre-assignment state that must not read
+// as a current failing streak after scope re-entry (SRV-007).
+func detectorBeforeCutoff(d detState, cutoff *time.Time) bool {
+	return d.updatedAt.Valid && beforeCutoff(d.updatedAt.Time.UTC(), cutoff)
 }
 
 // pendingSince is the per-pair pending clock: the later of the target's material// generation time (config_changed_at) and the row's assigned_at (present once a

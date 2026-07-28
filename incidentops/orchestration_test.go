@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -14,17 +13,15 @@ import (
 	"github.com/nettact/protocol/permission"
 	"github.com/nettact/protocol/telemetry"
 	"github.com/nettact/server-core/eventbus"
+	"github.com/nettact/server-core/fault"
 	"github.com/nettact/server-core/settings"
 	"github.com/nettact/server-core/store"
+	"github.com/nettact/server-core/store/storetest"
 )
 
 func openIncidentOpsTest(t *testing.T) (*store.DB, context.Context) {
 	t.Helper()
-	db, err := store.Open(filepath.Join(t.TempDir(), "incidentops.db"))
-	if err != nil {
-		t.Fatalf("open db: %v", err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
+	db := storetest.Open(t)
 	ctx := context.Background()
 	if _, err := db.ExecContext(ctx, `INSERT INTO sites(id,name) VALUES('site_default','Home')`); err != nil {
 		t.Fatalf("seed site: %v", err)
@@ -38,45 +35,46 @@ func openIncidentOpsTest(t *testing.T) (*store.DB, context.Context) {
 	return db, ctx
 }
 
-func seedIncidentAlert(t *testing.T, db *store.DB, incidentID, alertID, agentID, state string) {
+func seedIncidentSignal(t *testing.T, db *store.DB, incidentID, signalID, agentID, state string) {
 	t.Helper()
 	ctx := context.Background()
 	now := time.Now().UTC()
 	if _, err := db.ExecContext(ctx, `
 		INSERT INTO incidents(id,site_id,group_id,group_name,open_key,state,opened_at)
-		VALUES(?,'site_default','group','Group',?,'open',?)`, incidentID, "alert:"+alertID, now); err != nil {
+		VALUES(?,'site_default','group','Group',?,'open',?)`, incidentID, "sig:"+signalID, now); err != nil {
 		t.Fatalf("seed incident: %v", err)
 	}
 	if _, err := db.ExecContext(ctx, `
-		INSERT INTO alerts(id,agent_id,site_id,group_id,group_name,incident_id,state,started_at)
-		VALUES(? ,?,'site_default','group','Group',?,?,?)`, alertID, agentID, incidentID, state, now); err != nil {
-		t.Fatalf("seed alert: %v", err)
+		INSERT INTO fault_signals(id,agent_id,site_id,target_id,detector_key,group_id,group_name,incident_id,state,observed_at,confirmed_at)
+		VALUES(?,?,'site_default',?,'availability','group','Group',?,?,?,?)`,
+		signalID, agentID, "probe_"+signalID, incidentID, state, now, now); err != nil {
+		t.Fatalf("seed fault signal: %v", err)
 	}
 }
 
 func TestTraceCohortClosesAfterMissedResolutionCallback(t *testing.T) {
 	db, ctx := openIncidentOpsTest(t)
-	seedIncidentAlert(t, db, "inc_1", "alert_1", "agent_a", "firing")
-	seedIncidentAlert(t, db, "inc_2", "alert_2", "agent_a", "firing")
+	seedIncidentSignal(t, db, "inc_1", "sig_1", "agent_a", "firing")
+	seedIncidentSignal(t, db, "inc_2", "sig_2", "agent_a", "firing")
 	svc := New(db, nil, settings.New(db), nil)
 	plan := derivedTrace{mode: "icmp", destKey: "ip:1.1.1.1", destHost: "1.1.1.1", destIP: "1.1.1.1"}
 
-	first, created, _, err := svc.singleFlight(ctx, eventbus.EvidenceAdded{
-		IncidentID: "inc_1", AlertID: "alert_1", AgentID: "agent_a", SiteID: "site_default",
-	}, "cond_1", plan)
+	first, created, _, err := svc.singleFlight(ctx, fault.SignalEvent{
+		IncidentID: "inc_1", SignalID: "sig_1", AgentID: "agent_a", SiteID: "site_default",
+	}, plan)
 	if err != nil || !created {
 		t.Fatalf("create first report: id=%s created=%v err=%v", first, created, err)
 	}
-	second, created, _, err := svc.singleFlight(ctx, eventbus.EvidenceAdded{
-		IncidentID: "inc_2", AlertID: "alert_2", AgentID: "agent_a", SiteID: "site_default",
-	}, "cond_2", plan)
+	second, created, _, err := svc.singleFlight(ctx, fault.SignalEvent{
+		IncidentID: "inc_2", SignalID: "sig_2", AgentID: "agent_a", SiteID: "site_default",
+	}, plan)
 	if err != nil || created || second != first {
 		t.Fatalf("overlap did not share report: first=%s second=%s created=%v err=%v", first, second, created, err)
 	}
 
-	// Simulate a crash after alert resolution committed but before OnAlertResolved.
-	if _, err := db.ExecContext(ctx, `UPDATE alerts SET state='resolved', resolved_at=? WHERE id IN('alert_1','alert_2')`, time.Now().UTC()); err != nil {
-		t.Fatalf("resolve alerts: %v", err)
+	// Simulate a crash after the faults resolved but before OnSignalResolved ran.
+	if _, err := db.ExecContext(ctx, `UPDATE fault_signals SET state='resolved', resolved_at=? WHERE id IN('sig_1','sig_2')`, time.Now().UTC()); err != nil {
+		t.Fatalf("resolve signals: %v", err)
 	}
 	if err := svc.Recover(ctx); err != nil {
 		t.Fatalf("recover: %v", err)
@@ -92,10 +90,10 @@ func TestTraceCohortClosesAfterMissedResolutionCallback(t *testing.T) {
 		t.Fatalf("recovered cohort = open:%d active:%d, want 0/0", open, active)
 	}
 
-	seedIncidentAlert(t, db, "inc_3", "alert_3", "agent_a", "firing")
-	third, created, _, err := svc.singleFlight(ctx, eventbus.EvidenceAdded{
-		IncidentID: "inc_3", AlertID: "alert_3", AgentID: "agent_a", SiteID: "site_default",
-	}, "cond_3", plan)
+	seedIncidentSignal(t, db, "inc_3", "sig_3", "agent_a", "firing")
+	third, created, _, err := svc.singleFlight(ctx, fault.SignalEvent{
+		IncidentID: "inc_3", SignalID: "sig_3", AgentID: "agent_a", SiteID: "site_default",
+	}, plan)
 	if err != nil || !created || third == first {
 		t.Fatalf("new fault reused old report: old=%s new=%s created=%v err=%v", first, third, created, err)
 	}
@@ -164,8 +162,9 @@ func TestSnapshotSizeCapIncludesBaseAndEntries(t *testing.T) {
 			samples[j] = baseSample{TS: now.Add(time.Duration(j) * time.Second), Value: float64(j)}
 		}
 		base.Members = append(base.Members, baseMember{
-			AlertID: fmt.Sprintf("alert-%d", i), RuleID: "rule", AgentID: "agent_a", StartedAt: now,
-			Evidence: []baseEvidence{{ConditionID: "cond", TargetID: "target", MetricKind: "probe.icmp.loss_pct", Comparator: "gt", RecentSamples: samples}},
+			SignalID: fmt.Sprintf("sig-%d", i), DetectorKey: "availability", AgentID: "agent_a",
+			ObservedAt: now, ConfirmedAt: now,
+			Evidence: baseEvidence{TargetID: "target", MetricKind: "probe.icmp.loss_pct", Comparator: "gt", RecentSamples: samples},
 		})
 	}
 	baseJSON := mustJSON(base)
@@ -220,25 +219,28 @@ func setAgentPerms(t *testing.T, db *store.DB, agentID string, supported, grante
 	}
 }
 
-// seedEvidence freezes one alert_evidence row carrying trigger-time trace
-// inputs (probe kind, destination, TCP port).
-func seedEvidence(t *testing.T, db *store.DB, evidenceID, alertID, probeKind, targetAddr string, targetPort int, metricKind string) {
+// seedEvidence freezes a signal's trigger-time evidence — the probe kind, the
+// destination and the port the traceroute derivation reads.
+func seedEvidence(t *testing.T, db *store.DB, signalID, probeKind, targetAddr string, targetPort int, metricKind string) {
 	t.Helper()
 	if _, err := db.ExecContext(context.Background(), `
-		INSERT INTO alert_evidence(id,alert_id,condition_id,target_id,target_addr,target_port,probe_kind,metric_kind,comparator,threshold,value,observed_at)
-		VALUES(?,?,?,'target',?,?,?,?,'gt',0,1,?)`,
-		evidenceID, alertID, "cond_"+evidenceID, targetAddr, targetPort, probeKind, metricKind, time.Now().UTC()); err != nil {
+		UPDATE fault_signals SET probe_kind=?, target_addr=?, target_port=?, metric_kind=?, comparator='gt', threshold=0, value=1
+		WHERE id=?`, probeKind, targetAddr, targetPort, metricKind, signalID); err != nil {
 		t.Fatalf("seed evidence: %v", err)
 	}
 }
 
-// capturePusher accepts every push and records the trace requests it saw.
+// capturePusher accepts every push and records the requests it saw.
 type capturePusher struct {
-	mu     sync.Mutex
-	traces []pcfg.TraceRequest
+	mu      sync.Mutex
+	traces  []pcfg.TraceRequest
+	snapReq []pcfg.IncidentSnapshotRequest
 }
 
-func (p *capturePusher) PushIncidentSnapshotRequest(string, pcfg.IncidentSnapshotRequest) bool {
+func (p *capturePusher) PushIncidentSnapshotRequest(_ string, req pcfg.IncidentSnapshotRequest) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.snapReq = append(p.snapReq, req)
 	return true
 }
 
@@ -256,20 +258,20 @@ func (p *capturePusher) PushTraceRequest(_ string, req pcfg.TraceRequest) bool {
 // port, and dispatches normally with Mode=icmp on the wire.
 func TestTraceFallsBackToICMPWhenTCPPermissionUnavailable(t *testing.T) {
 	db, ctx := openIncidentOpsTest(t)
-	seedIncidentAlert(t, db, "inc_1", "alert_1", "agent_a", "firing")
+	seedIncidentSignal(t, db, "inc_1", "sig_1", "agent_a", "firing")
 	setAgentPerms(t, db, "agent_a",
 		[]permission.ID{permission.DiagnosticTracerouteICMP},
 		[]permission.ID{permission.DiagnosticTracerouteICMP, permission.DiagnosticTracerouteTCP},
 		[]permission.ID{permission.DiagnosticTracerouteICMP})
-	seedEvidence(t, db, "ev_1", "alert_1", "tcp", "192.0.2.10", 443, "probe.tcp.rtt_ms")
+	seedEvidence(t, db, "sig_1", "tcp", "192.0.2.10", 443, "probe.tcp.rtt_ms")
 
 	svc := New(db, nil, settings.New(db), nil)
 	pusher := &capturePusher{}
 	svc.SetPusher(pusher)
-	if err := svc.OnEvidence(ctx, eventbus.EvidenceAdded{
-		EvidenceID: "ev_1", AlertID: "alert_1", IncidentID: "inc_1", AgentID: "agent_a", SiteID: "site_default",
+	if err := svc.OnSignalConfirmed(ctx, fault.SignalEvent{
+		SignalID: "sig_1", IncidentID: "inc_1", AgentID: "agent_a", SiteID: "site_default",
 	}); err != nil {
-		t.Fatalf("on evidence: %v", err)
+		t.Fatalf("on fault confirmed: %v", err)
 	}
 
 	var mode, status, from, reason string
@@ -291,6 +293,53 @@ func TestTraceFallsBackToICMPWhenTCPPermissionUnavailable(t *testing.T) {
 	}
 }
 
+// Both one-shot pushes must carry their window as a receipt-relative budget, not
+// as this server's absolute deadline. An agent's clock is independent of ours, so
+// a timestamp would have the whole skew taken out of the window — a skew larger
+// than the window expires the request on arrival and the agent reports timeouts
+// (and, before the target error classes were split, "DNS resolution failed") for
+// work it was never given time to attempt. Bounding each budget by its configured
+// window is what distinguishes a duration from a smuggled epoch timestamp.
+func TestPushedWindowsAreRelativeBudgets(t *testing.T) {
+	db, ctx := openIncidentOpsTest(t)
+	seedIncidentSignal(t, db, "inc_1", "sig_1", "agent_a", "firing")
+	setAgentPerms(t, db, "agent_a",
+		[]permission.ID{permission.DiagnosticTracerouteICMP},
+		[]permission.ID{permission.DiagnosticTracerouteICMP},
+		[]permission.ID{permission.DiagnosticTracerouteICMP})
+	seedEvidence(t, db, "sig_1", "icmp", "192.0.2.10", 0, "probe.icmp.loss_pct")
+
+	svc := New(db, nil, settings.New(db), nil)
+	pusher := &capturePusher{}
+	svc.SetPusher(pusher)
+	if err := svc.OnSignalConfirmed(ctx, fault.SignalEvent{
+		SignalID: "sig_1", IncidentID: "inc_1", AgentID: "agent_a", SiteID: "site_default",
+	}); err != nil {
+		t.Fatalf("on fault confirmed: %v", err)
+	}
+	if err := svc.OnIncidentOpened(ctx, eventbus.IncidentEvent{
+		IncidentID: "inc_1", SiteID: "site_default", Severity: "critical",
+	}); err != nil {
+		t.Fatalf("on incident opened: %v", err)
+	}
+
+	if len(pusher.snapReq) != 1 {
+		t.Fatalf("snapshot pushes = %d, want 1", len(pusher.snapReq))
+	}
+	snapWindow := int(svc.snapshotDeadline(ctx).Milliseconds())
+	if got := pusher.snapReq[0].BudgetMs; got <= 0 || got > snapWindow {
+		t.Errorf("snapshot BudgetMs = %d, want within (0, %d]", got, snapWindow)
+	}
+
+	if len(pusher.traces) != 1 {
+		t.Fatalf("trace pushes = %d, want 1", len(pusher.traces))
+	}
+	traceWindow := int(svc.diagTotalTimeout(ctx).Milliseconds())
+	if got := pusher.traces[0].BudgetMs; got <= 0 || got > traceWindow {
+		t.Errorf("trace BudgetMs = %d, want within (0, %d]", got, traceWindow)
+	}
+}
+
 // TestTraceTerminalReasonDistinguishesPolicyFromCapability covers a TCP-monitor
 // fault on an agent with no traceroute permission at all: the report is
 // terminal unsupported and never dispatched, and the reason separates a
@@ -303,13 +352,13 @@ func TestTraceTerminalReasonDistinguishesPolicyFromCapability(t *testing.T) {
 	svc.SetPusher(pusher)
 
 	// agent_a: granted tcp, supported/effective empty → capability gap.
-	seedIncidentAlert(t, db, "inc_1", "alert_1", "agent_a", "firing")
+	seedIncidentSignal(t, db, "inc_1", "sig_1", "agent_a", "firing")
 	setAgentPerms(t, db, "agent_a", nil, []permission.ID{permission.DiagnosticTracerouteTCP}, nil)
-	seedEvidence(t, db, "ev_1", "alert_1", "tcp", "192.0.2.10", 443, "probe.tcp.rtt_ms")
-	if err := svc.OnEvidence(ctx, eventbus.EvidenceAdded{
-		EvidenceID: "ev_1", AlertID: "alert_1", IncidentID: "inc_1", AgentID: "agent_a", SiteID: "site_default",
+	seedEvidence(t, db, "sig_1", "tcp", "192.0.2.10", 443, "probe.tcp.rtt_ms")
+	if err := svc.OnSignalConfirmed(ctx, fault.SignalEvent{
+		SignalID: "sig_1", IncidentID: "inc_1", AgentID: "agent_a", SiteID: "site_default",
 	}); err != nil {
-		t.Fatalf("on evidence: %v", err)
+		t.Fatalf("on fault confirmed: %v", err)
 	}
 	var status, reason, from string
 	if err := db.QueryRowContext(ctx,
@@ -337,7 +386,7 @@ func TestTraceTerminalReasonDistinguishesPolicyFromCapability(t *testing.T) {
 // persisted fallback columns.
 func TestTraceReadsIncludeFallbackFields(t *testing.T) {
 	db, ctx := openIncidentOpsTest(t)
-	seedIncidentAlert(t, db, "inc_1", "alert_1", "agent_a", "firing")
+	seedIncidentSignal(t, db, "inc_1", "sig_1", "agent_a", "firing")
 	now := time.Now().UTC()
 	if _, err := db.ExecContext(ctx, `
 		INSERT INTO trace_reports(id,site_id,agent_id,dest_key,dest_host,mode,port,fallback_from,fallback_reason,
@@ -347,8 +396,8 @@ func TestTraceReadsIncludeFallbackFields(t *testing.T) {
 		t.Fatalf("seed report: %v", err)
 	}
 	if _, err := db.ExecContext(ctx, `
-		INSERT INTO trace_report_refs(report_id,incident_id,alert_id,condition_id,active,created_at)
-		VALUES('trace_fb','inc_1','alert_1','cond_1',1,?)`, now); err != nil {
+		INSERT INTO trace_report_refs(report_id,incident_id,signal_id,active,created_at)
+		VALUES('trace_fb','inc_1','sig_1',1,?)`, now); err != nil {
 		t.Fatalf("seed ref: %v", err)
 	}
 

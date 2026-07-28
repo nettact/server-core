@@ -362,10 +362,15 @@ func (s *Service) UpdateAgent(ctx context.Context, id, displayName string) error
 // are enforced (store.Open sets foreign_keys=ON), so FK-constrained child rows
 // (interfaces, agent_status_history, agent_group_members, monitor_status,
 // operational_issues) must go before the agent row; the non-FK per-agent tables
-// (agent_packets, events, alerts, rule_condition_state, agent_alerts) are cleared
-// too so no orphaned rows survive. Deleting an agent removes its connectivity
-// alerts outright (no recovery notification), matching the hard-delete policy. rule_condition_state keys on agent_id with no FK cascade,
-// so its per-agent live rows must be deleted explicitly here. All in one transaction.
+// (agent_packets, events, detector_state) are cleared too so no orphaned rows
+// survive. detector_state keys on agent_id with no FK cascade, so its live
+// counters must be deleted explicitly here.
+//
+// fault_signals are NOT deleted: they are recorded history carrying the agent's
+// frozen name, and a fault that happened does not stop having happened because
+// the agent was later removed. The caller force-resolves the agent's firing
+// signals (reason agent_deleted, so no recovery notification) before deleting.
+// All in one transaction.
 // Time-series data (series/samples/rollups, plus the metrics store's in-memory
 // cache) is NOT handled here — callers purge it via metrics.Store.PurgeAgent so
 // the cache stays consistent. Returns sql.ErrNoRows if no agent has that id.
@@ -395,9 +400,7 @@ func (s *Service) DeleteAgent(ctx context.Context, id string) error {
 		`DELETE FROM operational_issues WHERE agent_id=?`,
 		`DELETE FROM agent_packets WHERE agent_id=?`,
 		`DELETE FROM events WHERE agent_id=?`,
-		`DELETE FROM alerts WHERE agent_id=?`,
-		`DELETE FROM rule_condition_state WHERE agent_id=?`,
-		`DELETE FROM agent_alerts WHERE agent_id=?`,
+		`DELETE FROM detector_state WHERE agent_id=?`,
 	} {
 		if _, err := tx.ExecContext(ctx, stmt, id); err != nil {
 			return err

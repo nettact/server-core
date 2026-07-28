@@ -5,21 +5,16 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/nettact/server-core/identity"
 	"github.com/nettact/server-core/settings"
-	"github.com/nettact/server-core/store"
+	"github.com/nettact/server-core/store/storetest"
 )
 
 func TestDashboardLayoutRoundTrip(t *testing.T) {
-	db, err := store.Open(filepath.Join(t.TempDir(), "layout.db"))
-	if err != nil {
-		t.Fatalf("store.Open: %v", err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
+	db := storetest.Open(t)
 	d := Deps{Settings: settings.New(db)}
 
 	get := httptest.NewRecorder()
@@ -64,11 +59,7 @@ func TestDashboardLayoutRoundTrip(t *testing.T) {
 }
 
 func TestDashboardLayoutAcceptsTallSize(t *testing.T) {
-	db, err := store.Open(filepath.Join(t.TempDir(), "layout-tall.db"))
-	if err != nil {
-		t.Fatalf("store.Open: %v", err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
+	db := storetest.Open(t)
 	d := Deps{Settings: settings.New(db)}
 
 	payload := `{"version":1,"cards":[{"id":"network-quality","visible":true,"size":"tall"}]}`
@@ -80,11 +71,7 @@ func TestDashboardLayoutAcceptsTallSize(t *testing.T) {
 }
 
 func TestDashboardLayoutRouteRequiresSession(t *testing.T) {
-	db, err := store.Open(filepath.Join(t.TempDir(), "layout-auth.db"))
-	if err != nil {
-		t.Fatalf("store.Open: %v", err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
+	db := storetest.Open(t)
 	d := Deps{Identity: identity.New(db), Settings: settings.New(db)}
 
 	w := httptest.NewRecorder()
@@ -95,11 +82,7 @@ func TestDashboardLayoutRouteRequiresSession(t *testing.T) {
 }
 
 func TestUpdateDashboardLayoutRejectsInvalidPayloads(t *testing.T) {
-	db, err := store.Open(filepath.Join(t.TempDir(), "layout-invalid.db"))
-	if err != nil {
-		t.Fatalf("store.Open: %v", err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
+	db := storetest.Open(t)
 	d := Deps{Settings: settings.New(db)}
 
 	cases := map[string]string{

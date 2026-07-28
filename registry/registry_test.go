@@ -5,12 +5,12 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/nettact/server-core/eventbus"
 	"github.com/nettact/server-core/store"
+	"github.com/nettact/server-core/store/storetest"
 )
 
 func mustExec(t *testing.T, db *store.DB, q string, args ...any) {
@@ -24,11 +24,7 @@ func mustExec(t *testing.T, db *store.DB, q string, args ...any) {
 // agent, and the hard delete that must clear every table referencing the agent
 // (FK-constrained and not) in one transaction without tripping foreign_keys=ON.
 func TestUpdateAndDeleteAgent(t *testing.T) {
-	db, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
-	if err != nil {
-		t.Fatalf("open db: %v", err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
+	db := storetest.Open(t)
 	ctx := context.Background()
 	now := time.Now().UTC()
 
@@ -42,13 +38,14 @@ func TestUpdateAndDeleteAgent(t *testing.T) {
 	mustExec(t, db, `INSERT INTO agent_group_members(group_id,agent_id) VALUES('grp1','agent_x')`)
 	mustExec(t, db, `INSERT INTO agent_packets(agent_id,sequence,received_at) VALUES('agent_x',1,?)`, now)
 	mustExec(t, db, `INSERT INTO events(id,agent_id,site_id,ts,type) VALUES('e1','agent_x','site_default',?,'t')`, now)
-	mustExec(t, db, `INSERT INTO alerts(id,agent_id,site_id,group_id,state,started_at) VALUES('al1','agent_x','site_default','group','firing',?)`, now)
 	mustExec(t, db, `INSERT INTO monitor_groups(id,site_id,name,all_agents) VALUES('mg1','site_default','all',1)`)
 	mustExec(t, db, `INSERT INTO probe_tasks(id,site_id,group_id,kind,target,params,enabled) VALUES('mon1','site_default','mg1','http','https://example.test','{}',1)`)
-	mustExec(t, db, `INSERT INTO group_rules(id,group_id,site_id,name,op) VALUES('rule1','mg1','site_default','down','or')`)
-	mustExec(t, db, `INSERT INTO group_rule_conditions(id,rule_id,target_id,metric_kind,comparator,threshold) VALUES('cond1','rule1','mon1','probe.http.ok','lt',1)`)
-	mustExec(t, db, `INSERT INTO rule_condition_state(condition_id,agent_id,satisfied,last_eval_at) VALUES('cond1','agent_x',1,?)`, now)
-	mustExec(t, db, `INSERT INTO agent_alerts(id,site_id,agent_id,status,reason,offline_since,opened_at) VALUES('aa1','site_default','agent_x','firing','unexpected',?,?)`, now, now)
+	mustExec(t, db, `INSERT INTO detector_state(target_id,agent_id,detector_key,fail_rounds,updated_at) VALUES('mon1','agent_x','availability',2,?)`, now)
+	// A recorded fault is history, not agent-owned state: it must SURVIVE the
+	// delete, carrying the frozen names that make it readable afterwards.
+	mustExec(t, db, `INSERT INTO incidents(id,site_id,group_id,open_key,state,severity,opened_at) VALUES('inc1','site_default','mg1','sig:sig1','open','warn',?)`, now)
+	mustExec(t, db, `INSERT INTO fault_signals(id,site_id,agent_id,agent_name,target_id,detector_key,state,observed_at,confirmed_at,incident_id)
+		VALUES('sig1','site_default','agent_x','My Agent','mon1','availability','firing',?,?,'inc1')`, now, now)
 
 	bus := eventbus.New()
 	var statusEvents []eventbus.TargetStatusChanged
@@ -78,7 +75,7 @@ func TestUpdateAndDeleteAgent(t *testing.T) {
 	}
 	for _, tbl := range []string{
 		"interfaces", "agent_wifi", "agent_status_history", "agent_group_members",
-		"agent_packets", "events", "alerts", "rule_condition_state", "agent_alerts",
+		"agent_packets", "events", "detector_state",
 	} {
 		var n int
 		if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM `+tbl+` WHERE agent_id='agent_x'`).Scan(&n); err != nil {
@@ -87,6 +84,14 @@ func TestUpdateAndDeleteAgent(t *testing.T) {
 		if n != 0 {
 			t.Errorf("%s still has %d rows for deleted agent", tbl, n)
 		}
+	}
+	// The fault history survives, still naming the agent that detected it.
+	var frozenName string
+	if err := db.QueryRowContext(ctx, `SELECT agent_name FROM fault_signals WHERE id='sig1'`).Scan(&frozenName); err != nil {
+		t.Fatalf("fault history must survive an agent delete: %v", err)
+	}
+	if frozenName != "My Agent" {
+		t.Errorf("frozen agent_name = %q, want the name recorded at fault time", frozenName)
 	}
 	var agentN int
 	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM agents WHERE id='agent_x'`).Scan(&agentN); err != nil {
@@ -109,11 +114,7 @@ func TestUpdateAndDeleteAgent(t *testing.T) {
 // first-connected is stamped once and never moves, disconnect kind is recorded
 // and surfaced by SweepStale into the history reason, and the mute switch flips.
 func TestConnectivityProvenance(t *testing.T) {
-	db, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
-	if err != nil {
-		t.Fatalf("open db: %v", err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
+	db := storetest.Open(t)
 	ctx := context.Background()
 	stale := time.Now().UTC().Add(-time.Hour)
 
@@ -171,11 +172,7 @@ func TestConnectivityProvenance(t *testing.T) {
 // must stay online, while an equally stale, non-excluded agent flips offline
 // with a history row.
 func TestSweepStaleExcludesConnected(t *testing.T) {
-	db, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
-	if err != nil {
-		t.Fatalf("open db: %v", err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
+	db := storetest.Open(t)
 	ctx := context.Background()
 	stale := time.Now().UTC().Add(-time.Hour)
 
@@ -213,11 +210,7 @@ func TestSweepStaleExcludesConnected(t *testing.T) {
 }
 
 func TestStatusHistoryReturnsOnlyNewestTwentyEvents(t *testing.T) {
-	db, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
-	if err != nil {
-		t.Fatalf("open db: %v", err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
+	db := storetest.Open(t)
 	ctx := context.Background()
 	base := time.Now().UTC().Truncate(time.Second).Add(-time.Hour)
 

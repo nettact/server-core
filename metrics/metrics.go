@@ -678,7 +678,7 @@ type SeriesInfo struct {
 // target whose HTTP probe is failing every cycle. The samples stay in the store —
 // they are simply no longer "this monitor's series". A deleted monitor's leftover
 // series drop out for the same reason (no owner, no current kind). System series
-// (monitor_id='') have no owning kind and always pass.
+// (monitor_id=”) have no owning kind and always pass.
 func (s *Store) ListSeries(ctx context.Context, agentID string) ([]SeriesInfo, error) {
 	rows, err := s.db.Read().QueryContext(ctx, `
 		SELECT DISTINCT s.kind, COALESCE(s.target,''), COALESCE(s.layer,''), COALESCE(s.unit,''),
@@ -739,6 +739,11 @@ func (s *Store) LatestSnapshot(ctx context.Context, agentID string, sinceUnix in
 		// current round omitted a field. wifi.* ingestion + Host Metrics history
 		// are unaffected; only this snapshot output excludes them.
 		if strings.HasPrefix(string(si.kind), "wifi.") {
+			continue
+		}
+		// probe.round.ok is a server-derived bookkeeping series feeding the
+		// availability math, not a value any view charts or reads as "current".
+		if string(si.kind) == RoundOKKind {
 			continue
 		}
 		if si.monitorID != "" {

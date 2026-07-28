@@ -17,7 +17,7 @@ func templateSamplePayload() Payload {
 		SuspectedLayer: "wan",
 		URL:            "http://console/incidents?incident=inc_1",
 		At:             time.Date(2026, 7, 23, 10, 30, 0, 0, time.UTC),
-		Details: []AlertDetail{
+		Details: []FaultDetail{
 			// Deliberately out of order: warn(lan) listed first, critical(service)
 			// second, plus a duplicate name — buildVars must sort worst-first and dedupe.
 			{TargetName: "Warn Target", Target: "1.1.1.1", Severity: "warn", Layer: "lan",
@@ -60,7 +60,7 @@ func TestBuildVars(t *testing.T) {
 
 func TestBuildVarsFallsBackToAddress(t *testing.T) {
 	// A detail with no operator-set name falls back to the raw target address.
-	p := Payload{Details: []AlertDetail{{Target: "8.8.8.8", Severity: "warn", Layer: "dns"}}}
+	p := Payload{Details: []FaultDetail{{Target: "8.8.8.8", Severity: "warn", Layer: "dns"}}}
 	vars := buildVars(p, "en")
 	if vars["target"] != "8.8.8.8" || vars["targets"] != "8.8.8.8" {
 		t.Fatalf("target=%q targets=%q", vars["target"], vars["targets"])
