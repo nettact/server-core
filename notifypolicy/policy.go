@@ -10,7 +10,7 @@
 // Exactly one policy applies to any incident, resolved by a fixed precedence
 // with no stacking:
 //
-//	target policy > monitor-group policy > site default policy
+//	monitor-group policy > site default policy
 //
 // Stacking would let one incident reach the same channel twice through two
 // matching policies, so the resolver stops at the first enabled match.
@@ -42,9 +42,8 @@ var ErrDefaultPolicy = errors.New("the default notification policy cannot be del
 
 // Scope kinds, in precedence order.
 const (
-	ScopeTarget = "target"
-	ScopeGroup  = "group"
-	ScopeSite   = "site"
+	ScopeGroup = "group"
+	ScopeSite  = "site"
 )
 
 // Default policy values (ALERT-002 §8.2). A warning waits five minutes so a
@@ -94,7 +93,7 @@ func (p Policy) Covers(severity string) bool {
 // the delivery planner will actually use.
 type Effective struct {
 	Policy *Policy  `json:"policy"`
-	Source string   `json:"source"` // target | group | site | none
+	Source string   `json:"source"` // group | site | none
 	Chain  []string `json:"chain"`  // scopes consulted, most specific first
 }
 
@@ -264,7 +263,7 @@ func validate(p *Policy) error {
 	switch p.ScopeKind {
 	case ScopeSite:
 		p.ScopeID = ""
-	case ScopeGroup, ScopeTarget:
+	case ScopeGroup:
 		if strings.TrimSpace(p.ScopeID) == "" {
 			return fmt.Errorf("a %s policy needs a scope id", p.ScopeKind)
 		}

@@ -49,7 +49,7 @@ const (
 // list cannot silently change halfway through an incident's life, and a policy
 // edited or deleted mid-incident cannot orphan a pending notification.
 func (s *Service) PlanOpenTx(ctx context.Context, tx *sql.Tx, sc fault.IncidentScope, now time.Time) error {
-	eff, err := s.Resolve(ctx, sc.SiteID, sc.TargetID, sc.GroupID)
+	eff, err := s.Resolve(ctx, sc.SiteID, sc.GroupID)
 	if err != nil {
 		return err
 	}
@@ -68,7 +68,7 @@ func (s *Service) PlanOpenTx(ctx context.Context, tx *sql.Tx, sc fault.IncidentS
 // incident growing worse while someone is already looking at it is not worth a
 // second message, and the incident's own severity is live in the console.
 func (s *Service) EscalateTx(ctx context.Context, tx *sql.Tx, sc fault.IncidentScope, now time.Time) error {
-	eff, err := s.Resolve(ctx, sc.SiteID, sc.TargetID, sc.GroupID)
+	eff, err := s.Resolve(ctx, sc.SiteID, sc.GroupID)
 	if err != nil {
 		return err
 	}

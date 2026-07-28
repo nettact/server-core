@@ -119,7 +119,7 @@ func (h *harness) openIncident(id, severity string, now time.Time) {
 		h.t.Fatalf("begin: %v", err)
 	}
 	err = h.svc.PlanOpenTx(h.ctx, tx, fault.IncidentScope{
-		IncidentID: id, SiteID: "site_default", GroupID: "mg", TargetID: "t1", Severity: severity,
+		IncidentID: id, SiteID: "site_default", GroupID: "mg", Severity: severity,
 	}, now)
 	if err != nil {
 		_ = tx.Rollback()
@@ -326,7 +326,7 @@ func TestDeliveryIsIdempotentAcrossReplayAndRestart(t *testing.T) {
 			t.Fatalf("begin: %v", err)
 		}
 		if err := h.svc.PlanOpenTx(h.ctx, tx, fault.IncidentScope{
-			IncidentID: "inc_1", SiteID: "site_default", GroupID: "mg", TargetID: "t1", Severity: "warn",
+			IncidentID: "inc_1", SiteID: "site_default", GroupID: "mg", Severity: "warn",
 		}, now); err != nil {
 			_ = tx.Rollback()
 			t.Fatalf("replan: %v", err)
@@ -350,9 +350,10 @@ func TestDeliveryIsIdempotentAcrossReplayAndRestart(t *testing.T) {
 	}
 }
 
-// TestPrecedenceIsSingleHit: exactly one policy applies, most specific first, so
-// one incident can never reach the same channel through two matching policies.
-func TestPrecedenceIsSingleHit(t *testing.T) {
+// TestGroupPrecedenceIsSingleHit: exactly one policy applies, most specific
+// first, so one incident can never reach the same channel through two matching
+// policies.
+func TestGroupPrecedenceIsSingleHit(t *testing.T) {
 	h := newHarness(t)
 	h.setDefaultChannels("ch_a")
 	if _, err := h.svc.Create(h.ctx, "site_default", Policy{
@@ -370,28 +371,30 @@ func TestPrecedenceIsSingleHit(t *testing.T) {
 	if eff.Source != ScopeGroup || eff.Policy == nil || len(eff.Policy.ChannelIDs) != 1 || eff.Policy.ChannelIDs[0] != "ch_b" {
 		t.Fatalf("group override must win over the site default: %+v", eff)
 	}
-
-	// A target override wins over the group's.
-	if _, err := h.svc.Create(h.ctx, "site_default", Policy{
-		Name: "target", ScopeKind: ScopeTarget, ScopeID: "t1", Enabled: true,
-		MinSeverity: "warn", WarnDelaySec: 30, CriticalDelaySec: 5,
-		NotifyRecovery: true, ChannelIDs: []string{"ch_a"},
-	}); err != nil {
-		t.Fatalf("create target policy: %v", err)
-	}
-	eff, err = h.svc.ResolveForTarget(h.ctx, "t1")
-	if err != nil {
-		t.Fatalf("resolve: %v", err)
-	}
-	if eff.Source != ScopeTarget {
-		t.Fatalf("target override must win: %+v", eff)
+	if len(eff.Chain) != 1 || eff.Chain[0] != ScopeGroup {
+		t.Fatalf("resolved chain = %v, want [group]", eff.Chain)
 	}
 
 	now := time.Now().UTC()
 	h.openIncident("inc_1", "warn", now)
 	ds := h.deliveries("inc_1")
-	if len(ds) != 1 || ds[0].ChannelID != "ch_a" {
-		t.Fatalf("planned deliveries = %+v, want exactly the target policy's channel", ds)
+	if len(ds) != 1 || ds[0].ChannelID != "ch_b" {
+		t.Fatalf("planned deliveries = %+v, want exactly the group policy's channel", ds)
+	}
+}
+
+func TestTargetPolicyScopeIsRejected(t *testing.T) {
+	h := newHarness(t)
+	if _, err := h.svc.Create(h.ctx, "site_default", Policy{
+		Name: "target", ScopeKind: "target", ScopeID: "t1", Enabled: true,
+		MinSeverity: "warn", ChannelIDs: []string{"ch_a"},
+	}); err == nil {
+		t.Fatal("target-scoped policy was accepted")
+	}
+	if _, err := h.db.ExecContext(h.ctx, `
+		INSERT INTO notification_policies(id, site_id, name, scope_kind, scope_id)
+		VALUES('np_target', 'site_default', 'target', 'target', 't1')`); err == nil {
+		t.Fatal("database schema accepted a target-scoped policy")
 	}
 }
 
@@ -413,6 +416,9 @@ func TestDisabledOverrideFallsBack(t *testing.T) {
 	}
 	if eff.Source != ScopeSite || eff.Policy == nil || eff.Policy.ChannelIDs[0] != "ch_a" {
 		t.Fatalf("a disabled override must fall back to the site default: %+v", eff)
+	}
+	if len(eff.Chain) != 2 || eff.Chain[0] != ScopeGroup || eff.Chain[1] != ScopeSite {
+		t.Fatalf("fallback chain = %v, want [group site]", eff.Chain)
 	}
 }
 
@@ -551,13 +557,13 @@ func TestAgentIncidentUsesAgentWording(t *testing.T) {
 	}
 }
 
-// TestScopedPolicyDeletionFallsBackToDefault: removing an override must leave
-// the target governed by the site default, never by nothing.
+// TestScopedPolicyDeletionFallsBackToDefault: removing a group override must
+// leave the target governed by the site default, never by nothing.
 func TestScopedPolicyDeletionFallsBackToDefault(t *testing.T) {
 	h := newHarness(t)
 	h.setDefaultChannels("ch_a")
 	p, err := h.svc.Create(h.ctx, "site_default", Policy{
-		Name: "target", ScopeKind: ScopeTarget, ScopeID: "t1", Enabled: true,
+		Name: "group", ScopeKind: ScopeGroup, ScopeID: "mg", Enabled: true,
 		MinSeverity: "warn", WarnDelaySec: 30, CriticalDelaySec: 5, ChannelIDs: []string{"ch_b"},
 	})
 	if err != nil {

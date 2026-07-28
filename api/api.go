@@ -197,7 +197,7 @@ func Router(d Deps) http.Handler {
 			r.Get("/targets/{id}/detection-settings", d.handleGetDetectionSettings)
 			r.Patch("/targets/{id}/detection-settings", d.handleUpdateDetectionSettings)
 			// Notification policies decide whether/when/where a recorded fault is
-			// announced. Exactly one applies per incident (target > group > site).
+			// announced. Exactly one applies per incident (group > site).
 			r.Get("/sites/{id}/notification-policies", d.handleListNotificationPolicies)
 			r.Post("/sites/{id}/notification-policies", d.handleCreateNotificationPolicy)
 			r.Patch("/notification-policies/{id}", d.handleUpdateNotificationPolicy)

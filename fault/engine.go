@@ -189,7 +189,7 @@ func (s *Service) confirmSignal(ctx context.Context, tx *sql.Tx, agentID, siteID
 
 	scope := IncidentScope{
 		IncidentID: incidentID, SiteID: siteID, GroupID: r.GroupID,
-		TargetID: r.TargetID, Severity: newSeverity,
+		Severity: newSeverity,
 	}
 	if opened {
 		// One immutable base snapshot per incident, written synchronously in this

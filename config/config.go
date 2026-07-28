@@ -697,10 +697,6 @@ func (s *Service) SetSiteTargets(ctx context.Context, siteID string, targets []P
 		if _, err := tx.ExecContext(ctx, `DELETE FROM probe_tasks WHERE id=?`, id); err != nil {
 			return err
 		}
-		if _, err := tx.ExecContext(ctx,
-			`DELETE FROM notification_policies WHERE scope_kind='target' AND scope_id=?`, id); err != nil {
-			return err
-		}
 	}
 
 	// Bump the site serial once (in-tx) ONLY when the desired generation changes —

@@ -155,14 +155,14 @@ CREATE TABLE probe_detection_settings(
 -- ===== notification policies =====
 -- A policy consumes incidents; it takes no part in detection. Exactly one policy
 -- applies to any incident, resolved by a fixed precedence with no stacking:
---   target policy > monitor-group policy > site default policy
+--   monitor-group policy > site default policy
 -- Every site has one undeletable (editable) default policy. An empty channel
 -- list is a legal, meaningful state: "record every fault, send nothing".
 CREATE TABLE notification_policies(
   id                 TEXT PRIMARY KEY,                  -- 'np_' + uuid
   site_id            TEXT NOT NULL REFERENCES sites(id),
   name               TEXT NOT NULL,
-  scope_kind         TEXT NOT NULL CHECK(scope_kind IN('site','group','target')),
+  scope_kind         TEXT NOT NULL CHECK(scope_kind IN('site','group')),
   scope_id           TEXT NOT NULL DEFAULT '',          -- '' for the site scope
   enabled            INTEGER NOT NULL DEFAULT 1,
   min_severity       TEXT NOT NULL DEFAULT 'warn',

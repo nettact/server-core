@@ -104,16 +104,13 @@ type SnapshotWriter interface {
 }
 
 // IncidentScope describes the incident a delivery plan is being made for: enough
-// for the policy layer to resolve target > group > site precedence without
+// for the policy layer to resolve group > site precedence without
 // importing this package's types.
 type IncidentScope struct {
 	IncidentID string
 	SiteID     string
 	GroupID    string
-	// TargetID is empty for Agent-connectivity incidents, which resolve straight
-	// to the site default policy.
-	TargetID string
-	Severity string
+	Severity   string
 }
 
 // Planner is the notification-policy surface the engine calls inside its write
