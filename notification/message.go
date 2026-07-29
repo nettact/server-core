@@ -650,6 +650,19 @@ func probeReasonZh(code int) string {
 		return "状态码不符合预期"
 	case telemetry.ProbeReasonHTTPKeyword:
 		return "响应内容不匹配"
+	// The 8x family failed on the egress path, never at the target. The wording
+	// says so explicitly: whoever reads this notification must not go looking at a
+	// service that is perfectly healthy.
+	case telemetry.ProbeReasonProxyConnect:
+		return "代理不可达"
+	case telemetry.ProbeReasonProxyAuth:
+		return "代理认证失败"
+	case telemetry.ProbeReasonProxyDNS:
+		return "代理端域名解析失败"
+	case telemetry.ProbeReasonProxyRefused:
+		return "代理拒绝转发到目标"
+	case telemetry.ProbeReasonProxyConfig:
+		return "代理配置不可用（未回退直连）"
 	}
 	return fmt.Sprintf("未知错误（%d）", code)
 }
@@ -688,6 +701,18 @@ func probeReasonEn(code int) string {
 		return "unexpected HTTP status"
 	case telemetry.ProbeReasonHTTPKeyword:
 		return "response content mismatch"
+	// The 8x family failed on the egress path, never at the target — the wording
+	// has to keep the reader from investigating a healthy service.
+	case telemetry.ProbeReasonProxyConnect:
+		return "proxy unreachable"
+	case telemetry.ProbeReasonProxyAuth:
+		return "proxy authentication failed"
+	case telemetry.ProbeReasonProxyDNS:
+		return "proxy could not resolve the target"
+	case telemetry.ProbeReasonProxyRefused:
+		return "proxy refused to relay to the target"
+	case telemetry.ProbeReasonProxyConfig:
+		return "proxy config unusable (no direct fallback)"
 	}
 	return fmt.Sprintf("unknown error (%d)", code)
 }

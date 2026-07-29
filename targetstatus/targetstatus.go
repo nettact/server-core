@@ -306,8 +306,9 @@ func (s *Service) SiteStatuses(ctx context.Context, siteID string) (SiteStatuses
 	// than widening the snapshot, and a one-round skew in a 24-hour ratio is not
 	// observable.
 	avail := map[string]metrics.AvailabilityRatio{}
+	availByAgent := map[string]map[string]metrics.AvailabilityRatio{}
 	if s.metrics != nil {
-		avail, err = s.metrics.AvailabilityForSite(ctx, siteID, now.Add(-24*time.Hour).Unix(), now.Unix())
+		avail, availByAgent, err = s.metrics.AvailabilityForSiteWithAgents(ctx, siteID, now.Add(-24*time.Hour).Unix(), now.Unix())
 		if err != nil {
 			return SiteStatuses{}, err
 		}
@@ -317,7 +318,7 @@ func (s *Service) SiteStatuses(ctx context.Context, siteID string) (SiteStatuses
 	for i := range targets {
 		t := &targets[i]
 		out.Targets = append(out.Targets, s.assembleTarget(t, pairs[t.id], now,
-			msByKey, samples, detectors, signals, avail[t.id]))
+			msByKey, samples, detectors, signals, avail[t.id], availByAgent[t.id]))
 	}
 	sortTargets(out.Targets, targets)
 	return out, nil
@@ -329,7 +330,7 @@ func (s *Service) SiteStatuses(ctx context.Context, siteID string) (SiteStatuses
 func (s *Service) assembleTarget(t *targetRow, pairs []applicablePair, now time.Time,
 	msByKey map[string]*msRow, samples map[string]*sampleVal,
 	detectors map[string]detState, signals map[string]firingSignal,
-	avail metrics.AvailabilityRatio) TargetStatus {
+	avail metrics.AvailabilityRatio, availByAgent map[string]metrics.AvailabilityRatio) TargetStatus {
 
 	ts := TargetStatus{
 		TargetID: t.id, GroupID: t.groupID, Name: t.name, Kind: t.kind, Target: t.target,
@@ -358,6 +359,10 @@ func (s *Service) assembleTarget(t *targetRow, pairs []applicablePair, now time.
 
 	for _, p := range pairs {
 		as, agg := s.deriveAgent(t, p, now, msByKey, samples, detectors, signals)
+		if agentAvail := availByAgent[p.agentID]; agentAvail.Rounds > 0 {
+			ratio := agentAvail.Ratio
+			as.Availability24h = &ratio
+		}
 		ts.Agents = append(ts.Agents, as)
 		aggs = append(aggs, agg)
 

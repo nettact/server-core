@@ -602,3 +602,37 @@ func BenchmarkIngestBatch(b *testing.B) {
 		s.UpdateLatest("agent_bench", ids, ms)
 	}
 }
+
+func TestAvailabilityForSiteWithAgents(t *testing.T) {
+	db, s := openStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Second)
+	mk := func(ts time.Time, monitor string, value float64) telemetry.Metric {
+		return telemetry.Metric{
+			TS: ts, Kind: telemetry.MetricKind(RoundOKKind), Target: monitor,
+			MonitorID: monitor, Value: value, Unit: telemetry.UnitBool,
+		}
+	}
+	ingestBatch(t, db, s, "agent-a", []telemetry.Metric{
+		mk(now.Add(-4*time.Second), "target-1", 1),
+		mk(now.Add(-3*time.Second), "target-1", 0),
+	})
+	ingestBatch(t, db, s, "agent-b", []telemetry.Metric{
+		mk(now.Add(-2*time.Second), "target-1", 1),
+		mk(now.Add(-time.Second), "target-1", 1),
+	})
+
+	totals, agents, err := s.AvailabilityForSiteWithAgents(ctx, "site_default", now.Add(-time.Minute).Unix(), now.Add(time.Minute).Unix())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := totals["target-1"]; got.Rounds != 4 || got.OKRounds != 3 || got.Ratio != 0.75 {
+		t.Fatalf("target total = %+v, want 3/4 (0.75)", got)
+	}
+	if got := agents["target-1"]["agent-a"]; got.Rounds != 2 || got.OKRounds != 1 || got.Ratio != 0.5 {
+		t.Fatalf("agent-a = %+v, want 1/2 (0.5)", got)
+	}
+	if got := agents["target-1"]["agent-b"]; got.Rounds != 2 || got.OKRounds != 2 || got.Ratio != 1 {
+		t.Fatalf("agent-b = %+v, want 2/2 (1)", got)
+	}
+}

@@ -67,6 +67,22 @@ const (
 	KeyAgentStatusStaleSeconds         = "agent_status_stale_seconds"         // resource sample freshness cutoff
 )
 
+// LAN device inventory retention. Discovery is upsert-only — the agent never
+// reports a departure and ingest ignores OpRemove — so without an age cutoff the
+// devices table only ever grows. The worst offender is MAC randomization: phones
+// and laptops mint a fresh locally-administered address on every Wi-Fi join, and
+// each one would otherwise become a permanent row.
+//
+// The two keys are not symmetric. KeyDeviceRetentionDays is the master switch
+// (0 = never delete anything); KeyDeviceRandomMACRetentionDays only NARROWS the
+// window for randomized addresses (0 = no narrowing, they age out on the master
+// window). Modeling it this way makes the dangerous configuration — throwaway
+// addresses outliving real devices — impossible to reach by setting a key to 0.
+const (
+	KeyDeviceRetentionDays          = "device_retention_days"
+	KeyDeviceRandomMACRetentionDays = "device_random_mac_retention_days"
+)
+
 // IntBounds is one integer setting's default and inclusive [Min,Max] range.
 type IntBounds struct {
 	Default int
@@ -98,6 +114,12 @@ var IntKeys = map[string]IntBounds{
 	KeyAgentConnectivityGraceSeconds:   {Default: 60, Min: 15, Max: 3600},
 	KeyAgentConnectivityRecoverSeconds: {Default: 30, Min: 5, Max: 600},
 	KeyAgentStatusStaleSeconds:         {Default: 120, Min: 30, Max: 3600},
+	// Device retention. A present device is re-seen every regular collection
+	// cycle, so a week of silence is already a strong departure signal; a day is
+	// plenty for a throwaway address that is only ever seen during one Wi-Fi
+	// association. 0 has a distinct meaning per key — see the key comments.
+	KeyDeviceRetentionDays:          {Default: 7, Min: 0, Max: 365},
+	KeyDeviceRandomMACRetentionDays: {Default: 1, Min: 0, Max: 365},
 }
 
 type Service struct {

@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/nettact/protocol/wire"
+	"github.com/nettact/server-core/metrics"
 )
 
 func TestAggregateDecisionTable(t *testing.T) {
@@ -147,5 +148,19 @@ func TestPendingGraceExpiresToNoDataWithoutChangingExecution(t *testing.T) {
 				t.Fatalf("display = %q, want %q", got, tt.display)
 			}
 		})
+	}
+}
+
+func TestAssembleTargetIncludesPerAgentAvailability(t *testing.T) {
+	svc := &Service{}
+	target := &targetRow{id: "target", kind: "host", enabled: true}
+	pairs := []applicablePair{{agentID: "agent", agentName: "Agent", online: true}}
+
+	got := svc.assembleTarget(target, pairs, time.Now().UTC(), nil, nil, nil, nil,
+		metrics.AvailabilityRatio{}, map[string]metrics.AvailabilityRatio{
+			"agent": {AgentID: "agent", Rounds: 4, OKRounds: 3, Ratio: 0.75},
+		})
+	if len(got.Agents) != 1 || got.Agents[0].Availability24h == nil || *got.Agents[0].Availability24h != 0.75 {
+		t.Fatalf("agent availability = %+v, want 0.75", got.Agents)
 	}
 }

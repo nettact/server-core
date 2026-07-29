@@ -167,6 +167,12 @@ func Router(d Deps) http.Handler {
 			r.Post("/sites/{id}/monitor-groups", d.handleCreateMonitorGroup)
 			r.Put("/monitor-groups/{id}", d.handleUpdateMonitorGroup)
 			r.Delete("/monitor-groups/{id}", d.handleDeleteMonitorGroup)
+			// Egress proxies (SOCKS5 / HTTP CONNECT / WireGuard tunnel) a monitoring
+			// target can be pinned to. Credentials are write-only: reads redact them.
+			r.Get("/sites/{id}/proxies", d.handleListProxies)
+			r.Post("/sites/{id}/proxies", d.handleCreateProxy)
+			r.Put("/proxies/{id}", d.handleUpdateProxy)
+			r.Delete("/proxies/{id}", d.handleDeleteProxy)
 			r.Get("/sites/{id}/devices", d.handleListDevices)
 			// Operational issues (monitors not running under the agent's permission
 			// policy). Kept separate from alerts/incidents (never alerted on).
@@ -896,8 +902,10 @@ func (d Deps) handleSetTargets(w http.ResponseWriter, r *http.Request) {
 	siteID := chi.URLParam(r, "id")
 	if err := d.Config.SetSiteTargets(r.Context(), siteID, body.Targets); err != nil {
 		// A repeated target id is a malformed payload, not a server fault: answering
-		// 500 would tell the client to retry something that can never succeed.
-		if errors.Is(err, config.ErrDuplicateTargetID) {
+		// 500 would tell the client to retry something that can never succeed. The
+		// same holds for an unhonorable proxy pin (unknown/cross-site id, or a proxy
+		// type this probe kind cannot run through).
+		if errors.Is(err, config.ErrDuplicateTargetID) || errors.Is(err, config.ErrTargetProxy) {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}

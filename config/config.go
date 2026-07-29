@@ -127,6 +127,10 @@ type ProbeTarget struct {
 	Target  string           `json:"target"`
 	Params  pcfg.ProbeParams `json:"params"`
 	Enabled bool             `json:"enabled"`
+	// ProxyID pins this target's egress to a site proxy (proxies.id). Empty means a
+	// direct dial. It is a MATERIAL field: changing it changes what the agent does
+	// on the wire, so it advances the target's generation like kind/target/params.
+	ProxyID string `json:"proxy_id,omitempty"`
 }
 
 // ---- monitor groups ----
@@ -497,7 +501,8 @@ func reconcileGroupScope(ctx context.Context, tx txExec, groupID, siteID string,
 // monitor group id) for the management UI.
 func (s *Service) ListSiteTargets(ctx context.Context, siteID string) ([]ProbeTarget, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, group_id, kind, COALESCE(name,''), COALESCE(target,''), COALESCE(params,''), enabled
+		`SELECT id, group_id, kind, COALESCE(name,''), COALESCE(target,''), COALESCE(params,''), enabled,
+		        COALESCE(proxy_id,'')
 		 FROM probe_tasks WHERE site_id=? ORDER BY kind, target`, siteID)
 	if err != nil {
 		return nil, err
@@ -508,7 +513,7 @@ func (s *Service) ListSiteTargets(ctx context.Context, siteID string) ([]ProbeTa
 		var t ProbeTarget
 		var params string
 		var enabled int
-		if err := rows.Scan(&t.ID, &t.GroupID, &t.Kind, &t.Name, &t.Target, &params, &enabled); err != nil {
+		if err := rows.Scan(&t.ID, &t.GroupID, &t.Kind, &t.Name, &t.Target, &params, &enabled, &t.ProxyID); err != nil {
 			return nil, err
 		}
 		if params != "" {
@@ -588,6 +593,9 @@ func (s *Service) SetSiteTargets(ctx context.Context, siteID string, targets []P
 		return err
 	}
 	if err := validateTargetOwnership(ctx, tx, siteID, targets); err != nil {
+		return err
+	}
+	if err := validateTargetProxies(ctx, tx, siteID, targets); err != nil {
 		return err
 	}
 
@@ -725,12 +733,13 @@ func (s *Service) SetSiteTargets(ctx context.Context, siteID string, targets []P
 			changedAt = of.configChangedAt
 		}
 		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO probe_tasks(id, site_id, group_id, kind, name, target, params, enabled, config_serial, config_changed_at)
-			 VALUES(?,?,?,?,?,?,?,?,?,?)
+			`INSERT INTO probe_tasks(id, site_id, group_id, kind, name, target, params, enabled, proxy_id, config_serial, config_changed_at)
+			 VALUES(?,?,?,?,?,?,?,?,?,?,?)
 			 ON CONFLICT(id) DO UPDATE SET group_id=excluded.group_id, kind=excluded.kind, name=excluded.name,
-			   target=excluded.target, params=excluded.params, enabled=excluded.enabled,
+			   target=excluded.target, params=excluded.params, enabled=excluded.enabled, proxy_id=excluded.proxy_id,
 			   config_serial=excluded.config_serial, config_changed_at=excluded.config_changed_at`,
-			t.ID, siteID, t.GroupID, t.Kind, t.Name, t.Target, string(params), boolInt(t.Enabled), serial, changedAt); err != nil {
+			t.ID, siteID, t.GroupID, t.Kind, t.Name, t.Target, string(params), boolInt(t.Enabled),
+			nullIfEmpty(t.ProxyID), serial, changedAt); err != nil {
 			return err
 		}
 	}
@@ -772,20 +781,24 @@ func keysOf(m map[string]bool) []string {
 // targetFacts is a target's current stored identity, used to detect removed/moved
 // targets, per-target material change, and name-only edits during a reconcile.
 type targetFacts struct {
-	groupID, name, kind, target, params string
-	enabled                             bool
-	configSerial                        int
-	configChangedAt                     sql.NullTime
+	groupID, name, kind, target, params, proxyID string
+	enabled                                      bool
+	configSerial                                 int
+	configChangedAt                              sql.NullTime
 }
 
 // materialTargetChange reports whether the submitted target differs from its
 // stored facts in a way that changes what the agent probes (kind / target /
-// params / enabled). name and group_id are NOT material — they never change the
-// probe, so the target keeps its generation. newParams is the canonical marshal
-// of the submitted params.
+// params / enabled / proxy pin). name and group_id are NOT material — they never
+// change the probe, so the target keeps its generation. newParams is the
+// canonical marshal of the submitted params.
+//
+// proxy_id belongs here because it changes the egress path: the same request to
+// the same URL through a different proxy is a different probe, and a failure
+// streak measured on the old path says nothing about the new one.
 func materialTargetChange(old targetFacts, t ProbeTarget, newParams string) bool {
 	return old.kind != t.Kind || old.target != t.Target || old.enabled != t.Enabled ||
-		canonParams(old.params) != newParams
+		old.proxyID != t.ProxyID || canonParams(old.params) != newParams
 }
 
 // canonParams normalizes a stored params JSON string to the canonical marshal of
@@ -806,7 +819,8 @@ func canonParams(s string) string {
 // classify and delete against in-tx state, never a pre-transaction snapshot.
 func currentTargetFacts(ctx context.Context, q scopeQueryer, siteID string) (map[string]targetFacts, error) {
 	rows, err := q.QueryContext(ctx,
-		`SELECT id, group_id, COALESCE(name,''), kind, COALESCE(target,''), COALESCE(params,''), enabled, config_serial, config_changed_at
+		`SELECT id, group_id, COALESCE(name,''), kind, COALESCE(target,''), COALESCE(params,''), enabled,
+		        COALESCE(proxy_id,''), config_serial, config_changed_at
 		 FROM probe_tasks WHERE site_id=?`, siteID)
 	if err != nil {
 		return nil, err
@@ -817,7 +831,7 @@ func currentTargetFacts(ctx context.Context, q scopeQueryer, siteID string) (map
 		var id string
 		var f targetFacts
 		var enabled int
-		if err := rows.Scan(&id, &f.groupID, &f.name, &f.kind, &f.target, &f.params, &enabled, &f.configSerial, &f.configChangedAt); err != nil {
+		if err := rows.Scan(&id, &f.groupID, &f.name, &f.kind, &f.target, &f.params, &enabled, &f.proxyID, &f.configSerial, &f.configChangedAt); err != nil {
 			return nil, err
 		}
 		f.enabled = enabled == 1
@@ -890,6 +904,66 @@ func validateTargetOwnership(ctx context.Context, q scopeQueryer, siteID string,
 	return rows.Err()
 }
 
+// validateTargetProxies rejects the update if any target's proxy pin is not
+// honorable: an id that does not belong to this site, or a proxy type this probe
+// kind cannot run through (pcfg.ProxyCapable). Runs inside the write tx so the
+// proxy set it checks is the one the upsert commits against.
+//
+// Both checks exist because an unhonorable pin has no good runtime behavior. The
+// agent will not fall back to a direct dial (that would silently change the
+// egress path), so the monitor would simply never run — a save that quietly
+// produces a dead monitor. Rejecting here turns it into a fixable message on the
+// form instead. Kind and params are read from the SUBMITTED target, not the
+// stored one, so switching a proxied HTTP monitor to ICMP in the same save is
+// caught too.
+func validateTargetProxies(ctx context.Context, q scopeQueryer, siteID string, targets []ProbeTarget) error {
+	want := map[string]bool{}
+	for _, t := range targets {
+		if t.ProxyID != "" {
+			want[t.ProxyID] = true
+		}
+	}
+	if len(want) == 0 {
+		return nil
+	}
+	ids := make([]any, 0, len(want))
+	for id := range want {
+		ids = append(ids, id)
+	}
+	rows, err := q.QueryContext(ctx,
+		`SELECT id, name, type FROM proxies WHERE site_id=? AND id IN (`+placeholders(len(ids))+`)`,
+		append([]any{siteID}, ids...)...)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	have := map[string]ProxyRef{}
+	for rows.Next() {
+		var r ProxyRef
+		if err := rows.Scan(&r.ID, &r.Name, &r.Type); err != nil {
+			return err
+		}
+		have[r.ID] = r
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, t := range targets {
+		if t.ProxyID == "" {
+			continue
+		}
+		ref, ok := have[t.ProxyID]
+		if !ok {
+			return fmt.Errorf("%w: proxy %q does not belong to site %s", ErrTargetProxy, t.ProxyID, siteID)
+		}
+		if !pcfg.ProxyCapable(t.Kind, t.Params, ref.Type) {
+			return fmt.Errorf("%w: a %s monitor cannot run through the %s proxy %q",
+				ErrTargetProxy, t.Kind, ref.Type, ref.Name)
+		}
+	}
+	return nil
+}
+
 // DesiredStateFor builds the config to push to a specific agent. Targets are
 // resolved per agent through the group scope predicate: a target reaches this
 // agent when its monitor group broadcasts to the whole site or this agent belongs
@@ -905,7 +979,8 @@ func (s *Service) DesiredStateFor(ctx context.Context, agentID string) (pcfg.Des
 		Intervals:     pcfg.Intervals{BaseSeconds: defaultBaseSeconds, RegularSeconds: defaultRegularSeconds},
 	}
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT pt.id, kind, COALESCE(name,''), COALESCE(target,''), COALESCE(params,''), pt.config_serial
+		`SELECT pt.id, kind, COALESCE(name,''), COALESCE(target,''), COALESCE(params,''), pt.config_serial,
+		        COALESCE(pt.proxy_id,'')
 		 FROM probe_tasks pt
 		 WHERE pt.site_id=? AND pt.enabled=1 AND pt.kind<>'host'
 		   AND `+AgentScopePredicate+`
@@ -914,18 +989,34 @@ func (s *Service) DesiredStateFor(ctx context.Context, agentID string) (pcfg.Des
 		return pcfg.DesiredState{}, err
 	}
 	defer rows.Close()
+	referenced := map[string]bool{}
 	for rows.Next() {
 		var t pcfg.ProbeTarget
 		var params string
-		if err := rows.Scan(&t.MonitorID, &t.Kind, &t.Name, &t.Target, &params, &t.ConfigSerial); err != nil {
+		if err := rows.Scan(&t.MonitorID, &t.Kind, &t.Name, &t.Target, &params, &t.ConfigSerial, &t.ProxyID); err != nil {
 			return pcfg.DesiredState{}, err
 		}
 		if params != "" {
 			_ = json.Unmarshal([]byte(params), &t.Params)
 		}
+		if t.ProxyID != "" {
+			referenced[t.ProxyID] = true
+		}
 		ds.ProbeTargets = append(ds.ProbeTargets, t)
 	}
-	return ds, rows.Err()
+	if err := rows.Err(); err != nil {
+		return pcfg.DesiredState{}, err
+	}
+	// Push only the ENABLED referenced proxies. A referenced-but-disabled proxy is
+	// omitted on purpose while its targets stay above, so the agent reports
+	// proxy_missing rather than the monitors quietly disappearing from its view —
+	// which would be indistinguishable from having been deleted.
+	proxies, err := proxySpecsFor(ctx, s.db, st.SiteID, referenced)
+	if err != nil {
+		return pcfg.DesiredState{}, err
+	}
+	ds.Proxies = proxies
+	return ds, nil
 }
 
 // announce publishes TopicConfigChanged so the WebSocket hub pushes fresh

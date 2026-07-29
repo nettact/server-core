@@ -79,14 +79,18 @@ func Remediate(reason string, missing, granted []string, matchedSelector string)
 
 // Issue is one operational issue enriched with display + remediation fields.
 type Issue struct {
-	ID                 string       `json:"id"`
-	SiteID             string       `json:"site_id"`
-	AgentID            string       `json:"agent_id"`
-	AgentName          string       `json:"agent_name"`
-	Category           string       `json:"category"`
-	RefID              string       `json:"ref_id"`
-	MonitorName        string       `json:"monitor_name"`
-	Reason             string       `json:"reason"`
+	ID          string `json:"id"`
+	SiteID      string `json:"site_id"`
+	AgentID     string `json:"agent_id"`
+	AgentName   string `json:"agent_name"`
+	Category    string `json:"category"`
+	RefID       string `json:"ref_id"`
+	MonitorName string `json:"monitor_name"`
+	Reason      string `json:"reason"`
+	// DetailReason is the agent's specific cause behind Reason (proxy_missing,
+	// literal_denied, method_requires_extended…). Empty for a server-evaluated host
+	// monitor, whose status is the whole story.
+	DetailReason       string       `json:"detail_reason,omitempty"`
 	MissingPermissions []string     `json:"missing_permissions"`
 	MatchedSelector    string       `json:"matched_selector"`
 	PolicyHash         string       `json:"policy_hash"`
@@ -239,11 +243,12 @@ func (s *Service) ApplyMonitorStatus(ctx context.Context, agentID, siteID string
 		if e.Status == wire.MonitorStatusActive {
 			continue
 		}
-		key := dedupeKey(agentID, categoryMonitor, e.MonitorID, e.Status)
+		key := dedupeKey(agentID, categoryMonitor, e.MonitorID, e.Status, e.Reason)
 		blocked[key] = true
 		wasTransition, err := s.upsertIssue(ctx, tx, issueUpsert{
 			siteID: siteID, agentID: agentID, refID: e.MonitorID, reason: e.Status,
-			dedupeKey: key, missing: e.MissingPermissions, matchedSelector: e.MatchedSelector,
+			detailReason: e.Reason,
+			dedupeKey:    key, missing: e.MissingPermissions, matchedSelector: e.MatchedSelector,
 			policyHash: ms.PolicyHash, now: now,
 		})
 		if err != nil {
@@ -401,7 +406,9 @@ func (s *Service) ReevaluateHostMonitors(ctx context.Context, agentID string) er
 		}
 		wasTransition, err := s.upsertIssue(ctx, tx, issueUpsert{
 			siteID: siteID, agentID: agentID, refID: monitorID, reason: status,
-			dedupeKey: dedupeKey(agentID, categoryMonitor, monitorID, status),
+			// A host monitor is evaluated server-side, so there is no agent-reported detail
+			// reason to carry — the status is the whole story.
+			dedupeKey: dedupeKey(agentID, categoryMonitor, monitorID, status, ""),
 			missing:   reasonList, policyHash: policyHash, now: now,
 		})
 		if err != nil {
@@ -879,7 +886,7 @@ func (s *Service) queryIssues(ctx context.Context, where string, args ...any) ([
 		       COALESCE(NULLIF(a.display_name,''), NULLIF(a.hostname,''), oi.agent_id),
 		       oi.category, COALESCE(oi.ref_id,''),
 		       COALESCE(NULLIF(pt.name,''), COALESCE(pt.target,''), ''),
-		       oi.reason, oi.missing_permissions, oi.matched_selector, oi.policy_hash,
+		       oi.reason, oi.detail_reason, oi.missing_permissions, oi.matched_selector, oi.policy_hash,
 		       oi.state, oi.read, oi.count, oi.first_seen_at, oi.last_seen_at, oi.resolved_at,
 		       COALESCE(a.perm_granted,'[]')
 		FROM operational_issues oi
@@ -896,7 +903,7 @@ func (s *Service) queryIssues(ctx context.Context, where string, args ...any) ([
 		var read int
 		var resolvedAt sql.NullTime
 		if err := rows.Scan(&i.ID, &i.SiteID, &i.AgentID, &i.AgentName, &i.Category, &i.RefID,
-			&i.MonitorName, &i.Reason, &missing, &i.MatchedSelector, &i.PolicyHash,
+			&i.MonitorName, &i.Reason, &i.DetailReason, &missing, &i.MatchedSelector, &i.PolicyHash,
 			&i.State, &read, &i.Count, &i.FirstSeenAt, &i.LastSeenAt, &resolvedAt, &granted); err != nil {
 			return nil, err
 		}
@@ -995,9 +1002,13 @@ func scanMonitorRows(rows *sql.Rows) ([]MonitorStatusRow, error) {
 
 type issueUpsert struct {
 	siteID, agentID, refID, reason, dedupeKey string
-	missing                                   []string
-	matchedSelector, policyHash               string
-	now                                       time.Time
+	// detailReason is the agent's specific cause behind the coarse status (proxy_missing,
+	// literal_denied, method_requires_extended…). Stored so the issues list can say what
+	// to fix instead of only naming the status class.
+	detailReason                string
+	missing                     []string
+	matchedSelector, policyHash string
+	now                         time.Time
 }
 
 // upsertIssue inserts or refreshes a blocked issue and reports whether this was a
@@ -1013,10 +1024,10 @@ func (s *Service) upsertIssue(ctx context.Context, tx *sql.Tx, u issueUpsert) (b
 		return false, err
 	}
 	_, err = tx.ExecContext(ctx, `
-		INSERT INTO operational_issues(id, site_id, agent_id, category, ref_id, reason, dedupe_key,
-		                               missing_permissions, matched_selector, policy_hash,
+		INSERT INTO operational_issues(id, site_id, agent_id, category, ref_id, reason, detail_reason,
+		                               dedupe_key, missing_permissions, matched_selector, policy_hash,
 		                               state, read, count, first_seen_at, last_seen_at, resolved_at)
-		VALUES(?,?,?,?,?,?,?,?,?,?, 'active', 0, 1, ?, ?, NULL)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?, 'active', 0, 1, ?, ?, NULL)
 		ON CONFLICT(dedupe_key) DO UPDATE SET
 		  count = count + 1,
 		  last_seen_at = excluded.last_seen_at,
@@ -1024,10 +1035,11 @@ func (s *Service) upsertIssue(ctx context.Context, tx *sql.Tx, u issueUpsert) (b
 		  read = CASE WHEN operational_issues.state='resolved' THEN 0 ELSE operational_issues.read END,
 		  missing_permissions = excluded.missing_permissions,
 		  matched_selector = excluded.matched_selector,
+		  detail_reason = excluded.detail_reason,
 		  policy_hash = excluded.policy_hash,
 		  resolved_at = NULL`,
-		"issue_"+uuid.NewString(), u.siteID, u.agentID, categoryMonitor, u.refID, u.reason, u.dedupeKey,
-		marshalStrings(u.missing), u.matchedSelector, u.policyHash, u.now, u.now)
+		"issue_"+uuid.NewString(), u.siteID, u.agentID, categoryMonitor, u.refID, u.reason, u.detailReason,
+		u.dedupeKey, marshalStrings(u.missing), u.matchedSelector, u.policyHash, u.now, u.now)
 	return transition, err
 }
 
@@ -1260,8 +1272,12 @@ func (s *Service) publishStatus(siteID string, monitorIDs []string) {
 
 // ---- small utilities ----
 
-func dedupeKey(agentID, category, refID, reason string) string {
-	return agentID + "|" + category + "|" + refID + "|" + reason
+// dedupeKey identifies one operational issue. detailReason participates so a monitor
+// whose CAUSE changes — proxy_missing becoming proxy_unsupported after a proxy type
+// edit — surfaces as a new issue rather than silently mutating the existing row's
+// text, and so the previous cause is resolved rather than left active.
+func dedupeKey(agentID, category, refID, reason, detailReason string) string {
+	return agentID + "|" + category + "|" + refID + "|" + reason + "|" + detailReason
 }
 
 // validMonitorStatus reports whether s is a known agent-reportable monitor status

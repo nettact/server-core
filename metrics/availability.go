@@ -75,22 +75,38 @@ GROUP BY monitor_id, agent_id`
 // one continuous availability history, since the edit changed how it is probed,
 // not what "available" means.
 func (s *Store) AvailabilityForSite(ctx context.Context, siteID string, since, until int64) (map[string]AvailabilityRatio, error) {
+	totals, _, err := s.AvailabilityForSiteWithAgents(ctx, siteID, since, until)
+	return totals, err
+}
+
+// AvailabilityForSiteWithAgents returns the same per-target totals as
+// AvailabilityForSite together with each target's per-Agent breakdown. Both
+// views come from one query so batch status reads do not introduce an N+1 query.
+func (s *Store) AvailabilityForSiteWithAgents(ctx context.Context, siteID string, since, until int64) (map[string]AvailabilityRatio, map[string]map[string]AvailabilityRatio, error) {
 	rows, err := s.availability(ctx, `s.site_id = ?`, []any{siteID}, since, until)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	out := make(map[string]AvailabilityRatio, len(rows))
+	totals := make(map[string]AvailabilityRatio, len(rows))
+	perAgent := make(map[string]map[string]AvailabilityRatio)
 	for _, r := range rows {
-		agg := out[r.MonitorID]
+		agg := totals[r.MonitorID]
 		agg.MonitorID = r.MonitorID
 		agg.Rounds += r.Rounds
 		agg.OKRounds += r.OKRounds
-		out[r.MonitorID] = agg
+		totals[r.MonitorID] = agg
+
+		agents := perAgent[r.MonitorID]
+		if agents == nil {
+			agents = make(map[string]AvailabilityRatio)
+			perAgent[r.MonitorID] = agents
+		}
+		agents[r.AgentID] = r.withRatio()
 	}
-	for id, agg := range out {
-		out[id] = agg.withRatio()
+	for id, agg := range totals {
+		totals[id] = agg.withRatio()
 	}
-	return out, nil
+	return totals, perAgent, nil
 }
 
 // AvailabilityForTarget returns one target's availability over the window, both
