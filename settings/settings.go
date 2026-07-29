@@ -67,6 +67,23 @@ const (
 	KeyAgentStatusStaleSeconds         = "agent_status_stale_seconds"         // resource sample freshness cutoff
 )
 
+// Alert-storm suppression (ALERT-001). When one Agent's vantage point goes dark,
+// every monitor group under it breaches at once and each incident would announce
+// itself separately. These two knobs decide when that burst is collapsed into a
+// single "N faults at once" message.
+//
+// The threshold counts INCIDENTS, not monitor groups, because an incident is
+// exactly one message: five targets failing inside one unmerged group is five
+// messages, and that is the harassment being prevented. The rendered message
+// still states both numbers, so the reader is never misled about the scope.
+//
+// A threshold of 0 turns correlation off entirely and restores the per-incident
+// behaviour.
+const (
+	KeyIncidentStormThreshold     = "incident_storm_threshold"
+	KeyIncidentStormWindowSeconds = "incident_storm_window_seconds"
+)
+
 // LAN device inventory retention. Discovery is upsert-only — the agent never
 // reports a departure and ingest ignores OpRemove — so without an age cutoff the
 // devices table only ever grows. The worst offender is MAC randomization: phones
@@ -120,6 +137,13 @@ var IntKeys = map[string]IntBounds{
 	KeyAgentConnectivityGraceSeconds:   {Default: 60, Min: 15, Max: 3600},
 	KeyAgentConnectivityRecoverSeconds: {Default: 30, Min: 5, Max: 600},
 	KeyAgentStatusStaleSeconds:         {Default: 120, Min: 30, Max: 3600},
+	// Alert-storm correlation. Three is the smallest count that reads as "several
+	// things at once" rather than coincidence, and the 300s window matches the
+	// default warn notification delay (notifypolicy.DefaultWarnDelaySec) so the
+	// whole delay window can be collapsed into one message rather than only its
+	// tail. 0 threshold = correlation off.
+	KeyIncidentStormThreshold:     {Default: 3, Min: 0, Max: 50},
+	KeyIncidentStormWindowSeconds: {Default: 300, Min: 30, Max: 3600},
 	// Device retention. A present device is re-seen every regular collection
 	// cycle, so a week of silence is already a strong departure signal; a day is
 	// plenty for a throwaway address that is only ever seen during one Wi-Fi

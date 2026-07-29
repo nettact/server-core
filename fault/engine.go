@@ -189,7 +189,7 @@ func (s *Service) confirmSignal(ctx context.Context, tx *sql.Tx, agentID, siteID
 
 	scope := IncidentScope{
 		IncidentID: incidentID, SiteID: siteID, GroupID: r.GroupID,
-		Severity: newSeverity,
+		AgentID: agentID, Severity: newSeverity,
 	}
 	if opened {
 		// One immutable base snapshot per incident, written synchronously in this
@@ -265,6 +265,13 @@ func (s *Service) resolveSignal(ctx context.Context, tx *sql.Tx, signalID, reaso
 			return err
 		}
 		out.incidentUpdated = append(out.incidentUpdated, incidentEvent(incidentID, siteID, groupID, "", false))
+		// The incident plans nothing here, but its severity just changed downward.
+		// Anything the policy layer aggregates over it has to hear about that, or a
+		// notice still waiting out its delay will announce a severity that recovered
+		// before it was ever sent.
+		if s.planner != nil {
+			return s.planner.RecomputeTx(ctx, tx, incidentID, now)
+		}
 		return nil
 	}
 	if _, err := tx.ExecContext(ctx,
@@ -428,6 +435,14 @@ func recomputeIncident(ctx context.Context, tx *sql.Tx, incidentID string) (stri
 	_, err = tx.ExecContext(ctx,
 		`UPDATE incidents SET severity=?, suspected_layer=?, summary=? WHERE id=?`, worst, suspected, summary, incidentID)
 	return worst, err
+}
+
+// AddTimelineTx appends a timeline entry inside the caller's open write tx.
+// Exported so the notification-policy layer can record on the incident's own
+// timeline why its notice was suppressed in favour of a storm summary — the
+// operator reads one timeline, not two.
+func AddTimelineTx(ctx context.Context, tx *sql.Tx, incidentID, kind, message, ref string, now time.Time) {
+	addTimeline(ctx, tx, incidentID, kind, message, ref, now)
 }
 
 // addTimeline appends a timeline entry with an entity ref.

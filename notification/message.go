@@ -84,6 +84,24 @@ func RenderTitle(p Payload, lang string) string {
 		}
 		return "Agent 已恢复连接"
 	}
+	// A storm leads with the suspected root-cause layer, because that is the one
+	// piece of the message that tells the reader where to go look. "4 faults" says
+	// how bad it is; "likely at the WAN layer" says what to do about it.
+	if p.Event == "storm.opened" {
+		n := stormFaultCount(p)
+		layer := layerLabel(p.SuspectedLayer, lang)
+		if normLang(lang) == "en" {
+			return fmt.Sprintf("Suspected %s-layer fault: %d faults at once", layer, n)
+		}
+		return fmt.Sprintf("疑似%s层故障：%d 个故障同时告警", layer, n)
+	}
+	if p.Event == "storm.resolved" {
+		n := stormFaultCount(p)
+		if normLang(lang) == "en" {
+			return fmt.Sprintf("Network recovered: all %d faults are back", n)
+		}
+		return fmt.Sprintf("网络已恢复：%d 个故障全部恢复", n)
+	}
 	resolved := p.Event == "incident.resolved" || p.State == "resolved"
 	if normLang(lang) == "en" {
 		switch {
@@ -151,6 +169,9 @@ func RenderScope(p Payload, lang string) string {
 			return fmt.Sprintf("%d agents reconnected.", n)
 		}
 		return fmt.Sprintf("%d 个 Agent 已恢复连接。", n)
+	}
+	if p.Event == "storm.opened" || p.Event == "storm.resolved" {
+		return renderStormScope(p, lang)
 	}
 	if p.Event == "incident.resolved" || p.State == "resolved" {
 		// Only a merged incident spans the whole group; an unmerged group's incident
@@ -244,8 +265,172 @@ func RenderLines(p Payload, lang string) []string {
 		return RenderAgentLines(p, lang)
 	case "incident.resolved":
 		return RenderRecoveredLines(p, lang)
+	case "storm.opened", "storm.resolved":
+		return RenderStormLines(p, lang)
 	default:
 		return RenderDetails(p.Details, lang)
+	}
+}
+
+// --- storms (ALERT-001) ---
+
+// stormFaultCount is the number of faults a storm stands for. The nil guard is
+// for the non-storm events that also reach RenderTitle, not for an incomplete
+// storm payload — the builder always fills the count.
+func stormFaultCount(p Payload) int {
+	if p.Storm == nil {
+		return 0
+	}
+	return p.Storm.FaultCount
+}
+
+// renderStormScope is the storm's one-line diagnosis. It names the Agent the
+// faults were seen from, because that is what bounds the claim: this is what one
+// vantage point lost, not necessarily what the world lost.
+func renderStormScope(p Payload, lang string) string {
+	en := normLang(lang) == "en"
+	agent := ""
+	groups := 0
+	dur := 0
+	if p.Storm != nil {
+		agent, groups, dur = p.Storm.AgentName, p.Storm.GroupCount, p.Storm.DurationS
+	}
+	n := stormFaultCount(p)
+	if agent == "" {
+		if en {
+			agent = "this agent"
+		} else {
+			agent = "该 Agent"
+		}
+	}
+	if p.Event == "storm.resolved" {
+		if en {
+			return fmt.Sprintf("All %d faults on %s have recovered, after %s.", n, agent, durationLabel(dur, lang))
+		}
+		return fmt.Sprintf("来自 %s 的 %d 个故障已全部恢复，共持续 %s。", agent, n, durationLabel(dur, lang))
+	}
+	if en {
+		return fmt.Sprintf("%d faults broke out together on %s, across %d monitor group(s), likely at the %s layer.",
+			n, agent, groups, layerLabel(p.SuspectedLayer, lang))
+	}
+	return fmt.Sprintf("来自 %s 的 %d 个故障几乎同时发生，涉及 %d 个监控组，疑似%s层。",
+		agent, n, groups, layerLabel(p.SuspectedLayer, lang))
+}
+
+// RenderStormLines lists the monitor groups a storm hit, worst first, with the
+// same maxDetailLines cap and "+N more" tail every other list uses — a site-wide
+// outage must not produce a wall of text on a phone.
+func RenderStormLines(p Payload, lang string) []string {
+	if p.Storm == nil {
+		return nil
+	}
+	en := normLang(lang) == "en"
+	groups := make([]StormGroup, len(p.Storm.Groups))
+	copy(groups, p.Storm.Groups)
+	sort.SliceStable(groups, func(i, j int) bool {
+		if a, b := severityRank[groups[i].Severity], severityRank[groups[j].Severity]; a != b {
+			return a > b
+		}
+		return layerOrder[groups[i].Layer] < layerOrder[groups[j].Layer]
+	})
+	limit := len(groups)
+	if limit > maxDetailLines {
+		limit = maxDetailLines
+	}
+	out := make([]string, 0, limit+1)
+	for _, g := range groups[:limit] {
+		name := g.Name
+		if name == "" {
+			if en {
+				name = "(ungrouped)"
+			} else {
+				name = "（未分组）"
+			}
+		}
+		if p.Event == "storm.resolved" {
+			if en {
+				out = append(out, fmt.Sprintf("Group %q recovered", name))
+			} else {
+				out = append(out, fmt.Sprintf("监控组「%s」已恢复", name))
+			}
+			continue
+		}
+		if en {
+			out = append(out, fmt.Sprintf("Group %q — %s", name, severityLabel(g.Severity, lang)))
+		} else {
+			out = append(out, fmt.Sprintf("监控组「%s」— %s", name, severityLabel(g.Severity, lang)))
+		}
+	}
+	if rest := len(groups) - limit; rest > 0 {
+		if en {
+			out = append(out, fmt.Sprintf("+%d more", rest))
+		} else {
+			out = append(out, fmt.Sprintf("另有 %d 组", rest))
+		}
+	}
+	return out
+}
+
+// severityLabel renders a severity code as a human word. The enum leaks into a
+// few user-visible places already (the email trailer); this keeps the storm
+// lines from being one more of them.
+func severityLabel(sev, lang string) string {
+	if normLang(lang) == "en" {
+		switch sev {
+		case "critical":
+			return "critical"
+		case "error":
+			return "error"
+		case "warn":
+			return "warning"
+		case "info":
+			return "info"
+		}
+		return sev
+	}
+	switch sev {
+	case "critical":
+		return "严重"
+	case "error":
+		return "错误"
+	case "warn":
+		return "警告"
+	case "info":
+		return "提示"
+	}
+	return sev
+}
+
+// durationLabel renders a span in the largest unit that keeps it readable, so a
+// recovery notice says "12 分钟" rather than "743 秒".
+func durationLabel(seconds int, lang string) string {
+	en := normLang(lang) == "en"
+	if seconds < 0 {
+		seconds = 0
+	}
+	switch {
+	case seconds < 60:
+		if en {
+			return fmt.Sprintf("%ds", seconds)
+		}
+		return fmt.Sprintf("%d 秒", seconds)
+	case seconds < 3600:
+		if en {
+			return fmt.Sprintf("%dm", seconds/60)
+		}
+		return fmt.Sprintf("%d 分钟", seconds/60)
+	case seconds < 86400:
+		h := float64(seconds) / 3600
+		if en {
+			return fmt.Sprintf("%sh", strconv.FormatFloat(math.Round(h*10)/10, 'f', -1, 64))
+		}
+		return fmt.Sprintf("%s 小时", strconv.FormatFloat(math.Round(h*10)/10, 'f', -1, 64))
+	default:
+		d := float64(seconds) / 86400
+		if en {
+			return fmt.Sprintf("%sd", strconv.FormatFloat(math.Round(d*10)/10, 'f', -1, 64))
+		}
+		return fmt.Sprintf("%s 天", strconv.FormatFloat(math.Round(d*10)/10, 'f', -1, 64))
 	}
 }
 

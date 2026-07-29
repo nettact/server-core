@@ -21,12 +21,16 @@ var varPattern = regexp.MustCompile(`\{\{\s*([a-z_]+)\s*\}\}`)
 //	text             one-line scope/diagnosis
 //	summary          one-line summary leading with the top fault
 //	lines            per-target fault sentences, newline-joined
-//	target           worst-first primary target name
-//	targets          distinct target names, worst-first, comma-joined
-//	agents           agent names for a connectivity event, comma-joined
-//	event/state/severity/scope/incident_id/site_id/suspected_layer/url  raw Payload fields
+//	target           worst-first primary target name (storm: first monitor group)
+//	targets          distinct target names, worst-first, comma-joined (storm: group names)
+//	agents           agent names for a connectivity event, comma-joined (storm: the observing agent)
+//	event/state/severity/scope/incident_id/storm_id/site_id/suspected_layer/url  raw Payload fields
 //	agent_count      number of distinct alerting agents
 //	at               incident time, RFC3339
+//
+// event takes the values incident.opened / incident.resolved / agent.offline /
+// agent.recovered / storm.opened / storm.resolved / test. storm_id is empty for
+// everything but the two storm events, and incident_id is empty for those.
 func buildVars(p Payload, lang string) map[string]string {
 	// target / targets: distinct friendly names in worst-first order, falling
 	// back to the raw address when a target has no operator-set name.
@@ -56,6 +60,25 @@ func buildVars(p Payload, lang string) map[string]string {
 		}
 		agentNames = append(agentNames, name)
 	}
+	// A storm has no per-target details of its own — it stands for many faults at
+	// once. Fill the same two variables from the groups it hit and the Agent it was
+	// seen from, so a template authored against incident events still renders
+	// something true instead of an empty string.
+	if p.Storm != nil {
+		if len(targets) == 0 {
+			for _, g := range p.Storm.Groups {
+				if g.Name != "" {
+					targets = append(targets, g.Name)
+				}
+			}
+			if len(targets) > 0 {
+				target = targets[0]
+			}
+		}
+		if len(agentNames) == 0 && p.Storm.AgentName != "" {
+			agentNames = append(agentNames, p.Storm.AgentName)
+		}
+	}
 	return map[string]string{
 		"title":           RenderTitle(p, lang),
 		"text":            RenderScope(p, lang),
@@ -69,6 +92,7 @@ func buildVars(p Payload, lang string) map[string]string {
 		"severity":        p.Severity,
 		"scope":           p.Scope,
 		"incident_id":     p.IncidentID,
+		"storm_id":        p.StormID,
 		"site_id":         p.SiteID,
 		"suspected_layer": p.SuspectedLayer,
 		"url":             p.URL,

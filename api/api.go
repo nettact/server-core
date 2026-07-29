@@ -1325,9 +1325,34 @@ func (d Deps) handleListIncidents(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	// Open storms ride along for the same reason: "several things broke at once"
+	// is a property of the site right now, not of the current filter.
+	storms, err := d.Incident.OpenStorms(ctx, siteID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	// A storm being filtered to is included even once it has ended, so the deep
+	// link in a recovery summary can still name what the reader is looking at
+	// instead of leaving an anonymous filter chip.
+	if f.StormID != "" && !containsStorm(storms, f.StormID) {
+		if st, err := d.Incident.GetStorm(ctx, f.StormID); err == nil && st.SiteID == siteID {
+			storms = append(storms, st)
+		}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"items": incs, "total": total, "page": page, "page_size": pageSize, "summary": stats,
+		"items": incs, "total": total, "page": page, "page_size": pageSize,
+		"summary": stats, "storms": storms,
 	})
+}
+
+func containsStorm(storms []incident.Storm, id string) bool {
+	for _, s := range storms {
+		if s.ID == id {
+			return true
+		}
+	}
+	return false
 }
 
 // incidentFilter parses the fault centre's filter query parameters, writing a
@@ -1341,6 +1366,7 @@ func incidentFilter(w http.ResponseWriter, r *http.Request) (incident.Filter, bo
 		AgentID:   q.Get("agent"),
 		TargetID:  q.Get("target"),
 		ProbeKind: q.Get("kind"),
+		StormID:   q.Get("storm"),
 		Query:     q.Get("q"),
 	}
 	for name, dst := range map[string]**time.Time{"since": &f.Since, "until": &f.Until} {
@@ -2101,6 +2127,9 @@ func (d Deps) handleCreateChannel(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// Storm merging is not settable at creation: a new channel always starts
+	// merged (the column default), and the operator flips it from the list. One
+	// less decision in the add form for a setting almost nobody changes.
 	id, err := d.Notification.Create(r.Context(), body.Name, body.Type, body.Config)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -2348,9 +2377,10 @@ func validateListenAddr(v, effectiveAddr string) string {
 
 func (d Deps) handleUpdateChannel(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Name    string            `json:"name"`
-		Enabled bool              `json:"enabled"`
-		Config  map[string]string `json:"config"` // nil/omitted = keep existing
+		Name       string            `json:"name"`
+		Enabled    bool              `json:"enabled"`
+		StormMerge bool              `json:"storm_merge"`
+		Config     map[string]string `json:"config"` // nil/omitted = keep existing
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, maxChannelBodyBytes)).Decode(&body); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid body")
@@ -2376,7 +2406,7 @@ func (d Deps) handleUpdateChannel(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	if err := d.Notification.Update(r.Context(), id, body.Name, body.Enabled, body.Config); err != nil {
+	if err := d.Notification.Update(r.Context(), id, body.Name, body.Enabled, body.StormMerge, body.Config); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}

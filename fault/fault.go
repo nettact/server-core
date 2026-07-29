@@ -78,6 +78,39 @@ var severityRank = map[string]int{
 // an incident's suspected_layer.
 var layerPriority = []string{"local", "lan", "wan", "internet", "dns", "service", "wireless"}
 
+// MostFundamentalLayer picks the deepest layer present, which is the one most
+// likely to explain the rest: if the LAN is down, the DNS and service failures
+// above it are consequences, not independent faults. Returns "" when nothing is
+// annotated.
+//
+// Exported so the layer a storm blames is decided by the same ordering an
+// incident's suspected_layer is, rather than by a second copy that can drift.
+func MostFundamentalLayer(layers []string) string {
+	present := make(map[string]bool, len(layers))
+	for _, l := range layers {
+		present[l] = true
+	}
+	for _, l := range layerPriority {
+		if present[l] {
+			return l
+		}
+	}
+	return ""
+}
+
+// WorstSeverity returns the highest-ranked severity in the set, defaulting to
+// SeverityWarn for an empty or wholly unrecognized set (the same floor an
+// incident recomputes to).
+func WorstSeverity(severities []string) string {
+	worst := SeverityWarn
+	for _, sev := range severities {
+		if severityRank[sev] > severityRank[worst] {
+			worst = sev
+		}
+	}
+	return worst
+}
+
 // builtinLayer maps a probe kind to the network layer a failure of it most likely
 // implicates. This is an advisory annotation for grouping and display only — it
 // never suppresses a fault.
@@ -106,10 +139,16 @@ type SnapshotWriter interface {
 // IncidentScope describes the incident a delivery plan is being made for: enough
 // for the policy layer to resolve group > site precedence without
 // importing this package's types.
+//
+// AgentID is the vantage point the confirming signal was observed from. This
+// package makes no use of it — it is carried purely so the policy layer can
+// correlate a burst of simultaneous incidents seen by ONE agent into a single
+// announcement (ALERT-001). Detection stays entirely unaware of that grouping.
 type IncidentScope struct {
 	IncidentID string
 	SiteID     string
 	GroupID    string
+	AgentID    string
 	Severity   string
 }
 
@@ -126,6 +165,13 @@ type Planner interface {
 	// EscalateTx tightens an already-planned open notification when a merged
 	// incident's severity rises (and plans one that a lower severity had skipped).
 	EscalateTx(ctx context.Context, tx *sql.Tx, sc IncidentScope, now time.Time) error
+	// RecomputeTx notes that an incident's severity or suspected layer changed
+	// while it stayed OPEN — a partial recovery, where one member came back and
+	// others are still firing. There is nothing to re-plan for the incident
+	// itself, but any aggregate the policy layer maintains over it has to be
+	// refreshed, or a notice still waiting out its delay would describe a state
+	// that has already passed.
+	RecomputeTx(ctx context.Context, tx *sql.Tx, incidentID string, now time.Time) error
 	// ResolveTx cancels anything still pending and, for a genuine recovery, plans
 	// the paired recovery notification for the channels that actually received the
 	// open notification.

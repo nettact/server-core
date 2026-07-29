@@ -33,13 +33,19 @@ type Incident struct {
 	TraceCount        int    `json:"trace_count"`
 	MemberCount       int    `json:"member_count"`
 	ActiveMemberCount int    `json:"active_member_count"`
-	// NotifiedCount / PendingNotifyCount summarize the incident's notification
-	// records, so the list can distinguish "announced", "waiting out its delay" and
-	// "recorded only" without a second request per row.
-	NotifiedCount      int        `json:"notified_count"`
-	PendingNotifyCount int        `json:"pending_notify_count"`
-	OpenedAt           time.Time  `json:"opened_at"`
-	ResolvedAt         *time.Time `json:"resolved_at"`
+	// NotifiedCount / PendingNotifyCount summarize the notification records that
+	// speak for this fault — its own AND those of the storm that announced it on
+	// its behalf — so the list can distinguish "announced", "waiting out its delay"
+	// and "recorded only" without a second request per row.
+	NotifiedCount      int `json:"notified_count"`
+	PendingNotifyCount int `json:"pending_notify_count"`
+	// StormID is set when this fault was correlated into a burst that is announced
+	// once as a whole (ALERT-001). It says only that the fault is PART of a burst;
+	// whether anyone was actually told is the counts above, which already fold the
+	// storm's records in.
+	StormID    string     `json:"storm_id,omitempty"`
+	OpenedAt   time.Time  `json:"opened_at"`
+	ResolvedAt *time.Time `json:"resolved_at"`
 }
 
 // TimelineEntry is one incident timeline row, including the entity ref the fault
@@ -72,8 +78,19 @@ const incidentCols = `i.id, i.site_id, i.group_id, COALESCE(i.group_name,''), CO
 	(SELECT COUNT(*) FROM fault_signals s WHERE s.incident_id=i.id AND s.state='firing'),
 	COALESCE((SELECT status FROM incident_snapshots sn WHERE sn.incident_id=i.id),''),
 	(SELECT COUNT(DISTINCT report_id) FROM trace_report_refs trr WHERE trr.incident_id=i.id),
-	(SELECT COUNT(*) FROM notification_deliveries nd WHERE nd.incident_id=i.id AND nd.status='sent'),
-	(SELECT COUNT(*) FROM notification_deliveries nd WHERE nd.incident_id=i.id AND nd.status='pending')`
+	(SELECT COUNT(*) FROM notification_deliveries nd WHERE ` + deliveryForIncident + ` AND nd.status='sent'),
+	(SELECT COUNT(*) FROM notification_deliveries nd WHERE ` + deliveryForIncident + ` AND nd.status='pending'),
+	COALESCE(i.storm_id,'')`
+
+// deliveryForIncident matches the notification records that speak for one
+// incident — its own, plus those of the storm that announced it on its behalf.
+//
+// A storm member's own records are all canceled, so counting only those would
+// report "recorded only" for a fault everyone was in fact told about. Counting
+// the storm's records answers the question the console is actually asking: was
+// this fault announced? A NULL storm_id can never equal anything, so a
+// non-member matches only its own rows.
+const deliveryForIncident = `(nd.incident_id=i.id OR nd.storm_id=i.storm_id)`
 
 // Filter narrows an incident listing for the fault centre. Zero values mean "no
 // constraint", so the default listing is every incident newest-first.
@@ -84,6 +101,7 @@ type Filter struct {
 	AgentID   string
 	TargetID  string
 	ProbeKind string // probe kind, or a detector key like agent_connectivity
+	StormID   string // members of one correlated burst
 	Query     string // free text over incident title/summary and member target/agent names
 	Since     *time.Time
 	Until     *time.Time
@@ -107,6 +125,9 @@ func (f Filter) where(siteID string) (string, []any) {
 	}
 	if f.GroupID != "" {
 		add("i.group_id=?", f.GroupID)
+	}
+	if f.StormID != "" {
+		add("i.storm_id=?", f.StormID)
 	}
 	// Member-scoped filters go through EXISTS so an incident merging several
 	// members matches when ANY member does, without duplicating the incident row.
@@ -238,7 +259,7 @@ func scanIncident(row scanner) (Incident, error) {
 	err := row.Scan(&inc.ID, &inc.SiteID, &inc.GroupID, &inc.GroupName, &inc.Title, &inc.SuspectedLayer,
 		&inc.State, &inc.Severity, &inc.Summary, &inc.ResolveReason, &evidenceExpired,
 		&inc.OpenedAt, &resolved, &inc.MemberCount, &inc.ActiveMemberCount, &inc.SnapshotStatus, &inc.TraceCount,
-		&inc.NotifiedCount, &inc.PendingNotifyCount)
+		&inc.NotifiedCount, &inc.PendingNotifyCount, &inc.StormID)
 	if err != nil {
 		return Incident{}, err
 	}

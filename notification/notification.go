@@ -26,8 +26,9 @@ import (
 // so each channel can render title/summary/details in its own language at
 // delivery time.
 type Payload struct {
-	Event          string `json:"event"` // incident.opened | incident.updated | incident.resolved | incident.terminated | agent.offline | agent.recovered
+	Event          string `json:"event"` // incident.opened | incident.resolved | agent.offline | agent.recovered | storm.opened | storm.resolved
 	IncidentID     string `json:"incident_id"`
+	StormID        string `json:"storm_id,omitempty"`
 	SiteID         string `json:"site_id"`
 	State          string `json:"state"`                // open | resolved | terminated
 	Severity       string `json:"severity"`             // worst firing severity
@@ -43,8 +44,33 @@ type Payload struct {
 	Details          []FaultDetail     `json:"details,omitempty"`           // per-target firing facts (incident events)
 	RecoveredTargets []RecoveredTarget `json:"recovered_targets,omitempty"` // targets that came back (resolved/terminated events)
 	Agents           []AgentDetail     `json:"agents,omitempty"`            // per-agent facts (agent.offline / agent.recovered events)
+	Storm            *StormDetail      `json:"storm,omitempty"`             // correlated burst facts (storm.* events)
 	URL              string            `json:"url,omitempty"`               // deep link to the incident/agents view in the console
 	At               time.Time         `json:"at"`
+}
+
+// StormDetail is a correlated burst's facts (ALERT-001): many faults confirmed
+// at once from one Agent's vantage point, announced as a single message instead
+// of one per fault.
+//
+// Both counts are carried because they answer different questions and only
+// stating one would mislead: FaultCount is how many messages this notice
+// replaced, GroupCount is how far the damage spread. A single unmerged group
+// with five broken targets is five faults in one group, and a reader must be
+// able to tell that from five groups each losing one.
+type StormDetail struct {
+	AgentName  string       `json:"agent_name"`           // frozen display name of the observing Agent
+	FaultCount int          `json:"fault_count"`          // member incidents
+	GroupCount int          `json:"group_count"`          // distinct monitor groups they span
+	Groups     []StormGroup `json:"groups,omitempty"`     // per-group lines, worst first
+	DurationS  int          `json:"duration_s,omitempty"` // how long the storm lasted (resolved events)
+}
+
+// StormGroup is one monitor group caught in a storm.
+type StormGroup struct {
+	Name     string `json:"name"`
+	Severity string `json:"severity"`
+	Layer    string `json:"layer"`
 }
 
 // RecoveredTarget is one monitored target that was part of a now-resolved incident,
@@ -62,6 +88,13 @@ type Channel struct {
 	Type    string            `json:"type"` // "webhook" | "email" | "system"
 	Config  map[string]string `json:"config"`
 	Enabled bool              `json:"enabled"`
+	// StormMerge decides whether this destination receives one summary when many
+	// faults break out at once under a single Agent, or one message per fault
+	// (ALERT-001). On by default: for a phone or a chat room, N messages about one
+	// outage is the harm. Turn it off for a machine consumer — a ticketing webhook
+	// or a log sink — that needs one record per incident and would be made lossy
+	// by a summary.
+	StormMerge bool `json:"storm_merge"`
 }
 
 type Service struct {
@@ -73,8 +106,11 @@ func New(db *store.DB) *Service {
 	return &Service{db: db, client: &http.Client{Timeout: 10 * time.Second}}
 }
 
+const channelCols = `id, COALESCE(name,''), type, config, enabled, storm_merge`
+
 func (s *Service) List(ctx context.Context) ([]Channel, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, COALESCE(name,''), type, config, enabled FROM notification_channels ORDER BY type, name`)
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT `+channelCols+` FROM notification_channels ORDER BY type, name`)
 	if err != nil {
 		return nil, err
 	}
@@ -83,12 +119,13 @@ func (s *Service) List(ctx context.Context) ([]Channel, error) {
 	for rows.Next() {
 		var c Channel
 		var cfg string
-		var enabled int
-		if err := rows.Scan(&c.ID, &c.Name, &c.Type, &cfg, &enabled); err != nil {
+		var enabled, stormMerge int
+		if err := rows.Scan(&c.ID, &c.Name, &c.Type, &cfg, &enabled, &stormMerge); err != nil {
 			return nil, err
 		}
 		_ = json.Unmarshal([]byte(cfg), &c.Config)
 		c.Enabled = enabled == 1
+		c.StormMerge = stormMerge == 1
 		out = append(out, redact(c))
 	}
 	return out, rows.Err()
@@ -100,42 +137,51 @@ func (s *Service) List(ctx context.Context) ([]Channel, error) {
 func (s *Service) Get(ctx context.Context, id string) (Channel, error) {
 	var c Channel
 	var cfg string
-	var enabled int
+	var enabled, stormMerge int
 	err := s.db.QueryRowContext(ctx,
-		`SELECT id, COALESCE(name,''), type, config, enabled FROM notification_channels WHERE id=?`, id).
-		Scan(&c.ID, &c.Name, &c.Type, &cfg, &enabled)
+		`SELECT `+channelCols+` FROM notification_channels WHERE id=?`, id).
+		Scan(&c.ID, &c.Name, &c.Type, &cfg, &enabled, &stormMerge)
 	if err != nil {
 		return Channel{}, err
 	}
 	_ = json.Unmarshal([]byte(cfg), &c.Config)
 	c.Enabled = enabled == 1
+	c.StormMerge = stormMerge == 1
 	return c, nil
 }
 
-// Create adds a channel. config is stored as JSON.
+// Create adds a channel. config is stored as JSON. Storm merging starts on (the
+// column default) and is changed afterwards through Update.
 func (s *Service) Create(ctx context.Context, name, typ string, config map[string]string) (string, error) {
 	id := "chan_" + uuid.NewString()
 	b, _ := json.Marshal(config)
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO notification_channels(id, name, type, config, enabled) VALUES(?,?,?,?,1)`, id, name, typ, string(b))
+		`INSERT INTO notification_channels(id, name, type, config, enabled) VALUES(?,?,?,?,1)`,
+		id, name, typ, string(b))
 	return id, err
 }
 
-// Update edits a channel's name/enabled and, when config is non-nil, its config.
-func (s *Service) Update(ctx context.Context, id, name string, enabled bool, config map[string]string) error {
-	en := 0
-	if enabled {
-		en = 1
-	}
+// Update edits a channel's name/enabled/storm-merge and, when config is non-nil,
+// its config.
+func (s *Service) Update(ctx context.Context, id, name string, enabled, stormMerge bool, config map[string]string) error {
 	if config != nil {
 		b, _ := json.Marshal(config)
 		_, err := s.db.ExecContext(ctx,
-			`UPDATE notification_channels SET name=?, enabled=?, config=? WHERE id=?`, name, en, string(b), id)
+			`UPDATE notification_channels SET name=?, enabled=?, storm_merge=?, config=? WHERE id=?`,
+			name, boolInt(enabled), boolInt(stormMerge), string(b), id)
 		return err
 	}
 	_, err := s.db.ExecContext(ctx,
-		`UPDATE notification_channels SET name=?, enabled=? WHERE id=?`, name, en, id)
+		`UPDATE notification_channels SET name=?, enabled=?, storm_merge=? WHERE id=?`,
+		name, boolInt(enabled), boolInt(stormMerge), id)
 	return err
+}
+
+func boolInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
 }
 
 func (s *Service) Delete(ctx context.Context, id string) error {
