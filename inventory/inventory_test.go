@@ -174,6 +174,35 @@ func TestRetentionRandomWindowZeroInheritsMaster(t *testing.T) {
 	assertMACs(t, remaining(t, s), []string{burnedIn + "1", randomized + "2"})
 }
 
+// A randomized window wider than the master window must not extend the life of a
+// randomized address — the knob only ever narrows. The API rejects this pair, so
+// this covers the clamp itself: values written straight to the DB, or a future
+// caller that skips the API, must still not let throwaway addresses outlive real
+// devices. Both fixtures are older than the master window and younger than the
+// (ignored) 30-day randomized window, so an unclamped implementation keeps the
+// randomized one and this assertion fails.
+func TestRetentionRandomWindowNeverWidensMaster(t *testing.T) {
+	const day = 24 * time.Hour
+	db, st := seedDevices(t, map[string]time.Duration{
+		burnedIn + "1":   10 * day,
+		randomized + "2": 10 * day,
+		burnedIn + "3":   3 * day,
+		randomized + "4": 3 * day,
+	})
+	set(t, st, settings.KeyDeviceRetentionDays, 7)
+	set(t, st, settings.KeyDeviceRandomMACRetentionDays, 30)
+
+	s := New(db, st)
+	n, err := s.Retention(context.Background())
+	if err != nil {
+		t.Fatalf("retention: %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("deleted = %d, want 2", n)
+	}
+	assertMACs(t, remaining(t, s), []string{burnedIn + "3", randomized + "4"})
+}
+
 // A nil settings service (tests, hand-built wiring) must behave as the
 // registered defaults rather than as "retention off".
 func TestRetentionNilSettingsUsesDefaults(t *testing.T) {

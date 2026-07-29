@@ -2175,6 +2175,40 @@ func buildKnownSettingKeys() map[string]bool {
 	return m
 }
 
+// deviceRetentionConflict reports the error message when the posted settings
+// would leave the randomized-MAC retention window wider than the master one, or
+// "" when the pair is fine.
+//
+// A settings PUT is a partial merge, so each side is resolved from the request
+// when it sets that key and from stored state otherwise. That is what catches
+// the asymmetric edit: lowering only the master window below an already-stored
+// randomized window is the same inversion as raising the randomized one.
+//
+// A zero master window is exempt — retention is off entirely, so nothing outlives
+// anything — and a zero randomized window means "follow the master", which can
+// never exceed it.
+func (d Deps) deviceRetentionConflict(ctx context.Context, body map[string]string) string {
+	effective := func(key string) int {
+		if v, ok := body[key]; ok {
+			if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil {
+				return n
+			}
+		}
+		n, _ := d.Settings.Int(ctx, key)
+		return n
+	}
+	stable := effective(settings.KeyDeviceRetentionDays)
+	if stable <= 0 {
+		return ""
+	}
+	if random := effective(settings.KeyDeviceRandomMACRetentionDays); random > stable {
+		return settings.KeyDeviceRandomMACRetentionDays + " must not exceed " +
+			settings.KeyDeviceRetentionDays + " (" + strconv.Itoa(stable) +
+			"): it only narrows that window; use 0 to follow it"
+	}
+	return ""
+}
+
 // handleUpdateSettings merges the posted keys. Only known keys are accepted;
 // console_base_url is validated to be an absolute http(s) origin without a query
 // or fragment (or empty to clear it), listen_addr is validated (host allow-list,
@@ -2240,6 +2274,15 @@ func (d Deps) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		body[k] = strconv.Itoa(n)
+	}
+	// The two device-retention windows are range-checked independently above, which
+	// cannot see that one only ever narrows the other. Reject the inverted pair here
+	// rather than storing a value the pruner will refuse to honour: inventory clamps
+	// the randomized window to the master one, so accepting 30-over-7 would leave the
+	// console displaying 30 days while cleanup actually ran at 7.
+	if msg := d.deviceRetentionConflict(r.Context(), body); msg != "" {
+		writeError(w, http.StatusBadRequest, msg)
+		return
 	}
 	for k, v := range body {
 		if err := d.Settings.Set(r.Context(), k, v); err != nil {

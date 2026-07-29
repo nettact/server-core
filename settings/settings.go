@@ -76,8 +76,14 @@ const (
 // The two keys are not symmetric. KeyDeviceRetentionDays is the master switch
 // (0 = never delete anything); KeyDeviceRandomMACRetentionDays only NARROWS the
 // window for randomized addresses (0 = no narrowing, they age out on the master
-// window). Modeling it this way makes the dangerous configuration — throwaway
-// addresses outliving real devices — impossible to reach by setting a key to 0.
+// window).
+//
+// IntBounds cannot express that relationship — each key is range-checked on its
+// own — so the narrowing rule is enforced outside this table, in two places: the
+// settings API rejects a PUT whose resolved pair inverts it, and inventory clamps
+// the randomized window to the master one when reading. Without both, a 7-day
+// master beside a 30-day randomized window passes every per-key check and leaves
+// throwaway addresses outliving the real devices they exist to age out ahead of.
 const (
 	KeyDeviceRetentionDays          = "device_retention_days"
 	KeyDeviceRandomMACRetentionDays = "device_random_mac_retention_days"
