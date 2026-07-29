@@ -120,7 +120,7 @@ func (s *Service) MarkFirstConnected(ctx context.Context, id string) error {
 }
 
 // RecordDisconnect stores how an agent's most recent session ended (see the
-// last_disconnect_kind vocabulary in migration 0016). The sweeper reads it when
+// last_disconnect_kind vocabulary in the schema). The sweeper reads it when
 // it flips the agent offline, and the alert engine maps it to an alert reason.
 func (s *Service) RecordDisconnect(ctx context.Context, id, kind string) error {
 	_, err := s.db.ExecContext(ctx,

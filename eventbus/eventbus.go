@@ -9,16 +9,16 @@ import "sync"
 // Well-known topics.
 const (
 	// Fault-signal lifecycle, published post-commit by the built-in detectors.
-	TopicFaultConfirmed       = "fault.confirmed"
-	TopicFaultResolved        = "fault.resolved"
-	TopicIncidentOpened       = "incident.opened"
-	TopicIncidentUpdated      = "incident.updated"
-	TopicIncidentResolved     = "incident.resolved"
-	TopicConfigChanged        = "config.changed"
-	TopicIssueChanged         = "issue.changed"
-	TopicTargetStatusChanged  = "target.status.changed"
-	TopicAgentLivenessChanged = "agent.liveness.changed"
-	TopicAgentAlertChanged    = "agent.alert.changed"
+	TopicFaultConfirmed           = "fault.confirmed"
+	TopicFaultResolved            = "fault.resolved"
+	TopicIncidentOpened           = "incident.opened"
+	TopicIncidentUpdated          = "incident.updated"
+	TopicIncidentResolved         = "incident.resolved"
+	TopicConfigChanged            = "config.changed"
+	TopicIssueChanged             = "issue.changed"
+	TopicTargetStatusChanged      = "target.status.changed"
+	TopicAgentLivenessChanged     = "agent.liveness.changed"
+	TopicAgentConnectivityChanged = "agent.connectivity.changed"
 )
 
 // IncidentEvent is the payload for the incident lifecycle topics
@@ -54,12 +54,12 @@ type AgentLivenessChanged struct {
 	Status  string // online | offline
 }
 
-// AgentAlertChanged is the payload for TopicAgentAlertChanged, published by the
-// agent-alert engine after it opens or resolves a connectivity alert, so a
-// bridge can fan a fresh agent-status snapshot out to connected consoles. It
-// carries only the affected site; the console refetches the whole site's
-// agent-status list.
-type AgentAlertChanged struct {
+// AgentConnectivityChanged is the payload for TopicAgentConnectivityChanged,
+// published by the agent-connectivity engine after it opens or resolves a
+// liveness fault, so a bridge can fan a fresh agent-status snapshot out to
+// connected consoles. It carries only the affected site; the console refetches
+// the whole site's agent-status list.
+type AgentConnectivityChanged struct {
 	SiteID string
 }
 

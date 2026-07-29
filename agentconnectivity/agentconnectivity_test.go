@@ -1,4 +1,4 @@
-package agentalert
+package agentconnectivity
 
 import (
 	"context"

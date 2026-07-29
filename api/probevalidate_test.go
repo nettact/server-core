@@ -104,7 +104,6 @@ func TestValidateProbeParams(t *testing.T) {
 		{name: "icmp packet_count too high", kind: "icmp", params: pcfg.ProbeParams{PacketCount: 100000}, wantErr: "packet_count"},
 		{name: "icmp negative count", kind: "icmp", params: pcfg.ProbeParams{PacketCount: -1}, wantErr: "packet_count"},
 		{name: "icmp packet_size too big", kind: "icmp", params: pcfg.ProbeParams{PacketSize: 70000}, wantErr: "packet_size"},
-		{name: "icmp retries too high", kind: "icmp", params: pcfg.ProbeParams{Retries: 5000}, wantErr: "retries"},
 		{name: "icmp global timeout too long", kind: "icmp", params: pcfg.ProbeParams{GlobalTimeoutMs: 999999}, wantErr: "global_timeout_ms"},
 
 		// DNS record type + resolver endpoint.
@@ -136,8 +135,6 @@ func TestValidateProbeParams(t *testing.T) {
 		{name: "http defaults", kind: "http"},
 		{name: "http valid method", kind: "http", params: pcfg.ProbeParams{Method: "POST"}},
 		{name: "http bogus method", kind: "http", params: pcfg.ProbeParams{Method: "FETCH"}, wantErr: "method"},
-		{name: "http expected status ok", kind: "http", params: pcfg.ProbeParams{ExpectedStatus: 204}},
-		{name: "http expected status bogus", kind: "http", params: pcfg.ProbeParams{ExpectedStatus: 999}, wantErr: "expected_status"},
 		{name: "http redirects ok", kind: "http", params: pcfg.ProbeParams{MaxRedirects: 5}},
 		{name: "http redirects disabled", kind: "http", params: pcfg.ProbeParams{MaxRedirects: -1}},
 		{name: "http redirects absurd", kind: "http", params: pcfg.ProbeParams{MaxRedirects: 1000}, wantErr: "max_redirects"},

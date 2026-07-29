@@ -28,7 +28,7 @@ import (
 	"github.com/nettact/protocol/permission"
 	"github.com/nettact/protocol/telemetry"
 	"github.com/nettact/protocol/wire"
-	"github.com/nettact/server-core/agentalert"
+	"github.com/nettact/server-core/agentconnectivity"
 	"github.com/nettact/server-core/agentstatus"
 	"github.com/nettact/server-core/agentws"
 	"github.com/nettact/server-core/audit"
@@ -58,31 +58,31 @@ const sessionCookie = "nettact_session"
 
 // Deps are the services the HTTP layer needs.
 type Deps struct {
-	Identity     *identity.Service
-	Registry     *registry.Service
-	Metrics      *metrics.Store
-	Cleanup      *cleanup.Service
-	Config       *config.Service
-	Site         *site.Service
-	Inventory    *inventory.Service
-	Fault        *fault.Service
-	NotifyPolicy *notifypolicy.Service
-	Incident     *incident.Service
-	IncidentOps  *incidentops.Service // incident snapshot + traceroute orchestration reads
-	Notification *notification.Service
-	Settings     *settings.Service
-	Audit        *audit.Service
-	HostLive     *hostlive.Store       // in-memory live process/connection snapshots (never persisted)
-	OpIssue      *opissue.Service      // operational-issue engine (monitor status + issues)
-	TargetStatus *targetstatus.Service // authoritative current target-status aggregation (read-time)
-	AgentStatus  *agentstatus.Service  // per-agent health/resource rollup for the Agent status list (read-time)
-	AgentAlert   *agentalert.Engine    // agent offline/recovery connectivity-alert engine
-	SSE          *sse.Broker           // Server-Sent Events fan-out for live issue + target-status updates
-	AgentWS      *agentws.Hub          // persistent agent WebSocket channel (telemetry + config downlink)
-	Bus          *eventbus.Bus         // TopicConfigChanged for config mutations outside config.Service (group scope edits)
-	SPA          http.Handler          // optional embedded web UI (served for non-/api routes)
-	Dev          bool                  // relax CORS for the Vite origin
-	SecureCookie bool                  // set Secure on the session cookie (production/HTTPS)
+	Identity          *identity.Service
+	Registry          *registry.Service
+	Metrics           *metrics.Store
+	Cleanup           *cleanup.Service
+	Config            *config.Service
+	Site              *site.Service
+	Inventory         *inventory.Service
+	Fault             *fault.Service
+	NotifyPolicy      *notifypolicy.Service
+	Incident          *incident.Service
+	IncidentOps       *incidentops.Service // incident snapshot + traceroute orchestration reads
+	Notification      *notification.Service
+	Settings          *settings.Service
+	Audit             *audit.Service
+	HostLive          *hostlive.Store           // in-memory live process/connection snapshots (never persisted)
+	OpIssue           *opissue.Service          // operational-issue engine (monitor status + issues)
+	TargetStatus      *targetstatus.Service     // authoritative current target-status aggregation (read-time)
+	AgentStatus       *agentstatus.Service      // per-agent health/resource rollup for the Agent status list (read-time)
+	AgentConnectivity *agentconnectivity.Engine // agent offline/recovery liveness-fault engine
+	SSE               *sse.Broker               // Server-Sent Events fan-out for live issue + target-status updates
+	AgentWS           *agentws.Hub              // persistent agent WebSocket channel (telemetry + config downlink)
+	Bus               *eventbus.Bus             // TopicConfigChanged for config mutations outside config.Service (group scope edits)
+	SPA               http.Handler              // optional embedded web UI (served for non-/api routes)
+	Dev               bool                      // relax CORS for the Vite origin
+	SecureCookie      bool                      // set Secure on the session cookie (production/HTTPS)
 
 	// ListenStatus reports how the running server is actually bound (nil when the
 	// host doesn't provide one, e.g. bare server-core tests).
@@ -603,8 +603,8 @@ func (d Deps) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 		}
 		// Muting closes any firing connectivity alert immediately (no notification);
 		// unmuting lets the next engine tick reopen if still offline past grace.
-		if d.AgentAlert != nil {
-			d.AgentAlert.OnMuteChanged(r.Context(), id, *body.ConnectivityAlertsMuted)
+		if d.AgentConnectivity != nil {
+			d.AgentConnectivity.OnMuteChanged(r.Context(), id, *body.ConnectivityAlertsMuted)
 		}
 		d.Audit.Log(r.Context(), "admin", "agent.mute", id, strconv.FormatBool(*body.ConnectivityAlertsMuted))
 	}

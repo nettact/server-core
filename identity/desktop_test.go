@@ -63,7 +63,7 @@ func TestEnsureAdminReturnsExistingUser(t *testing.T) {
 	if second != first {
 		t.Fatalf("existing admin = %+v; want %+v", second, first)
 	}
-	if _, err := svc.Authenticate(ctx, "admin", "first-password"); err != nil {
+	if _, _, _, err := svc.LoginSession(ctx, "admin", "first-password"); err != nil {
 		t.Fatalf("original credentials no longer authenticate: %v", err)
 	}
 }
@@ -88,7 +88,7 @@ func TestEnsureAdminGeneratesFirstRunPassword(t *testing.T) {
 	if err := ValidatePassword(gen); err != nil {
 		t.Fatalf("generated password fails policy: %v", err)
 	}
-	if _, err := svc.Authenticate(ctx, "admin", gen); err != nil {
+	if _, _, _, err := svc.LoginSession(ctx, "admin", gen); err != nil {
 		t.Fatalf("generated password does not authenticate: %v", err)
 	}
 	second, gen2, err := svc.EnsureAdmin(ctx, "", "")

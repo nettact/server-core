@@ -1,6 +1,6 @@
-// Package agentalert is the Agent-liveness detector (AGENT-002): it confirms a
-// fault when an agent stays offline past a configurable grace period and resolves
-// it after the agent reconnects for a confirmation period.
+// Package agentconnectivity is the Agent-liveness detector (AGENT-002): it
+// confirms a fault when an agent stays offline past a configurable grace period
+// and resolves it after the agent reconnects for a confirmation period.
 //
 // It owns the liveness STATE MACHINE only. The fault it produces goes through the
 // same pipeline as every probe fault — a fault signal, its own incident, and a
@@ -15,7 +15,7 @@
 // after a server restart no fault can open before roughly startup + grace — well
 // after every agent's reconnect backoff — which prevents a mass false-offline
 // wave.
-package agentalert
+package agentconnectivity
 
 import (
 	"context"
@@ -235,7 +235,7 @@ func (e *Engine) publishChanges(sites map[string]bool) {
 		return
 	}
 	for siteID := range sites {
-		e.bus.Publish(eventbus.TopicAgentAlertChanged, eventbus.AgentAlertChanged{SiteID: siteID})
+		e.bus.Publish(eventbus.TopicAgentConnectivityChanged, eventbus.AgentConnectivityChanged{SiteID: siteID})
 	}
 }
 

@@ -145,9 +145,6 @@ func validateProbeParams(kind string, p *pcfg.ProbeParams) error {
 		if p.PacketCount < 0 || p.PacketCount > maxPacketCount {
 			return errors.New("packet_count out of range (0-" + strconv.Itoa(maxPacketCount) + ")")
 		}
-		if p.Retries < 0 || p.Retries > maxPacketCount {
-			return errors.New("retries out of range (0-" + strconv.Itoa(maxPacketCount) + ")")
-		}
 		if p.PacketSize < 0 || p.PacketSize > maxPacketSize {
 			return errors.New("packet_size out of range (0-" + strconv.Itoa(maxPacketSize) + ")")
 		}
@@ -189,9 +186,6 @@ func validateProbeParams(kind string, p *pcfg.ProbeParams) error {
 		p.Method = strings.ToUpper(strings.TrimSpace(p.Method))
 		if !validHTTPMethods[p.Method] {
 			return errors.New("invalid http method: " + p.Method)
-		}
-		if p.ExpectedStatus != 0 && (p.ExpectedStatus < 100 || p.ExpectedStatus > 599) {
-			return errors.New("expected_status out of range (100-599)")
 		}
 		if utf8.RuneCountInString(p.Keyword) > maxKeywordLen {
 			return errors.New("keyword too long (max " + strconv.Itoa(maxKeywordLen) + " characters)")

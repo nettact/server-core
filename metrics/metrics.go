@@ -1,8 +1,8 @@
 // Package metrics is the time-series store: a series dictionary + narrow raw
 // samples + downsampled rollups, sized for months-to-years of history in SQLite
-// (see migrations 0003/0011). Ingest writes samples; the API and rule engine
-// read via resolution-aware queries so any time range returns a bounded number
-// of points.
+// (see the series/samples/rollup tables in the schema). Ingest writes samples;
+// the API and rule engine read via resolution-aware queries so any time range
+// returns a bounded number of points.
 //
 // Series are keyed by (agent, monitor, kind, target, config_serial): monitor_id is
 // the user-created monitor (probe_tasks.id) stamped by the agent, and config_serial

@@ -221,27 +221,6 @@ func generatePassword(n int) (string, error) {
 	return string(b), nil
 }
 
-// Authenticate verifies a username/password. It does NOT mint a session; the
-// console login path uses LoginSession (which closes the verify→mint race).
-// Kept for out-of-band credential checks (and tests).
-func (s *Service) Authenticate(ctx context.Context, username, password string) (User, error) {
-	var u User
-	var hash string
-	err := s.db.Read().QueryRowContext(ctx,
-		`SELECT id, username, password_hash FROM users WHERE username=?`, username).
-		Scan(&u.ID, &u.Username, &hash)
-	if errors.Is(err, sql.ErrNoRows) {
-		return User{}, ErrAuth
-	}
-	if err != nil {
-		return User{}, err
-	}
-	if bcrypt.CompareHashAndPassword([]byte(hash), []byte(password)) != nil {
-		return User{}, ErrAuth
-	}
-	return u, nil
-}
-
 // LoginSession verifies a username/password and, only if the password is still
 // current, mints a session — closing the race where a password change lands
 // between the credential check and the INSERT and would otherwise mint a

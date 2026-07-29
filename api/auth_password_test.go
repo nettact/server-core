@@ -56,7 +56,7 @@ func TestHandleChangePasswordFlow(t *testing.T) {
 		t.Fatalf("weak new password status=%d body=%s", w.Code, w.Body.String())
 	}
 	// A rejected change must not have altered anything.
-	if _, err := id.Authenticate(ctx, "admin", "old-password"); err != nil {
+	if _, _, _, err := id.LoginSession(ctx, "admin", "old-password"); err != nil {
 		t.Fatalf("rejected change altered the password: %v", err)
 	}
 
@@ -65,10 +65,10 @@ func TestHandleChangePasswordFlow(t *testing.T) {
 		t.Fatalf("change status=%d body=%s", w.Code, w.Body.String())
 	}
 	// Old password no longer works; new one authenticates.
-	if _, err := id.Authenticate(ctx, "admin", "old-password"); !errors.Is(err, identity.ErrAuth) {
+	if _, _, _, err := id.LoginSession(ctx, "admin", "old-password"); !errors.Is(err, identity.ErrAuth) {
 		t.Fatalf("old password still authenticates: %v", err)
 	}
-	if _, err := id.Authenticate(ctx, "admin", "new-password"); err != nil {
+	if _, _, _, err := id.LoginSession(ctx, "admin", "new-password"); err != nil {
 		t.Fatalf("new password does not authenticate: %v", err)
 	}
 	// The other session is revoked; the caller's session survives.

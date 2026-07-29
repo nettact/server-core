@@ -59,7 +59,7 @@ func TestUpdatePassword(t *testing.T) {
 	if err := svc.UpdatePassword(ctx, admin.ID, "old-password", "short", keep); err == nil || errors.Is(err, ErrAuth) {
 		t.Fatalf("UpdatePassword with weak new password = %v; want policy error", err)
 	}
-	if _, err := svc.Authenticate(ctx, "admin", "old-password"); err != nil {
+	if _, _, _, err := svc.LoginSession(ctx, "admin", "old-password"); err != nil {
 		t.Fatalf("rejected updates changed the password: %v", err)
 	}
 	// A rejected change must not have revoked any session.
@@ -71,10 +71,10 @@ func TestUpdatePassword(t *testing.T) {
 	if err := svc.UpdatePassword(ctx, admin.ID, "old-password", "new-password", keep); err != nil {
 		t.Fatalf("UpdatePassword: %v", err)
 	}
-	if _, err := svc.Authenticate(ctx, "admin", "old-password"); !errors.Is(err, ErrAuth) {
+	if _, _, _, err := svc.LoginSession(ctx, "admin", "old-password"); !errors.Is(err, ErrAuth) {
 		t.Fatalf("old password still authenticates after change: %v", err)
 	}
-	if _, err := svc.Authenticate(ctx, "admin", "new-password"); err != nil {
+	if _, _, _, err := svc.LoginSession(ctx, "admin", "new-password"); err != nil {
 		t.Fatalf("new password does not authenticate: %v", err)
 	}
 	// The revocation rode along in the same transaction: other session gone, kept alive.
@@ -105,10 +105,10 @@ func TestUpdatePasswordConcurrentLosesWithErrAuth(t *testing.T) {
 	if err := svc.UpdatePassword(ctx, admin.ID, "old-password", "loser-password", ""); !errors.Is(err, ErrAuth) {
 		t.Fatalf("stale concurrent change = %v; want ErrAuth", err)
 	}
-	if _, err := svc.Authenticate(ctx, "admin", "winner-password"); err != nil {
+	if _, _, _, err := svc.LoginSession(ctx, "admin", "winner-password"); err != nil {
 		t.Fatalf("winner password does not authenticate: %v", err)
 	}
-	if _, err := svc.Authenticate(ctx, "admin", "loser-password"); !errors.Is(err, ErrAuth) {
+	if _, _, _, err := svc.LoginSession(ctx, "admin", "loser-password"); !errors.Is(err, ErrAuth) {
 		t.Fatalf("loser password authenticates: %v", err)
 	}
 }
@@ -192,10 +192,10 @@ func TestResetAdminPassword(t *testing.T) {
 	if username != "admin" {
 		t.Fatalf("ResetAdminPassword username = %q; want admin", username)
 	}
-	if _, err := svc.Authenticate(ctx, "admin", "brand-new-password"); err != nil {
+	if _, _, _, err := svc.LoginSession(ctx, "admin", "brand-new-password"); err != nil {
 		t.Fatalf("new password does not authenticate: %v", err)
 	}
-	if _, err := svc.Authenticate(ctx, "admin", "password"); !errors.Is(err, ErrAuth) {
+	if _, _, _, err := svc.LoginSession(ctx, "admin", "password"); !errors.Is(err, ErrAuth) {
 		t.Fatalf("old password still authenticates after reset: %v", err)
 	}
 	if _, err := svc.ValidateSession(ctx, live); !errors.Is(err, ErrAuth) {

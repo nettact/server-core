@@ -10,7 +10,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
-	"github.com/nettact/server-core/agentalert"
+	"github.com/nettact/server-core/agentconnectivity"
 	"github.com/nettact/server-core/agentstatus"
 	"github.com/nettact/server-core/audit"
 	"github.com/nettact/server-core/eventbus"
@@ -85,9 +85,9 @@ func TestUpdateAgentMuteOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 	d := Deps{
-		Registry:   registry.New(db, 0, eventbus.New()),
-		Audit:      audit.New(db),
-		AgentAlert: agentalert.New(db, settings.New(db), nil, eventbus.New()),
+		Registry:          registry.New(db, 0, eventbus.New()),
+		Audit:             audit.New(db),
+		AgentConnectivity: agentconnectivity.New(db, settings.New(db), nil, eventbus.New()),
 	}
 
 	body := `{"connectivity_alerts_muted":true}`
