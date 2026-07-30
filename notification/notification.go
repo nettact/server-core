@@ -13,6 +13,7 @@ import (
 	"mime"
 	"net/http"
 	"net/smtp"
+	"net/url"
 	"strings"
 	"time"
 
@@ -100,10 +101,54 @@ type Channel struct {
 type Service struct {
 	db     *store.DB
 	client *http.Client
+
+	// nativeDeepLinks says the host process has a per-user nettact:// protocol
+	// handler registered — the Desktop app on Windows. Only then may a native OS
+	// notification carry a nettact:// URI: clicking one on a host without a
+	// handler does nothing at all, which is worse than landing on a login page.
+	//
+	// It exists because a console URL and a native notification disagree about
+	// what "the console" means. Payload.URL is built from console_base_url, which
+	// may be a LAN IP, a hostname, or a reverse proxy — a different browser origin
+	// from the 127.0.0.1 the Desktop authenticates against, and cookies are
+	// per-origin. So a local toast click landed on the login page even though the
+	// user was signed in. The deep link routes the click back through the Desktop,
+	// which mints a fresh one-time login against whatever loopback address it is
+	// actually serving right now. Email and webhook recipients are not on this
+	// machine and keep the console URL regardless.
+	nativeDeepLinks bool
 }
 
-func New(db *store.DB) *Service {
-	return &Service{db: db, client: &http.Client{Timeout: 10 * time.Second}}
+func New(db *store.DB, nativeDeepLinks bool) *Service {
+	return &Service{
+		db:              db,
+		client:          &http.Client{Timeout: 10 * time.Second},
+		nativeDeepLinks: nativeDeepLinks,
+	}
+}
+
+// nativeClickURL picks the click action for a native OS notification: a
+// credential-free deep link when the host can receive one, else the console URL
+// every other channel uses.
+//
+// The URI carries only an action and a resource ID — never a session, token, or
+// any other secret — because it is visible to anything that can read the toast
+// XML and is handed to the shell to route.
+//
+// A payload sets StormID or IncidentID, never both (notifypolicy builds storm
+// and incident payloads separately), so the order below is only about being
+// deterministic. A payload with neither — nothing addressable to open — falls
+// back to the console URL rather than inventing a target.
+func (s *Service) nativeClickURL(p Payload) string {
+	if s.nativeDeepLinks {
+		switch {
+		case p.StormID != "":
+			return "nettact://storm/" + url.PathEscape(p.StormID)
+		case p.IncidentID != "":
+			return "nettact://incident/" + url.PathEscape(p.IncidentID)
+		}
+	}
+	return p.URL
 }
 
 const channelCols = `id, COALESCE(name,''), type, config, enabled, storm_merge`
@@ -426,9 +471,10 @@ func (s *Service) sendNative(ctx context.Context, lang string, p Payload) {
 	if lines := RenderLines(p, lang); len(lines) > 0 {
 		body = body + "\n" + lines[0] // keep the toast short — lead with the top fault
 	}
-	// p.URL is attached as the toast's click action (protocol activation) rather
-	// than printed into the body, so clicking the toast opens the incident page.
-	if err := nativeNotify(ctx, title, body, p.URL); err != nil {
+	// The click URL is attached as the toast's click action (protocol activation)
+	// rather than printed into the body, so clicking the toast opens the incident
+	// page. See nativeClickURL for why this is not simply p.URL.
+	if err := nativeNotify(ctx, title, body, s.nativeClickURL(p)); err != nil {
 		log.Printf("notify system: %v", err)
 	}
 }

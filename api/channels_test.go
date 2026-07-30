@@ -20,7 +20,7 @@ import (
 func channelTestDeps(t *testing.T) Deps {
 	t.Helper()
 	db := storetest.Open(t)
-	return Deps{Notification: notification.New(db), Settings: settings.New(db), Audit: audit.New(db)}
+	return Deps{Notification: notification.New(db, false), Settings: settings.New(db), Audit: audit.New(db)}
 }
 
 // putChannel invokes handleUpdateChannel with an injected chi "id" URL param.

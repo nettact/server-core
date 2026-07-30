@@ -15,7 +15,7 @@ import (
 func TestSystemChannelCRUD(t *testing.T) {
 	db := storetest.Open(t)
 	ctx := context.Background()
-	svc := New(db)
+	svc := New(db, false)
 
 	id, err := svc.Create(ctx, "Desktop", "system", map[string]string{})
 	if err != nil {
