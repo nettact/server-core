@@ -12,10 +12,17 @@ import (
 )
 
 const (
-	dashboardLayoutVersion     = 1
+	dashboardLayoutVersion     = 2
 	maxDashboardLayoutBodySize = 32 << 10
 	maxDashboardLayoutCards    = 64
 	maxDashboardCardIDLength   = 64
+	maxDashboardCardTypeLength = 64
+	maxDashboardTargetIDLength = 128
+
+	// The one card type that is instanced: several cards share it, each with
+	// its own id and target_id. Every other type is a singleton whose id
+	// equals its type.
+	monitorTargetCardType = "monitor-target"
 )
 
 type dashboardLayout struct {
@@ -24,9 +31,11 @@ type dashboardLayout struct {
 }
 
 type dashboardLayoutCard struct {
-	ID      string `json:"id"`
-	Visible bool   `json:"visible"`
-	Size    string `json:"size"`
+	ID       string `json:"id"`
+	Type     string `json:"type"`
+	Visible  bool   `json:"visible"`
+	Size     string `json:"size"`
+	TargetID string `json:"target_id,omitempty"`
 }
 
 // handleGetDashboardLayout returns null until a layout has been saved. This
@@ -114,6 +123,24 @@ func validateDashboardLayout(layout dashboardLayout) error {
 			return errors.New("dashboard card ids must be unique")
 		}
 		seen[card.ID] = struct{}{}
+		if card.Type == "" || card.Type != strings.TrimSpace(card.Type) || !utf8.ValidString(card.Type) || utf8.RuneCountInString(card.Type) > maxDashboardCardTypeLength {
+			return errors.New("dashboard card type is invalid")
+		}
+		if card.Type == monitorTargetCardType {
+			if card.TargetID == "" || card.TargetID != strings.TrimSpace(card.TargetID) || !utf8.ValidString(card.TargetID) || utf8.RuneCountInString(card.TargetID) > maxDashboardTargetIDLength {
+				return errors.New("dashboard target card target id is invalid")
+			}
+		} else {
+			if card.TargetID != "" {
+				return errors.New("dashboard card target id is not allowed")
+			}
+			// Only target cards are instanced. Letting a static card carry an
+			// id that differs from its type would let one card claim another
+			// card's slot in the console's layout map.
+			if card.ID != card.Type {
+				return errors.New("dashboard static card id must match its type")
+			}
+		}
 		switch card.Size {
 		case "compact", "medium", "wide", "tall":
 		default:

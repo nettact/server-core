@@ -131,10 +131,19 @@ func (s *Service) Retention(ctx context.Context) (int64, error) {
 // latest InterfaceSnapshot). Stale is computed by the API handler from SampledAt
 // and the agent's effective regular interval.
 type WiFiCollection struct {
-	State     string     `json:"state"`
-	Reason    string     `json:"reason,omitempty"`
-	SampledAt *time.Time `json:"sampled_at"`
-	Stale     bool       `json:"stale"`
+	State        string        `json:"state"`
+	Reason       string        `json:"reason,omitempty"`
+	SampledAt    *time.Time    `json:"sampled_at"`
+	Stale        bool          `json:"stale"`
+	DefaultRoute *DefaultRoute `json:"-"`
+}
+
+// DefaultRoute identifies the gateway the Agent's gateway monitor resolves and
+// the interface carrying it. The UI matches the gateway back to an interface
+// row instead of guessing from the name-sorted interface list.
+type DefaultRoute struct {
+	Gateway   string `json:"gateway"`
+	Interface string `json:"interface"`
 }
 
 // InterfaceWiFi is one wireless adapter's current status on an interface row.
@@ -169,11 +178,11 @@ type Interface struct {
 // unset for the caller to compute) and its interface rows, ordered by name.
 func (s *Service) ListInterfaces(ctx context.Context, agentID string) (WiFiCollection, []Interface, error) {
 	var col WiFiCollection
-	var reason sql.NullString
+	var reason, defaultGateway, defaultInterface sql.NullString
 	var sampled sql.NullTime
 	err := s.db.QueryRowContext(ctx,
-		`SELECT state, reason, sampled_at FROM agent_wifi WHERE agent_id=?`, agentID).
-		Scan(&col.State, &reason, &sampled)
+		`SELECT state, reason, sampled_at, default_gateway, default_interface FROM agent_wifi WHERE agent_id=?`, agentID).
+		Scan(&col.State, &reason, &sampled, &defaultGateway, &defaultInterface)
 	if err != nil && err != sql.ErrNoRows {
 		return col, nil, err
 	}
@@ -183,6 +192,9 @@ func (s *Service) ListInterfaces(ctx context.Context, agentID string) (WiFiColle
 	if sampled.Valid {
 		t := sampled.Time
 		col.SampledAt = &t
+	}
+	if defaultGateway.Valid || defaultInterface.Valid {
+		col.DefaultRoute = &DefaultRoute{Gateway: defaultGateway.String, Interface: defaultInterface.String}
 	}
 
 	rows, err := s.db.QueryContext(ctx, `

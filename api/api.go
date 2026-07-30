@@ -802,7 +802,11 @@ func (d Deps) handleAgentInterfaces(w http.ResponseWriter, r *http.Request) {
 	if ifaces == nil {
 		ifaces = []inventory.Interface{}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"wifi": col, "interfaces": ifaces})
+	payload := map[string]any{"wifi": col, "interfaces": ifaces}
+	if col.DefaultRoute != nil {
+		payload["default_route"] = col.DefaultRoute
+	}
+	writeJSON(w, http.StatusOK, payload)
 }
 
 // handleAgentSeries lists every series recorded for an agent, so the history

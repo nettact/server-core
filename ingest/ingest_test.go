@@ -32,6 +32,7 @@ func openWiFiIngest(t *testing.T) (*store.DB, *Service, *inventory.Service, *met
 func wifiPacket(seq uint64, sampled time.Time, state telemetry.WiFiLinkState, ssid string, interfaces bool) telemetry.Packet {
 	snap := telemetry.InterfaceSnapshot{SampledAt: sampled, WiFiState: telemetry.WiFiCollectionOK, Interfaces: []telemetry.InterfaceState{}}
 	if interfaces {
+		snap.DefaultRoute = &telemetry.SnapshotRoute{Gateway: "192.168.1.1", Interface: "wlan0"}
 		wifi := &telemetry.WiFiInfo{State: state}
 		if state == telemetry.WiFiConnected {
 			wifi.SSID = ssid
@@ -39,7 +40,7 @@ func wifiPacket(seq uint64, sampled time.Time, state telemetry.WiFiLinkState, ss
 			wifi.Channel = 36
 		}
 		snap.Interfaces = append(snap.Interfaces, telemetry.InterfaceState{
-			Name: "wlan0", Up: true, IsWireless: true,
+			Name: "wlan0", Gateway: "192.168.1.1", Up: true, IsWireless: true,
 			WiFi: wifi,
 		})
 	}
@@ -73,6 +74,9 @@ func TestInterfaceSnapshotUsesSequenceAndExactRoundNumerics(t *testing.T) {
 	col, ifaces, err := inv.ListInterfaces(ctx, "agent_wifi")
 	if err != nil || col.State != "ok" || len(ifaces) != 1 || ifaces[0].WiFi == nil {
 		t.Fatalf("connected inventory: col=%+v ifaces=%+v err=%v", col, ifaces, err)
+	}
+	if col.DefaultRoute == nil || col.DefaultRoute.Gateway != "192.168.1.1" || col.DefaultRoute.Interface != "wlan0" {
+		t.Fatalf("default route=%+v", col.DefaultRoute)
 	}
 	w := ifaces[0].WiFi
 	if w.SSID != "home" || w.SignalDBm == nil || *w.SignalDBm != -55 || w.TxMbps == nil || *w.TxMbps != 866.7 {
@@ -120,9 +124,12 @@ func TestInterfaceSnapshotUsesSequenceAndExactRoundNumerics(t *testing.T) {
 	if _, err := svc.Ingest(ctx, "agent_wifi", "site_default", wifiPacket(12, t1.Add(-30*time.Minute), "", "", false)); err != nil {
 		t.Fatalf("ingest empty snapshot: %v", err)
 	}
-	_, ifaces, err = inv.ListInterfaces(ctx, "agent_wifi")
+	col, ifaces, err = inv.ListInterfaces(ctx, "agent_wifi")
 	if err != nil || len(ifaces) != 0 {
 		t.Fatalf("empty snapshot did not clear rows: %+v err=%v", ifaces, err)
+	}
+	if col.DefaultRoute != nil {
+		t.Fatalf("empty snapshot retained default route: %+v", col.DefaultRoute)
 	}
 
 	var cols int

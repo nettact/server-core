@@ -24,7 +24,7 @@ func TestHandleAgentInterfacesFreshnessAndShape(t *testing.T) {
 	if _, err := db.ExecContext(ctx, `INSERT INTO agents(id,site_id,public_key,token_hash,status) VALUES('agent_wifi','site_default',x'00','h','online')`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.ExecContext(ctx, `INSERT INTO agent_wifi(agent_id,state,reason,sampled_at,last_sequence) VALUES('agent_wifi','ok',NULL,?,1)`, now.Add(-91*time.Second)); err != nil {
+	if _, err := db.ExecContext(ctx, `INSERT INTO agent_wifi(agent_id,state,reason,sampled_at,last_sequence,default_gateway,default_interface) VALUES('agent_wifi','ok',NULL,?,1,'192.168.1.1','wlan0')`, now.Add(-91*time.Second)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.ExecContext(ctx, `INSERT INTO interfaces(id,agent_id,name,up,is_wireless,wifi_state,wifi_reason,wifi_signal_dbm,updated_at) VALUES('if1','agent_wifi','wlan0',1,1,'connected','permission',-60,?)`, now); err != nil {
@@ -62,6 +62,10 @@ func TestHandleAgentInterfacesFreshnessAndShape(t *testing.T) {
 	}
 	if ifaces[0].WiFi.Reason != "permission" || ifaces[0].WiFi.SignalDBm == nil || *ifaces[0].WiFi.SignalDBm != -60 {
 		t.Fatalf("Wi-Fi API row=%+v", ifaces[0].WiFi)
+	}
+	var route inventory.DefaultRoute
+	if err := json.Unmarshal(body["default_route"], &route); err != nil || route.Gateway != "192.168.1.1" || route.Interface != "wlan0" {
+		t.Fatalf("default route=%+v err=%v", route, err)
 	}
 
 	if _, err := db.ExecContext(ctx, `UPDATE agent_wifi SET sampled_at=? WHERE agent_id='agent_wifi'`, time.Now().UTC()); err != nil {

@@ -467,13 +467,20 @@ func applyInterfaceSnapshot(ctx context.Context, tx *sql.Tx, agentID string, sna
 		}
 	}
 
+	var defaultGateway, defaultInterface sql.NullString
+	if snap.DefaultRoute != nil {
+		defaultGateway = nullStr(snap.DefaultRoute.Gateway)
+		defaultInterface = nullStr(snap.DefaultRoute.Interface)
+	}
 	_, err = tx.ExecContext(ctx, `
-		INSERT INTO agent_wifi(agent_id, state, reason, sampled_at, last_sequence)
-		VALUES(?,?,?,?,?)
+		INSERT INTO agent_wifi(agent_id, state, reason, sampled_at, last_sequence, default_gateway, default_interface)
+		VALUES(?,?,?,?,?,?,?)
 		ON CONFLICT(agent_id) DO UPDATE SET
 			state=excluded.state, reason=excluded.reason,
-			sampled_at=excluded.sampled_at, last_sequence=excluded.last_sequence`,
-		agentID, string(snap.WiFiState), nullStr(string(snap.WiFiReason)), snap.SampledAt.UTC(), int64(seq))
+			sampled_at=excluded.sampled_at, last_sequence=excluded.last_sequence,
+			default_gateway=excluded.default_gateway, default_interface=excluded.default_interface`,
+		agentID, string(snap.WiFiState), nullStr(string(snap.WiFiReason)), snap.SampledAt.UTC(), int64(seq),
+		defaultGateway, defaultInterface)
 	return err
 }
 

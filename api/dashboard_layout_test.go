@@ -23,7 +23,7 @@ func TestDashboardLayoutRoundTrip(t *testing.T) {
 		t.Fatalf("unset GET status=%d body=%q", get.Code, get.Body.String())
 	}
 
-	payload := `{"version":1,"cards":[{"id":"overall","visible":true,"size":"wide"},{"id":"latency","visible":false,"size":"compact"}]}`
+	payload := `{"version":2,"cards":[{"id":"overall","type":"overall","visible":true,"size":"wide"},{"id":"monitor-target-cloudflare","type":"monitor-target","visible":true,"size":"medium","target_id":"target_cloudflare"}]}`
 	put := httptest.NewRecorder()
 	d.handleUpdateDashboardLayout(put, httptest.NewRequest(http.MethodPut, "/api/v1/dashboard-layout", strings.NewReader(payload)))
 	if put.Code != http.StatusOK {
@@ -39,7 +39,7 @@ func TestDashboardLayoutRoundTrip(t *testing.T) {
 	if err := json.Unmarshal(get.Body.Bytes(), &got); err != nil {
 		t.Fatalf("decode GET: %v", err)
 	}
-	if got.Version != 1 || len(got.Cards) != 2 || got.Cards[1].ID != "latency" || got.Cards[1].Visible {
+	if got.Version != 2 || len(got.Cards) != 2 || got.Cards[1].Type != "monitor-target" || got.Cards[1].TargetID != "target_cloudflare" {
 		t.Fatalf("GET layout=%+v", got)
 	}
 	raw, err := d.Settings.Get(context.Background(), settings.KeyDashboardLayout)
@@ -62,7 +62,7 @@ func TestDashboardLayoutAcceptsTallSize(t *testing.T) {
 	db := storetest.Open(t)
 	d := Deps{Settings: settings.New(db)}
 
-	payload := `{"version":1,"cards":[{"id":"network-quality","visible":true,"size":"tall"}]}`
+	payload := `{"version":2,"cards":[{"id":"network-quality","type":"network-quality","visible":true,"size":"tall"}]}`
 	w := httptest.NewRecorder()
 	d.handleUpdateDashboardLayout(w, httptest.NewRequest(http.MethodPut, "/api/v1/dashboard-layout", strings.NewReader(payload)))
 	if w.Code != http.StatusOK {
@@ -86,13 +86,17 @@ func TestUpdateDashboardLayoutRejectsInvalidPayloads(t *testing.T) {
 	d := Deps{Settings: settings.New(db)}
 
 	cases := map[string]string{
-		"malformed":       `{"version":`,
-		"wrong version":   `{"version":2,"cards":[]}`,
-		"missing cards":   `{"version":1}`,
-		"duplicate id":    `{"version":1,"cards":[{"id":"a","visible":true,"size":"wide"},{"id":"a","visible":false,"size":"compact"}]}`,
-		"invalid size":    `{"version":1,"cards":[{"id":"a","visible":true,"size":"giant"}]}`,
-		"unknown field":   `{"version":1,"cards":[],"extra":true}`,
-		"multiple values": `{"version":1,"cards":[]} {}`,
+		"malformed":           `{"version":`,
+		"wrong version":       `{"version":1,"cards":[]}`,
+		"missing cards":       `{"version":2}`,
+		"missing type":        `{"version":2,"cards":[{"id":"a","visible":true,"size":"wide"}]}`,
+		"duplicate id":        `{"version":2,"cards":[{"id":"a","type":"a","visible":true,"size":"wide"},{"id":"a","type":"a","visible":false,"size":"compact"}]}`,
+		"invalid size":        `{"version":2,"cards":[{"id":"a","type":"a","visible":true,"size":"giant"}]}`,
+		"missing target id":   `{"version":2,"cards":[{"id":"a","type":"monitor-target","visible":true,"size":"medium"}]}`,
+		"target id on static": `{"version":2,"cards":[{"id":"a","type":"a","visible":true,"size":"wide","target_id":"target"}]}`,
+		"static id mismatch":  `{"version":2,"cards":[{"id":"overall","type":"monitor-target-lookalike","visible":true,"size":"wide"}]}`,
+		"unknown field":       `{"version":2,"cards":[],"extra":true}`,
+		"multiple values":     `{"version":2,"cards":[]} {}`,
 	}
 	for name, payload := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -105,7 +109,7 @@ func TestUpdateDashboardLayoutRejectsInvalidPayloads(t *testing.T) {
 	}
 
 	w := httptest.NewRecorder()
-	oversized := strings.Repeat(" ", maxDashboardLayoutBodySize) + `{"version":1,"cards":[]}`
+	oversized := strings.Repeat(" ", maxDashboardLayoutBodySize) + `{"version":2,"cards":[]}`
 	d.handleUpdateDashboardLayout(w, httptest.NewRequest(http.MethodPut, "/api/v1/dashboard-layout", strings.NewReader(oversized)))
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("oversized status=%d body=%s", w.Code, w.Body.String())
