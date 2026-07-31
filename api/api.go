@@ -211,6 +211,9 @@ func Router(d Deps) http.Handler {
 			// Fault signals: the single history surface for confirmed faults, filtered
 			// by agent / target / detector / state.
 			r.Get("/fault-signals", d.handleListFaultSignals)
+			// Fluctuations: failing streaks that recovered before confirming a fault —
+			// what explains an availability dip the fault centre has no record of.
+			r.Get("/fluctuations", d.handleListFluctuations)
 			// Built-in detector sensitivity, per target.
 			r.Get("/targets/{id}/detection-settings", d.handleGetDetectionSettings)
 			r.Patch("/targets/{id}/detection-settings", d.handleUpdateDetectionSettings)
@@ -1632,6 +1635,68 @@ func (d Deps) handleListFaultSignals(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, describeSignals(sigs))
+}
+
+// fluctuationView is a fluctuation plus the same bilingual description a fault
+// signal carries. The two are rendered by one function on purpose: a blip and an
+// outage caused by the same thing must not be described in two different
+// vocabularies, or the operator comparing them has to translate between them.
+type fluctuationView struct {
+	fault.Fluctuation
+	DescZh string `json:"desc_zh"`
+	DescEn string `json:"desc_en"`
+}
+
+// handleListFluctuations returns recorded sub-threshold streaks: the failures
+// behind an availability figure that never became a fault. Filtered by agent /
+// target / incident (an incident's precursors) and a time range.
+func (d Deps) handleListFluctuations(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	f := fault.FluctuationFilter{
+		SiteID:     siteParam(r),
+		AgentID:    q.Get("agent"),
+		TargetID:   q.Get("target"),
+		IncidentID: q.Get("incident"),
+	}
+	if n, err := strconv.ParseInt(q.Get("since"), 10, 64); err == nil && n > 0 {
+		f.Since = n
+	}
+	if n, err := strconv.ParseInt(q.Get("until"), 10, 64); err == nil && n > 0 {
+		f.Until = n
+	}
+	if n, err := strconv.Atoi(q.Get("limit")); err == nil && n > 0 {
+		f.Limit = n
+	}
+	page, err := d.Fault.ListFluctuations(r.Context(), f)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	views := make([]fluctuationView, 0, len(page.Items))
+	for _, fl := range page.Items {
+		det := notification.FaultDetail{
+			ProbeKind:    fl.ProbeKind,
+			MetricKind:   fl.MetricKind,
+			Comparator:   fl.Comparator,
+			Threshold:    fl.Threshold,
+			Value:        fl.Value,
+			TargetName:   fl.TargetName,
+			Target:       fl.TargetAddr,
+			Layer:        fl.Layer,
+			AgentHost:    fl.AgentName,
+			ReasonCode:   fl.ReasonCode,
+			ReasonDetail: fl.ReasonDetail,
+		}
+		views = append(views, fluctuationView{
+			Fluctuation: fl,
+			DescZh:      notification.DescribeDetail(det, "zh"),
+			DescEn:      notification.DescribeDetail(det, "en"),
+		})
+	}
+	writeJSON(w, http.StatusOK, struct {
+		Items []fluctuationView `json:"items"`
+		Total int               `json:"total"`
+	}{Items: views, Total: page.Total})
 }
 
 // ---- monitor groups ----

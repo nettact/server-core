@@ -269,17 +269,27 @@ func (s *Service) probeMeta(ctx context.Context, q rowQuerier, agentID, siteID s
 	// stopped probing it. A target id belonging to another site would likewise be
 	// evaluated under the sender's site. An out-of-scope target simply drops out of
 	// this map, so its samples are rejected by the generation filter downstream.
+	// The agent-reported schedule joins in alongside the target's own params because
+	// the two can legitimately disagree: the agent floors every interval at its local
+	// MinProbeInterval, so a 10s ICMP target on an agent configured with a 60s floor
+	// really runs every 60s. Deriving the round-gap tolerance from the unfloored
+	// params would then make every round look like it followed a gap, resetting the
+	// failing streak each time and preventing a fault from EVER confirming on that
+	// agent. Only the reported value knows the real cadence.
 	query := `
 		SELECT pt.id, pt.kind, pt.group_id, COALESCE(pt.name,''), COALESCE(pt.target,''),
 		       COALESCE(pt.params,''), pt.enabled, pt.config_serial,
 		       COALESCE(ds.fail_rounds, ?), COALESCE(ds.recover_rounds, ?),
-		       COALESCE(ds.icmp_loss_pct, ?), COALESCE(ds.revision, 1)
+		       COALESCE(ds.icmp_loss_pct, ?), COALESCE(ds.revision, 1),
+		       ms.source, ms.target_config_serial, ms.effective_interval_seconds,
+		       ms.cycle_deadline_ms, ms.upload_interval_seconds
 		FROM probe_tasks pt
 		LEFT JOIN probe_detection_settings ds ON ds.target_id = pt.id
+		LEFT JOIN monitor_status ms ON ms.monitor_id = pt.id AND ms.agent_id = ?
 		WHERE pt.site_id = ? AND ` + config.AgentScopePredicate + `
 		  AND pt.id IN (` + placeholders(len(ids)) + `)`
-	args := make([]any, 0, len(ids)+5)
-	args = append(args, def.FailRounds, def.RecoverRounds, def.ICMPLossPct, siteID, agentID)
+	args := make([]any, 0, len(ids)+6)
+	args = append(args, def.FailRounds, def.RecoverRounds, def.ICMPLossPct, agentID, siteID, agentID)
 	for _, id := range ids {
 		args = append(args, id)
 	}
@@ -292,16 +302,41 @@ func (s *Service) probeMeta(ctx context.Context, q rowQuerier, agentID, siteID s
 		var m fault.TargetMeta
 		var params string
 		var enabled int
+		var sched reportedSchedule
 		if err := rows.Scan(&m.ID, &m.Kind, &m.GroupID, &m.Name, &m.Addr, &params, &enabled, &m.ConfigSerial,
-			&m.Det.FailRounds, &m.Det.RecoverRounds, &m.Det.ICMPLossPct, &m.Det.Revision); err != nil {
+			&m.Det.FailRounds, &m.Det.RecoverRounds, &m.Det.ICMPLossPct, &m.Det.Revision,
+			&sched.source, &sched.configSerial, &sched.intervalSeconds,
+			&sched.cycleDeadlineMs, &sched.uploadSeconds); err != nil {
 			return nil, err
 		}
 		m.Enabled = enabled == 1
 		m.Port = portFromParams(params)
+		m.MaxRoundGap = roundGap(m.Kind, params, sched, m.ConfigSerial)
 		m.Det = m.Det.Normalize()
 		out[m.ID] = m
 	}
 	return out, rows.Err()
+}
+
+// reportedSchedule is one pair's agent-reported effective schedule, all nullable:
+// no monitor_status row yet, or a row that has not been confirmed for the current
+// generation, leaves every field invalid.
+type reportedSchedule struct {
+	source          sql.NullString
+	configSerial    sql.NullInt64
+	intervalSeconds sql.NullInt64
+	cycleDeadlineMs sql.NullInt64
+	uploadSeconds   sql.NullInt64
+}
+
+// confirmedFor reports whether this row is the agent's own echo for the given
+// target generation, i.e. whether its schedule describes what the agent is really
+// running now. Mirrors the `confirmed` test in targetstatus.deriveAgent.
+func (s reportedSchedule) confirmedFor(configSerial int) bool {
+	return s.source.Valid && s.source.String == "reported" &&
+		s.configSerial.Valid && int(s.configSerial.Int64) == configSerial &&
+		s.intervalSeconds.Valid && s.intervalSeconds.Int64 > 0 &&
+		s.cycleDeadlineMs.Valid && s.cycleDeadlineMs.Int64 > 0
 }
 
 // portFromParams extracts the target port from a probe_tasks.params blob, frozen
@@ -316,6 +351,38 @@ func portFromParams(params string) int {
 		return 0
 	}
 	return p.Port
+}
+
+// roundGap derives how far apart two of this target's rounds may be and still
+// count as consecutive.
+//
+// It is the same StaleAfter window the freshness derivation uses, so the engine's
+// notion of "these rounds are adjacent" cannot drift from the server's notion of
+// "this sample still describes the present". Deriving it per target matters
+// because the intervals span three orders of magnitude — 10s for ICMP, 30 minutes
+// for NAT — so no fixed threshold could serve both.
+//
+// The agent's own reported schedule wins when it has confirmed one for this
+// generation, because only it accounts for the agent-local MinProbeInterval floor;
+// the desired config is the fallback until that echo arrives, exactly as in
+// targetstatus.deriveAgent. Getting this backwards would silently disable fault
+// confirmation on any agent whose floor exceeds a target's configured interval.
+func roundGap(kind, params string, sched reportedSchedule, configSerial int) time.Duration {
+	if sched.confirmedFor(configSerial) {
+		var upload time.Duration
+		if sched.uploadSeconds.Valid && sched.uploadSeconds.Int64 > 0 {
+			upload = time.Duration(sched.uploadSeconds.Int64) * time.Second
+		}
+		return pcfg.StaleAfter(
+			time.Duration(sched.intervalSeconds.Int64)*time.Second,
+			time.Duration(sched.cycleDeadlineMs.Int64)*time.Millisecond,
+			upload)
+	}
+	var p pcfg.ProbeParams
+	if params != "" {
+		_ = json.Unmarshal([]byte(params), &p) // a bad blob just yields the kind's defaults
+	}
+	return pcfg.StaleAfter(pcfg.EffectiveInterval(kind, p), pcfg.CycleDeadline(kind, p), pcfg.DefaultUploadInterval)
 }
 
 // filterByGeneration keeps system metrics (MonitorID=="") verbatim and each probe

@@ -128,7 +128,12 @@ type TargetStatus struct {
 	// Availability24h is the share of verdict-reaching probe rounds in the last 24
 	// hours that succeeded, across every Agent. Nil when the window holds no
 	// verdict at all — "unknown" and "0%" are different answers and must look it.
-	Availability24h *float64      `json:"availability_24h,omitempty"`
+	Availability24h *float64 `json:"availability_24h,omitempty"`
+	// Fluctuations24h counts the failing streaks that recovered before confirming a
+	// fault over the same 24 hours, across every Agent. It travels with the
+	// availability figure because it is the answer to the question that figure
+	// raises: a ratio under 100% with no fault to show for it used to be a dead end.
+	Fluctuations24h int           `json:"fluctuations_24h"`
 	SignalIDs       []string      `json:"signal_ids"`
 	IncidentIDs     []string      `json:"incident_ids"`
 	Agents          []AgentStatus `json:"agents"`
@@ -163,6 +168,9 @@ type AgentStatus struct {
 	Fault *FaultRef `json:"fault,omitempty"`
 	// Availability24h is this pair's 24-hour probe-round success ratio.
 	Availability24h *float64 `json:"availability_24h,omitempty"`
+	// Fluctuations24h is this pair's count of recovered sub-threshold streaks over
+	// the same window — what explains the ratio beside it.
+	Fluctuations24h int `json:"fluctuations_24h"`
 }
 
 // ConfirmProgress is a detector's live confirmation streak: how many consecutive
@@ -313,12 +321,19 @@ func (s *Service) SiteStatuses(ctx context.Context, siteID string) (SiteStatuses
 			return SiteStatuses{}, err
 		}
 	}
+	// Fluctuation counts ride along for the same reason and on the same read pool:
+	// the console shows them next to the availability ratio, and one grouped query
+	// keeps that from costing a request per row.
+	flux, err := s.loadFluctuationCounts(ctx, siteID, now.Add(-24*time.Hour), now)
+	if err != nil {
+		return SiteStatuses{}, err
+	}
 
 	out := SiteStatuses{GeneratedAt: now, SiteID: siteID, Targets: make([]TargetStatus, 0, len(targets))}
 	for i := range targets {
 		t := &targets[i]
 		out.Targets = append(out.Targets, s.assembleTarget(t, pairs[t.id], now,
-			msByKey, samples, detectors, signals, avail[t.id], availByAgent[t.id]))
+			msByKey, samples, detectors, signals, avail[t.id], availByAgent[t.id], flux[t.id]))
 	}
 	sortTargets(out.Targets, targets)
 	return out, nil
@@ -330,7 +345,8 @@ func (s *Service) SiteStatuses(ctx context.Context, siteID string) (SiteStatuses
 func (s *Service) assembleTarget(t *targetRow, pairs []applicablePair, now time.Time,
 	msByKey map[string]*msRow, samples map[string]*sampleVal,
 	detectors map[string]detState, signals map[string]firingSignal,
-	avail metrics.AvailabilityRatio, availByAgent map[string]metrics.AvailabilityRatio) TargetStatus {
+	avail metrics.AvailabilityRatio, availByAgent map[string]metrics.AvailabilityRatio,
+	fluxByAgent map[string]int) TargetStatus {
 
 	ts := TargetStatus{
 		TargetID: t.id, GroupID: t.groupID, Name: t.name, Kind: t.kind, Target: t.target,
@@ -341,6 +357,32 @@ func (s *Service) assembleTarget(t *targetRow, pairs []applicablePair, now time.
 	if avail.Rounds > 0 {
 		r := avail.Ratio
 		ts.Availability24h = &r
+	}
+	// Counted over the SAME agents whose rounds produced the availability figure
+	// above, because this number exists to explain that figure and the two are read
+	// together. That population is neither "every agent with a fluctuation" nor
+	// "currently applicable agents":
+	//
+	//   - an agent removed from the group's scope keeps its probe.round.ok samples
+	//     (nothing purges them), so it still drags the ratio down for the rest of the
+	//     window — counting only applicable pairs would show 0 dips against a ratio
+	//     under 100%, which is the unexplained state this feature exists to remove;
+	//   - a DELETED agent has its series purged (metrics.Store.PurgeAgent) so it no
+	//     longer affects the ratio, yet its fluctuations are deliberately kept as
+	//     history — counting every agent in the map would then explain a dip that the
+	//     ratio no longer shows.
+	//
+	// availByAgent is exactly the set that contributed, so it is the right key set;
+	// applicable pairs are unioned in so a live agent is never silently omitted.
+	counted := make(map[string]bool, len(availByAgent)+len(pairs))
+	for agentID := range availByAgent {
+		counted[agentID] = true
+	}
+	for _, p := range pairs {
+		counted[p.agentID] = true
+	}
+	for agentID := range counted {
+		ts.Fluctuations24h += fluxByAgent[agentID]
 	}
 
 	// Deterministic per-agent order: agent_name, agent_id.
@@ -363,6 +405,7 @@ func (s *Service) assembleTarget(t *targetRow, pairs []applicablePair, now time.
 			ratio := agentAvail.Ratio
 			as.Availability24h = &ratio
 		}
+		as.Fluctuations24h = fluxByAgent[p.agentID]
 		ts.Agents = append(ts.Agents, as)
 		aggs = append(aggs, agg)
 
@@ -844,6 +887,44 @@ func (s *Service) loadFiringSignals(ctx context.Context, tx *sql.Tx, siteID stri
 			observedAt:  sig.ObservedAt.UTC(),
 			confirmedAt: sig.ConfirmedAt.UTC(),
 		}
+	}
+	return out, rows.Err()
+}
+
+// loadFluctuationCounts returns how many sub-threshold streaks recovered since
+// `since`, grouped target → agent → count.
+//
+// It reads outside the snapshot transaction for the same reason availability does:
+// nothing else in the status batch depends on it, and a count that is one dip
+// behind in a 24-hour window is not observable. One grouped query serves the whole
+// site, so putting the number beside every availability figure in the list costs a
+// single scan rather than a request per row.
+func (s *Service) loadFluctuationCounts(ctx context.Context, siteID string, since, until time.Time) (map[string]map[string]int, error) {
+	// Half-open [since, until), the same bounds the availability window uses. The
+	// upper bound is not decoration: timestamps come from the agent's clock, so one
+	// running ahead can write a fluctuation dated in the server's future. Without it
+	// that dip would be counted here while its round sample sits outside the
+	// availability window — a count explaining a ratio that does not yet include it —
+	// and would keep being counted in every refresh until wall time caught up.
+	rows, err := s.db.Read().QueryContext(ctx, `
+		SELECT target_id, agent_id, COUNT(*) FROM fluctuations
+		WHERE site_id=? AND ended_at >= ? AND ended_at < ? AND target_id <> ''
+		GROUP BY target_id, agent_id`, siteID, since, until)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]map[string]int{}
+	for rows.Next() {
+		var targetID, agentID string
+		var n int
+		if err := rows.Scan(&targetID, &agentID, &n); err != nil {
+			return nil, err
+		}
+		if out[targetID] == nil {
+			out[targetID] = map[string]int{}
+		}
+		out[targetID][agentID] = n
 	}
 	return out, rows.Err()
 }

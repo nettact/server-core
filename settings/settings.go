@@ -49,6 +49,10 @@ const (
 	KeyDiagGlobalConcurrency      = "diag_global_concurrency"
 	KeyDiagResolveHops            = "diag_resolve_hops"
 	KeyEvidenceRetentionDays      = "evidence_retention_days"
+	// KeyFluctuationRetentionDays ages out recorded sub-threshold streaks. It bounds
+	// only the UNLINKED ones: a fluctuation claimed as an incident's precursor is
+	// that incident's evidence and lives as long as it does.
+	KeyFluctuationRetentionDays = "fluctuation_retention_days"
 )
 
 // Agent connectivity detector (AGENT-002) knobs — detection only. Since
@@ -147,6 +151,7 @@ var IntKeys = map[string]IntBounds{
 	KeyDiagGlobalConcurrency:      {Default: 16, Min: 1, Max: 64},
 	KeyDiagResolveHops:            {Default: 0, Min: 0, Max: 1},
 	KeyEvidenceRetentionDays:      {Default: 30, Min: 1, Max: 365},
+	KeyFluctuationRetentionDays:   {Default: 30, Min: 1, Max: 365},
 	// Agent connectivity detection. Grace min (15s) stays above the sweeper's 10s
 	// presence grace so a confirmed fault is always strictly slower than the UI
 	// flipping the agent offline; stale default (120s) is ~4x the 30s host-metric

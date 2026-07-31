@@ -159,8 +159,73 @@ func TestAssembleTargetIncludesPerAgentAvailability(t *testing.T) {
 	got := svc.assembleTarget(target, pairs, time.Now().UTC(), nil, nil, nil, nil,
 		metrics.AvailabilityRatio{}, map[string]metrics.AvailabilityRatio{
 			"agent": {AgentID: "agent", Rounds: 4, OKRounds: 3, Ratio: 0.75},
-		})
+		}, nil)
 	if len(got.Agents) != 1 || got.Agents[0].Availability24h == nil || *got.Agents[0].Availability24h != 0.75 {
 		t.Fatalf("agent availability = %+v, want 0.75", got.Agents)
+	}
+}
+
+// TestAssembleTargetSumsFluctuationsAcrossAgents: the per-target figure has to be
+// the whole target's, or a dip seen only from a second Agent would go unexplained
+// on the row that shows the availability it dragged down.
+func TestAssembleTargetSumsFluctuationsAcrossAgents(t *testing.T) {
+	svc := &Service{}
+	target := &targetRow{id: "target", kind: "icmp", enabled: true}
+	pairs := []applicablePair{
+		{agentID: "agent_a", agentName: "A", online: true},
+		{agentID: "agent_b", agentName: "B", online: true},
+	}
+
+	got := svc.assembleTarget(target, pairs, time.Now().UTC(), nil, nil, nil, nil,
+		metrics.AvailabilityRatio{}, nil, map[string]int{"agent_a": 2, "agent_b": 3})
+	if got.Fluctuations24h != 5 {
+		t.Fatalf("target fluctuations = %d, want 5 (2 + 3)", got.Fluctuations24h)
+	}
+	byAgent := map[string]int{}
+	for _, a := range got.Agents {
+		byAgent[a.AgentID] = a.Fluctuations24h
+	}
+	if byAgent["agent_a"] != 2 || byAgent["agent_b"] != 3 {
+		t.Fatalf("per-agent fluctuations = %v, want a=2 b=3", byAgent)
+	}
+}
+
+// TestFluctuationTotalTracksTheAvailabilityPopulation: the count explains the ratio
+// printed beside it, so the two must be computed over the same agents.
+//
+// An agent removed from the group's scope keeps its round samples — nothing purges
+// them — so it still drags the ratio below 100% for the rest of the window while no
+// longer appearing as an applicable pair. Counting only pairs would show "0
+// fluctuations" against a dipped ratio: the unexplained state this whole feature
+// exists to eliminate.
+func TestFluctuationTotalTracksTheAvailabilityPopulation(t *testing.T) {
+	svc := &Service{}
+	target := &targetRow{id: "target", kind: "icmp", enabled: true}
+	pairs := []applicablePair{{agentID: "agent_live", agentName: "Live", online: true}}
+
+	got := svc.assembleTarget(target, pairs, time.Now().UTC(), nil, nil, nil, nil,
+		metrics.AvailabilityRatio{Rounds: 100, OKRounds: 97, Ratio: 0.97},
+		map[string]metrics.AvailabilityRatio{
+			"agent_live":     {AgentID: "agent_live", Rounds: 60, OKRounds: 59, Ratio: 0.983},
+			"agent_outscope": {AgentID: "agent_outscope", Rounds: 40, OKRounds: 38, Ratio: 0.95},
+		},
+		map[string]int{"agent_live": 1, "agent_outscope": 2})
+	if got.Fluctuations24h != 3 {
+		t.Fatalf("total = %d, want 3: the out-of-scope agent still moves the ratio, so its dips explain it",
+			got.Fluctuations24h)
+	}
+
+	// A DELETED agent is the mirror case: metrics.Store.PurgeAgent drops its series so
+	// it no longer affects the ratio, while its fluctuations are deliberately kept as
+	// history. Counting them would explain a dip the ratio no longer shows.
+	got = svc.assembleTarget(target, pairs, time.Now().UTC(), nil, nil, nil, nil,
+		metrics.AvailabilityRatio{Rounds: 60, OKRounds: 59, Ratio: 0.983},
+		map[string]metrics.AvailabilityRatio{
+			"agent_live": {AgentID: "agent_live", Rounds: 60, OKRounds: 59, Ratio: 0.983},
+		},
+		map[string]int{"agent_live": 1, "agent_deleted": 7})
+	if got.Fluctuations24h != 1 {
+		t.Fatalf("total = %d, want 1: a purged agent no longer moves the ratio, so its history must not explain it",
+			got.Fluctuations24h)
 	}
 }

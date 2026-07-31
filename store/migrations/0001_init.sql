@@ -395,6 +395,14 @@ CREATE TABLE detector_state(
   first_fail_ts    INTEGER,
   active_signal_id TEXT,
   last_value       REAL,
+  -- Per-round evidence of the current UNCONFIRMED failing streak: a JSON array of
+  -- {ts, metric_kind, value, reason_code, reason_detail}, one entry per failing
+  -- round, staged here because a streak spans ingest batches (one transaction
+  -- each) and the round that ends it carries no failure cause of its own. It is
+  -- what lets a sub-threshold streak be recorded with every round's real reason,
+  -- and what a confirming signal freezes as its own per-round evidence. Cleared
+  -- on confirm, on recovery, and on any counter reset; bounded by fail_threshold.
+  pending_fails    TEXT NOT NULL DEFAULT '[]',
   updated_at       TIMESTAMP NOT NULL,
   PRIMARY KEY(target_id, agent_id, detector_key)
 );
@@ -465,6 +473,13 @@ CREATE TABLE fault_signals(
   threshold         REAL NOT NULL DEFAULT 0,
   reason_code       INTEGER NOT NULL DEFAULT 0,         -- classified cause (telemetry.ProbeReason*)
   reason_detail     TEXT NOT NULL DEFAULT '',           -- which cert/status/OS error was behind it
+  -- Every round of the confirming streak, not just the last one: a JSON array of
+  -- {ts, metric_kind, value, reason_code, reason_detail}. The columns above are
+  -- the confirming round's summary; a streak that timed out twice and was then
+  -- refused says something different from three refusals, and diagnosis needs
+  -- both. Same shape as fluctuations.rounds_json. Empty for detectors that have
+  -- no rounds (agent connectivity).
+  rounds_json       TEXT NOT NULL DEFAULT '[]',
   observed_at       TIMESTAMP NOT NULL,                 -- first round of the failing streak
   confirmed_at      TIMESTAMP NOT NULL,                 -- round that reached the threshold
   resolved_at       TIMESTAMP,
@@ -476,6 +491,56 @@ CREATE INDEX idx_fault_signals_incident ON fault_signals(incident_id);
 CREATE INDEX idx_fault_signals_site_state ON fault_signals(site_id, state, confirmed_at);
 CREATE INDEX idx_fault_signals_target ON fault_signals(target_id, confirmed_at);
 CREATE INDEX idx_fault_signals_agent ON fault_signals(agent_id, confirmed_at);
+
+-- A sub-threshold failing streak that recovered before confirming a fault: the
+-- target failed 1..N-1 consecutive rounds and then answered again. This is the
+-- explanation behind a 99% availability figure — without it the dip is visible
+-- in the availability series but has no cause anywhere, because the recovering
+-- round wipes the streak from detector_state and raw samples only live 2 days.
+--
+-- Recorded only: never notified, never a member of an incident by itself. Display
+-- facts and per-round evidence are frozen at recovery time (fault_signals
+-- precedent), so a later rename or deletion cannot rewrite what it said.
+CREATE TABLE fluctuations(
+  id             TEXT PRIMARY KEY,                    -- 'flx_' + uuid
+  site_id        TEXT NOT NULL,
+  agent_id       TEXT NOT NULL,
+  agent_name     TEXT NOT NULL DEFAULT '',
+  target_id      TEXT NOT NULL DEFAULT '',            -- no FK: history outlives the target
+  target_name    TEXT NOT NULL DEFAULT '',
+  target_addr    TEXT NOT NULL DEFAULT '',
+  target_port    INTEGER NOT NULL DEFAULT 0,
+  probe_kind     TEXT NOT NULL DEFAULT '',
+  group_id       TEXT NOT NULL DEFAULT '',
+  layer          TEXT NOT NULL DEFAULT '',
+  fail_rounds    INTEGER NOT NULL,                    -- streak length, 1..fail_threshold-1
+  fail_threshold INTEGER NOT NULL,                    -- the threshold it did NOT reach, frozen
+  metric_kind    TEXT NOT NULL DEFAULT '',            -- summary evidence: the LAST failing round
+  comparator     TEXT NOT NULL DEFAULT '',
+  value          REAL NOT NULL DEFAULT 0,
+  threshold      REAL NOT NULL DEFAULT 0,
+  reason_code    INTEGER NOT NULL DEFAULT 0,          -- telemetry.ProbeReason*
+  reason_detail  TEXT NOT NULL DEFAULT '',
+  rounds_json    TEXT NOT NULL DEFAULT '[]',          -- every failing round (see fault_signals.rounds_json)
+  started_at     TIMESTAMP NOT NULL,                  -- first failing round of the streak
+  ended_at       TIMESTAMP NOT NULL,                  -- the round that recovered
+  -- Set when a later confirmed fault on the SAME target+agent claims this
+  -- fluctuation as a precursor (it recovered within the lookback window before
+  -- the fault was confirmed). A linked fluctuation is that incident's frozen
+  -- evidence: exempt from fluctuation retention, and deleted with the incident.
+  incident_id    TEXT REFERENCES incidents(id) ON DELETE CASCADE
+);
+-- One streak on one pair starts exactly once, so this is the natural key. It gives
+-- the same replay immunity the samples primary key gives metrics: the detector
+-- watermark normally stops a re-delivered packet from re-recording a dip, but a
+-- sensitivity edit or a scope change deletes detector_state WITHOUT bumping the
+-- config serial, so the watermark can restart at 0 while the agent is still
+-- retrying an unacked batch of the same rounds.
+CREATE UNIQUE INDEX idx_fluctuations_streak ON fluctuations(target_id, agent_id, started_at);
+CREATE INDEX idx_fluctuations_target   ON fluctuations(target_id, ended_at);
+CREATE INDEX idx_fluctuations_site     ON fluctuations(site_id, ended_at);
+CREATE INDEX idx_fluctuations_agent    ON fluctuations(agent_id, ended_at);
+CREATE INDEX idx_fluctuations_incident ON fluctuations(incident_id);
 
 CREATE TABLE incident_timeline(
   id          TEXT PRIMARY KEY,

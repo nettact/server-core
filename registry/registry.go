@@ -366,10 +366,12 @@ func (s *Service) UpdateAgent(ctx context.Context, id, displayName string) error
 // survive. detector_state keys on agent_id with no FK cascade, so its live
 // counters must be deleted explicitly here.
 //
-// fault_signals are NOT deleted: they are recorded history carrying the agent's
-// frozen name, and a fault that happened does not stop having happened because
-// the agent was later removed. The caller force-resolves the agent's firing
-// signals (reason agent_deleted, so no recovery notification) before deleting.
+// fault_signals and fluctuations are NOT deleted: they are recorded history
+// carrying the agent's frozen name, and a fault (or an availability dip) that
+// happened does not stop having happened because the agent was later removed. The
+// caller force-resolves the agent's firing signals (reason agent_deleted, so no
+// recovery notification) before deleting. Unlinked fluctuations age out on their
+// own retention; ones kept as an incident's precursors go with that incident.
 // All in one transaction.
 // Time-series data (series/samples/rollups, plus the metrics store's in-memory
 // cache) is NOT handled here — callers purge it via metrics.Store.PurgeAgent so

@@ -14,7 +14,9 @@
 //     caller's ingest transaction;
 //   - terminate.go   — the configuration-change termination paths;
 //   - agent_signal.go — the Agent-connectivity detector's write path;
-//   - signal_read.go — the read queries the API renders.
+//   - fluctuation.go — sub-threshold streaks that recovered: the record that
+//     explains an availability dip which raised no fault;
+//   - signal_read.go / fluctuation_read.go — the read queries the API renders.
 //
 // Notification is deliberately NOT here. The engine records the fact and plans a
 // delivery through the injected Planner; whether, when and where anything is
@@ -239,6 +241,11 @@ type Signal struct {
 	ResolvedAt        *time.Time `json:"resolved_at"`
 	IncidentID        string     `json:"incident_id"`
 	CurrentlyAbnormal bool       `json:"currently_abnormal"`
+	// Rounds is the cause of every round of the confirming streak, oldest first,
+	// frozen alongside the summary evidence above. Three failing rounds can fail
+	// three different ways, and only this tells the reader which. Empty for the
+	// agent-connectivity detector, which has no rounds.
+	Rounds []FailEvidence `json:"rounds"`
 }
 
 // SignalEvent is the bus payload for TopicFaultConfirmed / TopicFaultResolved,

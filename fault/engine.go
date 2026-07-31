@@ -30,6 +30,14 @@ type detectorState struct {
 	firstFailTS  sql.NullInt64
 	signalID     sql.NullString
 	lastValue    sql.NullFloat64
+	// pendingFails is the cause of each failing round of the streak in progress,
+	// oldest first. It is staged in the row rather than held in memory because a
+	// streak spans ingest batches — one transaction each — and it is needed because
+	// the round that ENDS a streak carries no failure cause: without it a recovered
+	// streak could only be recorded as "something failed twice". Accumulated only
+	// while no signal is firing (a confirmed fault has already frozen its own copy),
+	// so it is bounded by fail_threshold.
+	pendingFails []FailEvidence
 }
 
 // EvaluateAgentTx advances every affected detector by the rounds this batch
@@ -95,6 +103,11 @@ func (s *Service) advanceDetector(ctx context.Context, tx *sql.Tx, agentID, site
 		st.failRounds, st.okRounds = 0, 0
 		st.firstFailTS = sql.NullInt64{}
 		st.lastRoundTS = 0
+		// The discarded streak is not recorded as a fluctuation either. A streak cut
+		// short by an operator editing the target is an artefact of that edit, not a
+		// network event, and filing it as one would put noise in the very record whose
+		// job is to explain real dips.
+		st.pendingFails = nil
 	}
 
 	for _, r := range rounds {
@@ -104,6 +117,21 @@ func (s *Service) advanceDetector(ctx context.Context, tx *sql.Tx, agentID, site
 		if r.TS <= st.lastRoundTS {
 			continue
 		}
+		// A streak is N CONSECUTIVE rounds, and consecutive has to mean something in
+		// wall-clock terms. Nothing else expires a streak — an Agent that dies
+		// mid-streak leaves its counters untouched (its own connectivity fault covers
+		// the outage), so without this an Agent failing twice and returning a day later
+		// would either confirm a fault on "three consecutive rounds" spanning a day, or
+		// file a fluctuation whose window is a day wide. Either one answers "why is
+		// availability 99%?" with a fabrication, which is worse than not answering.
+		//
+		// Beyond the gap there is simply no evidence, so the streak is abandoned and
+		// counting starts fresh rather than being stitched across the hole.
+		if st.failRounds > 0 && st.lastRoundTS > 0 && r.TS-st.lastRoundTS > int64(r.Meta.maxRoundGap().Seconds()) {
+			st.failRounds, st.okRounds = 0, 0
+			st.firstFailTS = sql.NullInt64{}
+			st.pendingFails = nil
+		}
 		st.lastRoundTS = r.TS
 		st.lastValue = sql.NullFloat64{Float64: r.Value, Valid: true}
 		if r.Class == RoundFail {
@@ -112,18 +140,40 @@ func (s *Service) advanceDetector(ctx context.Context, tx *sql.Tx, agentID, site
 			if !st.firstFailTS.Valid {
 				st.firstFailTS = sql.NullInt64{Int64: r.TS, Valid: true}
 			}
+			if !st.signalID.Valid {
+				// Stage this round's cause while the streak is still unconfirmed. Once a
+				// signal is firing it owns the frozen evidence, so accumulating past that
+				// point would grow without bound through a long outage.
+				st.pendingFails = append(st.pendingFails, FailEvidence{
+					TS: r.TS, MetricKind: r.MetricKind, Value: r.Value,
+					ReasonCode: r.ReasonCode, ReasonDetail: r.ReasonDetail,
+				})
+			}
 			if !st.signalID.Valid && st.failRounds >= r.Det.FailRounds {
 				id, err := s.confirmSignal(ctx, tx, agentID, siteID, agentName, r, st, now, out)
 				if err != nil {
 					return err
 				}
 				st.signalID = sql.NullString{String: id, Valid: true}
+				st.pendingFails = nil // the signal froze its own copy
 			}
 			continue
+		}
+		// A streak that never confirmed is about to be erased by this success — its
+		// counter and start time are cleared below and nothing else in the system
+		// remembers it. Record it first: this is the dip behind a 99% availability
+		// figure, and until now it left no explanation anywhere. A streak that DID
+		// confirm is excluded (signalID set): that is a fault recovering, which the
+		// fault centre already tells in full.
+		if st.failRounds > 0 && !st.signalID.Valid {
+			if err := insertFluctuation(ctx, tx, agentID, siteID, agentName, r, st); err != nil {
+				return err
+			}
 		}
 		st.okRounds++
 		st.failRounds = 0
 		st.firstFailTS = sql.NullInt64{}
+		st.pendingFails = nil
 		if st.signalID.Valid && st.okRounds >= r.Det.RecoverRounds {
 			if err := s.resolveSignal(ctx, tx, st.signalID.String, ReasonRecovered, timeFromUnix(r.TS), now, out); err != nil {
 				return err
@@ -158,6 +208,13 @@ func (s *Service) confirmSignal(ctx context.Context, tx *sql.Tx, agentID, siteID
 		FailThreshold: r.Det.FailRounds, RecoverThreshold: r.Det.RecoverRounds,
 		MetricKind: r.MetricKind, Comparator: r.Comparator, Value: r.Value, Threshold: r.Threshold,
 		ReasonCode: r.ReasonCode, ReasonDetail: r.ReasonDetail,
+		// Freeze the cause of every round of the streak, not just the confirming one.
+		// The summary columns above answer "why is this firing"; these answer "what
+		// actually happened" — a target that timed out twice and was then refused
+		// points somewhere different from one refused three times, and the difference
+		// is invisible if only the last round survives. pendingFails holds the earlier
+		// rounds; this round is the last of them.
+		Rounds:     st.pendingFails,
 		ObservedAt: observed, ConfirmedAt: confirmed,
 	}
 	openKey := "sig:" + signalID
@@ -182,6 +239,11 @@ func (s *Service) confirmSignal(ctx context.Context, tx *sql.Tx, agentID, siteID
 		return "", err
 	}
 	addTimeline(ctx, tx, incidentID, "fault.confirmed", SignalTitle(sig), signalID, now)
+	// Claim the sub-threshold streaks that led up to this fault. They stop being
+	// standalone curiosities and become this incident's precursor evidence, which is
+	// often the most useful thing in it: "it had been flapping for half an hour" is
+	// a different diagnosis from "it failed out of nowhere".
+	linkPrecursors(ctx, tx, incidentID, r.TargetID, agentID, observed, now)
 	out.confirmed = append(out.confirmed, SignalEvent{
 		SignalID: signalID, IncidentID: incidentID, SiteID: siteID,
 		AgentID: agentID, TargetID: r.TargetID, Severity: sig.Severity,
@@ -297,13 +359,14 @@ func (s *Service) resolveSignal(ctx context.Context, tx *sql.Tx, signalID, reaso
 
 func loadDetectorState(ctx context.Context, tx *sql.Tx, targetID, agentID, detector string) (detectorState, error) {
 	var st detectorState
+	var pending string
 	err := tx.QueryRowContext(ctx, `
 		SELECT config_serial, detection_rev, fail_rounds, ok_rounds, last_round_ts,
-		       first_fail_ts, active_signal_id, last_value
+		       first_fail_ts, active_signal_id, last_value, pending_fails
 		FROM detector_state WHERE target_id=? AND agent_id=? AND detector_key=?`,
 		targetID, agentID, detector).
 		Scan(&st.configSerial, &st.detectionRev, &st.failRounds, &st.okRounds, &st.lastRoundTS,
-			&st.firstFailTS, &st.signalID, &st.lastValue)
+			&st.firstFailTS, &st.signalID, &st.lastValue, &pending)
 	if errors.Is(err, sql.ErrNoRows) {
 		return detectorState{}, nil
 	}
@@ -311,14 +374,25 @@ func loadDetectorState(ctx context.Context, tx *sql.Tx, targetID, agentID, detec
 		return detectorState{}, err
 	}
 	st.exists = true
+	st.pendingFails = decodeRounds(pending)
 	// Defend against a signal that was terminated out of band (config change,
 	// agent removal) without clearing this row: a resolved signal must never be
 	// treated as the detector's active one.
+	//
+	// The failing streak goes with it. Those rounds were already recorded as a
+	// confirmed fault, so carrying the counter forward would let the next
+	// succeeding round file them a SECOND time as a fluctuation — the same failures
+	// reported twice, once as an outage and once as a blip. Counting restarts
+	// instead, which is the same thing every other termination path does by deleting
+	// the row outright.
 	if st.signalID.Valid {
 		var state string
 		e := tx.QueryRowContext(ctx, `SELECT state FROM fault_signals WHERE id=?`, st.signalID.String).Scan(&state)
 		if errors.Is(e, sql.ErrNoRows) || (e == nil && state != "firing") {
 			st.signalID = sql.NullString{}
+			st.failRounds, st.okRounds = 0, 0
+			st.firstFailTS = sql.NullInt64{}
+			st.pendingFails = nil
 		} else if e != nil {
 			return detectorState{}, e
 		}
@@ -328,33 +402,43 @@ func loadDetectorState(ctx context.Context, tx *sql.Tx, targetID, agentID, detec
 
 func saveDetectorState(ctx context.Context, tx *sql.Tx, targetID, agentID, detector string,
 	configSerial, detectionRev int, st detectorState, now time.Time) error {
-	_, err := tx.ExecContext(ctx, `
+	pending, err := encodeRounds(st.pendingFails)
+	if err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `
 		INSERT INTO detector_state(target_id, agent_id, detector_key, config_serial, detection_rev,
-		    fail_rounds, ok_rounds, last_round_ts, first_fail_ts, active_signal_id, last_value, updated_at)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+		    fail_rounds, ok_rounds, last_round_ts, first_fail_ts, active_signal_id, last_value,
+		    pending_fails, updated_at)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(target_id, agent_id, detector_key) DO UPDATE SET
 		    config_serial=excluded.config_serial, detection_rev=excluded.detection_rev,
 		    fail_rounds=excluded.fail_rounds, ok_rounds=excluded.ok_rounds,
 		    last_round_ts=excluded.last_round_ts, first_fail_ts=excluded.first_fail_ts,
 		    active_signal_id=excluded.active_signal_id, last_value=excluded.last_value,
-		    updated_at=excluded.updated_at`,
+		    pending_fails=excluded.pending_fails, updated_at=excluded.updated_at`,
 		targetID, agentID, detector, configSerial, detectionRev,
-		st.failRounds, st.okRounds, st.lastRoundTS, st.firstFailTS, st.signalID, st.lastValue, now)
+		st.failRounds, st.okRounds, st.lastRoundTS, st.firstFailTS, st.signalID, st.lastValue,
+		pending, now)
 	return err
 }
 
 // insertSignal writes a confirmed signal with all its display facts frozen.
 func insertSignal(ctx context.Context, tx *sql.Tx, sig Signal, port int) error {
-	_, err := tx.ExecContext(ctx, `
+	roundsJSON, err := encodeRounds(sig.Rounds)
+	if err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `
 		INSERT INTO fault_signals(id, site_id, agent_id, target_id, detector_key, probe_kind,
 		    group_id, group_name, target_name, target_addr, target_port, agent_name, layer, severity,
 		    state, fail_threshold, recover_threshold, metric_kind, comparator, value, threshold,
-		    reason_code, reason_detail, observed_at, confirmed_at, incident_id)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'firing', ?,?,?,?,?,?,?,?,?,?,?)`,
+		    reason_code, reason_detail, rounds_json, observed_at, confirmed_at, incident_id)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'firing', ?,?,?,?,?,?,?,?,?,?,?,?)`,
 		sig.ID, sig.SiteID, sig.AgentID, sig.TargetID, sig.DetectorKey, sig.ProbeKind,
 		sig.GroupID, sig.GroupName, sig.TargetName, sig.TargetAddr, port, sig.AgentName, sig.Layer, sig.Severity,
 		sig.FailThreshold, sig.RecoverThreshold, sig.MetricKind, sig.Comparator, sig.Value, sig.Threshold,
-		sig.ReasonCode, sig.ReasonDetail, sig.ObservedAt, sig.ConfirmedAt, sig.IncidentID)
+		sig.ReasonCode, sig.ReasonDetail, roundsJSON, sig.ObservedAt, sig.ConfirmedAt, sig.IncidentID)
 	return err
 }
 

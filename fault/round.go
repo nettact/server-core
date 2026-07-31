@@ -5,6 +5,7 @@ import (
 	"sort"
 	"time"
 
+	pcfg "github.com/nettact/protocol/config"
 	"github.com/nettact/protocol/telemetry"
 	"github.com/nettact/server-core/metrics"
 )
@@ -111,6 +112,29 @@ type TargetMeta struct {
 	Enabled      bool
 	ConfigSerial int
 	Det          DetectionSettings
+	// MaxRoundGap is how far apart two rounds may be and still count as
+	// consecutive. Zero falls back to the kind's default schedule (see
+	// maxRoundGap), so a caller that does not set it still gets a sane bound
+	// rather than an unbounded one.
+	MaxRoundGap time.Duration
+}
+
+// maxRoundGap is the tolerance for calling two rounds consecutive, defaulting to
+// the target kind's own schedule when ingest did not supply one.
+//
+// It reuses StaleAfter, the same formula the server uses to decide a sample is too
+// old to describe the present. That is the honest boundary: if the gap between two
+// rounds exceeds it, the server would already have called the earlier one stale,
+// so treating them as adjacent members of one streak asserts a continuity nobody
+// observed. Deriving it from the target's real interval matters because those
+// intervals span three orders of magnitude — 10s for ICMP, 30 minutes for NAT — so
+// any single flat threshold would either be useless for one or break the other.
+func (m TargetMeta) maxRoundGap() time.Duration {
+	if m.MaxRoundGap > 0 {
+		return m.MaxRoundGap
+	}
+	var p pcfg.ProbeParams
+	return pcfg.StaleAfter(pcfg.EffectiveInterval(m.Kind, p), pcfg.CycleDeadline(m.Kind, p), 0)
 }
 
 // RoundClass is a probe round's verdict.

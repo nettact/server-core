@@ -121,6 +121,54 @@ func TestReasonDetailRendering(t *testing.T) {
 	}
 }
 
+// TestEveryReasonCodeHasBothLabels is the guard that keeps failure causes readable
+// as the enum grows. A probe classifies a failure into one of these codes and the
+// code is frozen onto the fault (and onto a fluctuation), so a code added without
+// labels does not fail loudly — it renders as "未知错误（84）" in the very place the
+// operator went to find out what broke. The list is maintained by hand on purpose:
+// adding a constant should make someone add its two sentences.
+func TestEveryReasonCodeHasBothLabels(t *testing.T) {
+	codes := []int{
+		telemetry.ProbeReasonNone,
+		telemetry.ProbeReasonTimeout,
+		telemetry.ProbeReasonRefused,
+		telemetry.ProbeReasonUnreachable,
+		telemetry.ProbeReasonDNS,
+		telemetry.ProbeReasonTLS,
+		telemetry.ProbeReasonReset,
+		telemetry.ProbeReasonOther,
+		telemetry.ProbeReasonDNSNXDomain,
+		telemetry.ProbeReasonDNSServFail,
+		telemetry.ProbeReasonDNSNoRecord,
+		telemetry.ProbeReasonTLSExpired,
+		telemetry.ProbeReasonTLSUntrusted,
+		telemetry.ProbeReasonTLSHostname,
+		telemetry.ProbeReasonHTTPStatus,
+		telemetry.ProbeReasonHTTPKeyword,
+		telemetry.ProbeReasonProxyConnect,
+		telemetry.ProbeReasonProxyAuth,
+		telemetry.ProbeReasonProxyDNS,
+		telemetry.ProbeReasonProxyRefused,
+		telemetry.ProbeReasonProxyConfig,
+	}
+	for _, code := range codes {
+		zh, en := probeReasonZh(code), probeReasonEn(code)
+		if zh == "" || strings.Contains(zh, "未知错误") {
+			t.Errorf("probeReasonZh(%d) = %q: every classified cause needs a Chinese label", code, zh)
+		}
+		if en == "" || strings.Contains(en, "unknown error") {
+			t.Errorf("probeReasonEn(%d) = %q: every classified cause needs an English label", code, en)
+		}
+	}
+	// The fallback still has to work, since an older server can meet a newer agent.
+	if got := probeReasonZh(9999); !strings.Contains(got, "9999") {
+		t.Errorf("unknown zh code should name the number, got %q", got)
+	}
+	if got := probeReasonEn(9999); !strings.Contains(got, "9999") {
+		t.Errorf("unknown en code should name the number, got %q", got)
+	}
+}
+
 // TestResolvedWithGroup verifies the recovery notice wording: a MERGED incident may
 // claim the whole group recovered and lists the recovered targets; an UNMERGED
 // (per-alert) incident names the group without a group-wide claim; and a payload
