@@ -503,7 +503,10 @@ func RenderAgentLines(p Payload, lang string) []string {
 			}
 			continue
 		}
-		lastSeen := a.LastSeenAt.Format("2006-01-02 15:04")
+		// Rendered without a zone marker, so it must be the reader's wall clock:
+		// timestamps arrive UTC, and the server's local zone is the recipient's
+		// (on-prem deployment).
+		lastSeen := a.LastSeenAt.Local().Format("2006-01-02 15:04")
 		if en {
 			out = append(out, fmt.Sprintf("%s: %s, last seen %s", name, offlineReasonLabel(a.Reason, lang), lastSeen))
 		} else {

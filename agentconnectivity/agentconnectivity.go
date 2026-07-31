@@ -46,7 +46,11 @@ type Engine struct {
 	set    *settings.Service
 	faults FaultRecorder // nil-safe: the state machine then records nothing
 	bus    *eventbus.Bus // nil-safe: no SSE bridge events published
-	now    func() time.Time
+	// now MUST keep Go's monotonic reading (i.e. plain time.Now, never .UTC()):
+	// its results are stored in the absent/connected clocks below and compared
+	// with Sub, which is what makes the grace and recovery windows immune to a
+	// wall-clock adjustment. Anything persisted is normalized by stamp().
+	now func() time.Time
 
 	mu             sync.Mutex
 	absentSince    map[string]time.Time // agentID -> first tick observed absent (cleared when connected)
@@ -66,6 +70,14 @@ func New(db *store.DB, set *settings.Service, faults FaultRecorder, bus *eventbu
 	}
 }
 
+// stamp is the wall-clock form of an engine time, for values that leave memory.
+// Everything this detector persists flows into columns the rest of the system
+// writes in UTC, and they are stored as text and compared lexicographically
+// (notification due_at, the status-history MAX subquery), so a local-time value
+// would sort hours away from its neighbours. Stripping the monotonic reading is
+// safe here precisely because nothing downstream measures elapsed time from it.
+func stamp(t time.Time) time.Time { return t.UTC() }
+
 // agentRow is the per-agent state Tick needs.
 type agentRow struct {
 	id          string
@@ -84,7 +96,10 @@ func (e *Engine) Tick(ctx context.Context, connectedIDs []string) error {
 	if e.faults == nil {
 		return nil
 	}
+	// now drives the elapsed-time windows and stays monotonic; at is the same
+	// instant in the form everything recorded uses.
 	now := e.now()
+	at := stamp(now)
 	enabled := e.set == nil || e.set.Bool(ctx, settings.KeyAgentConnectivityEnabled)
 	graceSec, _ := e.set.Int(ctx, settings.KeyAgentConnectivityGraceSeconds)
 	recoverSec, _ := e.set.Int(ctx, settings.KeyAgentConnectivityRecoverSeconds)
@@ -118,7 +133,7 @@ func (e *Engine) Tick(ctx context.Context, connectedIDs []string) error {
 			if _, ok := firing[a.id]; !ok {
 				continue
 			}
-			if err := e.faults.ResolveAgentSignal(ctx, a.id, fault.ReasonDisabled, now); err != nil {
+			if err := e.faults.ResolveAgentSignal(ctx, a.id, fault.ReasonDisabled, at); err != nil {
 				return err
 			}
 			changedSites[a.siteID] = true
@@ -153,7 +168,7 @@ func (e *Engine) Tick(ctx context.Context, connectedIDs []string) error {
 		// detector off, the agent did not come back) and skip the state machine.
 		if a.muted {
 			if hasFiring {
-				if err := e.faults.ResolveAgentSignal(ctx, a.id, fault.ReasonMuted, now); err != nil {
+				if err := e.faults.ResolveAgentSignal(ctx, a.id, fault.ReasonMuted, at); err != nil {
 					return err
 				}
 				changedSites[a.siteID] = true
@@ -169,7 +184,7 @@ func (e *Engine) Tick(ctx context.Context, connectedIDs []string) error {
 		if isConnected {
 			// Recovery requires a sustained connection, not a single late packet.
 			if hasFiring && now.Sub(e.connectedSince[a.id]) >= recover {
-				if err := e.faults.ResolveAgentSignal(ctx, a.id, fault.ReasonRecovered, now); err != nil {
+				if err := e.faults.ResolveAgentSignal(ctx, a.id, fault.ReasonRecovered, at); err != nil {
 					return err
 				}
 				changedSites[a.siteID] = true
@@ -184,8 +199,8 @@ func (e *Engine) Tick(ctx context.Context, connectedIDs []string) error {
 				SiteID:       a.siteID,
 				Name:         a.label(),
 				Reason:       reasonFor(a.disconnKind),
-				OfflineSince: a.offlineSince(now),
-			}, now)
+				OfflineSince: a.offlineSince(at),
+			}, at)
 			if err != nil {
 				return err
 			}
@@ -224,7 +239,7 @@ func (e *Engine) OnMuteChanged(ctx context.Context, agentID string, muted bool) 
 	if err := e.db.QueryRowContext(ctx, `SELECT site_id FROM agents WHERE id=?`, agentID).Scan(&siteID); err != nil {
 		return
 	}
-	if err := e.faults.ResolveAgentSignal(ctx, agentID, fault.ReasonMuted, e.now()); err != nil {
+	if err := e.faults.ResolveAgentSignal(ctx, agentID, fault.ReasonMuted, stamp(e.now())); err != nil {
 		return
 	}
 	e.publishChanges(map[string]bool{siteID: true})

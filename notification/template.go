@@ -97,7 +97,7 @@ func buildVars(p Payload, lang string) map[string]string {
 		"suspected_layer": p.SuspectedLayer,
 		"url":             p.URL,
 		"agent_count":     strconv.Itoa(p.AgentCount),
-		"at":              p.At.Format(time.RFC3339),
+		"at":              p.At.Local().Format(time.RFC3339),
 	}
 }
 

@@ -453,7 +453,7 @@ func (s *Service) sendEmail(cfg map[string]string, p Payload) {
 
 // emailFooter renders the localized "Site / Severity / Time" trailer.
 func emailFooter(p Payload, lang string) string {
-	at := p.At.Format(time.RFC3339)
+	at := p.At.Local().Format(time.RFC3339)
 	if normLang(lang) == "en" {
 		return fmt.Sprintf("Site: %s\r\nSeverity: %s\r\nTime: %s", p.SiteID, p.Severity, at)
 	}

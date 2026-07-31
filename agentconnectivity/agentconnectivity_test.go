@@ -3,6 +3,7 @@ package agentconnectivity
 import (
 	"context"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -23,6 +24,9 @@ type fakeRecorder struct {
 	opened   []fault.AgentSignalInput
 	resolved []resolveCall
 	seq      int
+	// stamps is every timestamp handed across the persistence boundary, so a test
+	// can assert the engine normalizes them even though this fake stores nothing.
+	stamps []time.Time
 }
 
 type resolveCall struct {
@@ -32,7 +36,8 @@ type resolveCall struct {
 
 func newFakeRecorder() *fakeRecorder { return &fakeRecorder{firing: map[string]string{}} }
 
-func (f *fakeRecorder) OpenAgentSignal(_ context.Context, in fault.AgentSignalInput, _ time.Time) (string, error) {
+func (f *fakeRecorder) OpenAgentSignal(_ context.Context, in fault.AgentSignalInput, now time.Time) (string, error) {
+	f.stamps = append(f.stamps, now)
 	if _, ok := f.firing[in.AgentID]; ok {
 		return "", nil // already firing; the unique index makes this a no-op
 	}
@@ -43,7 +48,8 @@ func (f *fakeRecorder) OpenAgentSignal(_ context.Context, in fault.AgentSignalIn
 	return id, nil
 }
 
-func (f *fakeRecorder) ResolveAgentSignal(_ context.Context, agentID, reason string, _ time.Time) error {
+func (f *fakeRecorder) ResolveAgentSignal(_ context.Context, agentID, reason string, now time.Time) error {
+	f.stamps = append(f.stamps, now)
 	if _, ok := f.firing[agentID]; !ok {
 		return nil
 	}
@@ -390,6 +396,50 @@ func TestReasonMapping(t *testing.T) {
 		in, ok := h.lastOpenOf(id)
 		if !ok || in.Reason != reason {
 			t.Fatalf("agent %s: expected reason %s, got %+v", id, reason, in)
+		}
+	}
+}
+
+// The grace and recovery windows are measured with Sub over values this clock
+// produced, so it has to carry Go's monotonic reading. Normalizing it to UTC at
+// the source (rather than at the persistence boundary) would strip that, letting
+// an NTP correction or a manual clock change confirm an outage that never
+// happened — or postpone one that did.
+func TestEngineClockKeepsMonotonicReading(t *testing.T) {
+	eng := New(nil, nil, nil, nil)
+	// time.Time.String documents the " m=±<seconds>" suffix as the marker for a
+	// present monotonic reading; there is no other exported way to observe it.
+	if got := eng.now().String(); !strings.Contains(got, " m=") {
+		t.Fatalf("engine clock has no monotonic reading: %s", got)
+	}
+}
+
+// Everything the engine hands the recorder is persisted next to rows the rest of
+// the system writes in UTC — and those columns are stored as text and compared
+// lexicographically, so a local-time value sorts hours away from its neighbours
+// (a notification whose due_at reads as local waits out the zone offset before a
+// UTC "now" ever reaches it).
+func TestPersistedTimestampsAreUTC(t *testing.T) {
+	h := newHarness(t)
+	// A server running east of Greenwich, which is where the skew shows up.
+	h.clock = time.Date(2026, 7, 31, 1, 43, 12, 0, time.FixedZone("CST", 8*3600))
+	// last_seen_at is written in UTC by the registry, so seed it the same way.
+	seen := h.clock.UTC()
+	h.seedAgent("agent_a", ptr(seen), ptr(seen), false, "error")
+
+	h.takeAgentOffline("agent_a") // confirms: OpenAgentSignal
+	h.tick("agent_a")             // reconnects
+	h.advance(10 * time.Second)   // sustained past recover (10s)
+	h.tick("agent_a")             // resolves: ResolveAgentSignal
+	if h.firing("agent_a") {
+		t.Fatal("expected the fault to resolve after a sustained reconnection")
+	}
+	if len(h.faults.stamps) == 0 {
+		t.Fatal("expected the recorder to have been called")
+	}
+	for i, ts := range h.faults.stamps {
+		if ts.Location() != time.UTC {
+			t.Errorf("stamp %d is %v (location %v), want UTC", i, ts, ts.Location())
 		}
 	}
 }

@@ -43,7 +43,9 @@ func TestBuildVars(t *testing.T) {
 		"suspected_layer": "wan",
 		"url":             "http://console/incidents?incident=inc_1",
 		"agent_count":     "2",
-		"at":              "2026-07-23T10:30:00Z",
+		// Rendered in the server's local zone (whatever the test host's is), so the
+		// expectation converts the same way instead of hardcoding an offset.
+		"at": time.Date(2026, 7, 23, 10, 30, 0, 0, time.UTC).Local().Format(time.RFC3339),
 		// Worst-first: critical target leads, warn follows; duplicate collapsed.
 		"target":  "Crit Target",
 		"targets": "Crit Target, Warn Target",
