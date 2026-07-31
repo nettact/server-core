@@ -50,6 +50,7 @@ import (
 	"github.com/nettact/server-core/site"
 	"github.com/nettact/server-core/sse"
 	"github.com/nettact/server-core/targetstatus"
+	"github.com/nettact/server-core/updatecheck"
 
 	neturl "net/url"
 )
@@ -83,6 +84,11 @@ type Deps struct {
 	SPA               http.Handler              // optional embedded web UI (served for non-/api routes)
 	Dev               bool                      // relax CORS for the Vite origin
 	SecureCookie      bool                      // set Secure on the session cookie (production/HTTPS)
+
+	// Update reports whether a newer release exists for this install (nil when
+	// update checking is switched off, or in bare server-core tests). Its Status
+	// rides along on server-info.
+	Update *updatecheck.Service
 
 	// ListenStatus reports how the running server is actually bound (nil when the
 	// host doesn't provide one, e.g. bare server-core tests).
@@ -338,12 +344,20 @@ func (d Deps) handleMe(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleServerInfo reports the host OS, whether native desktop notifications
-// are available on this build, and (when the host provides it) the listen
-// binding status so the UI can show effective vs pending listen settings.
+// are available on this build, (when the host provides it) the listen binding
+// status so the UI can show effective vs pending listen settings, and the last
+// update check's outcome.
+//
+// The "update" key is absent until a check has succeeded — and entirely absent
+// when update checking is switched off — so the console can treat its presence
+// as "there is something to show" rather than reading a half-filled block.
 func (d Deps) handleServerInfo(w http.ResponseWriter, r *http.Request) {
 	out := map[string]any{
 		"os":            runtime.GOOS,
 		"native_notify": notification.NativeSupported(),
+	}
+	if st, ok := d.Update.Status(); ok {
+		out["update"] = st
 	}
 	if d.ListenStatus != nil {
 		ls := d.ListenStatus(r.Context())
@@ -2192,15 +2206,17 @@ func (d Deps) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 }
 
 // knownSettingKeys is the allow-list of settings the generic settings API may
-// expose or write: the console base URL, the listen address, plus every
-// incident-snapshot / diagnostic integer knob (settings.IntKeys). Internal
-// values such as the dashboard layout and onboarding state use dedicated APIs.
+// expose or write: the console base URL, the listen address, the dismissed
+// update version, plus every incident-snapshot / diagnostic integer knob
+// (settings.IntKeys). Internal values such as the dashboard layout and
+// onboarding state use dedicated APIs.
 var knownSettingKeys = buildKnownSettingKeys()
 
 func buildKnownSettingKeys() map[string]bool {
 	m := map[string]bool{
-		settings.KeyConsoleBaseURL: true,
-		settings.KeyListenAddr:     true,
+		settings.KeyConsoleBaseURL:         true,
+		settings.KeyListenAddr:             true,
+		settings.KeyUpdateDismissedVersion: true,
 	}
 	for k := range settings.IntKeys {
 		m[k] = true
@@ -2245,8 +2261,9 @@ func (d Deps) deviceRetentionConflict(ctx context.Context, body map[string]strin
 // handleUpdateSettings merges the posted keys. Only known keys are accepted;
 // console_base_url is validated to be an absolute http(s) origin without a query
 // or fragment (or empty to clear it), listen_addr is validated (host allow-list,
-// port range, bind probe) and reports its effect timing in the response, and
-// every integer knob is range-checked against its registered bounds.
+// port range, bind probe) and reports its effect timing in the response,
+// update_dismissed_version is length-capped, and every integer knob is
+// range-checked against its registered bounds.
 func (d Deps) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	var body map[string]string
 	if err := json.NewDecoder(io.LimitReader(r.Body, 8192)).Decode(&body); err != nil {
@@ -2269,6 +2286,14 @@ func (d Deps) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		body[settings.KeyConsoleBaseURL] = v
+	}
+	if v, ok := body[settings.KeyUpdateDismissedVersion]; ok {
+		v = strings.TrimSpace(v)
+		if len(v) > settings.MaxDismissedVersionLen {
+			writeError(w, http.StatusBadRequest, settings.KeyUpdateDismissedVersion+" is too long")
+			return
+		}
+		body[settings.KeyUpdateDismissedVersion] = v
 	}
 	listenChanged := false
 	var listenNew string

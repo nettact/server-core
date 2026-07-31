@@ -106,6 +106,24 @@ const (
 	KeyDeviceRandomMACRetentionDays = "device_random_mac_retention_days"
 )
 
+// Update-notice state, shared by every surface that can announce a new release.
+//
+// The switch is a SERVER setting rather than per-client state on purpose: the
+// desktop tray balloon and the web-console banner announce the same release, so
+// turning notices off in the console has to silence the tray too. The desktop
+// keeps only its own once-per-version bookkeeping locally.
+//
+// KeyUpdateDismissedVersion holds the version whose console banner was closed
+// (the tray has no equivalent — a balloon is dismissed by ignoring it).
+const (
+	KeyUpdateNoticeDisabled   = "update_notice_disabled"
+	KeyUpdateDismissedVersion = "update_dismissed_version"
+)
+
+// MaxDismissedVersionLen bounds the stored dismissed version. It holds a release
+// tag the server itself reported, so this is a sanity cap, not a format rule.
+const MaxDismissedVersionLen = 64
+
 // IntBounds is one integer setting's default and inclusive [Min,Max] range.
 type IntBounds struct {
 	Default int
@@ -150,6 +168,9 @@ var IntKeys = map[string]IntBounds{
 	// association. 0 has a distinct meaning per key — see the key comments.
 	KeyDeviceRetentionDays:          {Default: 7, Min: 0, Max: 365},
 	KeyDeviceRandomMACRetentionDays: {Default: 1, Min: 0, Max: 365},
+	// Update notices default to on: a monitoring tool that quietly runs an old
+	// build is the failure mode worth avoiding.
+	KeyUpdateNoticeDisabled: {Default: 0, Min: 0, Max: 1},
 }
 
 type Service struct {
