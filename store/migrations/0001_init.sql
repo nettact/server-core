@@ -672,13 +672,19 @@ CREATE TABLE notification_channels(
 );
 
 -- WHO hears about a fault, separate from whether it is RECORDED. Scoped to the
--- site or one monitor group; exactly one row per scope, one default per site.
+-- site, one monitor group, or the Agent-connectivity detector; exactly one row
+-- per scope, one default per site.
+--
+-- The 'agent' scope is a per-site singleton (scope_id ''), not one row per
+-- Agent: an Agent going offline belongs to no monitor group, so without it the
+-- only way to route offline notices differently from probe faults would be to
+-- change the site default — which governs everything else too.
 CREATE TABLE notification_policies(
   id                 TEXT PRIMARY KEY,                  -- 'np_' + uuid
   site_id            TEXT NOT NULL REFERENCES sites(id),
   name               TEXT NOT NULL,
-  scope_kind         TEXT NOT NULL CHECK(scope_kind IN('site','group')),
-  scope_id           TEXT NOT NULL DEFAULT '',          -- '' for the site scope
+  scope_kind         TEXT NOT NULL CHECK(scope_kind IN('site','group','agent')),
+  scope_id           TEXT NOT NULL DEFAULT '',          -- '' for the site and agent scopes
   enabled            INTEGER NOT NULL DEFAULT 1,
   min_severity       TEXT NOT NULL DEFAULT 'warn',
   warn_delay_sec     INTEGER NOT NULL DEFAULT 300,

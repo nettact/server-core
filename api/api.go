@@ -218,12 +218,14 @@ func Router(d Deps) http.Handler {
 			r.Get("/targets/{id}/detection-settings", d.handleGetDetectionSettings)
 			r.Patch("/targets/{id}/detection-settings", d.handleUpdateDetectionSettings)
 			// Notification policies decide whether/when/where a recorded fault is
-			// announced. Exactly one applies per incident (group > site).
+			// announced. Exactly one applies per incident: group > site for a probe
+			// fault, agent > site for an Agent-offline one.
 			r.Get("/sites/{id}/notification-policies", d.handleListNotificationPolicies)
 			r.Post("/sites/{id}/notification-policies", d.handleCreateNotificationPolicy)
 			r.Patch("/notification-policies/{id}", d.handleUpdateNotificationPolicy)
 			r.Delete("/notification-policies/{id}", d.handleDeleteNotificationPolicy)
 			r.Get("/targets/{id}/effective-notification-policy", d.handleEffectiveNotificationPolicy)
+			r.Get("/sites/{id}/agent-connectivity-notification-policy", d.handleAgentConnectivityNotificationPolicy)
 			r.Get("/channels", d.handleListChannels)
 			r.Post("/channels", d.handleCreateChannel)
 			r.Post("/channels/test", d.handleTestChannel)
@@ -1852,9 +1854,10 @@ func (d Deps) reconcileScope(ctx context.Context, siteID string) error {
 
 func (d Deps) handleListNotificationPolicies(w http.ResponseWriter, r *http.Request) {
 	siteID := chi.URLParam(r, "id")
-	// Reading the list is also where a site's default policy first materializes, so
-	// the console never has to special-case a site that has never opened this page.
-	if _, err := d.NotifyPolicy.EnsureDefault(r.Context(), siteID); err != nil {
+	// Reading the list is also where a site's built-in policies first materialize,
+	// so the console never has to special-case a site that has never opened this
+	// page.
+	if err := d.NotifyPolicy.EnsureBuiltins(r.Context(), siteID); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -1960,7 +1963,7 @@ func (d Deps) handleDeleteNotificationPolicy(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	if err := d.NotifyPolicy.Delete(r.Context(), id); err != nil {
-		if errors.Is(err, notifypolicy.ErrDefaultPolicy) {
+		if errors.Is(err, notifypolicy.ErrUndeletablePolicy) {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
@@ -1980,6 +1983,20 @@ func (d Deps) handleEffectiveNotificationPolicy(w http.ResponseWriter, r *http.R
 		writeError(w, http.StatusNotFound, "target not found")
 		return
 	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, eff)
+}
+
+// handleAgentConnectivityNotificationPolicy previews which policy governs the
+// site's Agent-offline faults. Those incidents belong to no monitor group, so
+// the target-based preview above can never answer for them — and "which of these
+// two policies is actually in force" is exactly the question an operator has
+// after switching the Agent-connectivity one on or off.
+func (d Deps) handleAgentConnectivityNotificationPolicy(w http.ResponseWriter, r *http.Request) {
+	eff, err := d.NotifyPolicy.ResolveForAgentConnectivity(r.Context(), chi.URLParam(r, "id"))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return

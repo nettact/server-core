@@ -8,9 +8,10 @@
 // legal, meaningful configuration meaning "record everything, send nothing".
 //
 // Exactly one policy applies to any incident, resolved by a fixed precedence
-// with no stacking:
+// with no stacking. Which chain is walked depends on what the incident is:
 //
-//	monitor-group policy > site default policy
+//	probe fault        monitor-group policy > site default policy
+//	Agent offline      Agent-connectivity policy > site default policy
 //
 // Stacking would let one incident reach the same channel twice through two
 // matching policies, so the resolver stops at the first enabled match.
@@ -36,13 +37,17 @@ import (
 // ErrNotFound is returned when a policy lookup misses.
 var ErrNotFound = errors.New("notification policy not found")
 
-// ErrDefaultPolicy is returned when a caller tries to delete a site's default
-// policy, which is undeletable (but fully editable).
-var ErrDefaultPolicy = errors.New("the default notification policy cannot be deleted")
+// ErrUndeletablePolicy is returned when a caller tries to delete one of a site's
+// built-in policies (the default and the Agent-connectivity one). Both are
+// singletons the resolver relies on finding, and both are fully editable —
+// silencing one is expressed by an enabled policy with no channels.
+var ErrUndeletablePolicy = errors.New("this notification policy cannot be deleted")
 
-// Scope kinds, in precedence order.
+// Scope kinds. Group and agent are the specific scopes — each governs a
+// disjoint set of incidents — and site is the shared fallback under both.
 const (
 	ScopeGroup = "group"
+	ScopeAgent = "agent"
 	ScopeSite  = "site"
 )
 
@@ -52,6 +57,7 @@ const (
 	DefaultWarnDelaySec     = 300
 	DefaultCriticalDelaySec = 60
 	defaultPolicyName       = "默认通知策略"
+	agentPolicyName         = "Agent 连通性通知策略"
 )
 
 var severityRank = map[string]int{"info": 0, "warn": 1, "error": 2, "critical": 3}
@@ -118,31 +124,52 @@ func New(db *store.DB, notif Notifier, set *settings.Service, bus *eventbus.Bus)
 const policyCols = `id, site_id, name, scope_kind, scope_id, enabled, min_severity,
 	warn_delay_sec, critical_delay_sec, notify_recovery, channel_ids, is_default, created_at`
 
-// EnsureDefault creates the site's undeletable default policy if it is missing
-// and returns it. Idempotent (the partial unique index on is_default guards a
-// second default per site).
+// EnsureBuiltins creates the site's two undeletable policies if they are
+// missing: the default one every incident falls back to, and the
+// Agent-connectivity one that can route Agent-offline notices somewhere else.
+// Idempotent (the unique scope index guards a second row per scope).
 //
-// It ships with no channels on purpose: creating a site must never wire up
+// Both ship with no channels on purpose: creating a site must never wire up
 // outbound messaging the operator did not ask for. The console shows the empty
 // state explicitly as "faults are recorded, external notification not
 // configured" so it can never be mistaken for detection being off.
-func (s *Service) EnsureDefault(ctx context.Context, siteID string) (Policy, error) {
-	p, err := s.byScope(ctx, siteID, ScopeSite, "")
+//
+// The Agent one additionally ships DISABLED, which in this resolver means "fall
+// back to the site default" — so its mere existence changes nothing until an
+// operator deliberately turns it on. Materializing it up front (rather than on
+// first use) is what lets the console offer it as a switch instead of a
+// create-an-override flow, matching the fact that there is exactly one per site.
+func (s *Service) EnsureBuiltins(ctx context.Context, siteID string) error {
+	if err := s.ensureScope(ctx, siteID, ScopeSite, defaultPolicyName, true, true); err != nil {
+		return err
+	}
+	return s.ensureScope(ctx, siteID, ScopeAgent, agentPolicyName, false, false)
+}
+
+// ensureScope creates one built-in policy if the site has none for that scope.
+//
+// The read and the insert are not atomic, so two callers can both see the scope
+// missing — the console opening the notifications page in two tabs is enough.
+// ON CONFLICT DO NOTHING makes the loser a no-op instead of a 500, since by then
+// the row it wanted exists. It is deliberately NOT `INSERT OR IGNORE`: that also
+// swallows a CHECK violation, which would turn a database whose schema predates
+// a scope kind into a silently missing feature rather than a loud failure.
+func (s *Service) ensureScope(ctx context.Context, siteID, kind, name string, enabled, isDefault bool) error {
+	_, err := s.byScope(ctx, siteID, kind, "")
 	if err == nil {
-		return p, nil
+		return nil
 	}
 	if !errors.Is(err, ErrNotFound) {
-		return Policy{}, err
+		return err
 	}
-	id := "np_" + uuid.NewString()
-	if _, err := s.db.ExecContext(ctx, `
+	_, err = s.db.ExecContext(ctx, `
 		INSERT INTO notification_policies(id, site_id, name, scope_kind, scope_id, enabled,
 		    min_severity, warn_delay_sec, critical_delay_sec, notify_recovery, channel_ids, is_default, created_at)
-		VALUES(?,?,?,?,'',1,'warn',?,?,1,'[]',1,?)`,
-		id, siteID, defaultPolicyName, ScopeSite, DefaultWarnDelaySec, DefaultCriticalDelaySec, time.Now().UTC()); err != nil {
-		return Policy{}, err
-	}
-	return s.byScope(ctx, siteID, ScopeSite, "")
+		VALUES(?,?,?,?,'',?,'warn',?,?,1,'[]',?,?)
+		ON CONFLICT DO NOTHING`,
+		"np_"+uuid.NewString(), siteID, name, kind, boolInt(enabled),
+		DefaultWarnDelaySec, DefaultCriticalDelaySec, boolInt(isDefault), time.Now().UTC())
+	return err
 }
 
 // List returns a site's policies, default first then by scope kind and name.
@@ -189,13 +216,13 @@ func (s *Service) byScope(ctx context.Context, siteID, kind, scopeID string) (Po
 	return out[0], nil
 }
 
-// Create stores a new scope override. A site-scope policy cannot be created —
-// every site has exactly one, made by EnsureDefault.
+// Create stores a new monitor-group override. The site and agent scopes cannot
+// be created here — each site has exactly one of each, made by EnsureBuiltins.
 func (s *Service) Create(ctx context.Context, siteID string, p Policy) (Policy, error) {
 	p.SiteID = siteID
 	p.ScopeKind = strings.TrimSpace(p.ScopeKind)
-	if p.ScopeKind == ScopeSite {
-		return Policy{}, fmt.Errorf("the site policy already exists; edit it instead")
+	if p.ScopeKind == ScopeSite || p.ScopeKind == ScopeAgent {
+		return Policy{}, fmt.Errorf("the %s policy already exists; edit it instead", p.ScopeKind)
 	}
 	if err := validate(&p); err != nil {
 		return Policy{}, err
@@ -236,8 +263,9 @@ func (s *Service) Update(ctx context.Context, id string, p Policy) (Policy, erro
 	return s.Get(ctx, id)
 }
 
-// Delete removes a scope override; the affected targets fall back to the next
-// policy in the chain on their next incident. The default policy is undeletable.
+// Delete removes a monitor-group override; the affected targets fall back to the
+// next policy in the chain on their next incident. The two built-in policies are
+// undeletable — disabling one is how you fall back to the site default.
 // Already-planned deliveries keep the routing frozen when their incident opened.
 func (s *Service) Delete(ctx context.Context, id string) error {
 	cur, err := s.Get(ctx, id)
@@ -247,8 +275,8 @@ func (s *Service) Delete(ctx context.Context, id string) error {
 	if err != nil {
 		return err
 	}
-	if cur.IsDefault {
-		return ErrDefaultPolicy
+	if cur.IsDefault || cur.ScopeKind == ScopeAgent {
+		return ErrUndeletablePolicy
 	}
 	_, err = s.db.ExecContext(ctx, `DELETE FROM notification_policies WHERE id=?`, id)
 	return err
@@ -261,7 +289,8 @@ func validate(p *Policy) error {
 		return errors.New("policy name is required")
 	}
 	switch p.ScopeKind {
-	case ScopeSite:
+	// Both singletons: one row per site, so the scope id carries no information.
+	case ScopeSite, ScopeAgent:
 		p.ScopeID = ""
 	case ScopeGroup:
 		if strings.TrimSpace(p.ScopeID) == "" {

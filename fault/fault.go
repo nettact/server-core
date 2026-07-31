@@ -139,8 +139,8 @@ type SnapshotWriter interface {
 }
 
 // IncidentScope describes the incident a delivery plan is being made for: enough
-// for the policy layer to resolve group > site precedence without
-// importing this package's types.
+// for the policy layer to resolve its precedence chain without importing this
+// package's types.
 //
 // AgentID is the vantage point the confirming signal was observed from. This
 // package makes no use of it — it is carried purely so the policy layer can
@@ -152,6 +152,13 @@ type IncidentScope struct {
 	GroupID    string
 	AgentID    string
 	Severity   string
+	// AgentConnectivity marks this as an Agent-liveness incident, so the policy
+	// layer routes it through the site's Agent-connectivity policy instead of the
+	// group chain it has no place in. It is a flag rather than "AgentID is set
+	// and GroupID is not" because AgentID means something else entirely here (the
+	// vantage point, deliberately left empty on these incidents so an offline
+	// Agent never correlates into a storm).
+	AgentConnectivity bool
 }
 
 // Planner is the notification-policy surface the engine calls inside its write

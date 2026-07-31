@@ -106,6 +106,7 @@ func (s *Service) OpenAgentSignal(ctx context.Context, in AgentSignalInput, now 
 		if s.planner != nil {
 			if err := s.planner.PlanOpenTx(ctx, tx, IncidentScope{
 				IncidentID: incidentID, SiteID: in.SiteID, Severity: sig.Severity,
+				AgentConnectivity: true,
 			}, now); err != nil {
 				return "", err
 			}

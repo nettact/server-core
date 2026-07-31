@@ -72,6 +72,12 @@ func (s subject) cols() (any, any) {
 	return s.incidentID, nil
 }
 
+// queryFor is the one place the engine's scope becomes a policy lookup, so the
+// open and escalate paths can never walk different chains for the same incident.
+func queryFor(sc fault.IncidentScope) Query {
+	return Query{SiteID: sc.SiteID, GroupID: sc.GroupID, AgentConnectivity: sc.AgentConnectivity}
+}
+
 // PlanOpenTx schedules the open notification for a newly-opened incident, inside
 // the fault engine's transaction, so the plan and the fault it describes commit
 // together. Nothing is planned when no policy matches, the incident's severity is
@@ -88,7 +94,7 @@ func (s subject) cols() (any, any) {
 // storm inherits the exact channels and due times the members had planned,
 // rather than re-deriving them from a policy that may since have changed.
 func (s *Service) PlanOpenTx(ctx context.Context, tx *sql.Tx, sc fault.IncidentScope, now time.Time) error {
-	eff, err := s.Resolve(ctx, sc.SiteID, sc.GroupID)
+	eff, err := s.Resolve(ctx, queryFor(sc))
 	if err != nil {
 		return err
 	}
@@ -110,7 +116,7 @@ func (s *Service) PlanOpenTx(ctx context.Context, tx *sql.Tx, sc fault.IncidentS
 // incident growing worse while someone is already looking at it is not worth a
 // second message, and the incident's own severity is live in the console.
 func (s *Service) EscalateTx(ctx context.Context, tx *sql.Tx, sc fault.IncidentScope, now time.Time) error {
-	eff, err := s.Resolve(ctx, sc.SiteID, sc.GroupID)
+	eff, err := s.Resolve(ctx, queryFor(sc))
 	if err != nil {
 		return err
 	}

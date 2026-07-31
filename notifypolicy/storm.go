@@ -124,12 +124,23 @@ func stormOf(ctx context.Context, tx *sql.Tx, incidentID string) (string, error)
 // the incident: an incident's identity is its group, not the Agent that happened
 // to see it first, and denormalizing a second answer to "whose incident is this"
 // would eventually disagree with the signals.
+//
+// A CONNECTIVITY signal does not count as an observation. It carries the same
+// agent_id, but it says something about that Agent rather than something that
+// Agent saw, and a storm's claim is strictly "everything this vantage point can
+// see broke at once". Without the exclusion an Agent that reconnects and starts
+// reporting probe failures before its recovery-confirmation window elapses would
+// sweep its own still-open offline incident into the storm — cancelling the
+// notice its dedicated policy had just planned and folding it into a summary
+// routed by everyone else's channels, which is exactly the separation that
+// policy exists to provide.
 func unstormedOpenIncidents(ctx context.Context, tx *sql.Tx, siteID, agentID string, since time.Time) ([]string, error) {
 	rows, err := tx.QueryContext(ctx, `
 		SELECT i.id FROM incidents i
 		WHERE i.site_id=? AND i.state='open' AND i.storm_id IS NULL AND i.opened_at>=?
-		  AND EXISTS(SELECT 1 FROM fault_signals s WHERE s.incident_id=i.id AND s.agent_id=?)
-		ORDER BY i.opened_at`, siteID, since, agentID)
+		  AND EXISTS(SELECT 1 FROM fault_signals s
+		             WHERE s.incident_id=i.id AND s.agent_id=? AND s.detector_key<>?)
+		ORDER BY i.opened_at`, siteID, since, agentID, fault.DetectorAgentConnectivity)
 	if err != nil {
 		return nil, err
 	}

@@ -67,8 +67,8 @@ func newHarness(t *testing.T) *harness {
 	h.exec(`INSERT INTO probe_tasks(id,site_id,group_id,kind,name,target,params,enabled,config_serial) VALUES('t1','site_default','mg','icmp','Router','192.168.1.1','{}',1,1)`)
 	h.exec(`INSERT INTO notification_channels(id,name,type,config,enabled) VALUES('ch_a','A','webhook','{"url":"http://x"}',1)`)
 	h.exec(`INSERT INTO notification_channels(id,name,type,config,enabled) VALUES('ch_b','B','webhook','{"url":"http://y"}',1)`)
-	if _, err := h.svc.EnsureDefault(h.ctx, "site_default"); err != nil {
-		t.Fatalf("ensure default: %v", err)
+	if err := h.svc.EnsureBuiltins(h.ctx, "site_default"); err != nil {
+		t.Fatalf("ensure builtins: %v", err)
 	}
 	return h
 }
@@ -101,8 +101,70 @@ func (h *harness) setDefaultChannels(ids ...string) Policy {
 	return out
 }
 
+// agentPolicy returns the site's built-in Agent-connectivity policy.
+func (h *harness) agentPolicy() Policy {
+	h.t.Helper()
+	p, err := h.svc.byScope(h.ctx, "site_default", ScopeAgent, "")
+	if err != nil {
+		h.t.Fatalf("read agent policy: %v", err)
+	}
+	return p
+}
+
+// enableAgentPolicy switches the Agent-connectivity policy on and points it at
+// the given channels — the one action that separates Agent-offline routing from
+// everything else.
+func (h *harness) enableAgentPolicy(ids ...string) Policy {
+	h.t.Helper()
+	p := h.agentPolicy()
+	p.Enabled = true
+	p.ChannelIDs = ids
+	out, err := h.svc.Update(h.ctx, p.ID, p)
+	if err != nil {
+		h.t.Fatalf("update agent policy: %v", err)
+	}
+	return out
+}
+
+// openAgentIncident opens an Agent-connectivity incident — no monitor group,
+// fixed critical severity — and plans its notice exactly as the liveness
+// detector does, AgentConnectivity flag included.
+func (h *harness) openAgentIncident(id, agentID string, now time.Time) {
+	h.t.Helper()
+	h.exec(`INSERT INTO incidents(id,site_id,group_id,open_key,title,state,severity,opened_at)
+		VALUES(?,'site_default','',?, 'Agent offline','open','critical',?)`, id, "agent:"+agentID, now)
+	h.exec(`INSERT INTO fault_signals(id,site_id,agent_id,agent_name,target_id,detector_key,severity,state,
+		reason_detail,observed_at,confirmed_at,incident_id)
+		VALUES(?,'site_default',?,'node-1','','agent_connectivity','critical','firing',
+		'unexpected',?,?,?)`, "sig_"+id, agentID, now.Add(-time.Minute), now, id)
+
+	tx, err := h.db.BeginTx(h.ctx, nil)
+	if err != nil {
+		h.t.Fatalf("begin: %v", err)
+	}
+	err = h.svc.PlanOpenTx(h.ctx, tx, fault.IncidentScope{
+		IncidentID: id, SiteID: "site_default", Severity: "critical", AgentConnectivity: true,
+	}, now)
+	if err != nil {
+		_ = tx.Rollback()
+		h.t.Fatalf("plan: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		h.t.Fatalf("commit: %v", err)
+	}
+}
+
 // openIncident opens an incident with one firing member and plans its notice.
+// The scope carries NO vantage point, so storm correlation is off — which is
+// what almost every test here wants.
 func (h *harness) openIncident(id, severity string, now time.Time) {
+	h.t.Helper()
+	h.openIncidentAs(id, severity, "", now)
+}
+
+// openIncidentAs is openIncident with the observing agent named, which is what
+// makes the incident eligible for storm correlation.
+func (h *harness) openIncidentAs(id, severity, vantageAgentID string, now time.Time) {
 	h.t.Helper()
 	h.exec(`INSERT INTO incidents(id,site_id,group_id,open_key,title,state,severity,opened_at)
 		VALUES(?,'site_default','mg',?, 'Router unreachable','open',?,?)`, id, "sig:"+id, severity, now)
@@ -119,7 +181,8 @@ func (h *harness) openIncident(id, severity string, now time.Time) {
 		h.t.Fatalf("begin: %v", err)
 	}
 	err = h.svc.PlanOpenTx(h.ctx, tx, fault.IncidentScope{
-		IncidentID: id, SiteID: "site_default", GroupID: "mg", Severity: severity,
+		IncidentID: id, SiteID: "site_default", GroupID: "mg",
+		AgentID: vantageAgentID, Severity: severity,
 	}, now)
 	if err != nil {
 		_ = tx.Rollback()
@@ -476,9 +539,9 @@ func TestDefaultPolicyIsUndeletable(t *testing.T) {
 		t.Fatal("deleting the default policy must be refused")
 	}
 
-	// EnsureDefault is idempotent.
-	if _, err := h.svc.EnsureDefault(h.ctx, "site_default"); err != nil {
-		t.Fatalf("ensure default again: %v", err)
+	// EnsureBuiltins is idempotent.
+	if err := h.svc.EnsureBuiltins(h.ctx, "site_default"); err != nil {
+		t.Fatalf("ensure builtins again: %v", err)
 	}
 	var n int
 	if err := h.db.QueryRowContext(h.ctx,
@@ -487,6 +550,14 @@ func TestDefaultPolicyIsUndeletable(t *testing.T) {
 	}
 	if n != 1 {
 		t.Fatalf("expected exactly one default policy, got %d", n)
+	}
+	if err := h.db.QueryRowContext(h.ctx,
+		`SELECT COUNT(*) FROM notification_policies WHERE site_id='site_default' AND scope_kind=?`,
+		ScopeAgent).Scan(&n); err != nil {
+		t.Fatalf("count agent policies: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("expected exactly one Agent-connectivity policy, got %d", n)
 	}
 }
 
@@ -521,26 +592,7 @@ func TestAgentIncidentUsesAgentWording(t *testing.T) {
 	h := newHarness(t)
 	h.setDefaultChannels("ch_a")
 	now := time.Now().UTC()
-	h.exec(`INSERT INTO incidents(id,site_id,group_id,open_key,title,state,severity,opened_at)
-		VALUES('inc_ag','site_default','','agent:agent_a','Agent offline','open','critical',?)`, now)
-	h.exec(`INSERT INTO fault_signals(id,site_id,agent_id,agent_name,target_id,detector_key,severity,state,
-		reason_detail,observed_at,confirmed_at,incident_id)
-		VALUES('sig_ag','site_default','agent_a','node-1','','agent_connectivity','critical','firing',
-		'unexpected',?,?,'inc_ag')`, now.Add(-time.Minute), now)
-
-	tx, err := h.db.BeginTx(h.ctx, nil)
-	if err != nil {
-		t.Fatalf("begin: %v", err)
-	}
-	if err := h.svc.PlanOpenTx(h.ctx, tx, fault.IncidentScope{
-		IncidentID: "inc_ag", SiteID: "site_default", Severity: "critical",
-	}, now); err != nil {
-		_ = tx.Rollback()
-		t.Fatalf("plan: %v", err)
-	}
-	if err := tx.Commit(); err != nil {
-		t.Fatalf("commit: %v", err)
-	}
+	h.openAgentIncident("inc_ag", "agent_a", now)
 	h.exec(`UPDATE notification_deliveries SET due_at=? WHERE incident_id='inc_ag'`, now.Add(-time.Second))
 	if err := h.svc.Tick(h.ctx); err != nil {
 		t.Fatalf("tick: %v", err)
@@ -554,6 +606,199 @@ func TestAgentIncidentUsesAgentWording(t *testing.T) {
 	}
 	if p.Agents[0].Reason != "unexpected" {
 		t.Fatalf("agent reason = %q, want unexpected", p.Agents[0].Reason)
+	}
+}
+
+// TestAgentPolicyShipsDisabledSoRoutingIsUnchanged: the Agent-connectivity
+// policy exists from the moment a site does, but until someone turns it on the
+// site default governs Agent-offline faults exactly as it always did. A built-in
+// row that silently started diverting notices to nobody would be worse than not
+// having the feature.
+func TestAgentPolicyShipsDisabledSoRoutingIsUnchanged(t *testing.T) {
+	h := newHarness(t)
+	h.setDefaultChannels("ch_a")
+	if p := h.agentPolicy(); p.Enabled || len(p.ChannelIDs) != 0 {
+		t.Fatalf("the Agent policy must ship off and empty: %+v", p)
+	}
+
+	eff, err := h.svc.ResolveForAgentConnectivity(h.ctx, "site_default")
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if eff.Source != ScopeSite || eff.Policy == nil || eff.Policy.ChannelIDs[0] != "ch_a" {
+		t.Fatalf("a disabled Agent policy must fall back to the site default: %+v", eff)
+	}
+	if len(eff.Chain) != 2 || eff.Chain[0] != ScopeAgent || eff.Chain[1] != ScopeSite {
+		t.Fatalf("fallback chain = %v, want [agent site]", eff.Chain)
+	}
+
+	now := time.Now().UTC()
+	h.openAgentIncident("inc_ag", "agent_a", now)
+	ds := h.deliveries("inc_ag")
+	if len(ds) != 1 || ds[0].ChannelID != "ch_a" {
+		t.Fatalf("planned deliveries = %+v, want the site default's channel", ds)
+	}
+}
+
+// TestAgentPolicySeparatesOfflineRoutingFromProbeFaults is the point of the
+// feature: an enabled Agent-connectivity policy governs Agent-offline faults and
+// NOTHING else, so the two kinds of fault can reach different people with
+// different delays.
+func TestAgentPolicySeparatesOfflineRoutingFromProbeFaults(t *testing.T) {
+	h := newHarness(t)
+	h.setDefaultChannels("ch_a")
+	p := h.enableAgentPolicy("ch_b")
+	p.CriticalDelaySec = 0
+	if _, err := h.svc.Update(h.ctx, p.ID, p); err != nil {
+		t.Fatalf("set agent delay: %v", err)
+	}
+
+	eff, err := h.svc.ResolveForAgentConnectivity(h.ctx, "site_default")
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if eff.Source != ScopeAgent || len(eff.Chain) != 1 || eff.Chain[0] != ScopeAgent {
+		t.Fatalf("the Agent policy must win outright: %+v", eff)
+	}
+
+	now := time.Now().UTC()
+	h.openAgentIncident("inc_ag", "agent_a", now)
+	ds := h.deliveries("inc_ag")
+	if len(ds) != 1 || ds[0].ChannelID != "ch_b" {
+		t.Fatalf("Agent-offline deliveries = %+v, want only the Agent policy's channel", ds)
+	}
+	if ds[0].DueAt.After(now) {
+		t.Fatalf("Agent-offline due_at = %v, want the Agent policy's zero delay from %v", ds[0].DueAt, now)
+	}
+
+	// A probe fault in the same site is untouched by it.
+	h.openIncident("inc_1", "critical", now)
+	pd := h.deliveries("inc_1")
+	if len(pd) != 1 || pd[0].ChannelID != "ch_a" {
+		t.Fatalf("probe-fault deliveries = %+v, want the site default's channel", pd)
+	}
+}
+
+// TestAgentPolicyWithNoChannelsIsExplicitSilence: "record Agent outages but stop
+// paging me about them" must be expressible without switching the detector off
+// (which would lose the fault history) and without touching the site default
+// (which governs every probe fault too).
+func TestAgentPolicyWithNoChannelsIsExplicitSilence(t *testing.T) {
+	h := newHarness(t)
+	h.setDefaultChannels("ch_a")
+	h.enableAgentPolicy()
+
+	now := time.Now().UTC()
+	h.openAgentIncident("inc_ag", "agent_a", now)
+	if got := h.deliveries("inc_ag"); len(got) != 0 {
+		t.Fatalf("an enabled Agent policy with no channels must plan nothing, got %+v", got)
+	}
+	if err := h.svc.Tick(h.ctx); err != nil {
+		t.Fatalf("tick: %v", err)
+	}
+	if h.cap.count() != 0 {
+		t.Fatalf("nothing may be sent, sent %d", h.cap.count())
+	}
+	// The fault itself is recorded in full — that is what makes this different
+	// from turning the detector off.
+	var state string
+	if err := h.db.QueryRowContext(h.ctx, `SELECT state FROM incidents WHERE id='inc_ag'`).Scan(&state); err != nil {
+		t.Fatalf("read incident: %v", err)
+	}
+	if state != "open" {
+		t.Fatalf("incident state = %q, want open", state)
+	}
+}
+
+// TestAgentIncidentIsNeverSweptIntoAStorm guards the separation the Agent policy
+// promises. An Agent that reconnects keeps its offline incident open through the
+// recovery-confirmation window while it is already reporting probe results, so a
+// storm forming in that window would otherwise find the offline incident (its
+// signal carries the same agent_id) and swallow it — cancelling the notice the
+// Agent policy planned and re-routing it through the other members' channels.
+func TestAgentIncidentIsNeverSweptIntoAStorm(t *testing.T) {
+	h := newHarness(t)
+	h.setDefaultChannels("ch_a")
+	h.enableAgentPolicy("ch_b")
+	// Correlate aggressively: two incidents in the window are a storm.
+	h.exec(`INSERT INTO app_settings(key,value) VALUES(?,'2')
+		ON CONFLICT(key) DO UPDATE SET value=excluded.value`, settings.KeyIncidentStormThreshold)
+
+	now := time.Now().UTC()
+	h.openAgentIncident("inc_ag", "agent_a", now)
+	// Two probe incidents observed by the SAME agent, enough to form a storm.
+	// Without the exclusion the FIRST of them already reaches the threshold,
+	// because the offline incident counts as the second member.
+	h.openIncidentAs("inc_1", "critical", "agent_a", now)
+	h.openIncidentAs("inc_2", "critical", "agent_a", now)
+
+	var stormed sql.NullString
+	if err := h.db.QueryRowContext(h.ctx, `SELECT storm_id FROM incidents WHERE id='inc_ag'`).Scan(&stormed); err != nil {
+		t.Fatalf("read agent incident: %v", err)
+	}
+	if stormed.Valid {
+		t.Fatalf("the Agent-offline incident was swept into storm %q", stormed.String)
+	}
+	// Its own notice is untouched: still pending, still on the Agent policy's channel.
+	ds := h.deliveries("inc_ag")
+	if len(ds) != 1 || ds[0].ChannelID != "ch_b" || ds[0].Status != statusPending {
+		t.Fatalf("Agent-offline deliveries = %+v, want one pending row on ch_b", ds)
+	}
+	// The probe incidents did correlate, so the test is proving exclusion rather
+	// than that no storm was possible in the first place.
+	var storms int
+	if err := h.db.QueryRowContext(h.ctx, `SELECT COUNT(*) FROM alert_storms`).Scan(&storms); err != nil {
+		t.Fatalf("count storms: %v", err)
+	}
+	if storms != 1 {
+		t.Fatalf("expected the probe incidents to form one storm, got %d", storms)
+	}
+}
+
+// TestEnsureBuiltinsToleratesAConcurrentFirstRead: two requests hitting the
+// notification-policy page before the built-ins exist both see them missing. The
+// loser of that race must be a no-op, not a unique-constraint 500.
+func TestEnsureBuiltinsToleratesAConcurrentFirstRead(t *testing.T) {
+	h := newHarness(t)
+	h.exec(`DELETE FROM notification_policies WHERE site_id='site_default'`)
+
+	const racers = 4
+	errs := make(chan error, racers)
+	start := make(chan struct{})
+	for i := 0; i < racers; i++ {
+		go func() {
+			<-start
+			errs <- h.svc.EnsureBuiltins(context.Background(), "site_default")
+		}()
+	}
+	close(start)
+	for i := 0; i < racers; i++ {
+		if err := <-errs; err != nil {
+			t.Fatalf("concurrent EnsureBuiltins: %v", err)
+		}
+	}
+
+	var n int
+	if err := h.db.QueryRowContext(h.ctx,
+		`SELECT COUNT(*) FROM notification_policies WHERE site_id='site_default'`).Scan(&n); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("expected exactly the two built-in policies, got %d", n)
+	}
+}
+
+// TestAgentPolicyIsUndeletable: the resolver expects to find it, and disabling
+// is the supported way to go back to the site default.
+func TestAgentPolicyIsUndeletable(t *testing.T) {
+	h := newHarness(t)
+	if err := h.svc.Delete(h.ctx, h.agentPolicy().ID); !errors.Is(err, ErrUndeletablePolicy) {
+		t.Fatalf("delete agent policy = %v, want ErrUndeletablePolicy", err)
+	}
+	if _, err := h.svc.Create(h.ctx, "site_default", Policy{
+		Name: "second", ScopeKind: ScopeAgent, Enabled: true, MinSeverity: "warn",
+	}); err == nil {
+		t.Fatal("a second Agent-connectivity policy was accepted")
 	}
 }
 
