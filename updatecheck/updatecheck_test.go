@@ -253,15 +253,27 @@ func TestCheckMissingProductIsAnError(t *testing.T) {
 	}
 }
 
-func TestStatusUnknownBeforeFirstSuccess(t *testing.T) {
+// The block has to reach the console before — and despite — a failing check: it
+// is what the software-update panel is gated on, and that panel holds the notice
+// switch. What must NOT survive a failed check is any claim about versions.
+func TestStatusPublishedBeforeFirstSuccess(t *testing.T) {
 	s := New(Config{InstallType: InstallServer, CurrentVersion: "v1.0.0", BaseURL: "http://127.0.0.1:1"})
-	if _, ok := s.Status(); ok {
-		t.Error("Status() reported known before any successful check")
+	assert := func(when string) {
+		t.Helper()
+		st, ok := s.Status()
+		if !ok {
+			t.Fatalf("Status() reported unknown %s", when)
+		}
+		if st.CurrentVersion != "v1.0.0" || st.InstallType != InstallServer || st.DownloadURL != DownloadPageURL {
+			t.Errorf("Status() = %+v %s; want the install described", st, when)
+		}
+		if st.ProductChecked || st.UpdateAvailable || st.LatestVersion != "" || !st.CheckedAt.IsZero() {
+			t.Errorf("Status() = %+v %s; want no claim about versions", st, when)
+		}
 	}
+	assert("before any check")
 	s.RunOnce(context.Background()) // must not panic; failure is logged and dropped
-	if _, ok := s.Status(); ok {
-		t.Error("Status() reported known after a failed check")
-	}
+	assert("after a failed check")
 }
 
 func TestRunOnceFiresOnUpdateOnlyWhenNewer(t *testing.T) {

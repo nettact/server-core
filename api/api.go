@@ -351,9 +351,11 @@ func (d Deps) handleMe(w http.ResponseWriter, r *http.Request) {
 // status so the UI can show effective vs pending listen settings, and the last
 // update check's outcome.
 //
-// The "update" key is absent until a check has succeeded — and entirely absent
-// when update checking is switched off — so the console can treat its presence
-// as "there is something to show" rather than reading a half-filled block.
+// The "update" key is present whenever this install checks for updates at all,
+// even before the first check answers (product_checked says whether it did), and
+// absent only when update checking is switched off. The console gates its
+// software-update panel on it, and that panel holds the notice switch the
+// desktop tray shares — so a pending or failing check must not hide it.
 func (d Deps) handleServerInfo(w http.ResponseWriter, r *http.Request) {
 	out := map[string]any{
 		"os":            runtime.GOOS,

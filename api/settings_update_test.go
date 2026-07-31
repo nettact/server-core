@@ -75,7 +75,11 @@ func TestUpdateSettingsRejectsBadValues(t *testing.T) {
 	}
 }
 
-func TestServerInfoOmitsUpdateUntilChecked(t *testing.T) {
+// The block's presence means "this install checks for updates", which is what
+// the console gates its software-update panel on. Only an install that will
+// never check omits it — a pending or failing check must not take the panel, and
+// with it the shared notice switch, away.
+func TestServerInfoUpdateBlockTracksTheService(t *testing.T) {
 	d := updateSettingsDeps(t)
 
 	// No update service at all (bare server-core, or checking switched off).
@@ -83,15 +87,22 @@ func TestServerInfoOmitsUpdateUntilChecked(t *testing.T) {
 		t.Error("server-info carried an update block without an update service")
 	}
 
-	// A service that has not completed a check yet is equally silent: a
-	// half-filled block would make the console announce a version it never read.
 	d.Update = updatecheck.New(updatecheck.Config{
 		InstallType:    updatecheck.InstallServer,
 		CurrentVersion: "v1.0.0",
 		BaseURL:        "http://127.0.0.1:1",
 	})
-	if _, ok := decodeServerInfo(t, d)["update"]; ok {
-		t.Error("server-info carried an update block before the first successful check")
+	block, ok := decodeServerInfo(t, d)["update"].(map[string]any)
+	if !ok {
+		t.Fatal("server-info omitted the update block before the first check")
+	}
+	// Present, but claiming nothing: product_checked is what tells the console the
+	// version fields came from a check that completed.
+	if block["current_version"] != "v1.0.0" {
+		t.Errorf("update = %v; want the running version reported", block)
+	}
+	if block["product_checked"] != false || block["update_available"] != false {
+		t.Errorf("update = %v; want no claim about versions before a check", block)
 	}
 }
 

@@ -111,7 +111,9 @@ type Config struct {
 }
 
 // Status is the last check's outcome, serialized into GET /api/v1/server-info
-// under "update".
+// under "update". It is published from the moment the service exists, so its
+// presence means "this install checks for updates" rather than "a check has
+// succeeded" — see ProductChecked for the latter.
 type Status struct {
 	InstallType     string `json:"install_type"`
 	CurrentVersion  string `json:"current_version"`
@@ -192,6 +194,20 @@ func New(cfg Config) *Service {
 	if s.now == nil {
 		s.now = time.Now
 	}
+	// Publish a baseline before the first check runs. The console gates its whole
+	// software-update panel — including the notice switch shared with the desktop
+	// tray — on this block being present, and a check that has not finished yet
+	// (or cannot finish: no network, a Store query with no license) must not take
+	// the switch away from the person trying to turn notices back on.
+	//
+	// ProductChecked stays false until a check actually answers, which is what
+	// stops the empty LatestVersion here from reading as "you are up to date".
+	s.status = Status{
+		InstallType:    s.cfg.InstallType,
+		CurrentVersion: s.cfg.CurrentVersion,
+		DownloadURL:    s.downloadURL,
+	}
+	s.known = true
 	return s
 }
 
@@ -223,8 +239,10 @@ func (s *Service) CheckNow(ctx context.Context) (Status, error) {
 	return s.check(ctx)
 }
 
-// Status returns the last useful check result. ok is false until one succeeds,
-// which is what keeps the server-info payload free of a half-filled block.
+// Status returns the last useful check result, or the baseline New published
+// when no check has answered yet. ok is false only for a nil service — update
+// checking switched off — which is what keeps the server-info payload free of an
+// update block on an install that will never fill one in.
 func (s *Service) Status() (Status, bool) {
 	if s == nil {
 		return Status{}, false
