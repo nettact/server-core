@@ -243,6 +243,19 @@ type Signal struct {
 	Threshold         float64    `json:"threshold"`
 	ReasonCode        int        `json:"reason_code"`
 	ReasonDetail      string     `json:"reason_detail"`
+	// The endpoint the failing probe actually talked to, frozen alongside the rest
+	// of the evidence. A DNS monitor dials a resolver, a NAT monitor a STUN server,
+	// a pinned monitor its proxy — none of which is TargetAddr — so this is what a
+	// path diagnostic must be aimed at. Not rendered in any signal view; it exists
+	// so the diagnostic can be derived from frozen evidence instead of live config.
+	ResolverAddr     string `json:"resolver_addr,omitempty"`
+	ResolverProtocol string `json:"resolver_protocol,omitempty"`
+	StunAddr         string `json:"stun_addr,omitempty"`
+	StunTransport    string `json:"stun_transport,omitempty"`
+	ProxyID          string `json:"proxy_id,omitempty"`
+	ProxyType        string `json:"proxy_type,omitempty"`
+	ProxyAddr        string `json:"proxy_addr,omitempty"`
+
 	ObservedAt        time.Time  `json:"observed_at"`
 	ConfirmedAt       time.Time  `json:"confirmed_at"`
 	ResolvedAt        *time.Time `json:"resolved_at"`

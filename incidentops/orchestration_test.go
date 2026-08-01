@@ -57,7 +57,7 @@ func TestTraceCohortClosesAfterMissedResolutionCallback(t *testing.T) {
 	seedIncidentSignal(t, db, "inc_1", "sig_1", "agent_a", "firing")
 	seedIncidentSignal(t, db, "inc_2", "sig_2", "agent_a", "firing")
 	svc := New(db, nil, settings.New(db), nil)
-	plan := derivedTrace{mode: "icmp", destKey: "ip:1.1.1.1", destHost: "1.1.1.1", destIP: "1.1.1.1"}
+	plan := derivedTrace{mode: "icmp", destKey: "ip:1.1.1.1", destHost: "1.1.1.1", destIP: "1.1.1.1", subjectKind: traceSubjectTarget}
 
 	first, created, _, err := svc.singleFlight(ctx, fault.SignalEvent{
 		IncidentID: "inc_1", SignalID: "sig_1", AgentID: "agent_a", SiteID: "site_default",
@@ -220,13 +220,29 @@ func setAgentPerms(t *testing.T, db *store.DB, agentID string, supported, grante
 }
 
 // seedEvidence freezes a signal's trigger-time evidence — the probe kind, the
-// destination and the port the traceroute derivation reads.
+// destination and the port the traceroute derivation reads. Subject evidence
+// (resolver / STUN / proxy) is seeded by seedSubjectEvidence.
 func seedEvidence(t *testing.T, db *store.DB, signalID, probeKind, targetAddr string, targetPort int, metricKind string) {
 	t.Helper()
 	if _, err := db.ExecContext(context.Background(), `
 		UPDATE fault_signals SET probe_kind=?, target_addr=?, target_port=?, metric_kind=?, comparator='gt', threshold=0, value=1
 		WHERE id=?`, probeKind, targetAddr, targetPort, metricKind, signalID); err != nil {
 		t.Fatalf("seed evidence: %v", err)
+	}
+}
+
+// seedSubjectEvidence freezes the diagnosis-subject columns a DIAG-003 plan reads:
+// where the probe actually dialed, and the classified cause that separates a
+// tunnel failure from a failure beyond the tunnel.
+func seedSubjectEvidence(t *testing.T, db *store.DB, signalID string, evd traceEvidence) {
+	t.Helper()
+	if _, err := db.ExecContext(context.Background(), `
+		UPDATE fault_signals SET reason_code=?, resolver_addr=?, resolver_protocol=?,
+		    stun_addr=?, stun_transport=?, proxy_id=?, proxy_type=?, proxy_addr=?
+		WHERE id=?`,
+		evd.reasonCode, evd.resolverAddr, evd.resolverProtocol, evd.stunAddr, evd.stunTransport,
+		evd.proxyID, evd.proxyType, evd.proxyAddr, signalID); err != nil {
+		t.Fatalf("seed subject evidence: %v", err)
 	}
 }
 
@@ -376,7 +392,7 @@ func TestTraceTerminalReasonDistinguishesPolicyFromCapability(t *testing.T) {
 
 	// agent_b: nothing granted → policy denial.
 	setAgentPerms(t, db, "agent_b", nil, nil, nil)
-	d, ok := svc.deriveTrace(ctx, "agent_b", "tcp", "192.0.2.10", 443)
+	d, ok := svc.deriveTrace(ctx, "agent_b", traceEvidence{probeKind: "tcp", targetAddr: "192.0.2.10", targetPort: 443})
 	if !ok || d.terminal != telemetry.TraceStatusUnsupported || d.reason != "permission_denied" {
 		t.Fatalf("ungranted plan = %+v ok=%v, want terminal unsupported/permission_denied", d, ok)
 	}

@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"net"
+	"net/netip"
 	"net/url"
 	"strconv"
 	"strings"
@@ -33,8 +35,12 @@ func nonterminalTrace(status string) bool {
 // TraceEligibleMetric reports whether a firing condition — identified by its
 // probe kind and breached metric — is a network-availability fault eligible for
 // an automatic traceroute. It is the single source of truth for the eligible
-// metric set: only icmp/tcp/http probe metrics qualify; dns, nat, gateway, host,
+// metric set: icmp/tcp/http/dns/nat probe metrics qualify; gateway, host,
 // wireless and pure-resource metrics never trigger a trace.
+//
+// dns and nat qualify because their probe DOES dial a network endpoint — a
+// resolver, a STUN server — even though it is not the monitored target. What
+// they diagnose is chosen in deriveTrace; see traceSubject*.
 func TraceEligibleMetric(probeKind, metricKind string) bool {
 	switch probeKind {
 	case "icmp":
@@ -43,12 +49,49 @@ func TraceEligibleMetric(probeKind, metricKind string) bool {
 		return strings.HasPrefix(metricKind, "probe.tcp.")
 	case "http":
 		return strings.HasPrefix(metricKind, "probe.http.")
+	case "dns":
+		return strings.HasPrefix(metricKind, "probe.dns.")
+	case "nat":
+		return strings.HasPrefix(metricKind, "probe.nat.")
 	}
 	return false
 }
 
-// traceModeForKind maps an eligible probe kind to its natural traceroute mode.
-// ICMP monitors run ICMP traceroute; TCP and HTTP monitors run TCP traceroute.
+// What a trace report diagnoses. The monitored target is only one option: a
+// probe reaches its target through a resolver, a proxy or a tunnel, and when the
+// fault is on that path, tracing the target measures a path the probe never
+// used. Mirrored by the trace_reports.subject_kind CHECK constraint and by the
+// console's subject labels.
+const (
+	traceSubjectTarget     = "target"      // the monitored endpoint itself
+	traceSubjectResolver   = "resolver"    // the DNS server a dns monitor queried
+	traceSubjectProxy      = "proxy"       // the socks5/http proxy a pinned monitor dialed
+	traceSubjectWGEndpoint = "wg_endpoint" // a WireGuard peer's physical endpoint
+	traceSubjectSTUNServer = "stun_server" // the STUN server a nat monitor probed
+)
+
+// Why a WireGuard fault is diagnosed at the peer endpoint rather than inside the
+// tunnel. Both trace the same physical path — the distinction is what the
+// operator should conclude from it, and it comes from the frozen reason code, not
+// from the trace.
+const (
+	// subjectTunnelUnreachable: the probe never got through the tunnel (a proxy_*
+	// reason), so the peer's reachability IS the fault.
+	subjectTunnelUnreachable = "tunnel_unreachable"
+	// subjectTunnelTargetUnreachable: the tunnel carried the probe and the TARGET
+	// failed. Hop-by-hop tracing inside the tunnel is not implementable on the
+	// current userspace stack (see todos/DIAG-004), so the peer path is traced as
+	// the nearest useful evidence and must be labelled as exactly that.
+	subjectTunnelTargetUnreachable = "tunnel_target_unreachable"
+	// An empty subject reason on a WireGuard plan means neither could be
+	// established — see wgSubjectReason.
+)
+
+// traceModeForKind maps a directly-dialed probe kind to its natural traceroute
+// mode. ICMP monitors run ICMP traceroute; TCP and HTTP monitors run TCP
+// traceroute. dns/nat are absent on purpose: their mode follows the resolver
+// protocol / STUN transport, not the kind (see deriveTrace).
+//
 // The only automatic mode change happens later, in deriveTrace's permission
 // gate: a TCP plan whose agent lacks the TCP permission but holds the ICMP one
 // is downgraded to ICMP mode with the fallback recorded (fallbackFrom /
@@ -71,6 +114,12 @@ func traceModeForKind(kind string) (string, bool) {
 const (
 	reasonPermissionDenied     = "permission_denied"
 	reasonRawSocketUnavailable = "raw_socket_unavailable"
+	// The subject exists but has no traceable address. Distinct from
+	// no_destination, which means the monitored target itself was unknown.
+	reasonResolverUnknown  = "resolver_unknown"  // the agent could not name the resolver it used
+	reasonResolverLoopback = "resolver_loopback" // the resolver is a local stub; the path is zero hops
+	reasonProxyUnknown     = "proxy_unknown"     // the pinned proxy has no usable address (deleted/incomplete)
+	reasonNoSTUNServer     = "no_stun_server"    // the STUN endpoint was never recorded
 )
 
 // derivedTrace is the resolved traceroute plan for one eligible condition.
@@ -80,6 +129,12 @@ type derivedTrace struct {
 	destHost string
 	destIP   string
 	port     int
+	// subjectKind names WHAT the destination above is (traceSubject*), and
+	// subjectReason why that subject was chosen where the choice is not implied by
+	// the kind. Without them a resolver trace and a target trace are
+	// indistinguishable on read: same columns, opposite meanings.
+	subjectKind   string
+	subjectReason string
 	// fallbackFrom/fallbackReason record an automatic mode downgrade: a TCP plan
 	// whose agent lacks the TCP permission but holds the ICMP one runs as ICMP
 	// with fallbackFrom="tcp" and the stable why-code (raw_socket_unavailable |
@@ -95,48 +150,60 @@ type derivedTrace struct {
 	reason   string
 }
 
+// traceEvidence is one fault signal's frozen trigger-time evidence, as far as
+// diagnosis derivation is concerned. Every field is read from fault_signals, and
+// nothing here is ever re-read from live config.
+type traceEvidence struct {
+	probeKind  string
+	targetAddr string
+	targetPort int
+	// reasonCode is the frozen telemetry.ProbeReason* classification. It is what
+	// separates "the tunnel is down" from "the tunnel is up and the target is down"
+	// — two faults with identical destinations and opposite conclusions.
+	reasonCode int
+
+	resolverAddr     string
+	resolverProtocol string
+	stunAddr         string
+	stunTransport    string
+	proxyID          string
+	proxyType        string
+	proxyAddr        string
+}
+
 // deriveTrace resolves the traceroute plan entirely from a condition's frozen
-// trigger-time evidence — the probe kind, the frozen destination (target_addr) and
-// the frozen TCP port (target_port) — gating on the detecting agent's effective
-// traceroute permission. It never reads live probe_tasks, so a target edited or
-// deleted between the fault and this derivation can never redirect the diagnostic
-// to a different endpoint or port. A TCP plan whose agent lacks the TCP
-// permission falls back to ICMP mode when the ICMP permission is held (recorded
-// via fallbackFrom/fallbackReason so the console can explain the downgrade); a
-// non-derivable destination/port or a fully missing permission yields a terminal
-// failed/unsupported plan rather than a dispatch. No auto-elevation, ever.
-func (s *Service) deriveTrace(ctx context.Context, agentID, probeKind, targetAddr string, targetPort int) (derivedTrace, bool) {
-	mode, ok := traceModeForKind(probeKind)
+// trigger-time evidence, gating on the detecting agent's effective traceroute
+// permission. It never reads live probe_tasks or proxies, so a target, resolver
+// or proxy edited or deleted between the fault and this derivation can never
+// redirect the diagnostic to a different endpoint or port.
+//
+// The plan answers "what carried this probe", not "what was being monitored" —
+// those diverge for every indirect probe:
+//
+//	pinned to socks5/http  → the PROXY (agent→proxy→target; a direct trace to the
+//	                         target measures a path the probe never used, and the
+//	                         relay protocols cannot carry a hop-by-hop diagnostic)
+//	pinned to wireguard    → the peer ENDPOINT's physical path (in-tunnel hop-by-hop
+//	                         is not implementable on the userspace stack; DIAG-004)
+//	dns                    → the RESOLVER (the queried name is dialed by nobody)
+//	nat                    → the STUN SERVER (which is the monitored target, but only
+//	                         the probe knows the port and transport it used)
+//	otherwise              → the target itself
+//
+// A TCP plan whose agent lacks the TCP permission falls back to ICMP mode when
+// the ICMP permission is held (recorded via fallbackFrom/fallbackReason so the
+// console can explain the downgrade); a non-derivable destination/port or a fully
+// missing permission yields a terminal failed/unsupported plan rather than a
+// dispatch. No auto-elevation, ever.
+func (s *Service) deriveTrace(ctx context.Context, agentID string, evd traceEvidence) (derivedTrace, bool) {
+	d, ok := planTrace(evd)
 	if !ok {
 		return derivedTrace{}, false
 	}
-
-	d := derivedTrace{mode: mode}
-	switch probeKind {
-	case "icmp":
-		if targetAddr == "" {
-			return derivedTrace{mode: mode, terminal: telemetry.TraceStatusFailed, reason: "no_destination"}, true
-		}
-		d.destKey, d.destHost, d.destIP = canonicalDest(targetAddr)
-	case "tcp":
-		if targetAddr == "" {
-			return derivedTrace{mode: mode, terminal: telemetry.TraceStatusFailed, reason: "no_destination"}, true
-		}
-		if targetPort < 1 || targetPort > 65535 {
-			return derivedTrace{mode: mode, terminal: telemetry.TraceStatusFailed, reason: "no_tcp_port"}, true
-		}
-		d.destKey, d.destHost, d.destIP = canonicalDest(targetAddr)
-		d.port = targetPort
-	case "http":
-		// The frozen target_addr is the monitored URL; host and port are decoded from
-		// it (explicit port, else scheme default) so both are immutable evidence.
-		host, hport, derr := hostPortFromURL(targetAddr)
-		if derr != nil {
-			return derivedTrace{mode: mode, terminal: telemetry.TraceStatusFailed, reason: "bad_url"}, true
-		}
-		d.destKey, d.destHost, d.destIP = canonicalDest(host)
-		d.port = hport
+	if d.terminal != "" {
+		return d, true
 	}
+	mode := d.mode
 
 	// Permission gate: the detecting agent must actually hold the mode's
 	// traceroute permission in its effective policy. A TCP plan is never
@@ -160,6 +227,282 @@ func (s *Service) deriveTrace(ctx context.Context, agentID, probeKind, targetAdd
 		d.reason = reasonPermissionDenied
 	}
 	return d, true
+}
+
+// planTrace picks the diagnosis subject, destination and mode from frozen
+// evidence alone — no permissions, no I/O, no clock. deriveTrace layers the
+// agent's permissions on top. Returns ok=false for a fault whose kind has no
+// diagnosable path at all (gateway, host, wireless, resource), which
+// TraceEligibleMetric already excludes.
+func planTrace(evd traceEvidence) (derivedTrace, bool) {
+	// An egress pin wins over the probe kind: whatever the monitor asked about, the
+	// packets went to the proxy first, and a fault on that leg has nothing to do
+	// with the target's own path.
+	if evd.proxyID != "" {
+		return planProxyTrace(evd)
+	}
+	switch evd.probeKind {
+	case "dns":
+		return planResolverTrace(evd)
+	case "nat":
+		return planSTUNTrace(evd)
+	}
+
+	mode, ok := traceModeForKind(evd.probeKind)
+	if !ok {
+		return derivedTrace{}, false
+	}
+	d := derivedTrace{mode: mode, subjectKind: traceSubjectTarget}
+	switch evd.probeKind {
+	case "icmp":
+		if evd.targetAddr == "" {
+			return terminalPlan(mode, traceSubjectTarget, "", "no_destination"), true
+		}
+		d.destKey, d.destHost, d.destIP = canonicalDest(evd.targetAddr)
+	case "tcp":
+		if evd.targetAddr == "" {
+			return terminalPlan(mode, traceSubjectTarget, "", "no_destination"), true
+		}
+		if evd.targetPort < 1 || evd.targetPort > 65535 {
+			return terminalPlan(mode, traceSubjectTarget, "", "no_tcp_port"), true
+		}
+		d.destKey, d.destHost, d.destIP = canonicalDest(evd.targetAddr)
+		d.port = evd.targetPort
+	case "http":
+		// The frozen target_addr is the monitored URL; host and port are decoded from
+		// it (explicit port, else scheme default) so both are immutable evidence.
+		host, hport, derr := hostPortFromURL(evd.targetAddr)
+		if derr != nil {
+			return terminalPlan(mode, traceSubjectTarget, "", "bad_url"), true
+		}
+		d.destKey, d.destHost, d.destIP = canonicalDest(host)
+		d.port = hport
+	}
+	return d, true
+}
+
+// planProxyTrace diagnoses the egress a pinned monitor dialed.
+//
+// For socks5/http that is the proxy's own listener: the probe path is
+// agent→proxy→target, the relay protocols cannot carry a hop-by-hop diagnostic
+// through to the target, and a direct trace from the host would measure a path
+// the probe never used. There is deliberately no direct-to-target control trace:
+// it reads as "the real path" to anyone skimming the report, which is the exact
+// misreading this whole feature exists to prevent.
+//
+// For wireguard it is the peer's physical endpoint. Tracing INSIDE the tunnel is
+// not implementable on the current userspace stack (the netstack ping socket
+// exposes no TTL control and its IP layer drops Time-Exceeded outright — see
+// todos/DIAG-004), so the endpoint path is traced in both cases and
+// subject_reason carries which question it answers.
+func planProxyTrace(evd traceEvidence) (derivedTrace, bool) {
+	switch evd.proxyType {
+	case pcfg.ProxyTypeWireGuard:
+		host, _, err := net.SplitHostPort(strings.TrimSpace(evd.proxyAddr))
+		if err != nil {
+			// A bare host is a legitimate endpoint spelling; only an empty one is undiagnosable.
+			host = strings.TrimSpace(evd.proxyAddr)
+		}
+		if host == "" {
+			return terminalPlan(pcfg.TraceModeICMP, traceSubjectWGEndpoint, "", reasonProxyUnknown), true
+		}
+		// The peer endpoint is a UDP listener, so only its ICMP path is traceable —
+		// a TCP trace to it would report a closed port on a perfectly healthy tunnel.
+		d := derivedTrace{
+			mode:          pcfg.TraceModeICMP,
+			subjectKind:   traceSubjectWGEndpoint,
+			subjectReason: wgSubjectReason(evd.reasonCode),
+		}
+		d.destKey, d.destHost, d.destIP = canonicalDest(host)
+		return d, true
+	case pcfg.ProxyTypeSOCKS5, pcfg.ProxyTypeHTTP:
+		host, portStr, err := net.SplitHostPort(strings.TrimSpace(evd.proxyAddr))
+		if err != nil {
+			return terminalPlan(pcfg.TraceModeTCP, traceSubjectProxy, "", reasonProxyUnknown), true
+		}
+		port, perr := strconv.Atoi(portStr)
+		if host == "" || perr != nil || port < 1 || port > 65535 {
+			return terminalPlan(pcfg.TraceModeTCP, traceSubjectProxy, "", reasonProxyUnknown), true
+		}
+		d := derivedTrace{mode: pcfg.TraceModeTCP, subjectKind: traceSubjectProxy, port: port}
+		d.destKey, d.destHost, d.destIP = canonicalDest(host)
+		return d, true
+	}
+	// A pin with no recognizable type — an unrecorded egress, or one this build does
+	// not know. The fault is real but its path is unnameable, so say so rather than
+	// falling back to a direct trace that would describe a path the probe never took.
+	return terminalPlan(pcfg.TraceModeTCP, traceSubjectProxy, "", reasonProxyUnknown), true
+}
+
+// wgSubjectReason reads the frozen classification to say which question the peer
+// trace answers. The 8x family means the probe never made it through the tunnel,
+// so the peer's reachability IS the fault; another classified cause means the
+// tunnel carried the probe and the target failed beyond it, where this trace is
+// the nearest available evidence rather than the fault's own path.
+//
+// ProbeReasonNone on a FAILING round means the fault carries no classification at
+// all — a NAT monitor never produces one (reasonMetricKind excludes nat), and any
+// probe can lose its error_class sample. Neither verdict may be asserted then:
+// claiming the tunnel worked would be a fabrication in exactly the case where it
+// is most likely to be the culprit. The empty reason renders as "undetermined".
+func wgSubjectReason(reasonCode int) string {
+	switch {
+	case reasonCode >= telemetry.ProbeReasonProxyConnect && reasonCode <= telemetry.ProbeReasonProxyConfig:
+		return subjectTunnelUnreachable
+	case reasonCode == telemetry.ProbeReasonNone:
+		return ""
+	}
+	return subjectTunnelTargetUnreachable
+}
+
+// planResolverTrace diagnoses the DNS server a failing lookup used, which answers
+// the question the target's own name cannot: is the resolver unreachable, or
+// reachable but not answering? The queried name is dialed by nobody, so it has no
+// path to trace.
+//
+// The mode follows the resolver's protocol, because that is the port the probe's
+// own traffic used: plain UDP has no TCP port worth probing (ICMP), DoT/DoH/TCP
+// each have theirs.
+//
+// A conclusive rcode (NXDOMAIN/SERVFAIL) still traces the resolver. That is
+// intentional: a clean path to a resolver that answers SERVFAIL is itself the
+// finding — the network is fine and the DNS service is not.
+func planResolverTrace(evd traceEvidence) (derivedTrace, bool) {
+	addr := strings.TrimSpace(evd.resolverAddr)
+	if addr == "" {
+		// No resolver was named: a system-resolver monitor on a platform that cannot
+		// report one. Guessing the host's current resolver could name a server this
+		// query never used, so the diagnostic reports itself unavailable instead.
+		return terminalPlan(pcfg.TraceModeICMP, traceSubjectResolver, "", reasonResolverUnknown), true
+	}
+
+	var host string
+	var port int
+	switch evd.resolverProtocol {
+	case "doh":
+		var err error
+		host, port, err = hostPortFromURL(addr)
+		if err != nil {
+			return terminalPlan(pcfg.TraceModeTCP, traceSubjectResolver, "", "bad_url"), true
+		}
+	default:
+		var err error
+		host, port, err = splitHostPortDefault(addr, resolverDefaultPort(evd.resolverProtocol))
+		if err != nil {
+			return terminalPlan(pcfg.TraceModeICMP, traceSubjectResolver, "", "no_destination"), true
+		}
+	}
+
+	// A local stub resolver (systemd-resolved's 127.0.0.53, a container sidecar)
+	// has no path: every hop of it is inside this host. Tracing it would return one
+	// meaningless hop and imply the network was examined when it was not — the
+	// upstream the stub forwards to is invisible from here.
+	if isLoopbackHost(host) {
+		return terminalPlan(pcfg.TraceModeICMP, traceSubjectResolver, "", reasonResolverLoopback), true
+	}
+
+	mode := pcfg.TraceModeICMP
+	if evd.resolverProtocol != "" && evd.resolverProtocol != "udp" {
+		mode = pcfg.TraceModeTCP
+	}
+	d := derivedTrace{mode: mode, subjectKind: traceSubjectResolver}
+	d.destKey, d.destHost, d.destIP = canonicalDest(host)
+	if mode == pcfg.TraceModeTCP {
+		d.port = port
+	}
+	return d, true
+}
+
+// resolverDefaultPort is the port a resolver protocol uses when the probe did not
+// record one. Mirrors the agent's DNS collector defaults.
+func resolverDefaultPort(protocol string) int {
+	if protocol == "dot" {
+		return 853
+	}
+	return 53
+}
+
+// planSTUNTrace diagnoses the STUN server a NAT probe exchanged with. Unlike DNS,
+// that server IS the monitored target — but only the probe knows which port and
+// transport it actually used, so the plan is still built from the frozen endpoint
+// rather than from target_addr.
+func planSTUNTrace(evd traceEvidence) (derivedTrace, bool) {
+	addr := strings.TrimSpace(evd.stunAddr)
+	if addr == "" {
+		return terminalPlan(pcfg.TraceModeICMP, traceSubjectSTUNServer, "", reasonNoSTUNServer), true
+	}
+	// UDP and DTLS are datagram transports with no connectable TCP port, so their
+	// path is traced with ICMP; TCP/TLS trace to the port the probe connected to.
+	mode := pcfg.TraceModeICMP
+	switch evd.stunTransport {
+	case "tcp", "tls":
+		mode = pcfg.TraceModeTCP
+	}
+	host, port, err := splitHostPortDefault(addr, stunDefaultPort(evd.stunTransport))
+	if err != nil {
+		return terminalPlan(mode, traceSubjectSTUNServer, "", "no_destination"), true
+	}
+	d := derivedTrace{mode: mode, subjectKind: traceSubjectSTUNServer}
+	d.destKey, d.destHost, d.destIP = canonicalDest(host)
+	if mode == pcfg.TraceModeTCP {
+		d.port = port
+	}
+	return d, true
+}
+
+// stunDefaultPort mirrors the agent's STUN port defaults (RFC 5389/5928): 5349
+// for the TLS-wrapped transports, 3478 otherwise.
+func stunDefaultPort(transport string) int {
+	switch transport {
+	case "tls", "dtls":
+		return 5349
+	}
+	return 3478
+}
+
+// terminalPlan is a plan that is created in a terminal state and never
+// dispatched. The subject is still recorded: "no path diagnostic for the
+// resolver" is a different statement from "no path diagnostic for the target",
+// and the console renders the difference.
+func terminalPlan(mode, subjectKind, subjectReason, reason string) derivedTrace {
+	return derivedTrace{
+		mode: mode, subjectKind: subjectKind, subjectReason: subjectReason,
+		terminal: telemetry.TraceStatusFailed, reason: reason,
+	}
+}
+
+// splitHostPortDefault splits a "host:port" endpoint, accepting a bare host and
+// supplying def for it. An empty host is an error — the caller must not trace a
+// destination it cannot name.
+func splitHostPortDefault(addr string, def int) (string, int, error) {
+	host, portStr, err := net.SplitHostPort(addr)
+	if err != nil {
+		if addr == "" {
+			return "", 0, errors.New("no host")
+		}
+		return addr, def, nil
+	}
+	if host == "" {
+		return "", 0, errors.New("no host")
+	}
+	port, perr := strconv.Atoi(portStr)
+	if perr != nil || port < 1 || port > 65535 {
+		port = def
+	}
+	return host, port, nil
+}
+
+// isLoopbackHost reports whether a destination resolves to this host by
+// definition — a loopback literal or the loopback name.
+func isLoopbackHost(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	addr, err := netip.ParseAddr(host)
+	if err != nil {
+		return false
+	}
+	return addr.IsLoopback()
 }
 
 // tcpTraceDenialReason classifies why an agent's effective set lacks the TCP
@@ -221,21 +564,26 @@ func (s *Service) OnSignalConfirmed(ctx context.Context, ev fault.SignalEvent) e
 	if !s.diagEnabled(ctx) {
 		return nil
 	}
-	var probeKind, targetAddr, metricKind string
-	var targetPort int
+	var evd traceEvidence
+	var metricKind string
 	err := s.db.Read().QueryRowContext(ctx,
-		`SELECT COALESCE(probe_kind,''), COALESCE(target_addr,''), target_port, COALESCE(metric_kind,'')
-		 FROM fault_signals WHERE id=?`, ev.SignalID).Scan(&probeKind, &targetAddr, &targetPort, &metricKind)
+		`SELECT COALESCE(probe_kind,''), COALESCE(target_addr,''), target_port, COALESCE(metric_kind,''),
+		        reason_code, resolver_addr, resolver_protocol, stun_addr, stun_transport,
+		        proxy_id, proxy_type, proxy_addr
+		 FROM fault_signals WHERE id=?`, ev.SignalID).
+		Scan(&evd.probeKind, &evd.targetAddr, &evd.targetPort, &metricKind,
+			&evd.reasonCode, &evd.resolverAddr, &evd.resolverProtocol, &evd.stunAddr, &evd.stunTransport,
+			&evd.proxyID, &evd.proxyType, &evd.proxyAddr)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil
 	}
 	if err != nil {
 		return err
 	}
-	if !TraceEligibleMetric(probeKind, metricKind) {
+	if !TraceEligibleMetric(evd.probeKind, metricKind) {
 		return nil
 	}
-	d, ok := s.deriveTrace(ctx, ev.AgentID, probeKind, targetAddr, targetPort)
+	d, ok := s.deriveTrace(ctx, ev.AgentID, evd)
 	if !ok {
 		return nil
 	}
@@ -259,6 +607,18 @@ func (s *Service) OnSignalConfirmed(ctx context.Context, ev fault.SignalEvent) e
 	}
 	return nil
 }
+
+// openCohortQuery finds the open-cohort report for a plan's key. It MUST match
+// idx_trace_singleflight column for column — both the attach and the lost-race
+// re-select go through it, and a key narrower than the index would attach a fault
+// to a report diagnosing something else.
+//
+// subject_reason is part of the key because a report stores exactly one, frozen
+// at creation: two faults on the same WireGuard peer, one that never crossed the
+// tunnel and one that did, would otherwise share a report that tells the second
+// incident the first one's opposite conclusion.
+const openCohortQuery = `SELECT id FROM trace_reports
+	WHERE agent_id=? AND dest_key=? AND mode=? AND port=? AND subject_kind=? AND subject_reason=? AND cohort_open=1`
 
 // singleFlight attaches a reference to the open-cohort report for the plan's key,
 // or creates a fresh report (queued, or terminal when the plan is terminal) and
@@ -294,10 +654,12 @@ func (s *Service) singleFlight(ctx context.Context, ev fault.SignalEvent, d deri
 		return reportID, true, false, nil
 	}
 
-	// Existing open cohort for this key → attach and share.
-	err = tx.QueryRowContext(ctx,
-		`SELECT id FROM trace_reports WHERE agent_id=? AND dest_key=? AND mode=? AND port=? AND cohort_open=1`,
-		ev.AgentID, d.destKey, d.mode, d.port).Scan(&reportID)
+	// Existing open cohort for this key → attach and share. subject_kind is part of
+	// the key: the same host traced as a resolver and as a monitored target are two
+	// different diagnostics, and sharing one report between them would answer one
+	// fault with the other's evidence.
+	err = tx.QueryRowContext(ctx, openCohortQuery,
+		ev.AgentID, d.destKey, d.mode, d.port, d.subjectKind, d.subjectReason).Scan(&reportID)
 	if err == nil {
 		if err = insertRef(ctx, tx, reportID, ev, now); err != nil {
 			return "", false, false, err
@@ -318,9 +680,8 @@ func (s *Service) singleFlight(ctx context.Context, ev fault.SignalEvent, d deri
 		// Lost the unique-index race for this open key: re-select the winner and
 		// attach to it instead of creating a duplicate open cohort.
 		var winner string
-		if e2 := tx.QueryRowContext(ctx,
-			`SELECT id FROM trace_reports WHERE agent_id=? AND dest_key=? AND mode=? AND port=? AND cohort_open=1`,
-			ev.AgentID, d.destKey, d.mode, d.port).Scan(&winner); e2 == nil {
+		if e2 := tx.QueryRowContext(ctx, openCohortQuery,
+			ev.AgentID, d.destKey, d.mode, d.port, d.subjectKind, d.subjectReason).Scan(&winner); e2 == nil {
 			if err = insertRef(ctx, tx, winner, ev, now); err != nil {
 				return "", false, false, err
 			}
@@ -354,11 +715,11 @@ func (s *Service) insertReport(ctx context.Context, tx *sql.Tx, reportID string,
 	}
 	_, err := tx.ExecContext(ctx, `
 		INSERT INTO trace_reports(id, site_id, agent_id, agent_name, dest_key, dest_host, dest_ip, mode, port,
-			fallback_from, fallback_reason,
+			fallback_from, fallback_reason, subject_kind, subject_reason,
 			status, reason, max_hops, attempts, timeout_ms, resolve_hops, cohort_open, requested_at, completed_at, deadline_at)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		reportID, ev.SiteID, ev.AgentID, s.agentName(ctx, ev.AgentID), d.destKey, d.destHost, d.destIP, d.mode, d.port,
-		d.fallbackFrom, d.fallbackReason,
+		d.fallbackFrom, d.fallbackReason, d.subjectKind, d.subjectReason,
 		status, reason, s.diagMaxHops(ctx), s.diagAttempts(ctx), int(s.diagTotalTimeout(ctx).Milliseconds()),
 		boolInt(s.diagResolveHops(ctx)), cohortOpen, now, completed, deadline)
 	return err

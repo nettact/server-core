@@ -112,6 +112,15 @@ type TargetMeta struct {
 	Enabled      bool
 	ConfigSerial int
 	Det          DetectionSettings
+	// The target's egress pin as it stood when these samples were produced (the
+	// generation filter guarantees that). Frozen onto a confirmed signal so a path
+	// diagnostic can be aimed at the proxy the probe actually dialed rather than at
+	// a target the traffic never reached directly. ProxyID empty means a direct
+	// dial; a non-empty id with an empty type means the proxy row is already gone.
+	ProxyID   string
+	ProxyType string // socks5 | http | wireguard
+	// ProxyAddr is "host:port" for socks5/http and the peer endpoint for wireguard.
+	ProxyAddr string
 	// MaxRoundGap is how far apart two rounds may be and still count as
 	// consecutive. Zero falls back to the kind's default schedule (see
 	// maxRoundGap), so a caller that does not set it still gets a sane bound
@@ -175,6 +184,16 @@ type Round struct {
 	Layer        string
 	Det          DetectionSettings
 	Meta         TargetMeta
+	// The endpoint this round's probe actually talked to, as the collector named it
+	// on the cycle's own samples. A DNS monitor's queried name and a NAT monitor's
+	// resolved STUN endpoint are not dialable/complete addresses on their own, so
+	// these are the only record of where the traffic went. Empty for probe kinds
+	// that dial their target directly, and for a DNS probe whose platform cannot
+	// name the system resolver.
+	ResolverAddr     string
+	ResolverProtocol string
+	StunAddr         string
+	StunTransport    string
 }
 
 // SuccessMetricKind maps a probe kind to the metric whose value decides whether
@@ -283,6 +302,13 @@ func BuildRounds(ms []telemetry.Metric, meta map[string]TargetMeta) []Round {
 		hasReason    bool
 		reasonCode   int
 		reasonDetail string
+		// Where the probe actually went. The two families sit on different samples:
+		// NAT names its STUN server on the primary metric (it has no reason metric at
+		// all), DNS names its resolver on the error_class metric alongside the detail.
+		resolverAddr     string
+		resolverProtocol string
+		stunAddr         string
+		stunTransport    string
 	}
 	acc := map[roundKey]*roundAcc{}
 	for i := range ms {
@@ -314,11 +340,15 @@ func BuildRounds(ms []telemetry.Metric, meta map[string]TargetMeta) []Round {
 			a.value = m.Value
 			a.layer = string(m.Layer)
 			a.configSerial = m.ConfigSerial
+			a.stunAddr = m.Labels[telemetry.NATServerLabel]
+			a.stunTransport = m.Labels[telemetry.NATTransportLabel]
 			continue
 		}
 		a.hasReason = true
 		a.reasonCode = int(m.Value)
 		a.reasonDetail = m.Labels[telemetry.ProbeReasonDetailLabel]
+		a.resolverAddr = m.Labels[telemetry.DNSResolverLabel]
+		a.resolverProtocol = m.Labels[telemetry.DNSResolverProtocolLabel]
 	}
 
 	out := make([]Round, 0, len(acc))
@@ -336,6 +366,7 @@ func BuildRounds(ms []telemetry.Metric, meta map[string]TargetMeta) []Round {
 			Class: class, MetricKind: SuccessMetricKind(tm.Kind), Comparator: comparatorFor(tm.Kind),
 			Value: a.value, Threshold: thresholdFor(tm.Kind, tm.Det),
 			ConfigSerial: a.configSerial, Layer: a.layer, Det: tm.Det, Meta: tm,
+			StunAddr: a.stunAddr, StunTransport: a.stunTransport,
 		}
 		if r.Layer == "" {
 			r.Layer = builtinLayer(tm.Kind)
@@ -343,6 +374,8 @@ func BuildRounds(ms []telemetry.Metric, meta map[string]TargetMeta) []Round {
 		if a.hasReason {
 			r.ReasonCode = a.reasonCode
 			r.ReasonDetail = a.reasonDetail
+			r.ResolverAddr = a.resolverAddr
+			r.ResolverProtocol = a.resolverProtocol
 		}
 		out = append(out, r)
 	}

@@ -105,9 +105,17 @@ type TraceSummary struct {
 	// FallbackFrom/FallbackReason surface a derivation-time permission fallback:
 	// the report ran in Mode after being downgraded from FallbackFrom ('' when
 	// it ran in its natural mode), because of FallbackReason.
-	FallbackFrom   string     `json:"fallback_from,omitempty"`   // ''|'tcp' — the mode this report fell back from
-	FallbackReason string     `json:"fallback_reason,omitempty"` // 'raw_socket_unavailable'|'permission_denied'
-	ActiveRefs     int        `json:"active_refs"`
+	FallbackFrom   string `json:"fallback_from,omitempty"`   // ''|'tcp' — the mode this report fell back from
+	FallbackReason string `json:"fallback_reason,omitempty"` // 'raw_socket_unavailable'|'permission_denied'
+	// SubjectKind names what DestHost is, which is not always the monitored target:
+	// 'target'|'resolver'|'proxy'|'wg_endpoint'|'stun_server'. SubjectReason
+	// qualifies a WireGuard endpoint trace ('tunnel_unreachable' = the probe never
+	// crossed the tunnel; 'tunnel_target_unreachable' = it did and the target
+	// failed beyond it, so this path is context rather than the fault's own).
+	// Without these a resolver trace and a target trace read identically.
+	SubjectKind   string     `json:"subject_kind"`
+	SubjectReason string     `json:"subject_reason,omitempty"`
+	ActiveRefs    int        `json:"active_refs"`
 	RequestedAt    time.Time  `json:"requested_at"`
 	StartedAt      *time.Time `json:"started_at"`
 	CompletedAt    *time.Time `json:"completed_at"`
@@ -121,6 +129,7 @@ func (s *Service) TracesForIncident(ctx context.Context, incidentID string) ([]T
 		SELECT tr.id, tr.agent_id, COALESCE(tr.agent_name,''), tr.mode, tr.dest_host, COALESCE(tr.dest_ip,''),
 		       tr.port, tr.status, COALESCE(tr.reason,''), tr.reached, tr.reached_ttl,
 		       COALESCE(tr.fallback_from,''), COALESCE(tr.fallback_reason,''),
+		       COALESCE(tr.subject_kind,''), COALESCE(tr.subject_reason,''),
 		       (SELECT COUNT(*) FROM trace_report_refs r2 WHERE r2.report_id=tr.id AND r2.incident_id=? AND r2.active=1),
 		       tr.requested_at, tr.started_at, tr.completed_at, tr.deadline_at
 		FROM trace_reports tr
@@ -147,6 +156,7 @@ func scanTraceSummary(rows *sql.Rows) (TraceSummary, error) {
 	var started, completed sql.NullTime
 	if err := rows.Scan(&t.ReportID, &t.AgentID, &t.AgentName, &t.Mode, &t.DestHost, &t.DestIP,
 		&t.Port, &t.Status, &t.Reason, &reached, &t.ReachedTTL, &t.FallbackFrom, &t.FallbackReason,
+		&t.SubjectKind, &t.SubjectReason,
 		&t.ActiveRefs, &t.RequestedAt, &started, &completed, &t.DeadlineAt); err != nil {
 		return TraceSummary{}, err
 	}
@@ -188,10 +198,12 @@ func (s *Service) TraceReport(ctx context.Context, reportID string) (TraceReport
 	err := s.db.Read().QueryRowContext(ctx, `
 		SELECT id, site_id, agent_id, COALESCE(agent_name,''), mode, dest_host, COALESCE(dest_ip,''), port,
 		       status, COALESCE(reason,''), reached, reached_ttl, COALESCE(fallback_from,''), COALESCE(fallback_reason,''),
+		       COALESCE(subject_kind,''), COALESCE(subject_reason,''),
 		       requested_at, started_at, completed_at, deadline_at
 		FROM trace_reports WHERE id=?`, reportID).
 		Scan(&v.ReportID, &siteID, &v.AgentID, &v.AgentName, &v.Mode, &v.DestHost, &v.DestIP, &v.Port,
 			&v.Status, &v.Reason, &reached, &v.ReachedTTL, &v.FallbackFrom, &v.FallbackReason,
+			&v.SubjectKind, &v.SubjectReason,
 			&v.RequestedAt, &started, &completed, &v.DeadlineAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return TraceReportView{}, "", false, nil

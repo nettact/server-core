@@ -10,6 +10,8 @@ import (
 	"database/sql"
 	"encoding/json"
 	"log"
+	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -276,16 +278,25 @@ func (s *Service) probeMeta(ctx context.Context, q rowQuerier, agentID, siteID s
 	// params would then make every round look like it followed a gap, resetting the
 	// failing streak each time and preventing a fault from EVER confirming on that
 	// agent. Only the reported value knows the real cadence.
+	// The proxy join carries the target's egress identity onto the fault evidence:
+	// a probe pinned to a proxy dials the PROXY, so a path diagnostic aimed at the
+	// target would measure a path the probe never took. Reading it here rather than
+	// at diagnosis time is what keeps it frozen — and it is sound to read live,
+	// because a proxy edit bumps every referencing task's config_serial, so samples
+	// that survive the generation filter were produced under this very row.
 	query := `
 		SELECT pt.id, pt.kind, pt.group_id, COALESCE(pt.name,''), COALESCE(pt.target,''),
 		       COALESCE(pt.params,''), pt.enabled, pt.config_serial,
 		       COALESCE(ds.fail_rounds, ?), COALESCE(ds.recover_rounds, ?),
 		       COALESCE(ds.icmp_loss_pct, ?), COALESCE(ds.revision, 1),
 		       ms.source, ms.target_config_serial, ms.effective_interval_seconds,
-		       ms.cycle_deadline_ms, ms.upload_interval_seconds
+		       ms.cycle_deadline_ms, ms.upload_interval_seconds,
+		       COALESCE(pt.proxy_id,''), COALESCE(px.type,''), COALESCE(px.host,''),
+		       COALESCE(px.port,0), COALESCE(px.wg_endpoint,'')
 		FROM probe_tasks pt
 		LEFT JOIN probe_detection_settings ds ON ds.target_id = pt.id
 		LEFT JOIN monitor_status ms ON ms.monitor_id = pt.id AND ms.agent_id = ?
+		LEFT JOIN proxies px ON px.id = pt.proxy_id
 		WHERE pt.site_id = ? AND ` + config.AgentScopePredicate + `
 		  AND pt.id IN (` + placeholders(len(ids)) + `)`
 	args := make([]any, 0, len(ids)+6)
@@ -303,14 +314,18 @@ func (s *Service) probeMeta(ctx context.Context, q rowQuerier, agentID, siteID s
 		var params string
 		var enabled int
 		var sched reportedSchedule
+		var proxyHost, wgEndpoint string
+		var proxyPort int
 		if err := rows.Scan(&m.ID, &m.Kind, &m.GroupID, &m.Name, &m.Addr, &params, &enabled, &m.ConfigSerial,
 			&m.Det.FailRounds, &m.Det.RecoverRounds, &m.Det.ICMPLossPct, &m.Det.Revision,
 			&sched.source, &sched.configSerial, &sched.intervalSeconds,
-			&sched.cycleDeadlineMs, &sched.uploadSeconds); err != nil {
+			&sched.cycleDeadlineMs, &sched.uploadSeconds,
+			&m.ProxyID, &m.ProxyType, &proxyHost, &proxyPort, &wgEndpoint); err != nil {
 			return nil, err
 		}
 		m.Enabled = enabled == 1
 		m.Port = portFromParams(params)
+		m.ProxyAddr = proxyAddr(m.ProxyType, proxyHost, proxyPort, wgEndpoint)
 		m.MaxRoundGap = roundGap(m.Kind, params, sched, m.ConfigSerial)
 		m.Det = m.Det.Normalize()
 		out[m.ID] = m
@@ -337,6 +352,20 @@ func (s reportedSchedule) confirmedFor(configSerial int) bool {
 		s.configSerial.Valid && int(s.configSerial.Int64) == configSerial &&
 		s.intervalSeconds.Valid && s.intervalSeconds.Int64 > 0 &&
 		s.cycleDeadlineMs.Valid && s.cycleDeadlineMs.Int64 > 0
+}
+
+// proxyAddr renders a proxy's dialable identity: the peer endpoint for a
+// WireGuard tunnel (already "host:port"), the listener for a relay proxy. Empty
+// when the columns for this type are unset, so a half-formed address is reported
+// as an undiagnosable egress rather than traced as if it were real.
+func proxyAddr(proxyType, host string, port int, wgEndpoint string) string {
+	if proxyType == pcfg.ProxyTypeWireGuard {
+		return strings.TrimSpace(wgEndpoint)
+	}
+	if host == "" || port <= 0 {
+		return ""
+	}
+	return net.JoinHostPort(host, strconv.Itoa(port))
 }
 
 // portFromParams extracts the target port from a probe_tasks.params blob, frozen

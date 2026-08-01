@@ -208,6 +208,12 @@ func (s *Service) confirmSignal(ctx context.Context, tx *sql.Tx, agentID, siteID
 		FailThreshold: r.Det.FailRounds, RecoverThreshold: r.Det.RecoverRounds,
 		MetricKind: r.MetricKind, Comparator: r.Comparator, Value: r.Value, Threshold: r.Threshold,
 		ReasonCode: r.ReasonCode, ReasonDetail: r.ReasonDetail,
+		// Where the probe actually went, from the confirming round's own samples and
+		// the generation-matched proxy pin. Frozen so a later config edit cannot
+		// redirect this fault's path diagnostic to a different endpoint.
+		ResolverAddr: r.ResolverAddr, ResolverProtocol: r.ResolverProtocol,
+		StunAddr: r.StunAddr, StunTransport: r.StunTransport,
+		ProxyID: r.Meta.ProxyID, ProxyType: r.Meta.ProxyType, ProxyAddr: r.Meta.ProxyAddr,
 		// Freeze the cause of every round of the streak, not just the confirming one.
 		// The summary columns above answer "why is this firing"; these answer "what
 		// actually happened" — a target that timed out twice and was then refused
@@ -429,16 +435,23 @@ func insertSignal(ctx context.Context, tx *sql.Tx, sig Signal, port int) error {
 	if err != nil {
 		return err
 	}
+	// The diagnosis-subject columns are empty for every detector that has no probe
+	// behind it (agent connectivity), which the zero-valued Signal supplies.
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO fault_signals(id, site_id, agent_id, target_id, detector_key, probe_kind,
 		    group_id, group_name, target_name, target_addr, target_port, agent_name, layer, severity,
 		    state, fail_threshold, recover_threshold, metric_kind, comparator, value, threshold,
-		    reason_code, reason_detail, rounds_json, observed_at, confirmed_at, incident_id)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'firing', ?,?,?,?,?,?,?,?,?,?,?,?)`,
+		    reason_code, reason_detail,
+		    resolver_addr, resolver_protocol, stun_addr, stun_transport, proxy_id, proxy_type, proxy_addr,
+		    rounds_json, observed_at, confirmed_at, incident_id)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'firing', ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		sig.ID, sig.SiteID, sig.AgentID, sig.TargetID, sig.DetectorKey, sig.ProbeKind,
 		sig.GroupID, sig.GroupName, sig.TargetName, sig.TargetAddr, port, sig.AgentName, sig.Layer, sig.Severity,
 		sig.FailThreshold, sig.RecoverThreshold, sig.MetricKind, sig.Comparator, sig.Value, sig.Threshold,
-		sig.ReasonCode, sig.ReasonDetail, roundsJSON, sig.ObservedAt, sig.ConfirmedAt, sig.IncidentID)
+		sig.ReasonCode, sig.ReasonDetail,
+		sig.ResolverAddr, sig.ResolverProtocol, sig.StunAddr, sig.StunTransport,
+		sig.ProxyID, sig.ProxyType, sig.ProxyAddr,
+		roundsJSON, sig.ObservedAt, sig.ConfirmedAt, sig.IncidentID)
 	return err
 }
 

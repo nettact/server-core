@@ -473,6 +473,21 @@ CREATE TABLE fault_signals(
   threshold         REAL NOT NULL DEFAULT 0,
   reason_code       INTEGER NOT NULL DEFAULT 0,         -- classified cause (telemetry.ProbeReason*)
   reason_detail     TEXT NOT NULL DEFAULT '',           -- which cert/status/OS error was behind it
+  -- Frozen DIAGNOSIS SUBJECT: the endpoint the failing probe actually talked to,
+  -- which is not always the monitored one. A DNS monitor dials a resolver, a
+  -- proxied monitor dials its proxy, a tunnelled one dials a WireGuard peer — so
+  -- a path diagnostic aimed at target_addr would measure a path the probe never
+  -- used. Frozen here for the same reason as everything above: derivation must
+  -- never re-read live config, or an edit between fault and diagnosis silently
+  -- redirects the diagnostic. Written from the confirming round's own evidence
+  -- (resolver/STUN labels) and the probe's proxy pin at confirmation time.
+  resolver_addr     TEXT NOT NULL DEFAULT '',           -- DNS: "host:port" or DoH URL ('' = unnameable)
+  resolver_protocol TEXT NOT NULL DEFAULT '',           -- udp | tcp | dot | doh
+  stun_addr         TEXT NOT NULL DEFAULT '',           -- NAT: resolved STUN "host:port"
+  stun_transport    TEXT NOT NULL DEFAULT '',           -- udp | tcp | tls | dtls
+  proxy_id          TEXT NOT NULL DEFAULT '',           -- egress pin at fault time ('' = direct)
+  proxy_type        TEXT NOT NULL DEFAULT '',           -- socks5 | http | wireguard
+  proxy_addr        TEXT NOT NULL DEFAULT '',           -- socks5/http "host:port"; wireguard peer endpoint
   -- Every round of the confirming streak, not just the last one: a JSON array of
   -- {ts, metric_kind, value, reason_code, reason_detail}. The columns above are
   -- the confirming round's summary; a streak that timed out twice and was then
@@ -632,10 +647,25 @@ CREATE TABLE trace_reports(
   -- instead; these record the mode it was originally requested as and why it
   -- was downgraded, so a fallback reads as a fallback rather than a failure.
   fallback_from   TEXT NOT NULL DEFAULT '',   -- '' | tcp
-  fallback_reason TEXT NOT NULL DEFAULT ''    -- raw_socket_unavailable | permission_denied
+  fallback_reason TEXT NOT NULL DEFAULT '',   -- raw_socket_unavailable | permission_denied
+  -- WHAT this diagnostic traced, which is not always the monitored target: a DNS
+  -- fault traces its resolver, a proxied fault its proxy, a tunnelled fault the
+  -- WireGuard peer's physical path. Without it a resolver trace and a target
+  -- trace render identically, and the destination alone cannot say which is which.
+  subject_kind    TEXT NOT NULL DEFAULT 'target'
+                  CHECK(subject_kind IN('target','resolver','proxy','wg_endpoint','stun_server')),
+  -- '' | tunnel_unreachable | tunnel_target_unreachable. Empty on a WireGuard
+  -- subject means the fault carried no classified cause, so neither verdict is
+  -- asserted (a NAT monitor never produces one).
+  subject_reason  TEXT NOT NULL DEFAULT ''
 );
+-- The subject columns are part of the key: the same host is a different
+-- diagnosis as a resolver than as a monitored target, and a WireGuard peer
+-- traced because the tunnel is down is a different conclusion from one traced
+-- because the tunnel worked. Merging either pair would answer one fault with
+-- another fault's evidence, since a report freezes one subject and one reason.
 CREATE UNIQUE INDEX idx_trace_singleflight
-  ON trace_reports(agent_id, dest_key, mode, port) WHERE cohort_open=1;
+  ON trace_reports(agent_id, dest_key, mode, port, subject_kind, subject_reason) WHERE cohort_open=1;
 CREATE INDEX idx_trace_status ON trace_reports(status);
 
 CREATE TABLE trace_hops(
