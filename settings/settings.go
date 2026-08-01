@@ -144,7 +144,7 @@ var IntKeys = map[string]IntBounds{
 	KeyIncidentSnapshotDeadlineMs: {Default: 10000, Min: 1000, Max: 60000},
 	KeyIncidentSnapshotMaxBytes:   {Default: 262144, Min: 65536, Max: 1048576},
 	KeyDiagEnabled:                {Default: 1, Min: 0, Max: 1},
-	KeyDiagTotalTimeoutMs:         {Default: 90000, Min: 5000, Max: 120000},
+	KeyDiagTotalTimeoutMs:         {Default: 300000, Min: 5000, Max: 600000},
 	KeyDiagMaxHops:                {Default: 30, Min: 1, Max: 64},
 	KeyDiagAttemptsPerHop:         {Default: 3, Min: 1, Max: 5},
 	KeyDiagAgentConcurrency:       {Default: 4, Min: 1, Max: 16},

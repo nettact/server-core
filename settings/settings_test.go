@@ -46,3 +46,11 @@ func TestSettingsRoundTrip(t *testing.T) {
 		t.Fatalf("nil ConsoleBaseURL = %q, want empty", got)
 	}
 }
+
+func TestDiagnosticTotalTimeoutBounds(t *testing.T) {
+	got := IntKeys[KeyDiagTotalTimeoutMs]
+	want := IntBounds{Default: 300000, Min: 5000, Max: 600000}
+	if got != want {
+		t.Fatalf("diag total timeout bounds = %+v, want %+v", got, want)
+	}
+}
