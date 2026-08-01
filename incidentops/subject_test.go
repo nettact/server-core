@@ -129,6 +129,23 @@ func TestPlanTracePicksTheSubjectThatCarriedTheProbe(t *testing.T) {
 			wantReason: subjectTunnelTargetUnreachable,
 		},
 		{
+			name: "an unusable proxy pin is not reported as a tunnel outage",
+			// ProxyConfig means the probe never dialed: the pin was missing, disabled or
+			// uninitializable. Nothing tested the tunnel, so it must not be called down.
+			evd: traceEvidence{probeKind: "icmp", targetAddr: "10.7.0.5", reasonCode: telemetry.ProbeReasonProxyConfig,
+				proxyID: "px_3", proxyType: pcfg.ProxyTypeWireGuard, proxyAddr: "vpn.example:51820"},
+			wantSubject: traceSubjectWGEndpoint, wantHost: "vpn.example", wantMode: pcfg.TraceModeICMP,
+			wantReason: subjectTunnelNotAttempted,
+		},
+		{
+			name: "a rejected relay through the tunnel is a tunnel failure",
+			evd: traceEvidence{probeKind: "tcp", targetAddr: "10.7.0.5", targetPort: 443,
+				reasonCode: telemetry.ProbeReasonProxyRefused,
+				proxyID:    "px_3", proxyType: pcfg.ProxyTypeWireGuard, proxyAddr: "vpn.example:51820"},
+			wantSubject: traceSubjectWGEndpoint, wantHost: "vpn.example", wantMode: pcfg.TraceModeICMP,
+			wantReason: subjectTunnelUnreachable,
+		},
+		{
 			name: "an unclassified tunnelled fault asserts neither tunnel verdict",
 			// A NAT monitor never carries a reason code (reasonMetricKind excludes nat),
 			// so claiming the tunnel worked would be a fabrication in exactly the case

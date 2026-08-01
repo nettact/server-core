@@ -83,7 +83,13 @@ const (
 	// current userspace stack (see todos/DIAG-004), so the peer path is traced as
 	// the nearest useful evidence and must be labelled as exactly that.
 	subjectTunnelTargetUnreachable = "tunnel_target_unreachable"
-	// An empty subject reason on a WireGuard plan means neither could be
+	// subjectTunnelNotAttempted: the tunnel was never used, because the pinned
+	// proxy was missing, disabled, unusable for the probe kind or failed to
+	// initialize. No packet left the host, so nothing was observed about the
+	// tunnel or the target — the peer trace is only a reachability check, and the
+	// fault is a configuration problem.
+	subjectTunnelNotAttempted = "tunnel_not_attempted"
+	// An empty subject reason on a WireGuard plan means none of the above could be
 	// established — see wgSubjectReason.
 )
 
@@ -335,20 +341,29 @@ func planProxyTrace(evd traceEvidence) (derivedTrace, bool) {
 }
 
 // wgSubjectReason reads the frozen classification to say which question the peer
-// trace answers. The 8x family means the probe never made it through the tunnel,
-// so the peer's reachability IS the fault; another classified cause means the
-// tunnel carried the probe and the target failed beyond it, where this trace is
-// the nearest available evidence rather than the fault's own path.
+// trace answers.
+//
+// Codes 81-84 each describe a real attempt that did not get through the tunnel
+// (unreachable peer, rejected credentials, a name the far side could not resolve,
+// a refused relay), so the peer's reachability IS the fault. ProxyConfig (85) is
+// deliberately NOT among them: it means the probe never dialed at all because the
+// pinned proxy was absent, disabled, unusable or uninitializable, so no packet
+// ever tested the tunnel and calling it unreachable would assert an outage nobody
+// observed. Another classified cause means the tunnel carried the probe and the
+// target failed beyond it, where this trace is the nearest available evidence
+// rather than the fault's own path.
 //
 // ProbeReasonNone on a FAILING round means the fault carries no classification at
 // all — a NAT monitor never produces one (reasonMetricKind excludes nat), and any
-// probe can lose its error_class sample. Neither verdict may be asserted then:
+// probe can lose its error_class sample. No verdict may be asserted then:
 // claiming the tunnel worked would be a fabrication in exactly the case where it
 // is most likely to be the culprit. The empty reason renders as "undetermined".
 func wgSubjectReason(reasonCode int) string {
 	switch {
-	case reasonCode >= telemetry.ProbeReasonProxyConnect && reasonCode <= telemetry.ProbeReasonProxyConfig:
+	case reasonCode >= telemetry.ProbeReasonProxyConnect && reasonCode <= telemetry.ProbeReasonProxyRefused:
 		return subjectTunnelUnreachable
+	case reasonCode == telemetry.ProbeReasonProxyConfig:
+		return subjectTunnelNotAttempted
 	case reasonCode == telemetry.ProbeReasonNone:
 		return ""
 	}

@@ -654,9 +654,9 @@ CREATE TABLE trace_reports(
   -- trace render identically, and the destination alone cannot say which is which.
   subject_kind    TEXT NOT NULL DEFAULT 'target'
                   CHECK(subject_kind IN('target','resolver','proxy','wg_endpoint','stun_server')),
-  -- '' | tunnel_unreachable | tunnel_target_unreachable. Empty on a WireGuard
-  -- subject means the fault carried no classified cause, so neither verdict is
-  -- asserted (a NAT monitor never produces one).
+  -- '' | tunnel_unreachable | tunnel_target_unreachable | tunnel_not_attempted.
+  -- Empty on a WireGuard subject means the fault carried no classified cause, so
+  -- no verdict is asserted (a NAT monitor never produces one).
   subject_reason  TEXT NOT NULL DEFAULT ''
 );
 -- The subject columns are part of the key: the same host is a different
