@@ -403,6 +403,8 @@ func (s *Service) DeleteAgent(ctx context.Context, id string) error {
 		`DELETE FROM agent_packets WHERE agent_id=?`,
 		`DELETE FROM events WHERE agent_id=?`,
 		`DELETE FROM detector_state WHERE agent_id=?`,
+		`DELETE FROM game_buckets WHERE run_id IN (SELECT id FROM game_runs WHERE agent_id=?)`,
+		`DELETE FROM game_runs WHERE agent_id=?`,
 	} {
 		if _, err := tx.ExecContext(ctx, stmt, id); err != nil {
 			return err

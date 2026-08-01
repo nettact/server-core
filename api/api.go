@@ -36,6 +36,7 @@ import (
 	"github.com/nettact/server-core/config"
 	"github.com/nettact/server-core/eventbus"
 	"github.com/nettact/server-core/fault"
+	"github.com/nettact/server-core/gamedata"
 	"github.com/nettact/server-core/hostlive"
 	"github.com/nettact/server-core/identity"
 	"github.com/nettact/server-core/incident"
@@ -73,6 +74,7 @@ type Deps struct {
 	Notification      *notification.Service
 	Settings          *settings.Service
 	Audit             *audit.Service
+	GameData          *gamedata.Service         // game presentation runs + per-second buckets (not metrics)
 	HostLive          *hostlive.Store           // in-memory live process/connection snapshots (never persisted)
 	OpIssue           *opissue.Service          // operational-issue engine (monitor status + issues)
 	TargetStatus      *targetstatus.Service     // authoritative current target-status aggregation (read-time)
@@ -156,6 +158,13 @@ func Router(d Deps) http.Handler {
 			// agent, GET polls for the result. Never stored.
 			r.Post("/agents/{id}/snapshot", d.handleRequestSnapshot)
 			r.Get("/agents/{id}/snapshot", d.handleGetSnapshot)
+			// Game presentation history: runs (one continuous stretch of a game
+			// presenting frames) with their whole-run summaries, and the per-second
+			// buckets under one run. Deliberately not metrics — see package gamedata.
+			r.Get("/agents/{id}/game-runs", d.handleListGameRuns)
+			r.Get("/game-runs/{id}", d.handleGetGameRun)
+			r.Get("/game-runs/{id}/buckets", d.handleGameRunBuckets)
+			r.Delete("/game-runs/{id}", d.handleDeleteGameRun)
 			r.Get("/enrollment-tokens", d.handleListTokens)
 			r.Post("/enrollment-tokens", d.handleCreateToken)
 			r.Get("/sites/{id}/targets", d.handleListTargets)

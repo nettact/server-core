@@ -379,6 +379,105 @@ CREATE TABLE events(
 );
 CREATE INDEX idx_events_site_ts ON events(site_id, ts);
 
+-- ===== game presentation =====
+--
+-- Frame data deliberately does NOT live in series/samples. A second of rendering
+-- is a distribution, not a scalar: the figure a player recognizes — the slowest
+-- 1% of frames across a whole session — is a property of every frame, and no
+-- average of per-second averages reconstructs it. Histograms can simply be added,
+-- so the distribution is what gets stored and whole-run figures are derived from
+-- the sum. Runs give those frames the boundary they belong to, because the unit
+-- being compared is "this evening's session", not "the last hour of wall clock".
+--
+-- NULL here means NOT MEASURED, and never zero. Frame sources differ in how far
+-- they can see: one follows every frame to the screen, another only knows a frame
+-- was handed over. "This game dropped no frames" and "we cannot see dropped
+-- frames" are different facts, and storing 0 for both would make the second one
+-- unrecoverable — every chart would then render a source's blind spot as a
+-- flawless result. Readers must restore the absent value as absent.
+
+CREATE TABLE game_runs(
+  id TEXT PRIMARY KEY,
+  agent_id TEXT NOT NULL REFERENCES agents(id),
+  site_id TEXT NOT NULL,
+  proc TEXT NOT NULL DEFAULT '',
+  title TEXT NOT NULL DEFAULT '',
+  started_at INTEGER NOT NULL,     -- unix seconds, first second captured
+  last_seen_at INTEGER NOT NULL,   -- unix seconds, newest second captured
+  -- Set only once the run is KNOWN to be over, so a session cut short by an agent
+  -- restart stays distinguishable from one whose ending was actually observed.
+  ended_at INTEGER,
+  source TEXT NOT NULL DEFAULT '',
+  -- The sensor's capability list verbatim (JSON array of names), NOT a bitmap: a
+  -- capability introduced later must not need a bit assigned to it, and a reader
+  -- meeting an unfamiliar name has to be able to ignore that one name rather than
+  -- misread every bit after it. Together with source it records how the run was
+  -- measured, without which a game that stopped dropping frames is
+  -- indistinguishable from a capture that stopped being able to see drops.
+  caps TEXT NOT NULL DEFAULT '[]',
+  -- The whole-run totals, folded in as each second lands rather than derived from
+  -- game_buckets on read. Buckets are kept for days and runs for months, so a
+  -- summary recomputed from surviving buckets reports every run older than the
+  -- bucket window as zero frames at null FPS — destroying exactly the
+  -- cross-session comparison the long run window exists to preserve. It is also
+  -- what keeps listing a page of runs off a scan of every second beneath them.
+  presented INTEGER NOT NULL DEFAULT 0,
+  -- NULL until a second arrives that could actually count them, and NULL forever
+  -- for a source that never can: a zero here would report a blind spot as a run
+  -- that dropped nothing, which is the one mistake this schema exists to prevent.
+  displayed INTEGER,
+  dropped INTEGER,
+  -- The run's merged frame-time histogram, encoded exactly like game_buckets.hist
+  -- and carrying the layout its counts were binned under for the same reason —
+  -- see game_buckets.hist_layout. NULL until the first second is folded in, which
+  -- is also the only thing that tells a run which recorded no seconds apart from
+  -- one whose seconds presented nothing: presented is a count, and a count of
+  -- zero cannot say which happened.
+  hist_layout TEXT,
+  hist BLOB
+);
+CREATE INDEX idx_game_runs_agent ON game_runs(agent_id, started_at DESC);
+
+CREATE TABLE game_buckets(
+  run_id TEXT NOT NULL REFERENCES game_runs(id) ON DELETE CASCADE,
+  ts INTEGER NOT NULL,             -- unix seconds, the second this sample closed
+  presented INTEGER NOT NULL,      -- the one count every source knows
+  displayed INTEGER,               -- NULL unless frames are tracked to the screen
+  dropped INTEGER,
+  app_frames INTEGER,              -- NULL unless generated frames are told apart
+  generated_frames INTEGER,
+  ft_avg REAL NOT NULL,
+  ft_p50 REAL NOT NULL,
+  ft_p95 REAL NOT NULL,
+  ft_p99 REAL NOT NULL,
+  ft_max REAL NOT NULL,
+  ft_sd  REAL NOT NULL,
+  -- The frozen bin layout the counts were produced under, stored per bucket
+  -- because the NAME is the compatibility contract: a reader that does not know
+  -- the layout must refuse the counts rather than apply its own edges, which
+  -- would silently turn a bin index into the wrong frame time. hist is the bins
+  -- as uint32 little-endian (24 bins = 96 bytes for log24_v1).
+  hist_layout TEXT NOT NULL,
+  hist BLOB NOT NULL,
+  disp_ft_avg REAL,                -- NULL without the displayed capability
+  disp_ft_p95 REAL,
+  present_mode TEXT,
+  sync_interval INTEGER,           -- 0 means vsync off, a real reading; NULL means unobserved
+  tearing INTEGER,                 -- 0 means "no tearing", likewise a real reading
+  api TEXT,
+  -- NULL when no presentation metadata was observed at all. It is what keeps "the
+  -- second was uniform" apart from "we never looked": every other column in this
+  -- group is legitimately empty on its own, so without a discriminator the two
+  -- collapse into one.
+  present_changed INTEGER,
+  quality TEXT,                    -- JSON array of flags; NULL when none apply
+  PRIMARY KEY(run_id, ts)
+) WITHOUT ROWID;
+-- Retention deletes by age across every run at once, and this is by far the
+-- fastest-growing table in the store (one row per second of play), so the age
+-- sweep gets its own index rather than scanning the whole table hourly.
+CREATE INDEX idx_game_buckets_ts ON game_buckets(ts);
+
 -- ===== fault detection & incidents =====
 
 -- Per-(target, agent, detector) streak state driving the built-in availability

@@ -110,6 +110,18 @@ const (
 	KeyDeviceRandomMACRetentionDays = "device_random_mac_retention_days"
 )
 
+// Game presentation retention. The two windows are independent because the rows
+// they bound are nothing alike: a bucket is one row per second of play, and a run
+// is one row per session carrying the summary an operator compares over months.
+// Ageing them together would mean either keeping seconds nobody will chart or
+// discarding the history that makes "is this machine getting worse" answerable.
+//
+// 0 disables that window, in which case those rows are kept indefinitely.
+const (
+	KeyGameBucketRetentionDays = "game_bucket_retention_days"
+	KeyGameRunRetentionDays    = "game_run_retention_days"
+)
+
 // Update-notice state, shared by every surface that can announce a new release.
 //
 // The switch is a SERVER setting rather than per-client state on purpose: the
@@ -173,6 +185,11 @@ var IntKeys = map[string]IntBounds{
 	// association. 0 has a distinct meaning per key — see the key comments.
 	KeyDeviceRetentionDays:          {Default: 7, Min: 0, Max: 365},
 	KeyDeviceRandomMACRetentionDays: {Default: 1, Min: 0, Max: 365},
+	// Game data. A week of seconds covers "what happened in that session" while a
+	// quarter of runs covers "has this machine got worse", which is the comparison
+	// the run summaries exist for.
+	KeyGameBucketRetentionDays: {Default: 7, Min: 0, Max: 365},
+	KeyGameRunRetentionDays:    {Default: 90, Min: 0, Max: 3650},
 	// Update notices default to on: a monitoring tool that quietly runs an old
 	// build is the failure mode worth avoiding.
 	KeyUpdateNoticeDisabled: {Default: 0, Min: 0, Max: 1},

@@ -22,6 +22,7 @@ import (
 	"github.com/nettact/server-core/config"
 	"github.com/nettact/server-core/eventbus"
 	"github.com/nettact/server-core/fault"
+	"github.com/nettact/server-core/gamedata"
 	"github.com/nettact/server-core/metrics"
 	"github.com/nettact/server-core/store"
 )
@@ -164,6 +165,13 @@ func (s *Service) Ingest(ctx context.Context, agentID, siteID string, pkt teleme
 			if err := applyInterfaceSnapshot(ctx, tx, agentID, pkt.InterfaceSnapshots[n-1], pkt.Metrics, pkt.Sequence, now); err != nil {
 				return Ack{}, err
 			}
+		}
+		// Game presentation data rides beside the metrics rather than as metrics,
+		// because a second of frames is a distribution and not a value. It is written
+		// in the same transaction so a committed packet never leaves a run without the
+		// seconds that arrived with it. Its own permission gate lives in gamedata.Apply.
+		if _, err := gamedata.Apply(ctx, tx, agentID, siteID, pkt.GameRuns, pkt.GameBuckets); err != nil {
+			return Ack{}, err
 		}
 		// Fault evaluation runs INSIDE this sample transaction so samples, detector
 		// state, fault signals, incidents and notification plans commit atomically:
