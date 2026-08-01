@@ -93,7 +93,8 @@ func TestConfirmedSignalFreezesTheDiagnosisSubject(t *testing.T) {
 		"t_dns": {ID: "t_dns", Kind: "dns", GroupID: "mg", Name: "Lookup", Addr: "example.com",
 			Enabled: true, ConfigSerial: 1, Det: det,
 			// The egress pin, as ingest read it under the same config generation.
-			ProxyID: "px_1", ProxyType: "wireguard", ProxyAddr: "vpn.example:51820"},
+			ProxyID: "px_1", ProxyType: "wireguard", ProxyAddr: "vpn.example:51820",
+			ProxyConfigSerial: 7},
 	}
 	rounds := BuildRounds(dnsMetrics(time.Now().Unix(), 0, map[string]string{
 		telemetry.DNSResolverLabel:         "1.1.1.1:53",
@@ -113,17 +114,19 @@ func TestConfirmedSignalFreezesTheDiagnosisSubject(t *testing.T) {
 	}
 
 	var resolver, proto, proxyID, proxyType, proxyAddr string
+	var proxySerial int
 	if err := h.db.QueryRowContext(h.ctx, `
-		SELECT resolver_addr, resolver_protocol, proxy_id, proxy_type, proxy_addr
+		SELECT resolver_addr, resolver_protocol, proxy_id, proxy_type, proxy_addr, proxy_config_serial
 		FROM fault_signals WHERE target_id='t_dns'`).
-		Scan(&resolver, &proto, &proxyID, &proxyType, &proxyAddr); err != nil {
+		Scan(&resolver, &proto, &proxyID, &proxyType, &proxyAddr, &proxySerial); err != nil {
 		t.Fatalf("read frozen subject: %v", err)
 	}
 	if resolver != "1.1.1.1:53" || proto != "udp" {
 		t.Fatalf("frozen resolver=%q/%q, want 1.1.1.1:53/udp", resolver, proto)
 	}
-	if proxyID != "px_1" || proxyType != "wireguard" || proxyAddr != "vpn.example:51820" {
-		t.Fatalf("frozen proxy=%q/%q/%q, want px_1/wireguard/vpn.example:51820", proxyID, proxyType, proxyAddr)
+	if proxyID != "px_1" || proxyType != "wireguard" || proxyAddr != "vpn.example:51820" || proxySerial != 7 {
+		t.Fatalf("frozen proxy=%q/%q/%q serial=%d, want px_1/wireguard/vpn.example:51820/7",
+			proxyID, proxyType, proxyAddr, proxySerial)
 	}
 }
 

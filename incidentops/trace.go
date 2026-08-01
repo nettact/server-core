@@ -70,18 +70,21 @@ const (
 	traceSubjectSTUNServer = "stun_server" // the STUN server a nat monitor probed
 )
 
-// Why a WireGuard fault is diagnosed at the peer endpoint rather than inside the
-// tunnel. Both trace the same physical path — the distinction is what the
-// operator should conclude from it, and it comes from the frozen reason code, not
-// from the trace.
+// Which question a WireGuard fault's trace answers. The verdict comes from the
+// frozen reason code, not from the trace itself; together with path_scope it
+// tells the operator whether the hops describe the fault's own path or the
+// nearest evidence to it.
 const (
 	// subjectTunnelUnreachable: the probe never got through the tunnel (a proxy_*
-	// reason), so the peer's reachability IS the fault.
+	// reason), so the peer's physical reachability IS the fault.
 	subjectTunnelUnreachable = "tunnel_unreachable"
 	// subjectTunnelTargetUnreachable: the tunnel carried the probe and the TARGET
-	// failed. Hop-by-hop tracing inside the tunnel is not implementable on the
-	// current userspace stack (see todos/DIAG-004), so the peer path is traced as
-	// the nearest useful evidence and must be labelled as exactly that.
+	// failed beyond it. The fault's own path is the in-tunnel one, so the trace
+	// runs INSIDE the tunnel (subject target, path_scope wireguard_inner),
+	// pinned to the exact egress generation the evidence froze. Only when the
+	// in-tunnel destination cannot be derived from frozen evidence does the
+	// peer's physical path stand in as nearest-available evidence, and it must
+	// be labelled as exactly that.
 	subjectTunnelTargetUnreachable = "tunnel_target_unreachable"
 	// subjectTunnelNotAttempted: the tunnel was never used, because the pinned
 	// proxy was missing, disabled, unusable for the probe kind or failed to
@@ -126,6 +129,21 @@ const (
 	reasonResolverLoopback = "resolver_loopback" // the resolver is a local stub; the path is zero hops
 	reasonProxyUnknown     = "proxy_unknown"     // the pinned proxy has no usable address (deleted/incomplete)
 	reasonNoSTUNServer     = "no_stun_server"    // the STUN endpoint was never recorded
+	// The result's self-attested execution path (path_scope + egress reference)
+	// disagreed with the plan's. The claimed hops describe a path the plan did
+	// not ask for, so they are discarded and the report fails with this code
+	// instead of rendering them as if they were the planned path.
+	reasonAttestationMismatch = "attestation_mismatch"
+)
+
+// Which path a trace's probes travel, orthogonal to the subject (who is being
+// measured). Local aliases of the wire-shared telemetry.TracePath* values —
+// trace_reports.path_scope, the agent's TraceResult attestation and these plans
+// must all speak the same vocabulary, so the values are the protocol's own.
+const (
+	pathScopeDirect     = telemetry.TracePathDirect
+	pathScopeWGPhysical = telemetry.TracePathWireGuardPhysical
+	pathScopeWGInner    = telemetry.TracePathWireGuardInner
 )
 
 // derivedTrace is the resolved traceroute plan for one eligible condition.
@@ -141,6 +159,15 @@ type derivedTrace struct {
 	// indistinguishable on read: same columns, opposite meanings.
 	subjectKind   string
 	subjectReason string
+	// pathScope says which path the probes travel (pathScope*): the host stack,
+	// the host-stack path toward a WireGuard peer's physical endpoint, or
+	// hop-by-hop inside the tunnel. For an in-tunnel plan egressID and
+	// egressConfigSerial pin the exact proxy generation the fault evidence froze
+	// — the agent must match both or fail closed, never a rotated key and never
+	// the host stack.
+	pathScope          string
+	egressID           string
+	egressConfigSerial int
 	// fallbackFrom/fallbackReason record an automatic mode downgrade: a TCP plan
 	// whose agent lacks the TCP permission but holds the ICMP one runs as ICMP
 	// with fallbackFrom="tcp" and the stable why-code (raw_socket_unavailable |
@@ -175,13 +202,18 @@ type traceEvidence struct {
 	proxyID          string
 	proxyType        string
 	proxyAddr        string
+	// proxyConfigSerial is the pin's config generation at fault time — what an
+	// in-tunnel plan pins its egress to, so a proxy rotated between the fault and
+	// the diagnostic can never be re-enabled to carry the probes.
+	proxyConfigSerial int
 }
 
 // deriveTrace resolves the traceroute plan entirely from a condition's frozen
 // trigger-time evidence, gating on the detecting agent's effective traceroute
-// permission. It never reads live probe_tasks or proxies, so a target, resolver
-// or proxy edited or deleted between the fault and this derivation can never
-// redirect the diagnostic to a different endpoint or port.
+// permission (granted alone for an in-tunnel plan — see the gate below). It
+// never reads live probe_tasks or proxies, so a target, resolver or proxy
+// edited or deleted between the fault and this derivation can never redirect
+// the diagnostic to a different endpoint or port.
 //
 // The plan answers "what carried this probe", not "what was being monitored" —
 // those diverge for every indirect probe:
@@ -189,8 +221,11 @@ type traceEvidence struct {
 //	pinned to socks5/http  → the PROXY (agent→proxy→target; a direct trace to the
 //	                         target measures a path the probe never used, and the
 //	                         relay protocols cannot carry a hop-by-hop diagnostic)
-//	pinned to wireguard    → the peer ENDPOINT's physical path (in-tunnel hop-by-hop
-//	                         is not implementable on the userspace stack; DIAG-004)
+//	pinned to wireguard    → INSIDE the tunnel toward the frozen destination when
+//	                         the tunnel carried the probe and the target failed
+//	                         beyond it; the peer ENDPOINT's physical path when the
+//	                         tunnel itself failed, was never attempted, or the
+//	                         in-tunnel destination cannot be derived
 //	dns                    → the RESOLVER (the queried name is dialed by nobody)
 //	nat                    → the STUN SERVER (which is the monitored target, but only
 //	                         the probe knows the port and transport it used)
@@ -218,6 +253,20 @@ func (s *Service) deriveTrace(ctx context.Context, agentID string, evd traceEvid
 	// it is terminal unsupported, with the denial reason distinguishing a policy
 	// denial from a capability gap (needs Administrator).
 	supported, granted, effective := s.agentPermissions(ctx, agentID)
+
+	// An in-tunnel plan is gated on GRANTED, not effective. Its probes never
+	// touch the host stack — they are built in userspace and injected into the
+	// WireGuard device — so the raw-socket capability that shapes supported (and
+	// through it effective) is irrelevant, and demanding it would deny a path
+	// the agent can always take. This mirrors the agent engine's own egress
+	// gate; a policy that never granted ICMP still terminalizes.
+	if d.pathScope == pathScopeWGInner {
+		if !granted.Has(permission.DiagnosticTracerouteICMP) {
+			d.terminal = telemetry.TraceStatusUnsupported
+			d.reason = reasonPermissionDenied
+		}
+		return d, true
+	}
 	switch {
 	case mode == pcfg.TraceModeTCP && !effective.Has(permission.DiagnosticTracerouteTCP):
 		if effective.Has(permission.DiagnosticTracerouteICMP) {
@@ -258,7 +307,7 @@ func planTrace(evd traceEvidence) (derivedTrace, bool) {
 	if !ok {
 		return derivedTrace{}, false
 	}
-	d := derivedTrace{mode: mode, subjectKind: traceSubjectTarget}
+	d := derivedTrace{mode: mode, subjectKind: traceSubjectTarget, pathScope: pathScopeDirect}
 	switch evd.probeKind {
 	case "icmp":
 		if evd.targetAddr == "" {
@@ -296,14 +345,37 @@ func planTrace(evd traceEvidence) (derivedTrace, bool) {
 // it reads as "the real path" to anyone skimming the report, which is the exact
 // misreading this whole feature exists to prevent.
 //
-// For wireguard it is the peer's physical endpoint. Tracing INSIDE the tunnel is
-// not implementable on the current userspace stack (the netstack ping socket
-// exposes no TTL control and its IP layer drops Time-Exceeded outright — see
-// todos/DIAG-004), so the endpoint path is traced in both cases and
-// subject_reason carries which question it answers.
+// For wireguard the plan follows the frozen verdict. When the tunnel carried
+// the probe and the TARGET failed beyond it, the fault's own path is the
+// in-tunnel one, and that is what gets traced: ICMP probes injected inside the
+// tunnel toward the frozen destination, pinned to the exact egress generation
+// the evidence froze (the agent matches both ID and serial or fails closed —
+// never a rotated key, never the host stack). When the tunnel itself failed or
+// was never attempted — or, degenerately, the in-tunnel destination cannot be
+// derived from the frozen evidence — the peer's physical endpoint is traced
+// over the host stack instead, with subject_reason saying which question that
+// answers.
 func planProxyTrace(evd traceEvidence) (derivedTrace, bool) {
 	switch evd.proxyType {
 	case pcfg.ProxyTypeWireGuard:
+		if wgSubjectReason(evd.reasonCode) == subjectTunnelTargetUnreachable {
+			if host, ok := innerTraceDest(evd); ok {
+				// The subject is the target itself — path_scope is what marks the hops
+				// as in-tunnel ones, so the existing subject vocabulary stays intact.
+				d := derivedTrace{
+					mode:               pcfg.TraceModeICMP,
+					subjectKind:        traceSubjectTarget,
+					subjectReason:      subjectTunnelTargetUnreachable,
+					pathScope:          pathScopeWGInner,
+					egressID:           evd.proxyID,
+					egressConfigSerial: evd.proxyConfigSerial,
+				}
+				d.destKey, d.destHost, d.destIP = canonicalDest(host)
+				return d, true
+			}
+			// No derivable in-tunnel destination: fall through to the physical
+			// endpoint trace — coarse, but honestly labelled as the nearest evidence.
+		}
 		host, _, err := net.SplitHostPort(strings.TrimSpace(evd.proxyAddr))
 		if err != nil {
 			// A bare host is a legitimate endpoint spelling; only an empty one is undiagnosable.
@@ -318,6 +390,7 @@ func planProxyTrace(evd traceEvidence) (derivedTrace, bool) {
 			mode:          pcfg.TraceModeICMP,
 			subjectKind:   traceSubjectWGEndpoint,
 			subjectReason: wgSubjectReason(evd.reasonCode),
+			pathScope:     pathScopeWGPhysical,
 		}
 		d.destKey, d.destHost, d.destIP = canonicalDest(host)
 		return d, true
@@ -330,7 +403,7 @@ func planProxyTrace(evd traceEvidence) (derivedTrace, bool) {
 		if host == "" || perr != nil || port < 1 || port > 65535 {
 			return terminalPlan(pcfg.TraceModeTCP, traceSubjectProxy, "", reasonProxyUnknown), true
 		}
-		d := derivedTrace{mode: pcfg.TraceModeTCP, subjectKind: traceSubjectProxy, port: port}
+		d := derivedTrace{mode: pcfg.TraceModeTCP, subjectKind: traceSubjectProxy, port: port, pathScope: pathScopeDirect}
 		d.destKey, d.destHost, d.destIP = canonicalDest(host)
 		return d, true
 	}
@@ -340,8 +413,8 @@ func planProxyTrace(evd traceEvidence) (derivedTrace, bool) {
 	return terminalPlan(pcfg.TraceModeTCP, traceSubjectProxy, "", reasonProxyUnknown), true
 }
 
-// wgSubjectReason reads the frozen classification to say which question the peer
-// trace answers.
+// wgSubjectReason reads the frozen classification to say which question a
+// WireGuard fault's trace answers.
 //
 // Codes 81-84 each describe a real attempt that did not get through the tunnel
 // (unreachable peer, rejected credentials, a name the far side could not resolve,
@@ -350,8 +423,10 @@ func planProxyTrace(evd traceEvidence) (derivedTrace, bool) {
 // pinned proxy was absent, disabled, unusable or uninitializable, so no packet
 // ever tested the tunnel and calling it unreachable would assert an outage nobody
 // observed. Another classified cause means the tunnel carried the probe and the
-// target failed beyond it, where this trace is the nearest available evidence
-// rather than the fault's own path.
+// target failed beyond it — the fault's own path is the in-tunnel one, which
+// planProxyTrace traces from inside the tunnel; only when innerTraceDest cannot
+// name that path's destination does the peer trace stand in as the nearest
+// available evidence.
 //
 // ProbeReasonNone on a FAILING round means the fault carries no classification at
 // all — a NAT monitor never produces one (reasonMetricKind excludes nat), and any
@@ -368,6 +443,57 @@ func wgSubjectReason(reasonCode int) string {
 		return ""
 	}
 	return subjectTunnelTargetUnreachable
+}
+
+// innerTraceDest derives the in-tunnel destination for a tunnel_target_unreachable
+// fault from frozen evidence alone: the endpoint the probe dialed THROUGH the
+// tunnel. It mirrors the per-kind subject selection of the direct planners —
+// icmp/tcp dial the target, http its URL's host, dns its resolver, nat its STUN
+// server — because that endpoint, not the monitor's nominal name, is where the
+// failing packets went. ok=false when the evidence cannot name one (the rare
+// degenerate case), which sends planProxyTrace back to the physical peer trace.
+func innerTraceDest(evd traceEvidence) (string, bool) {
+	switch evd.probeKind {
+	case "icmp", "tcp":
+		if evd.targetAddr == "" {
+			return "", false
+		}
+		return evd.targetAddr, true
+	case "http":
+		host, _, err := hostPortFromURL(evd.targetAddr)
+		if err != nil {
+			return "", false
+		}
+		return host, true
+	case "dns":
+		addr := strings.TrimSpace(evd.resolverAddr)
+		if addr == "" {
+			return "", false
+		}
+		if evd.resolverProtocol == "doh" {
+			host, _, err := hostPortFromURL(addr)
+			if err != nil {
+				return "", false
+			}
+			return host, true
+		}
+		host, _, err := splitHostPortDefault(addr, resolverDefaultPort(evd.resolverProtocol))
+		if err != nil {
+			return "", false
+		}
+		return host, true
+	case "nat":
+		addr := strings.TrimSpace(evd.stunAddr)
+		if addr == "" {
+			return "", false
+		}
+		host, _, err := splitHostPortDefault(addr, stunDefaultPort(evd.stunTransport))
+		if err != nil {
+			return "", false
+		}
+		return host, true
+	}
+	return "", false
 }
 
 // planResolverTrace diagnoses the DNS server a failing lookup used, which answers
@@ -420,7 +546,7 @@ func planResolverTrace(evd traceEvidence) (derivedTrace, bool) {
 	if evd.resolverProtocol != "" && evd.resolverProtocol != "udp" {
 		mode = pcfg.TraceModeTCP
 	}
-	d := derivedTrace{mode: mode, subjectKind: traceSubjectResolver}
+	d := derivedTrace{mode: mode, subjectKind: traceSubjectResolver, pathScope: pathScopeDirect}
 	d.destKey, d.destHost, d.destIP = canonicalDest(host)
 	if mode == pcfg.TraceModeTCP {
 		d.port = port
@@ -457,7 +583,7 @@ func planSTUNTrace(evd traceEvidence) (derivedTrace, bool) {
 	if err != nil {
 		return terminalPlan(mode, traceSubjectSTUNServer, "", "no_destination"), true
 	}
-	d := derivedTrace{mode: mode, subjectKind: traceSubjectSTUNServer}
+	d := derivedTrace{mode: mode, subjectKind: traceSubjectSTUNServer, pathScope: pathScopeDirect}
 	d.destKey, d.destHost, d.destIP = canonicalDest(host)
 	if mode == pcfg.TraceModeTCP {
 		d.port = port
@@ -478,11 +604,13 @@ func stunDefaultPort(transport string) int {
 // terminalPlan is a plan that is created in a terminal state and never
 // dispatched. The subject is still recorded: "no path diagnostic for the
 // resolver" is a different statement from "no path diagnostic for the target",
-// and the console renders the difference.
+// and the console renders the difference. The scope is direct — no probe will
+// ever travel, so the honest claim is the zero one.
 func terminalPlan(mode, subjectKind, subjectReason, reason string) derivedTrace {
 	return derivedTrace{
 		mode: mode, subjectKind: subjectKind, subjectReason: subjectReason,
-		terminal: telemetry.TraceStatusFailed, reason: reason,
+		pathScope: pathScopeDirect,
+		terminal:  telemetry.TraceStatusFailed, reason: reason,
 	}
 }
 
@@ -566,7 +694,7 @@ func hostPortFromURL(raw string) (string, int, error) {
 // OnSignalConfirmed reacts to one newly-confirmed fault signal (wired onto
 // TopicFaultConfirmed, post-commit). When the fault is an eligible network fault
 // it single-flights a traceroute report for the detecting agent: if an open
-// cohort already exists for the (agent, destination, mode, port) key it attaches
+// cohort already exists for the plan's key (see openCohortQuery) it attaches
 // an active reference and shares that in-flight/final report, otherwise it
 // creates a fresh queued report and reference and dispatches it. Non-eligible
 // faults are ignored; non-derivable/policy-ineligible inputs produce a terminal
@@ -584,11 +712,11 @@ func (s *Service) OnSignalConfirmed(ctx context.Context, ev fault.SignalEvent) e
 	err := s.db.Read().QueryRowContext(ctx,
 		`SELECT COALESCE(probe_kind,''), COALESCE(target_addr,''), target_port, COALESCE(metric_kind,''),
 		        reason_code, resolver_addr, resolver_protocol, stun_addr, stun_transport,
-		        proxy_id, proxy_type, proxy_addr
+		        proxy_id, proxy_type, proxy_addr, proxy_config_serial
 		 FROM fault_signals WHERE id=?`, ev.SignalID).
 		Scan(&evd.probeKind, &evd.targetAddr, &evd.targetPort, &metricKind,
 			&evd.reasonCode, &evd.resolverAddr, &evd.resolverProtocol, &evd.stunAddr, &evd.stunTransport,
-			&evd.proxyID, &evd.proxyType, &evd.proxyAddr)
+			&evd.proxyID, &evd.proxyType, &evd.proxyAddr, &evd.proxyConfigSerial)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil
 	}
@@ -631,9 +759,13 @@ func (s *Service) OnSignalConfirmed(ctx context.Context, ev fault.SignalEvent) e
 // subject_reason is part of the key because a report stores exactly one, frozen
 // at creation: two faults on the same WireGuard peer, one that never crossed the
 // tunnel and one that did, would otherwise share a report that tells the second
-// incident the first one's opposite conclusion.
+// incident the first one's opposite conclusion. The path columns are part of it
+// for the same reason one level down: two WireGuard tunnels can both contain
+// 10.0.0.10, and the same in-tunnel address traced through different tunnels —
+// or different generations of one tunnel — is a different execution.
 const openCohortQuery = `SELECT id FROM trace_reports
-	WHERE agent_id=? AND dest_key=? AND mode=? AND port=? AND subject_kind=? AND subject_reason=? AND cohort_open=1`
+	WHERE agent_id=? AND dest_key=? AND mode=? AND port=? AND subject_kind=? AND subject_reason=?
+	  AND path_scope=? AND egress_id=? AND egress_config_serial=? AND cohort_open=1`
 
 // singleFlight attaches a reference to the open-cohort report for the plan's key,
 // or creates a fresh report (queued, or terminal when the plan is terminal) and
@@ -674,7 +806,8 @@ func (s *Service) singleFlight(ctx context.Context, ev fault.SignalEvent, d deri
 	// different diagnostics, and sharing one report between them would answer one
 	// fault with the other's evidence.
 	err = tx.QueryRowContext(ctx, openCohortQuery,
-		ev.AgentID, d.destKey, d.mode, d.port, d.subjectKind, d.subjectReason).Scan(&reportID)
+		ev.AgentID, d.destKey, d.mode, d.port, d.subjectKind, d.subjectReason,
+		d.pathScope, d.egressID, d.egressConfigSerial).Scan(&reportID)
 	if err == nil {
 		if err = insertRef(ctx, tx, reportID, ev, now); err != nil {
 			return "", false, false, err
@@ -696,7 +829,8 @@ func (s *Service) singleFlight(ctx context.Context, ev fault.SignalEvent, d deri
 		// attach to it instead of creating a duplicate open cohort.
 		var winner string
 		if e2 := tx.QueryRowContext(ctx, openCohortQuery,
-			ev.AgentID, d.destKey, d.mode, d.port, d.subjectKind, d.subjectReason).Scan(&winner); e2 == nil {
+			ev.AgentID, d.destKey, d.mode, d.port, d.subjectKind, d.subjectReason,
+			d.pathScope, d.egressID, d.egressConfigSerial).Scan(&winner); e2 == nil {
 			if err = insertRef(ctx, tx, winner, ev, now); err != nil {
 				return "", false, false, err
 			}
@@ -730,11 +864,11 @@ func (s *Service) insertReport(ctx context.Context, tx *sql.Tx, reportID string,
 	}
 	_, err := tx.ExecContext(ctx, `
 		INSERT INTO trace_reports(id, site_id, agent_id, agent_name, dest_key, dest_host, dest_ip, mode, port,
-			fallback_from, fallback_reason, subject_kind, subject_reason,
+			fallback_from, fallback_reason, subject_kind, subject_reason, path_scope, egress_id, egress_config_serial,
 			status, reason, max_hops, attempts, timeout_ms, resolve_hops, cohort_open, requested_at, completed_at, deadline_at)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		reportID, ev.SiteID, ev.AgentID, s.agentName(ctx, ev.AgentID), d.destKey, d.destHost, d.destIP, d.mode, d.port,
-		d.fallbackFrom, d.fallbackReason, d.subjectKind, d.subjectReason,
+		d.fallbackFrom, d.fallbackReason, d.subjectKind, d.subjectReason, d.pathScope, d.egressID, d.egressConfigSerial,
 		status, reason, s.diagMaxHops(ctx), s.diagAttempts(ctx), int(s.diagTotalTimeout(ctx).Milliseconds()),
 		boolInt(s.diagResolveHops(ctx)), cohortOpen, now, completed, deadline)
 	return err
@@ -857,13 +991,23 @@ func (s *Service) buildTraceRequest(ctx context.Context, reportID string) (pcfg.
 	var req pcfg.TraceRequest
 	var resolve int
 	var deadline time.Time
+	var pathScope, egressID string
+	var egressSerial int
 	err := s.db.Read().QueryRowContext(ctx, `
-		SELECT id, mode, dest_host, port, max_hops, attempts, timeout_ms, resolve_hops, deadline_at
+		SELECT id, mode, dest_host, port, max_hops, attempts, timeout_ms, resolve_hops, deadline_at,
+		       path_scope, egress_id, egress_config_serial
 		FROM trace_reports WHERE id=?`, reportID).
 		Scan(&req.ReportID, &req.Mode, &req.DestinationHost, &req.TCPPort, &req.MaxHops, &req.AttemptsPerHop,
-			&req.TotalTimeoutMs, &resolve, &deadline)
+			&req.TotalTimeoutMs, &resolve, &deadline, &pathScope, &egressID, &egressSerial)
 	if err != nil {
 		return pcfg.TraceRequest{}, false
+	}
+	// Only an in-tunnel plan pins the request to an egress: a wireguard_physical
+	// plan is a host-stack trace ABOUT a tunnel, and setting the pin would make
+	// the agent run it inside the tunnel instead.
+	if pathScope == pathScopeWGInner {
+		req.EgressProxyID = egressID
+		req.EgressConfigSerial = egressSerial
 	}
 	req.BudgetMs = int(time.Until(deadline).Milliseconds())
 	if req.BudgetMs <= 0 {
@@ -877,16 +1021,20 @@ func (s *Service) buildTraceRequest(ctx context.Context, reportID string) (pcfg.
 
 // IngestTrace persists one agent's terminal traceroute result. It matches by
 // report id + authenticated agent id and requires a nonterminal report, validates
-// bounded hops/attempts, transactionally replaces the hop rows and writes the
-// terminal state, and emits a timeline completion entry for every referencing
-// incident. Duplicate, late and wrong-agent results are idempotent no-ops and can
-// never attach elsewhere.
+// the result's path attestation against the plan, validates bounded
+// hops/attempts, transactionally replaces the hop rows and writes the terminal
+// state, and emits a timeline completion entry for every referencing incident.
+// Duplicate, late and wrong-agent results are idempotent no-ops and can never
+// attach elsewhere. A result whose attestation disagrees with the plan is
+// recorded as failed/attestation_mismatch with its claimed status and hops
+// discarded — visible, never rendered as if it were the planned path.
 func (s *Service) IngestTrace(ctx context.Context, agentID string, res telemetry.TraceResult) error {
-	var reportAgent, status string
-	var maxHops, attempts int
+	var reportAgent, status, planScope, planEgressID string
+	var maxHops, attempts, planEgressSerial int
 	err := s.db.Read().QueryRowContext(ctx,
-		`SELECT agent_id, status, max_hops, attempts FROM trace_reports WHERE id=?`, res.ReportID).
-		Scan(&reportAgent, &status, &maxHops, &attempts)
+		`SELECT agent_id, status, max_hops, attempts, path_scope, egress_id, egress_config_serial
+		 FROM trace_reports WHERE id=?`, res.ReportID).
+		Scan(&reportAgent, &status, &maxHops, &attempts, &planScope, &planEgressID, &planEgressSerial)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil
 	}
@@ -900,6 +1048,22 @@ func (s *Service) IngestTrace(ctx context.Context, agentID string, res telemetry
 	final := res.Status
 	if !terminalTraceStatus(final) {
 		final = telemetry.TraceStatusFailed
+	}
+	reason := res.Reason
+	if !attestationMatches(planScope, planEgressID, planEgressSerial, res) {
+		// The hops describe a path the plan did not ask for — a trace that fell
+		// back to the host stack when the tunnel was wanted, or claims a tunnel
+		// the plan never named. Nothing the agent asserted about that path can be
+		// kept: not the status, not the reached verdict, not the hop list. The
+		// agent's own fail-closed results are NOT this case — they attest the
+		// planned path and carry their own reason, so they land above as failed
+		// with that reason intact.
+		final = telemetry.TraceStatusFailed
+		reason = reasonAttestationMismatch
+		res.Hops = nil
+		res.Reached = false
+		res.ReachedTTL = 0
+		res.DestinationIP = ""
 	}
 	now := time.Now().UTC()
 
@@ -920,7 +1084,7 @@ func (s *Service) IngestTrace(ctx context.Context, agentID string, res telemetry
 		SET status=?, reason=?, dest_ip=CASE WHEN ?<>'' THEN ? ELSE dest_ip END,
 		    reached=?, reached_ttl=?, started_at=COALESCE(started_at,?), completed_at=?
 		WHERE id=? AND status IN('queued','running')`,
-		final, res.Reason, res.DestinationIP, res.DestinationIP, boolInt(res.Reached), res.ReachedTTL,
+		final, reason, res.DestinationIP, res.DestinationIP, boolInt(res.Reached), res.ReachedTTL,
 		firstNonZeroTime(res.StartedAt, now), now, res.ReportID)
 	if err != nil {
 		return err
@@ -942,6 +1106,23 @@ func (s *Service) IngestTrace(ctx context.Context, agentID string, res telemetry
 	}
 	committed = true
 	return nil
+}
+
+// attestationMatches reports whether a result's self-attested execution path is
+// the one the plan asked for. An in-tunnel plan demands wireguard_inner plus the
+// exact egress generation it pinned — an echo of a different serial means the
+// probes ran through a tunnel the evidence never froze. Direct AND
+// wireguard_physical plans are both executed on the host stack (physical is a
+// host-stack trace ABOUT a tunnel), so they demand a direct attestation — an
+// empty PathScope reads as direct, per the wire contract — with empty egress
+// fields.
+func attestationMatches(planScope, planEgressID string, planEgressSerial int, res telemetry.TraceResult) bool {
+	if planScope == pathScopeWGInner {
+		return res.PathScope == telemetry.TracePathWireGuardInner &&
+			res.EgressProxyID == planEgressID && res.EgressConfigSerial == planEgressSerial
+	}
+	return (res.PathScope == "" || res.PathScope == telemetry.TracePathDirect) &&
+		res.EgressProxyID == "" && res.EgressConfigSerial == 0
 }
 
 // terminalTraceStatus reports whether a status is one of the agent's terminal

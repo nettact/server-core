@@ -214,6 +214,7 @@ func (s *Service) confirmSignal(ctx context.Context, tx *sql.Tx, agentID, siteID
 		ResolverAddr: r.ResolverAddr, ResolverProtocol: r.ResolverProtocol,
 		StunAddr: r.StunAddr, StunTransport: r.StunTransport,
 		ProxyID: r.Meta.ProxyID, ProxyType: r.Meta.ProxyType, ProxyAddr: r.Meta.ProxyAddr,
+		ProxyConfigSerial: r.Meta.ProxyConfigSerial,
 		// Freeze the cause of every round of the streak, not just the confirming one.
 		// The summary columns above answer "why is this firing"; these answer "what
 		// actually happened" — a target that timed out twice and was then refused
@@ -442,15 +443,16 @@ func insertSignal(ctx context.Context, tx *sql.Tx, sig Signal, port int) error {
 		    group_id, group_name, target_name, target_addr, target_port, agent_name, layer, severity,
 		    state, fail_threshold, recover_threshold, metric_kind, comparator, value, threshold,
 		    reason_code, reason_detail,
-		    resolver_addr, resolver_protocol, stun_addr, stun_transport, proxy_id, proxy_type, proxy_addr,
+		    resolver_addr, resolver_protocol, stun_addr, stun_transport,
+		    proxy_id, proxy_type, proxy_addr, proxy_config_serial,
 		    rounds_json, observed_at, confirmed_at, incident_id)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'firing', ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'firing', ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		sig.ID, sig.SiteID, sig.AgentID, sig.TargetID, sig.DetectorKey, sig.ProbeKind,
 		sig.GroupID, sig.GroupName, sig.TargetName, sig.TargetAddr, port, sig.AgentName, sig.Layer, sig.Severity,
 		sig.FailThreshold, sig.RecoverThreshold, sig.MetricKind, sig.Comparator, sig.Value, sig.Threshold,
 		sig.ReasonCode, sig.ReasonDetail,
 		sig.ResolverAddr, sig.ResolverProtocol, sig.StunAddr, sig.StunTransport,
-		sig.ProxyID, sig.ProxyType, sig.ProxyAddr,
+		sig.ProxyID, sig.ProxyType, sig.ProxyAddr, sig.ProxyConfigSerial,
 		roundsJSON, sig.ObservedAt, sig.ConfirmedAt, sig.IncidentID)
 	return err
 }

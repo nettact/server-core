@@ -23,6 +23,9 @@ func TestPlanTracePicksTheSubjectThatCarriedTheProbe(t *testing.T) {
 		wantMode    string
 		wantPort    int
 		wantReason  string // subjectReason
+		wantScope   string // pathScope; "" asserts direct
+		wantEgress  string // egressID; paired with wantSerial on in-tunnel plans
+		wantSerial  int
 	}{
 		// Direct probes keep tracing their own target.
 		{
@@ -119,14 +122,40 @@ func TestPlanTracePicksTheSubjectThatCarriedTheProbe(t *testing.T) {
 			evd: traceEvidence{probeKind: "icmp", targetAddr: "10.7.0.5", reasonCode: telemetry.ProbeReasonProxyConnect,
 				proxyID: "px_3", proxyType: pcfg.ProxyTypeWireGuard, proxyAddr: "vpn.example:51820"},
 			wantSubject: traceSubjectWGEndpoint, wantHost: "vpn.example", wantMode: pcfg.TraceModeICMP,
-			wantReason: subjectTunnelUnreachable,
+			wantReason: subjectTunnelUnreachable, wantScope: pathScopeWGPhysical,
 		},
 		{
-			name: "a target failure beyond a working tunnel traces the peer as context",
+			name: "a target failure beyond a working tunnel traces INSIDE the tunnel",
+			// The tunnel carried the probe, so the fault's own path is the in-tunnel
+			// one: subject is the target itself, path_scope marks the hops as
+			// in-tunnel, and the plan pins the exact egress generation the fault froze.
 			evd: traceEvidence{probeKind: "icmp", targetAddr: "10.7.0.5", reasonCode: telemetry.ProbeReasonTimeout,
-				proxyID: "px_3", proxyType: pcfg.ProxyTypeWireGuard, proxyAddr: "vpn.example:51820"},
+				proxyID: "px_3", proxyType: pcfg.ProxyTypeWireGuard, proxyAddr: "vpn.example:51820",
+				proxyConfigSerial: 7},
+			wantSubject: traceSubjectTarget, wantHost: "10.7.0.5", wantMode: pcfg.TraceModeICMP,
+			wantReason: subjectTunnelTargetUnreachable, wantScope: pathScopeWGInner,
+			wantEgress: "px_3", wantSerial: 7,
+		},
+		{
+			name: "an http fault beyond the tunnel derives its in-tunnel host from the URL",
+			evd: traceEvidence{probeKind: "http", targetAddr: "https://app.internal:8443/health",
+				reasonCode: telemetry.ProbeReasonTimeout,
+				proxyID:    "px_3", proxyType: pcfg.ProxyTypeWireGuard, proxyAddr: "vpn.example:51820",
+				proxyConfigSerial: 7},
+			wantSubject: traceSubjectTarget, wantHost: "app.internal", wantMode: pcfg.TraceModeICMP,
+			wantReason: subjectTunnelTargetUnreachable, wantScope: pathScopeWGInner,
+			wantEgress: "px_3", wantSerial: 7,
+		},
+		{
+			name: "an underivable in-tunnel destination falls back to the physical peer",
+			// The degenerate case: the tunnel worked, but the frozen evidence cannot
+			// name what the probe dialed inside it. The peer's physical path is coarse
+			// but honest — and it must be labelled as physical, never as in-tunnel.
+			evd: traceEvidence{probeKind: "icmp", targetAddr: "", reasonCode: telemetry.ProbeReasonTimeout,
+				proxyID: "px_3", proxyType: pcfg.ProxyTypeWireGuard, proxyAddr: "vpn.example:51820",
+				proxyConfigSerial: 7},
 			wantSubject: traceSubjectWGEndpoint, wantHost: "vpn.example", wantMode: pcfg.TraceModeICMP,
-			wantReason: subjectTunnelTargetUnreachable,
+			wantReason: subjectTunnelTargetUnreachable, wantScope: pathScopeWGPhysical,
 		},
 		{
 			name: "an unusable proxy pin is not reported as a tunnel outage",
@@ -135,7 +164,7 @@ func TestPlanTracePicksTheSubjectThatCarriedTheProbe(t *testing.T) {
 			evd: traceEvidence{probeKind: "icmp", targetAddr: "10.7.0.5", reasonCode: telemetry.ProbeReasonProxyConfig,
 				proxyID: "px_3", proxyType: pcfg.ProxyTypeWireGuard, proxyAddr: "vpn.example:51820"},
 			wantSubject: traceSubjectWGEndpoint, wantHost: "vpn.example", wantMode: pcfg.TraceModeICMP,
-			wantReason: subjectTunnelNotAttempted,
+			wantReason: subjectTunnelNotAttempted, wantScope: pathScopeWGPhysical,
 		},
 		{
 			name: "a rejected relay through the tunnel is a tunnel failure",
@@ -143,7 +172,7 @@ func TestPlanTracePicksTheSubjectThatCarriedTheProbe(t *testing.T) {
 				reasonCode: telemetry.ProbeReasonProxyRefused,
 				proxyID:    "px_3", proxyType: pcfg.ProxyTypeWireGuard, proxyAddr: "vpn.example:51820"},
 			wantSubject: traceSubjectWGEndpoint, wantHost: "vpn.example", wantMode: pcfg.TraceModeICMP,
-			wantReason: subjectTunnelUnreachable,
+			wantReason: subjectTunnelUnreachable, wantScope: pathScopeWGPhysical,
 		},
 		{
 			name: "an unclassified tunnelled fault asserts neither tunnel verdict",
@@ -154,7 +183,7 @@ func TestPlanTracePicksTheSubjectThatCarriedTheProbe(t *testing.T) {
 				stunAddr: "stun.example:3478", stunTransport: "udp",
 				proxyID: "px_3", proxyType: pcfg.ProxyTypeWireGuard, proxyAddr: "vpn.example:51820"},
 			wantSubject: traceSubjectWGEndpoint, wantHost: "vpn.example", wantMode: pcfg.TraceModeICMP,
-			wantReason: "",
+			wantReason: "", wantScope: pathScopeWGPhysical,
 		},
 	}
 	for _, c := range cases {
@@ -172,6 +201,16 @@ func TestPlanTracePicksTheSubjectThatCarriedTheProbe(t *testing.T) {
 			}
 			if d.subjectReason != c.wantReason {
 				t.Fatalf("plan subjectReason=%q, want %q", d.subjectReason, c.wantReason)
+			}
+			wantScope := c.wantScope
+			if wantScope == "" {
+				wantScope = pathScopeDirect
+			}
+			if d.pathScope != wantScope {
+				t.Fatalf("plan pathScope=%q, want %q", d.pathScope, wantScope)
+			}
+			if d.egressID != c.wantEgress || d.egressConfigSerial != c.wantSerial {
+				t.Fatalf("plan egress=%q/%d, want %q/%d", d.egressID, d.egressConfigSerial, c.wantEgress, c.wantSerial)
 			}
 		})
 	}
@@ -369,7 +408,10 @@ func TestCohortSeparatesOpposingTunnelVerdicts(t *testing.T) {
 	tunnelDown.reasonCode = telemetry.ProbeReasonProxyConnect
 	seedSubjectEvidence(t, db, "sig_1", tunnelDown)
 
-	seedEvidence(t, db, "sig_2", "icmp", "10.7.0.6", 0, "probe.icmp.loss_pct")
+	// The target-side fault carries no derivable in-tunnel destination (empty
+	// frozen address), so it degenerates to the SAME peer endpoint as sig_1 —
+	// which is exactly the collision this test exists to keep apart.
+	seedEvidence(t, db, "sig_2", "icmp", "", 0, "probe.icmp.loss_pct")
 	targetDown := wg
 	targetDown.reasonCode = telemetry.ProbeReasonTimeout
 	seedSubjectEvidence(t, db, "sig_2", targetDown)
@@ -468,6 +510,10 @@ func TestTraceReadsIncludeSubjectFields(t *testing.T) {
 		t.Fatalf("summary subject=%s/%s, want wg_endpoint/tunnel_unreachable",
 			sums[0].SubjectKind, sums[0].SubjectReason)
 	}
+	if sums[0].PathScope != pathScopeWGPhysical || sums[0].EgressID != "" || sums[0].EgressConfigSerial != 0 {
+		t.Fatalf("summary path=%s egress=%q/%d, want wireguard_physical with no egress pin",
+			sums[0].PathScope, sums[0].EgressID, sums[0].EgressConfigSerial)
+	}
 	view, _, ok, err := svc.TraceReport(ctx, sums[0].ReportID)
 	if err != nil || !ok {
 		t.Fatalf("TraceReport ok=%v err=%v", ok, err)
@@ -475,5 +521,62 @@ func TestTraceReadsIncludeSubjectFields(t *testing.T) {
 	if view.SubjectKind != traceSubjectWGEndpoint || view.SubjectReason != subjectTunnelUnreachable {
 		t.Fatalf("report view subject=%s/%s, want wg_endpoint/tunnel_unreachable",
 			view.SubjectKind, view.SubjectReason)
+	}
+	if view.PathScope != pathScopeWGPhysical || view.EgressID != "" || view.EgressConfigSerial != 0 {
+		t.Fatalf("report view path=%s egress=%q/%d, want wireguard_physical with no egress pin",
+			view.PathScope, view.EgressID, view.EgressConfigSerial)
+	}
+}
+
+// A target failure beyond a working tunnel must produce an IN-TUNNEL report end
+// to end: the row freezes the frozen target as its own destination with the
+// egress generation pinned, and the pushed wire request carries that pin so the
+// agent runs the probes inside the tunnel — not toward the peer's public
+// endpoint, which DIAG-003 used to trace as the nearest available evidence.
+func TestTunnelTargetFaultDispatchesAnInTunnelTrace(t *testing.T) {
+	db, ctx := openIncidentOpsTest(t)
+	seedIncidentSignal(t, db, "inc_1", "sig_1", "agent_a", "firing")
+	setAgentPerms(t, db, "agent_a",
+		[]permission.ID{permission.DiagnosticTracerouteICMP},
+		[]permission.ID{permission.DiagnosticTracerouteICMP},
+		[]permission.ID{permission.DiagnosticTracerouteICMP})
+	seedEvidence(t, db, "sig_1", "icmp", "10.7.0.5", 0, "probe.icmp.loss_pct")
+	seedSubjectEvidence(t, db, "sig_1", traceEvidence{
+		reasonCode: telemetry.ProbeReasonTimeout,
+		proxyID:    "px_1", proxyType: pcfg.ProxyTypeWireGuard, proxyAddr: "vpn.example:51820",
+		proxyConfigSerial: 7,
+	})
+
+	svc := New(db, nil, settings.New(db), nil)
+	pusher := &capturePusher{}
+	svc.SetPusher(pusher)
+	if err := svc.OnSignalConfirmed(ctx, fault.SignalEvent{
+		SignalID: "sig_1", IncidentID: "inc_1", AgentID: "agent_a", SiteID: "site_default",
+	}); err != nil {
+		t.Fatalf("on fault confirmed: %v", err)
+	}
+
+	var subject, host, scope, egressID string
+	var serial int
+	if err := db.QueryRowContext(ctx,
+		`SELECT subject_kind, dest_host, path_scope, egress_id, egress_config_serial FROM trace_reports`).
+		Scan(&subject, &host, &scope, &egressID, &serial); err != nil {
+		t.Fatalf("read report: %v", err)
+	}
+	if subject != traceSubjectTarget || host != "10.7.0.5" || scope != pathScopeWGInner {
+		t.Fatalf("report subject=%s host=%s path=%s, want target/10.7.0.5/wireguard_inner", subject, host, scope)
+	}
+	if egressID != "px_1" || serial != 7 {
+		t.Fatalf("report egress=%q/%d, want the frozen px_1/7", egressID, serial)
+	}
+	if len(pusher.traces) != 1 {
+		t.Fatalf("pushed %d requests, want 1", len(pusher.traces))
+	}
+	req := pusher.traces[0]
+	if req.EgressProxyID != "px_1" || req.EgressConfigSerial != 7 {
+		t.Fatalf("wire request egress=%q/%d, want px_1/7", req.EgressProxyID, req.EgressConfigSerial)
+	}
+	if req.Mode != pcfg.TraceModeICMP || req.DestinationHost != "10.7.0.5" {
+		t.Fatalf("wire request mode=%s dest=%s, want icmp/10.7.0.5", req.Mode, req.DestinationHost)
 	}
 }

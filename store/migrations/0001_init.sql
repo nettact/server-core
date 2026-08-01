@@ -488,6 +488,10 @@ CREATE TABLE fault_signals(
   proxy_id          TEXT NOT NULL DEFAULT '',           -- egress pin at fault time ('' = direct)
   proxy_type        TEXT NOT NULL DEFAULT '',           -- socks5 | http | wireguard
   proxy_addr        TEXT NOT NULL DEFAULT '',           -- socks5/http "host:port"; wireguard peer endpoint
+  -- The pinned proxy's config generation at fault time. An in-tunnel trace is
+  -- pinned to exactly this generation so a key rotated between fault and
+  -- diagnosis can never be re-enabled to carry the probes (0 = no pin).
+  proxy_config_serial INTEGER NOT NULL DEFAULT 0,
   -- Every round of the confirming streak, not just the last one: a JSON array of
   -- {ts, metric_kind, value, reason_code, reason_detail}. The columns above are
   -- the confirming round's summary; a streak that timed out twice and was then
@@ -657,15 +661,32 @@ CREATE TABLE trace_reports(
   -- '' | tunnel_unreachable | tunnel_target_unreachable | tunnel_not_attempted.
   -- Empty on a WireGuard subject means the fault carried no classified cause, so
   -- no verdict is asserted (a NAT monitor never produces one).
-  subject_reason  TEXT NOT NULL DEFAULT ''
+  subject_reason  TEXT NOT NULL DEFAULT '',
+  -- WHICH PATH the probes travel, orthogonal to subject_kind (which says who is
+  -- being measured): direct host stack, the host-stack path toward a WireGuard
+  -- peer's physical endpoint, or hop-by-hop INSIDE the tunnel. An in-tunnel
+  -- report and a physical-endpoint report about the same tunnel must never
+  -- render alike — their hops describe different networks.
+  path_scope           TEXT NOT NULL DEFAULT 'direct'
+                       CHECK(path_scope IN('direct','wireguard_physical','wireguard_inner')),
+  -- The exact proxy generation an in-tunnel trace is pinned to, frozen from the
+  -- fault evidence. The agent must match both ID and serial or fail closed —
+  -- never a rotated key, never the host stack — and ingest rejects a result
+  -- whose attestation disagrees. '' / 0 on every host-stack report.
+  egress_id            TEXT NOT NULL DEFAULT '',
+  egress_config_serial INTEGER NOT NULL DEFAULT 0
 );
 -- The subject columns are part of the key: the same host is a different
 -- diagnosis as a resolver than as a monitored target, and a WireGuard peer
 -- traced because the tunnel is down is a different conclusion from one traced
 -- because the tunnel worked. Merging either pair would answer one fault with
 -- another fault's evidence, since a report freezes one subject and one reason.
+-- The path columns are part of the key for the same reason one level down: two
+-- WireGuard tunnels can both contain 10.0.0.10, and the same in-tunnel address
+-- traced through different tunnels — or different generations of one tunnel —
+-- is a different execution with a different answer.
 CREATE UNIQUE INDEX idx_trace_singleflight
-  ON trace_reports(agent_id, dest_key, mode, port, subject_kind, subject_reason) WHERE cohort_open=1;
+  ON trace_reports(agent_id, dest_key, mode, port, subject_kind, subject_reason, path_scope, egress_id, egress_config_serial) WHERE cohort_open=1;
 CREATE INDEX idx_trace_status ON trace_reports(status);
 
 CREATE TABLE trace_hops(

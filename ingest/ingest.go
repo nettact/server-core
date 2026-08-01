@@ -292,7 +292,7 @@ func (s *Service) probeMeta(ctx context.Context, q rowQuerier, agentID, siteID s
 		       ms.source, ms.target_config_serial, ms.effective_interval_seconds,
 		       ms.cycle_deadline_ms, ms.upload_interval_seconds,
 		       COALESCE(pt.proxy_id,''), COALESCE(px.type,''), COALESCE(px.host,''),
-		       COALESCE(px.port,0), COALESCE(px.wg_endpoint,'')
+		       COALESCE(px.port,0), COALESCE(px.wg_endpoint,''), COALESCE(px.config_serial,0)
 		FROM probe_tasks pt
 		LEFT JOIN probe_detection_settings ds ON ds.target_id = pt.id
 		LEFT JOIN monitor_status ms ON ms.monitor_id = pt.id AND ms.agent_id = ?
@@ -320,7 +320,7 @@ func (s *Service) probeMeta(ctx context.Context, q rowQuerier, agentID, siteID s
 			&m.Det.FailRounds, &m.Det.RecoverRounds, &m.Det.ICMPLossPct, &m.Det.Revision,
 			&sched.source, &sched.configSerial, &sched.intervalSeconds,
 			&sched.cycleDeadlineMs, &sched.uploadSeconds,
-			&m.ProxyID, &m.ProxyType, &proxyHost, &proxyPort, &wgEndpoint); err != nil {
+			&m.ProxyID, &m.ProxyType, &proxyHost, &proxyPort, &wgEndpoint, &m.ProxyConfigSerial); err != nil {
 			return nil, err
 		}
 		m.Enabled = enabled == 1

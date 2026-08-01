@@ -109,17 +109,25 @@ type TraceSummary struct {
 	FallbackReason string `json:"fallback_reason,omitempty"` // 'raw_socket_unavailable'|'permission_denied'
 	// SubjectKind names what DestHost is, which is not always the monitored target:
 	// 'target'|'resolver'|'proxy'|'wg_endpoint'|'stun_server'. SubjectReason
-	// qualifies a WireGuard endpoint trace ('tunnel_unreachable' = the probe never
+	// qualifies a WireGuard trace ('tunnel_unreachable' = the probe never
 	// crossed the tunnel; 'tunnel_target_unreachable' = it did and the target
-	// failed beyond it, so this path is context rather than the fault's own).
-	// Without these a resolver trace and a target trace read identically.
-	SubjectKind   string     `json:"subject_kind"`
-	SubjectReason string     `json:"subject_reason,omitempty"`
-	ActiveRefs    int        `json:"active_refs"`
-	RequestedAt    time.Time  `json:"requested_at"`
-	StartedAt      *time.Time `json:"started_at"`
-	CompletedAt    *time.Time `json:"completed_at"`
-	DeadlineAt     time.Time  `json:"deadline_at"`
+	// failed beyond it). Without these a resolver trace and a target trace read
+	// identically.
+	SubjectKind   string `json:"subject_kind"`
+	SubjectReason string `json:"subject_reason,omitempty"`
+	// PathScope says which path the hops describe, orthogonal to the subject:
+	// 'direct'|'wireguard_physical'|'wireguard_inner'. An in-tunnel report
+	// carries the egress generation it ran through in EgressID/EgressConfigSerial
+	// ('' / 0 on every host-stack report) — without the scope, in-tunnel hops and
+	// host-stack hops toward the same address would render identically.
+	PathScope          string     `json:"path_scope"`
+	EgressID           string     `json:"egress_id,omitempty"`
+	EgressConfigSerial int        `json:"egress_config_serial,omitempty"`
+	ActiveRefs         int        `json:"active_refs"`
+	RequestedAt        time.Time  `json:"requested_at"`
+	StartedAt          *time.Time `json:"started_at"`
+	CompletedAt        *time.Time `json:"completed_at"`
+	DeadlineAt         time.Time  `json:"deadline_at"`
 }
 
 // TracesForIncident returns the traceroute reports referenced by an incident,
@@ -130,6 +138,7 @@ func (s *Service) TracesForIncident(ctx context.Context, incidentID string) ([]T
 		       tr.port, tr.status, COALESCE(tr.reason,''), tr.reached, tr.reached_ttl,
 		       COALESCE(tr.fallback_from,''), COALESCE(tr.fallback_reason,''),
 		       COALESCE(tr.subject_kind,''), COALESCE(tr.subject_reason,''),
+		       tr.path_scope, tr.egress_id, tr.egress_config_serial,
 		       (SELECT COUNT(*) FROM trace_report_refs r2 WHERE r2.report_id=tr.id AND r2.incident_id=? AND r2.active=1),
 		       tr.requested_at, tr.started_at, tr.completed_at, tr.deadline_at
 		FROM trace_reports tr
@@ -157,6 +166,7 @@ func scanTraceSummary(rows *sql.Rows) (TraceSummary, error) {
 	if err := rows.Scan(&t.ReportID, &t.AgentID, &t.AgentName, &t.Mode, &t.DestHost, &t.DestIP,
 		&t.Port, &t.Status, &t.Reason, &reached, &t.ReachedTTL, &t.FallbackFrom, &t.FallbackReason,
 		&t.SubjectKind, &t.SubjectReason,
+		&t.PathScope, &t.EgressID, &t.EgressConfigSerial,
 		&t.ActiveRefs, &t.RequestedAt, &started, &completed, &t.DeadlineAt); err != nil {
 		return TraceSummary{}, err
 	}
@@ -199,11 +209,13 @@ func (s *Service) TraceReport(ctx context.Context, reportID string) (TraceReport
 		SELECT id, site_id, agent_id, COALESCE(agent_name,''), mode, dest_host, COALESCE(dest_ip,''), port,
 		       status, COALESCE(reason,''), reached, reached_ttl, COALESCE(fallback_from,''), COALESCE(fallback_reason,''),
 		       COALESCE(subject_kind,''), COALESCE(subject_reason,''),
+		       path_scope, egress_id, egress_config_serial,
 		       requested_at, started_at, completed_at, deadline_at
 		FROM trace_reports WHERE id=?`, reportID).
 		Scan(&v.ReportID, &siteID, &v.AgentID, &v.AgentName, &v.Mode, &v.DestHost, &v.DestIP, &v.Port,
 			&v.Status, &v.Reason, &reached, &v.ReachedTTL, &v.FallbackFrom, &v.FallbackReason,
 			&v.SubjectKind, &v.SubjectReason,
+			&v.PathScope, &v.EgressID, &v.EgressConfigSerial,
 			&v.RequestedAt, &started, &completed, &v.DeadlineAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return TraceReportView{}, "", false, nil

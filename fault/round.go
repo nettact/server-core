@@ -121,6 +121,10 @@ type TargetMeta struct {
 	ProxyType string // socks5 | http | wireguard
 	// ProxyAddr is "host:port" for socks5/http and the peer endpoint for wireguard.
 	ProxyAddr string
+	// ProxyConfigSerial is the pin's config generation. Frozen so an in-tunnel
+	// diagnostic can demand exactly the generation that carried the failing
+	// probes — a key rotated after the fault must never be re-enabled for it.
+	ProxyConfigSerial int
 	// MaxRoundGap is how far apart two rounds may be and still count as
 	// consecutive. Zero falls back to the kind's default schedule (see
 	// maxRoundGap), so a caller that does not set it still gets a sane bound

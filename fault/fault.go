@@ -219,30 +219,30 @@ type Signal struct {
 	ID string `json:"id"`
 	// Title is the rendered standard statement (see SignalTitle), computed on read
 	// so the stored row keeps only structured facts.
-	Title             string     `json:"title"`
-	SiteID            string     `json:"site_id"`
-	AgentID           string     `json:"agent_id"`
-	AgentName         string     `json:"agent_name"`
-	TargetID          string     `json:"target_id,omitempty"`
-	TargetName        string     `json:"target_name"`
-	TargetAddr        string     `json:"target_addr"`
-	Port              int        `json:"target_port,omitempty"`
-	DetectorKey       string     `json:"detector_key"`
-	ProbeKind         string     `json:"probe_kind"`
-	GroupID           string     `json:"group_id,omitempty"`
-	GroupName         string     `json:"group_name"`
-	Layer             string     `json:"layer"`
-	Severity          string     `json:"severity"`
-	State             string     `json:"state"`
-	ResolveReason     string     `json:"resolve_reason,omitempty"`
-	FailThreshold     int        `json:"fail_threshold"`
-	RecoverThreshold  int        `json:"recover_threshold"`
-	MetricKind        string     `json:"metric_kind"`
-	Comparator        string     `json:"comparator"`
-	Value             float64    `json:"value"`
-	Threshold         float64    `json:"threshold"`
-	ReasonCode        int        `json:"reason_code"`
-	ReasonDetail      string     `json:"reason_detail"`
+	Title            string  `json:"title"`
+	SiteID           string  `json:"site_id"`
+	AgentID          string  `json:"agent_id"`
+	AgentName        string  `json:"agent_name"`
+	TargetID         string  `json:"target_id,omitempty"`
+	TargetName       string  `json:"target_name"`
+	TargetAddr       string  `json:"target_addr"`
+	Port             int     `json:"target_port,omitempty"`
+	DetectorKey      string  `json:"detector_key"`
+	ProbeKind        string  `json:"probe_kind"`
+	GroupID          string  `json:"group_id,omitempty"`
+	GroupName        string  `json:"group_name"`
+	Layer            string  `json:"layer"`
+	Severity         string  `json:"severity"`
+	State            string  `json:"state"`
+	ResolveReason    string  `json:"resolve_reason,omitempty"`
+	FailThreshold    int     `json:"fail_threshold"`
+	RecoverThreshold int     `json:"recover_threshold"`
+	MetricKind       string  `json:"metric_kind"`
+	Comparator       string  `json:"comparator"`
+	Value            float64 `json:"value"`
+	Threshold        float64 `json:"threshold"`
+	ReasonCode       int     `json:"reason_code"`
+	ReasonDetail     string  `json:"reason_detail"`
 	// The endpoint the failing probe actually talked to, frozen alongside the rest
 	// of the evidence. A DNS monitor dials a resolver, a NAT monitor a STUN server,
 	// a pinned monitor its proxy — none of which is TargetAddr — so this is what a
@@ -255,6 +255,10 @@ type Signal struct {
 	ProxyID          string `json:"proxy_id,omitempty"`
 	ProxyType        string `json:"proxy_type,omitempty"`
 	ProxyAddr        string `json:"proxy_addr,omitempty"`
+	// ProxyConfigSerial pins the egress generation the failing probes ran under,
+	// so an in-tunnel diagnostic can demand exactly that generation rather than
+	// whatever the proxy has been rotated to since.
+	ProxyConfigSerial int `json:"proxy_config_serial,omitempty"`
 
 	ObservedAt        time.Time  `json:"observed_at"`
 	ConfirmedAt       time.Time  `json:"confirmed_at"`
