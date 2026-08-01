@@ -43,16 +43,27 @@ func Apply(ctx context.Context, tx *sql.Tx, agentID, siteID string, runs []games
 	// WAL would otherwise still land here — storing frame data the operator has
 	// since revoked. The effective set is the intersection the agent reported, so a
 	// build or platform that cannot capture frames also fails this test.
-	ok, err := hasGamePermission(ctx, tx, agentID)
+	//
+	// Read once for the whole packet rather than per bucket: it is the same row for
+	// every second in the batch, and a batch commonly carries a minute of them.
+	perms, err := agentPermissions(ctx, tx, agentID)
 	if err != nil {
 		return res, err
 	}
-	if !ok {
+	if !perms.Has(permission.GamePerformanceRead) {
 		res.Denied = true
 		log.Printf("gamedata: dropped %d run(s) and %d bucket(s) from agent %s without %s",
 			len(runs), len(buckets), agentID, permission.GamePerformanceRead)
 		return res, nil
 	}
+	// The adapter telemetry is a second, narrower read. Frame timings come from the
+	// game's own presentation, while GPU utilization and VRAM describe the card and
+	// every process sharing it — so an operator can grant the first and withhold the
+	// second, and a WAL that drained after that narrowing must not smuggle the
+	// difference in. Only those two blocks are stripped: the CPU/GPU splits, the
+	// latency figures and the busiest core are all derived from the frame stream
+	// this agent is already allowed to read.
+	gpuOK := perms.Has(permission.GameGPURead)
 
 	for _, run := range runs {
 		if run.ID == "" {
@@ -73,10 +84,21 @@ func Apply(ctx context.Context, tx *sql.Tx, agentID, siteID string, runs []games
 		return res, err
 	}
 	deltas := map[string]*runDelta{}
+	stripped := 0
 	for _, b := range buckets {
 		if !known[b.RunID] || !knownLayout(b.Hist) {
 			res.Rejected++
 			continue
+		}
+		// b is a copy, so clearing the blocks here affects what this packet stores and
+		// nothing the caller still holds. The bucket is not rejected over it: the
+		// second's frame data is permitted and worth keeping — only the part the
+		// policy withholds goes missing, which is exactly the NULL that means "not
+		// measured" everywhere else in this table.
+		if !gpuOK && (b.GPUTel != nil || b.ProcVRAM != nil) {
+			b.GPUTel = nil
+			b.ProcVRAM = nil
+			stripped++
 		}
 		stored, err := insertBucket(ctx, tx, b)
 		if err != nil {
@@ -97,23 +119,26 @@ func Apply(ctx context.Context, tx *sql.Tx, agentID, siteID string, runs []games
 	if res.Rejected > 0 {
 		log.Printf("gamedata: rejected %d bucket(s) from agent %s (unknown run or histogram layout)", res.Rejected, agentID)
 	}
+	if stripped > 0 {
+		log.Printf("gamedata: stripped GPU telemetry from %d bucket(s) of agent %s without %s",
+			stripped, agentID, permission.GameGPURead)
+	}
 	return res, nil
 }
 
-// hasGamePermission reports whether the agent's reported effective set includes
-// the frame-data permission. An agent row that has vanished mid-batch simply
-// fails the test rather than erroring: there is nothing left to attribute the data
-// to.
-func hasGamePermission(ctx context.Context, tx *sql.Tx, agentID string) (bool, error) {
+// agentPermissions returns the agent's reported effective set. An agent row that
+// has vanished mid-batch yields the empty set rather than an error: there is
+// nothing left to attribute the data to, so it fails every test below on its own.
+func agentPermissions(ctx context.Context, tx *sql.Tx, agentID string) (permission.Set, error) {
 	var effective string
 	err := tx.QueryRowContext(ctx, `SELECT COALESCE(perm_effective,'[]') FROM agents WHERE id=?`, agentID).Scan(&effective)
 	if errors.Is(err, sql.ErrNoRows) {
-		return false, nil
+		return permission.Set{}, nil
 	}
 	if err != nil {
-		return false, err
+		return permission.Set{}, err
 	}
-	return permission.FromStrings(decodeStrings(effective)).Has(permission.GamePerformanceRead), nil
+	return permission.FromStrings(decodeStrings(effective)), nil
 }
 
 // knownLayout reports whether this histogram is one this build can interpret.
@@ -253,6 +278,66 @@ func insertBucket(ctx context.Context, tx *sql.Tx, b gamesense.Bucket) (bool, er
 		procWS = nullUint64(b.ProcRes.WSBytes)
 		procPriv = nullUint64(b.ProcRes.PrivBytes)
 	}
+
+	// The diag blocks. The three frame-derived ones are written whole or not at
+	// all, matching how the sensor acquires them — a group is registered when the
+	// session opens and either produces every figure in it or none — so each
+	// group's columns share one presence and the group's first column is what a
+	// reader tests. Zeros inside a present block are measurements: a second in
+	// which the game waited on nothing really did wait zero milliseconds.
+	var (
+		cpuBusyAvg, cpuBusyP95, cpuWaitAvg, cpuWaitP95 sql.NullFloat64
+		gpuLatencyAvg, gpuTimeAvg, gpuTimeP95          sql.NullFloat64
+		gpuBusyAvg, gpuBusyP95, gpuWaitAvg             sql.NullFloat64
+		gpuInPresentAvg, gpuRenderLatencyAvg           sql.NullFloat64
+		latDisplayAvg, latAnimErrAvg, latAnimErrP95    sql.NullFloat64
+		gpuUtilPct                                     sql.NullFloat64
+		gpuMemUsed, gpuMemSize                         sql.NullInt64
+		vramUsed, vramBudget                           sql.NullInt64
+		busiestCore                                    sql.NullFloat64
+	)
+	if c := b.CPUSplit; c != nil {
+		cpuBusyAvg = nullFloat(c.BusyAvg, true)
+		cpuBusyP95 = nullFloat(c.BusyP95, true)
+		cpuWaitAvg = nullFloat(c.WaitAvg, true)
+		cpuWaitP95 = nullFloat(c.WaitP95, true)
+	}
+	if g := b.GPUSplit; g != nil {
+		gpuLatencyAvg = nullFloat(g.LatencyAvg, true)
+		gpuTimeAvg = nullFloat(g.TimeAvg, true)
+		gpuTimeP95 = nullFloat(g.TimeP95, true)
+		gpuBusyAvg = nullFloat(g.BusyAvg, true)
+		gpuBusyP95 = nullFloat(g.BusyP95, true)
+		gpuWaitAvg = nullFloat(g.WaitAvg, true)
+		gpuInPresentAvg = nullFloat(g.InPresentAvg, true)
+		gpuRenderLatencyAvg = nullFloat(g.RenderLatencyAvg, true)
+	}
+	if l := b.Latency; l != nil {
+		latDisplayAvg = nullFloat(l.DisplayAvg, true)
+		latAnimErrAvg = nullFloat(l.AnimErrAvg, true)
+		latAnimErrP95 = nullFloat(l.AnimErrP95, true)
+	}
+	// Adapter telemetry breaks that rule on purpose: which figures a driver
+	// publishes varies by vendor, so each column carries its own presence the way
+	// the proc_res readings do.
+	if g := b.GPUTel; g != nil {
+		if g.UtilPct != nil {
+			gpuUtilPct = nullFloat(*g.UtilPct, true)
+		}
+		gpuMemUsed = nullUint64(g.MemUsed)
+		gpuMemSize = nullUint64(g.MemSize)
+	}
+	// Used is unconditional for a present block — it is what says the read
+	// happened — while the budget stays optional, since an OS that does not
+	// publish one still leaves the level worth recording.
+	if v := b.ProcVRAM; v != nil {
+		vramUsed = nullUint64(&v.Used)
+		vramBudget = nullUint64(v.Budget)
+	}
+	if b.BusiestCorePct != nil {
+		busiestCore = nullFloat(*b.BusiestCorePct, true)
+	}
+
 	res, err := tx.ExecContext(ctx, `
 		INSERT OR IGNORE INTO game_buckets(
 			run_id, ts, presented, displayed, dropped, app_frames, generated_frames,
@@ -260,8 +345,15 @@ func insertBucket(ctx context.Context, tx *sql.Tx, b gamesense.Bucket) (bool, er
 			hist_layout, hist, disp_ft_avg, disp_ft_p95,
 			present_mode, sync_interval, tearing, api, present_changed,
 			stutter_count, stutter_excess_ms,
-			proc_cpu_pct, proc_ws_bytes, proc_priv_bytes, quality)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+			proc_cpu_pct, proc_ws_bytes, proc_priv_bytes,
+			cpu_busy_avg, cpu_busy_p95, cpu_wait_avg, cpu_wait_p95,
+			gpu_latency_avg, gpu_time_avg, gpu_time_p95, gpu_busy_avg, gpu_busy_p95,
+			gpu_wait_avg, gpu_in_present_avg, gpu_render_latency_avg,
+			lat_display_avg, lat_anim_err_avg, lat_anim_err_p95,
+			gpu_util_pct, gpu_mem_used, gpu_mem_size,
+			proc_vram_used, proc_vram_budget, busiest_core_pct, quality)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,
+		       ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		b.RunID, b.TS.Unix(), b.Frames.Presented,
 		nullInt(b.Frames.Displayed), nullInt(b.Frames.Dropped),
 		nullInt(b.Frames.App), nullInt(b.Frames.Generated),
@@ -269,7 +361,13 @@ func insertBucket(ctx context.Context, tx *sql.Tx, b gamesense.Bucket) (bool, er
 		b.Hist.Layout, encodeHist(b.Hist.Counts), dispAvg, dispP95,
 		mode, sync, tearing, api, presentChanged,
 		stutterCount, stutterExcess,
-		procCPU, procWS, procPriv, encodeStrings(b.Quality))
+		procCPU, procWS, procPriv,
+		cpuBusyAvg, cpuBusyP95, cpuWaitAvg, cpuWaitP95,
+		gpuLatencyAvg, gpuTimeAvg, gpuTimeP95, gpuBusyAvg, gpuBusyP95,
+		gpuWaitAvg, gpuInPresentAvg, gpuRenderLatencyAvg,
+		latDisplayAvg, latAnimErrAvg, latAnimErrP95,
+		gpuUtilPct, gpuMemUsed, gpuMemSize,
+		vramUsed, vramBudget, busiestCore, encodeStrings(b.Quality))
 	if err != nil {
 		return false, err
 	}

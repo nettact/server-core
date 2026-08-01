@@ -306,7 +306,13 @@ func (s *Service) ListBuckets(ctx context.Context, runID string, f BucketFilter)
 		         hist_layout, hist, disp_ft_avg, disp_ft_p95,
 		         present_mode, sync_interval, tearing, api, present_changed,
 		         stutter_count, stutter_excess_ms,
-		         proc_cpu_pct, proc_ws_bytes, proc_priv_bytes, quality
+		         proc_cpu_pct, proc_ws_bytes, proc_priv_bytes,
+		         cpu_busy_avg, cpu_busy_p95, cpu_wait_avg, cpu_wait_p95,
+		         gpu_latency_avg, gpu_time_avg, gpu_time_p95, gpu_busy_avg, gpu_busy_p95,
+		         gpu_wait_avg, gpu_in_present_avg, gpu_render_latency_avg,
+		         lat_display_avg, lat_anim_err_avg, lat_anim_err_p95,
+		         gpu_util_pct, gpu_mem_used, gpu_mem_size,
+		         proc_vram_used, proc_vram_budget, busiest_core_pct, quality
 		    FROM game_buckets WHERE run_id=?`
 	args := []any{runID}
 	if f.Since > 0 {
@@ -338,13 +344,29 @@ func (s *Service) ListBuckets(ctx context.Context, runID string, f BucketFilter)
 			stutterCount                  sql.NullInt64
 			stutterExcess, procCPU        sql.NullFloat64
 			procWS, procPriv              sql.NullInt64
+
+			cpuBusyAvg, cpuBusyP95, cpuWaitAvg, cpuWaitP95 sql.NullFloat64
+			gpuLatencyAvg, gpuTimeAvg, gpuTimeP95          sql.NullFloat64
+			gpuBusyAvg, gpuBusyP95, gpuWaitAvg             sql.NullFloat64
+			gpuInPresentAvg, gpuRenderLatencyAvg           sql.NullFloat64
+			latDisplayAvg, latAnimErrAvg, latAnimErrP95    sql.NullFloat64
+			gpuUtilPct                                     sql.NullFloat64
+			gpuMemUsed, gpuMemSize                         sql.NullInt64
+			vramUsed, vramBudget                           sql.NullInt64
+			busiestCore                                    sql.NullFloat64
 		)
 		if err := rows.Scan(&ts, &b.Frames.Presented, &displayed, &dropped, &app, &gen,
 			&b.FT.Avg, &b.FT.P50, &b.FT.P95, &b.FT.P99, &b.FT.Max, &b.FT.SD,
 			&b.Hist.Layout, &blob, &dispAvg, &dispP95,
 			&mode, &sync, &tearing, &api, &presentChanged,
 			&stutterCount, &stutterExcess,
-			&procCPU, &procWS, &procPriv, &quality); err != nil {
+			&procCPU, &procWS, &procPriv,
+			&cpuBusyAvg, &cpuBusyP95, &cpuWaitAvg, &cpuWaitP95,
+			&gpuLatencyAvg, &gpuTimeAvg, &gpuTimeP95, &gpuBusyAvg, &gpuBusyP95,
+			&gpuWaitAvg, &gpuInPresentAvg, &gpuRenderLatencyAvg,
+			&latDisplayAvg, &latAnimErrAvg, &latAnimErrP95,
+			&gpuUtilPct, &gpuMemUsed, &gpuMemSize,
+			&vramUsed, &vramBudget, &busiestCore, &quality); err != nil {
 			return nil, err
 		}
 		b.RunID = runID
@@ -389,6 +411,55 @@ func (s *Service) ListBuckets(ctx context.Context, runID string, f BucketFilter)
 				PrivBytes: uint64Ptr(procPriv),
 			}
 		}
+		// The diag blocks, each rebuilt on its own discriminator. The three
+		// frame-derived ones were written whole, so their first column answers for the
+		// group — and every figure inside comes back as stored, zeros included: a
+		// second whose frames waited on nothing measured a real zero, and dropping the
+		// block over it would erase the very finding "this second was not GPU-bound".
+		if cpuBusyAvg.Valid {
+			b.CPUSplit = &gamesense.CPUSplit{
+				BusyAvg: cpuBusyAvg.Float64, BusyP95: cpuBusyP95.Float64,
+				WaitAvg: cpuWaitAvg.Float64, WaitP95: cpuWaitP95.Float64,
+			}
+		}
+		if gpuLatencyAvg.Valid {
+			b.GPUSplit = &gamesense.GPUSplit{
+				LatencyAvg: gpuLatencyAvg.Float64,
+				TimeAvg:    gpuTimeAvg.Float64, TimeP95: gpuTimeP95.Float64,
+				BusyAvg: gpuBusyAvg.Float64, BusyP95: gpuBusyP95.Float64,
+				WaitAvg:          gpuWaitAvg.Float64,
+				InPresentAvg:     gpuInPresentAvg.Float64,
+				RenderLatencyAvg: gpuRenderLatencyAvg.Float64,
+			}
+		}
+		if latDisplayAvg.Valid {
+			b.Latency = &gamesense.Latency{
+				DisplayAvg: latDisplayAvg.Float64,
+				AnimErrAvg: latAnimErrAvg.Float64,
+				AnimErrP95: latAnimErrP95.Float64,
+			}
+		}
+		// Adapter telemetry has no discriminator column and needs none, exactly like
+		// the resource block above: its three readings are independent, so ANY of them
+		// says the poll happened. A poll that returned nothing at all told us nothing
+		// and comes back as the absence it was — which is also what an agent without
+		// game.gpu.read stores.
+		if gpuUtilPct.Valid || gpuMemUsed.Valid || gpuMemSize.Valid {
+			b.GPUTel = &gamesense.GPUTel{
+				UtilPct: float64Ptr(gpuUtilPct),
+				MemUsed: uint64Ptr(gpuMemUsed),
+				MemSize: uint64Ptr(gpuMemSize),
+			}
+		}
+		// The used level is the block: a budget alone would describe headroom against
+		// an unknown occupancy, which is not a reading of anything.
+		if vramUsed.Valid {
+			b.ProcVRAM = &gamesense.ProcVRAM{
+				Used:   uint64(vramUsed.Int64),
+				Budget: uint64Ptr(vramBudget),
+			}
+		}
+		b.BusiestCorePct = float64Ptr(busiestCore)
 		b.Quality = decodeStrings(quality.String)
 		out = append(out, b)
 	}

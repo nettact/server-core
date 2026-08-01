@@ -536,6 +536,65 @@ CREATE TABLE game_buckets(
   proc_cpu_pct REAL,               -- % of total CPU capacity (all cores), 0-100
   proc_ws_bytes INTEGER,           -- working set
   proc_priv_bytes INTEGER,         -- private (committed) bytes
+  -- The diag columns: the deeper per-second breakdowns a diag-tier profile buys.
+  -- None of them is folded onto game_runs, and that is deliberate. They exist to
+  -- answer "what was this second bound by", which is a question about a moment;
+  -- a whole-run average of a bottleneck verdict names no bottleneck, and the
+  -- seconds are still there for the window anyone asks it of.
+  --
+  -- The frame-derived groups (cpu_*, gpu_* splits, lat_*) are group-atomic: the
+  -- sensor registers whole metric groups when a session opens and either gets
+  -- them all or none, so each group's columns are written and left NULL
+  -- together and the group's FIRST column serves as its discriminator. Nothing
+  -- inside a group needs a presence flag of its own because a half-filled group
+  -- is not a state that can occur.
+  cpu_busy_avg REAL,               -- ms of CPU work the game itself did per frame
+  cpu_busy_p95 REAL,
+  cpu_wait_avg REAL,               -- ms per frame spent waiting on something else
+  cpu_wait_p95 REAL,
+  -- The frame's GPU side, scoped to the tracked process: this is the game's own
+  -- work from the frame events, NOT the card's total load. gpu_util_pct below is
+  -- the other half of that comparison and comes from somewhere else entirely.
+  gpu_latency_avg REAL,            -- frame start -> GPU work start
+  gpu_time_avg REAL,               -- GPU total duration per frame
+  gpu_time_p95 REAL,
+  gpu_busy_avg REAL,               -- GPU active time per frame
+  gpu_busy_p95 REAL,
+  gpu_wait_avg REAL,
+  gpu_in_present_avg REAL,         -- blocked inside the Present call
+  gpu_render_latency_avg REAL,     -- Present -> GPU completion
+  -- How long the second's frames took to reach the screen, and how far the
+  -- game's pacing drifted from what was shown. lat_display_avg is an estimate
+  -- whose error bar depends on present_mode above, so the two are read together.
+  lat_display_avg REAL,
+  lat_anim_err_avg REAL,           -- |animation error|; the source is signed, the absolute value is stored
+  lat_anim_err_p95 REAL,
+  -- Whole-adapter telemetry, polled once at the second boundary rather than
+  -- derived from frames. These three are EACH independent, like the proc_*
+  -- readings and unlike the frame-derived groups above: which figures a driver
+  -- publishes varies by vendor and by metric, so a card reporting utilization
+  -- and no memory is an ordinary card rather than a failed read. Read-back
+  -- rebuilds the block when ANY of them is non-NULL.
+  --
+  -- These two blocks (gpu_* telemetry and proc_vram_*) are also the ones gated
+  -- by game.gpu.read: they describe the adapter and every process sharing it,
+  -- not just the game whose frames the run is about, so ingest NULLs them for an
+  -- agent that holds only game.performance.read.
+  gpu_util_pct REAL,               -- whole-GPU utilization 0-100 (NOT this process)
+  gpu_mem_used INTEGER,            -- whole-GPU dedicated memory used, bytes
+  gpu_mem_size INTEGER,            -- dedicated memory capacity, bytes
+  -- The game process's own dedicated video memory, which is what gpu_mem_used
+  -- cannot say: a full card says nothing about who filled it. used is the
+  -- discriminator for the block; budget is independently NULL because the OS
+  -- does not always expose a per-process budget, and the level is still the
+  -- measurement without it.
+  proc_vram_used INTEGER,
+  proc_vram_budget INTEGER,
+  -- The busiest logical core, % 0-100. It stands alone rather than joining the
+  -- proc_* group because it describes the machine and not the process: a
+  -- single-threaded game pins one core while proc_cpu_pct — a share of all
+  -- cores — reads low, and that gap is the whole finding.
+  busiest_core_pct REAL,
   quality TEXT,                    -- JSON array of flags; NULL when none apply
   PRIMARY KEY(run_id, ts)
 ) WITHOUT ROWID;

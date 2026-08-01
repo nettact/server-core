@@ -15,8 +15,8 @@ import (
 	"github.com/nettact/server-core/store/storetest"
 )
 
-// openGameDB seeds a site and one agent holding the game permissions, which is
-// the ordinary case; the denial test overrides the agent's effective set.
+// openGameDB seeds a site and one agent holding every game permission, which is
+// the ordinary case; the denial tests seed agents with narrower sets.
 func openGameDB(t *testing.T) (*store.DB, *Service) {
 	t.Helper()
 	db := storetest.Open(t)
@@ -26,7 +26,7 @@ func openGameDB(t *testing.T) (*store.DB, *Service) {
 		`INSERT INTO sites(id,name,created_at) VALUES('site_default','Default',?)`, now); err != nil {
 		t.Fatalf("seed site: %v", err)
 	}
-	seedAgent(t, db, "agent_game", `["game.process.detect","game.performance.read"]`)
+	seedAgent(t, db, "agent_game", `["game.process.detect","game.performance.read","game.gpu.read"]`)
 	return db, New(db, settings.New(db))
 }
 
@@ -388,6 +388,283 @@ func TestBucketStutterAndProcRes(t *testing.T) {
 	}
 	if ws.Valid || priv.Valid {
 		t.Fatalf("a cpu-only sample stored ws=%v priv=%v, want NULL", ws, priv)
+	}
+}
+
+// diagSample fills a bucket with one of everything a diag-tier second carries, so
+// the tests below can take it apart rather than each rebuilding it.
+func diagSample(b *gamesense.Bucket) {
+	b.CPUSplit = &gamesense.CPUSplit{BusyAvg: 4.1, BusyP95: 5.9, WaitAvg: 2.8, WaitP95: 3.4}
+	b.GPUSplit = &gamesense.GPUSplit{
+		LatencyAvg: 1.2, TimeAvg: 6.1, TimeP95: 7.7,
+		BusyAvg: 5.8, BusyP95: 7.2, WaitAvg: 0.3,
+		InPresentAvg: 0.9, RenderLatencyAvg: 5.2,
+	}
+	b.Latency = &gamesense.Latency{DisplayAvg: 12.5, AnimErrAvg: 0.8, AnimErrP95: 2.1}
+	b.GPUTel = &gamesense.GPUTel{UtilPct: floatPtr(87.5), MemUsed: u64p(6 << 30), MemSize: u64p(8 << 30)}
+	b.ProcVRAM = &gamesense.ProcVRAM{Used: 5 << 30, Budget: u64p(7 << 30)}
+	b.BusiestCorePct = floatPtr(99.5)
+}
+
+// TestBucketDiagBlocksRoundTrip covers the deeper breakdowns a diag-tier profile
+// buys. They come in two kinds and the storage has to keep them apart: the
+// frame-derived groups are written whole, so a block of measured zeros — the
+// second that waited on nothing, which is precisely the "not GPU-bound" verdict —
+// must survive as a block; the polled adapter readings are independent, because a
+// driver publishing utilization and no memory is an ordinary card and not a
+// failed read.
+func TestBucketDiagBlocksRoundTrip(t *testing.T) {
+	db, svc := openGameDB(t)
+	ctx := context.Background()
+	start := time.Now().UTC().Add(-time.Hour).Truncate(time.Second)
+	h := hist([2]float64{5, 100})
+
+	full := bucket("run_1", start, 100, h)
+	diagSample(&full)
+
+	// A second in which nothing waited on anything. Every figure is a measured 0,
+	// and dropping the blocks over it would erase the finding.
+	zeroed := bucket("run_1", start.Add(time.Second), 100, h)
+	zeroed.CPUSplit = &gamesense.CPUSplit{}
+	zeroed.GPUSplit = &gamesense.GPUSplit{}
+	zeroed.Latency = &gamesense.Latency{}
+	zeroed.BusiestCorePct = floatPtr(0)
+
+	// The two halves of a card that publishes only part of its telemetry.
+	utilOnly := bucket("run_1", start.Add(2*time.Second), 100, h)
+	utilOnly.GPUTel = &gamesense.GPUTel{UtilPct: floatPtr(41)}
+	memOnly := bucket("run_1", start.Add(3*time.Second), 100, h)
+	memOnly.GPUTel = &gamesense.GPUTel{MemUsed: u64p(2 << 30), MemSize: u64p(8 << 30)}
+
+	// An OS that publishes no per-process budget. The level is still the reading.
+	noBudget := bucket("run_1", start.Add(4*time.Second), 100, h)
+	noBudget.ProcVRAM = &gamesense.ProcVRAM{Used: 1 << 30}
+
+	// A diag second whose polled sources fell over: the flag rides the existing
+	// quality array, and the blocks are simply absent.
+	degraded := bucket("run_1", start.Add(5*time.Second), 100, h)
+	degraded.CPUSplit = &gamesense.CPUSplit{BusyAvg: 3, BusyP95: 4, WaitAvg: 1, WaitP95: 2}
+	degraded.Quality = []string{gamesense.QualityDiagDegraded}
+
+	bare := bucket("run_1", start.Add(6*time.Second), 100, h) // a base-tier second
+
+	apply(t, db, "agent_game", []gamesense.Run{run("run_1", start, 6)},
+		[]gamesense.Bucket{full, zeroed, utilOnly, memOnly, noBudget, degraded, bare})
+
+	got, err := svc.ListBuckets(ctx, "run_1", BucketFilter{})
+	if err != nil || len(got) != 7 {
+		t.Fatalf("ListBuckets = %d err=%v, want 7", len(got), err)
+	}
+
+	// Everything present comes back byte for byte. The group-atomic blocks are
+	// compared by value: a field silently dropped or reordered in the column list
+	// would otherwise pass every spot check.
+	g := got[0]
+	if g.CPUSplit == nil || *g.CPUSplit != *full.CPUSplit {
+		t.Fatalf("cpu_split = %+v, want %+v", g.CPUSplit, full.CPUSplit)
+	}
+	if g.GPUSplit == nil || *g.GPUSplit != *full.GPUSplit {
+		t.Fatalf("gpu_split = %+v, want %+v", g.GPUSplit, full.GPUSplit)
+	}
+	if g.Latency == nil || *g.Latency != *full.Latency {
+		t.Fatalf("lat = %+v, want %+v", g.Latency, full.Latency)
+	}
+	if g.GPUTel == nil || g.GPUTel.UtilPct == nil || *g.GPUTel.UtilPct != 87.5 ||
+		g.GPUTel.MemUsed == nil || *g.GPUTel.MemUsed != 6<<30 ||
+		g.GPUTel.MemSize == nil || *g.GPUTel.MemSize != 8<<30 {
+		t.Fatalf("gpu_tel = %+v, want all three readings back", g.GPUTel)
+	}
+	if g.ProcVRAM == nil || g.ProcVRAM.Used != 5<<30 ||
+		g.ProcVRAM.Budget == nil || *g.ProcVRAM.Budget != 7<<30 {
+		t.Fatalf("proc_vram = %+v", g.ProcVRAM)
+	}
+	if g.BusiestCorePct == nil || *g.BusiestCorePct != 99.5 {
+		t.Fatalf("busiest_core_pct = %v, want 99.5", g.BusiestCorePct)
+	}
+
+	z := got[1]
+	if z.CPUSplit == nil || *z.CPUSplit != (gamesense.CPUSplit{}) {
+		t.Fatalf("a measured all-zero cpu split came back as %+v, want a zeroed block", z.CPUSplit)
+	}
+	if z.GPUSplit == nil || *z.GPUSplit != (gamesense.GPUSplit{}) {
+		t.Fatalf("a measured all-zero gpu split came back as %+v", z.GPUSplit)
+	}
+	if z.Latency == nil || *z.Latency != (gamesense.Latency{}) {
+		t.Fatalf("a measured all-zero latency block came back as %+v", z.Latency)
+	}
+	if z.BusiestCorePct == nil || *z.BusiestCorePct != 0 {
+		t.Fatalf("busiest core = %v, want a measured 0%%", z.BusiestCorePct)
+	}
+	if z.GPUTel != nil || z.ProcVRAM != nil {
+		t.Fatalf("an unpolled second acquired %+v / %+v", z.GPUTel, z.ProcVRAM)
+	}
+
+	// Half a card's telemetry stays half. Filling the rest in with zeros would
+	// report a card at no load or with no memory installed.
+	u := got[2].GPUTel
+	if u == nil || u.UtilPct == nil || *u.UtilPct != 41 {
+		t.Fatalf("util-only gpu_tel = %+v", u)
+	}
+	if u.MemUsed != nil || u.MemSize != nil {
+		t.Fatalf("util-only gpu_tel invented memory readings: %+v", u)
+	}
+	m := got[3].GPUTel
+	if m == nil || m.MemUsed == nil || *m.MemUsed != 2<<30 || m.MemSize == nil || *m.MemSize != 8<<30 {
+		t.Fatalf("mem-only gpu_tel = %+v", m)
+	}
+	if m.UtilPct != nil {
+		t.Fatalf("mem-only gpu_tel invented a utilization: %+v", m)
+	}
+
+	v := got[4].ProcVRAM
+	if v == nil || v.Used != 1<<30 {
+		t.Fatalf("budget-less proc_vram = %+v, want the level kept", v)
+	}
+	if v.Budget != nil {
+		t.Fatalf("proc_vram invented a budget: %v", *v.Budget)
+	}
+
+	d := got[5]
+	if d.CPUSplit == nil || d.GPUTel != nil || d.ProcVRAM != nil {
+		t.Fatalf("degraded second = cpu:%+v gpu_tel:%+v vram:%+v, want only the frame-derived block",
+			d.CPUSplit, d.GPUTel, d.ProcVRAM)
+	}
+	if len(d.Quality) != 1 || d.Quality[0] != gamesense.QualityDiagDegraded {
+		t.Fatalf("quality = %+v, want the degradation flag on the existing array", d.Quality)
+	}
+
+	b := got[6]
+	if b.CPUSplit != nil || b.GPUSplit != nil || b.Latency != nil ||
+		b.GPUTel != nil || b.ProcVRAM != nil || b.BusiestCorePct != nil {
+		t.Fatalf("a base-tier second came back carrying diag blocks: %+v", b)
+	}
+
+	// And the columns must say the same, since they are what a later reader sees:
+	// a base-tier second leaves every diag column NULL rather than storing the
+	// zeros its struct fields hold.
+	var (
+		cpuBusy, gpuLatency, latDisplay, util, core sql.NullFloat64
+		memUsed, vramUsed                           sql.NullInt64
+	)
+	scanDiag := func(ts time.Time) {
+		t.Helper()
+		if err := db.QueryRowContext(ctx, `
+			SELECT cpu_busy_avg, gpu_latency_avg, lat_display_avg, gpu_util_pct,
+			       busiest_core_pct, gpu_mem_used, proc_vram_used
+			  FROM game_buckets WHERE run_id='run_1' AND ts=?`, ts.Unix()).
+			Scan(&cpuBusy, &gpuLatency, &latDisplay, &util, &core, &memUsed, &vramUsed); err != nil {
+			t.Fatal(err)
+		}
+	}
+	scanDiag(bare.TS)
+	if cpuBusy.Valid || gpuLatency.Valid || latDisplay.Valid || util.Valid ||
+		core.Valid || memUsed.Valid || vramUsed.Valid {
+		t.Fatalf("a base-tier second stored diag values instead of NULL: %v %v %v %v %v %v %v",
+			cpuBusy, gpuLatency, latDisplay, util, core, memUsed, vramUsed)
+	}
+	scanDiag(zeroed.TS)
+	if !cpuBusy.Valid || cpuBusy.Float64 != 0 || !gpuLatency.Valid || !latDisplay.Valid || !core.Valid {
+		t.Fatalf("a measured-zero second stored %v / %v / %v / %v, want real 0s",
+			cpuBusy, gpuLatency, latDisplay, core)
+	}
+	if util.Valid || memUsed.Valid || vramUsed.Valid {
+		t.Fatalf("an unpolled second stored adapter readings: %v %v %v", util, memUsed, vramUsed)
+	}
+	scanDiag(noBudget.TS)
+	var budget sql.NullInt64
+	if err := db.QueryRowContext(ctx,
+		`SELECT proc_vram_budget FROM game_buckets WHERE run_id='run_1' AND ts=?`,
+		noBudget.TS.Unix()).Scan(&budget); err != nil {
+		t.Fatal(err)
+	}
+	if !vramUsed.Valid || budget.Valid {
+		t.Fatalf("budget-less vram stored used=%v budget=%v, want a level and a NULL budget",
+			vramUsed, budget)
+	}
+}
+
+// TestGPUTelemetryNeedsItsOwnPermission is the second half of the ingest gate.
+// game.performance.read buys the game's own frame stream; the adapter's
+// utilization and its video memory describe the card and every process sharing
+// it, which is a different read an operator can withhold on its own. A WAL that
+// drained after that narrowing must not smuggle it in — and must not take the
+// frame-derived breakdowns down with it, since those were never gated on it.
+func TestGPUTelemetryNeedsItsOwnPermission(t *testing.T) {
+	db, svc := openGameDB(t)
+	ctx := context.Background()
+	seedAgent(t, db, "agent_nogpu", `["game.process.detect","game.performance.read"]`)
+	start := time.Now().UTC().Add(-time.Hour).Truncate(time.Second)
+	h := hist([2]float64{5, 100})
+
+	gated := bucket("run_nogpu", start, 100, h)
+	diagSample(&gated)
+	res := apply(t, db, "agent_nogpu", []gamesense.Run{run("run_nogpu", start, 0)},
+		[]gamesense.Bucket{gated})
+	// The second itself is permitted: only the withheld part goes missing, and the
+	// bucket is stored rather than refused.
+	if res.Denied || res.Buckets != 1 || res.Rejected != 0 {
+		t.Fatalf("apply = %+v, want the second stored with its GPU readings dropped", res)
+	}
+
+	allowed := bucket("run_gpu", start, 100, h)
+	diagSample(&allowed)
+	apply(t, db, "agent_game", []gamesense.Run{run("run_gpu", start, 0)},
+		[]gamesense.Bucket{allowed})
+
+	stripped, err := svc.ListBuckets(ctx, "run_nogpu", BucketFilter{})
+	if err != nil || len(stripped) != 1 {
+		t.Fatalf("ListBuckets run_nogpu = %d err=%v", len(stripped), err)
+	}
+	s := stripped[0]
+	if s.GPUTel != nil || s.ProcVRAM != nil {
+		t.Fatalf("gpu_tel=%+v proc_vram=%+v landed for an agent without game.gpu.read",
+			s.GPUTel, s.ProcVRAM)
+	}
+	// Everything derived from the frame stream rides the permission the agent does
+	// hold, including the GPU-side frame breakdown — it comes from the game's own
+	// presentation, not from the adapter.
+	if s.CPUSplit == nil || *s.CPUSplit != *gated.CPUSplit {
+		t.Fatalf("cpu_split = %+v, want the frame-derived block kept", s.CPUSplit)
+	}
+	if s.GPUSplit == nil || *s.GPUSplit != *gated.GPUSplit {
+		t.Fatalf("gpu_split = %+v, want the frame-derived block kept", s.GPUSplit)
+	}
+	if s.Latency == nil || *s.Latency != *gated.Latency {
+		t.Fatalf("lat = %+v, want the frame-derived block kept", s.Latency)
+	}
+	if s.BusiestCorePct == nil || *s.BusiestCorePct != 99.5 {
+		t.Fatalf("busiest_core_pct = %v, want the host reading kept", s.BusiestCorePct)
+	}
+
+	// The columns, not just the structs: this is what a later reader sees.
+	var util, core sql.NullFloat64
+	var memUsed, memSize, vramUsed, vramBudget sql.NullInt64
+	if err := db.QueryRowContext(ctx, `
+		SELECT gpu_util_pct, gpu_mem_used, gpu_mem_size, proc_vram_used, proc_vram_budget, busiest_core_pct
+		  FROM game_buckets WHERE run_id='run_nogpu'`).
+		Scan(&util, &memUsed, &memSize, &vramUsed, &vramBudget, &core); err != nil {
+		t.Fatal(err)
+	}
+	if util.Valid || memUsed.Valid || memSize.Valid || vramUsed.Valid || vramBudget.Valid {
+		t.Fatalf("gated columns stored %v %v %v %v %v, want all NULL",
+			util, memUsed, memSize, vramUsed, vramBudget)
+	}
+	if !core.Valid {
+		t.Fatalf("busiest_core_pct was stripped along with the adapter readings")
+	}
+
+	// The agent holding both keeps everything, which is what makes the difference
+	// above a policy decision rather than a lost write path.
+	kept, err := svc.ListBuckets(ctx, "run_gpu", BucketFilter{})
+	if err != nil || len(kept) != 1 {
+		t.Fatalf("ListBuckets run_gpu = %d err=%v", len(kept), err)
+	}
+	k := kept[0]
+	if k.GPUTel == nil || k.GPUTel.UtilPct == nil || *k.GPUTel.UtilPct != 87.5 {
+		t.Fatalf("gpu_tel = %+v for an agent holding game.gpu.read", k.GPUTel)
+	}
+	if k.ProcVRAM == nil || k.ProcVRAM.Used != 5<<30 {
+		t.Fatalf("proc_vram = %+v for an agent holding game.gpu.read", k.ProcVRAM)
 	}
 }
 
