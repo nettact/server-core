@@ -50,20 +50,28 @@ func New(db *store.DB, st *settings.Service) *Service {
 // those AND for a run whose profile has since been deleted — the stamp is history
 // and outlives the configuration, so they are two fields rather than one that
 // would have to lie about one of the cases.
+//
+// StutterCount and StutterExcessMs are the run's long-frame totals, summed from
+// the seconds that carried a stutter block. They are pointers because a capture
+// that never watched for long frames must not report a run that never hitched:
+// that claim is the single most misleading zero this package could produce, so it
+// is reserved for runs in which at least one second actually looked.
 type Run struct {
-	ID          string     `json:"id"`
-	AgentID     string     `json:"agent_id"`
-	SiteID      string     `json:"site_id"`
-	Proc        string     `json:"proc"`
-	Title       string     `json:"title,omitempty"`
-	ProfileID   *string    `json:"profile_id"`
-	ProfileName *string    `json:"profile_name"`
-	StartedAt   time.Time  `json:"started_at"`
-	LastSeenAt  time.Time  `json:"last_seen_at"`
-	EndedAt     *time.Time `json:"ended_at"`
-	Source      string     `json:"source,omitempty"`
-	Caps        []string   `json:"caps"`
-	Summary     Summary    `json:"summary"`
+	ID              string     `json:"id"`
+	AgentID         string     `json:"agent_id"`
+	SiteID          string     `json:"site_id"`
+	Proc            string     `json:"proc"`
+	Title           string     `json:"title,omitempty"`
+	ProfileID       *string    `json:"profile_id"`
+	ProfileName     *string    `json:"profile_name"`
+	StartedAt       time.Time  `json:"started_at"`
+	LastSeenAt      time.Time  `json:"last_seen_at"`
+	EndedAt         *time.Time `json:"ended_at"`
+	Source          string     `json:"source,omitempty"`
+	Caps            []string   `json:"caps"`
+	StutterCount    *int64     `json:"stutter_count"`
+	StutterExcessMs *float64   `json:"stutter_excess_ms"`
+	Summary         Summary    `json:"summary"`
 }
 
 // Summary is a run's whole-run figures, derived by summing its buckets'
@@ -159,6 +167,16 @@ func nullFloat(v float64, ok bool) sql.NullFloat64 {
 	return sql.NullFloat64{Float64: v, Valid: true}
 }
 
+// nullUint64 carries an optional byte count. SQLite's INTEGER is signed, which
+// costs nothing at the magnitudes involved here — a process's memory footprint —
+// and keeps the column readable by every tool that opens the file.
+func nullUint64(v *uint64) sql.NullInt64 {
+	if v == nil {
+		return sql.NullInt64{}
+	}
+	return sql.NullInt64{Int64: int64(*v), Valid: true}
+}
+
 func nullBool(v *bool) sql.NullInt64 {
 	if v == nil {
 		return sql.NullInt64{}
@@ -188,6 +206,24 @@ func int64Ptr(v sql.NullInt64) *int64 {
 	}
 	n := v.Int64
 	return &n
+}
+
+func uint64Ptr(v sql.NullInt64) *uint64 {
+	if !v.Valid {
+		return nil
+	}
+	n := uint64(v.Int64)
+	return &n
+}
+
+// float64Ptr is int64Ptr for a real column: an absent reading stays absent
+// rather than becoming the 0.0 a NullFloat64 carries when invalid.
+func float64Ptr(v sql.NullFloat64) *float64 {
+	if !v.Valid {
+		return nil
+	}
+	f := v.Float64
+	return &f
 }
 
 // strPtr keeps an absent text column absent. A NULL profile stamp is "this

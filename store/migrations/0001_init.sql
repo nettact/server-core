@@ -475,7 +475,15 @@ CREATE TABLE game_runs(
   -- one whose seconds presented nothing: presented is a count, and a count of
   -- zero cannot say which happened.
   hist_layout TEXT,
-  hist BLOB
+  hist BLOB,
+  -- The run's long-frame totals, folded from the seconds that carried a stutter
+  -- block exactly as displayed/dropped are folded: NULL until the first such
+  -- second lands, and NULL forever for a capture that never watched for long
+  -- frames. The zero matters more here than anywhere else in this table — "this
+  -- session never hitched" is the headline the feature exists to produce — so it
+  -- may only ever be written by a second that actually looked.
+  stutter_count INTEGER,
+  stutter_excess_ms REAL
 );
 CREATE INDEX idx_game_runs_agent ON game_runs(agent_id, started_at DESC);
 
@@ -511,6 +519,23 @@ CREATE TABLE game_buckets(
   -- group is legitimately empty on its own, so without a discriminator the two
   -- collapse into one.
   present_changed INTEGER,
+  -- The second's long-frame events. The pair is written and left NULL together,
+  -- so stutter_count non-NULL is the discriminator for the whole block: a second
+  -- that was watched and held no hitch stores 0 / 0.0, which is a real
+  -- measurement and the one every smooth second of a run is made of. NULL is
+  -- "nothing was watching for long frames", which no count can express.
+  stutter_count INTEGER,
+  stutter_excess_ms REAL,
+  -- The tracked game process's own resource usage, sampled at the second
+  -- boundary rather than derived from the frame stream. Unlike the stutter pair
+  -- these three are independent: CPU is a delta with no value on the first
+  -- observed second of a run, while memory is a level readable at once, so each
+  -- column is NULL exactly when its own reading was absent. Read-back rebuilds
+  -- the block when ANY of them is non-NULL — a block in which every reading was
+  -- missing carried nothing and is not worth telling apart from no block.
+  proc_cpu_pct REAL,               -- % of total CPU capacity (all cores), 0-100
+  proc_ws_bytes INTEGER,           -- working set
+  proc_priv_bytes INTEGER,         -- private (committed) bytes
   quality TEXT,                    -- JSON array of flags; NULL when none apply
   PRIMARY KEY(run_id, ts)
 ) WITHOUT ROWID;

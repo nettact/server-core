@@ -115,7 +115,8 @@ func (s *Service) DeleteRun(ctx context.Context, id string) error {
 
 const runCols = `r.id, r.agent_id, r.site_id, r.proc, r.title, r.profile_id, gp.name,
 	r.started_at, r.last_seen_at, r.ended_at, r.source, r.caps,
-	r.presented, r.displayed, r.dropped, r.hist_layout, r.hist`
+	r.presented, r.displayed, r.dropped, r.hist_layout, r.hist,
+	r.stutter_count, r.stutter_excess_ms`
 
 // runFrom joins the profile a run was stamped with, when it still exists. The
 // join is LEFT and same-site: a deleted profile must leave the run readable with
@@ -169,10 +170,13 @@ func (s *Service) queryRuns(ctx context.Context, q string, args ...any) ([]Run, 
 			displayed, dropped     sql.NullInt64
 			layout                 sql.NullString
 			blob                   []byte
+			stutterCount           sql.NullInt64
+			stutterExcess          sql.NullFloat64
 		)
 		if err := rows.Scan(&r.ID, &r.AgentID, &r.SiteID, &r.Proc, &r.Title, &profileID, &profileName,
 			&started, &lastSeen, &ended, &r.Source, &caps,
-			&presented, &displayed, &dropped, &layout, &blob); err != nil {
+			&presented, &displayed, &dropped, &layout, &blob,
+			&stutterCount, &stutterExcess); err != nil {
 			return nil, err
 		}
 		r.ProfileID = strPtr(profileID)
@@ -187,6 +191,11 @@ func (s *Service) queryRuns(ctx context.Context, q string, args ...any) ([]Run, 
 		if r.Caps == nil {
 			r.Caps = []string{}
 		}
+		// Straight off the run row rather than through runAggregate: the aggregate
+		// exists to turn the merged histogram into the FPS figures, and these two are
+		// already the answer, folded at ingest and stored as they will be reported.
+		r.StutterCount = int64Ptr(stutterCount)
+		r.StutterExcessMs = float64Ptr(stutterExcess)
 		r.Summary = newRunAggregate(presented, displayed, dropped, layout, blob).summary(r)
 		out = append(out, r)
 	}
@@ -295,7 +304,9 @@ func (s *Service) ListBuckets(ctx context.Context, runID string, f BucketFilter)
 	q := `SELECT ts, presented, displayed, dropped, app_frames, generated_frames,
 		         ft_avg, ft_p50, ft_p95, ft_p99, ft_max, ft_sd,
 		         hist_layout, hist, disp_ft_avg, disp_ft_p95,
-		         present_mode, sync_interval, tearing, api, present_changed, quality
+		         present_mode, sync_interval, tearing, api, present_changed,
+		         stutter_count, stutter_excess_ms,
+		         proc_cpu_pct, proc_ws_bytes, proc_priv_bytes, quality
 		    FROM game_buckets WHERE run_id=?`
 	args := []any{runID}
 	if f.Since > 0 {
@@ -324,11 +335,16 @@ func (s *Service) ListBuckets(ctx context.Context, runID string, f BucketFilter)
 			dispAvg, dispP95              sql.NullFloat64
 			mode, api, quality            sql.NullString
 			sync, tearing, presentChanged sql.NullInt64
+			stutterCount                  sql.NullInt64
+			stutterExcess, procCPU        sql.NullFloat64
+			procWS, procPriv              sql.NullInt64
 		)
 		if err := rows.Scan(&ts, &b.Frames.Presented, &displayed, &dropped, &app, &gen,
 			&b.FT.Avg, &b.FT.P50, &b.FT.P95, &b.FT.P99, &b.FT.Max, &b.FT.SD,
 			&b.Hist.Layout, &blob, &dispAvg, &dispP95,
-			&mode, &sync, &tearing, &api, &presentChanged, &quality); err != nil {
+			&mode, &sync, &tearing, &api, &presentChanged,
+			&stutterCount, &stutterExcess,
+			&procCPU, &procWS, &procPriv, &quality); err != nil {
 			return nil, err
 		}
 		b.RunID = runID
@@ -351,6 +367,26 @@ func (s *Service) ListBuckets(ctx context.Context, runID string, f BucketFilter)
 				Tearing: boolPtr(tearing),
 				API:     api.String,
 				Changed: presentChanged.Int64 != 0,
+			}
+		}
+		// stutter_count is the discriminator for its own block, the way
+		// present_changed is for the presentation one: the pair is written together,
+		// so a NULL count means nothing watched rather than nothing happened.
+		if stutterCount.Valid {
+			b.Stutter = &gamesense.Stutter{
+				Count:    int(stutterCount.Int64),
+				ExcessMs: stutterExcess.Float64,
+			}
+		}
+		// The resource block has no such column, and needs none: its three readings
+		// are independent, so ANY of them being present is what says the block was
+		// there. One that carried no reading at all said nothing, and comes back as
+		// the absence it was.
+		if procCPU.Valid || procWS.Valid || procPriv.Valid {
+			b.ProcRes = &gamesense.ProcRes{
+				CPUPct:    float64Ptr(procCPU),
+				WSBytes:   uint64Ptr(procWS),
+				PrivBytes: uint64Ptr(procPriv),
 			}
 		}
 		b.Quality = decodeStrings(quality.String)

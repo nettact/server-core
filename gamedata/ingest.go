@@ -218,6 +218,9 @@ func insertBucket(ctx context.Context, tx *sql.Tx, b gamesense.Bucket) (bool, er
 		dispAvg, dispP95              sql.NullFloat64
 		mode, api                     sql.NullString
 		sync, tearing, presentChanged sql.NullInt64
+		stutterCount                  sql.NullInt64
+		stutterExcess, procCPU        sql.NullFloat64
+		procWS, procPriv              sql.NullInt64
 	)
 	if b.DispFT != nil {
 		dispAvg = nullFloat(b.DispFT.Avg, true)
@@ -232,19 +235,41 @@ func insertBucket(ctx context.Context, tx *sql.Tx, b gamesense.Bucket) (bool, er
 		// column that says the block was observed at all.
 		presentChanged = nullBool(&b.Present.Changed)
 	}
+	if b.Stutter != nil {
+		// Both columns unconditionally, the zero included: the pair IS the record
+		// that the second was watched, and a watched second holding no long frame is
+		// the observation every smooth stretch of a run is made of.
+		stutterCount = nullInt(&b.Stutter.Count)
+		stutterExcess = nullFloat(b.Stutter.ExcessMs, true)
+	}
+	if b.ProcRes != nil {
+		// Each reading stands alone here, unlike the stutter pair. The CPU delta and
+		// the memory level come from different queries and fail separately — the
+		// first second of a run has no CPU delta to report — so an absent one leaves
+		// its own column NULL instead of taking the others down with it.
+		if b.ProcRes.CPUPct != nil {
+			procCPU = nullFloat(*b.ProcRes.CPUPct, true)
+		}
+		procWS = nullUint64(b.ProcRes.WSBytes)
+		procPriv = nullUint64(b.ProcRes.PrivBytes)
+	}
 	res, err := tx.ExecContext(ctx, `
 		INSERT OR IGNORE INTO game_buckets(
 			run_id, ts, presented, displayed, dropped, app_frames, generated_frames,
 			ft_avg, ft_p50, ft_p95, ft_p99, ft_max, ft_sd,
 			hist_layout, hist, disp_ft_avg, disp_ft_p95,
-			present_mode, sync_interval, tearing, api, present_changed, quality)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+			present_mode, sync_interval, tearing, api, present_changed,
+			stutter_count, stutter_excess_ms,
+			proc_cpu_pct, proc_ws_bytes, proc_priv_bytes, quality)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		b.RunID, b.TS.Unix(), b.Frames.Presented,
 		nullInt(b.Frames.Displayed), nullInt(b.Frames.Dropped),
 		nullInt(b.Frames.App), nullInt(b.Frames.Generated),
 		b.FT.Avg, b.FT.P50, b.FT.P95, b.FT.P99, b.FT.Max, b.FT.SD,
 		b.Hist.Layout, encodeHist(b.Hist.Counts), dispAvg, dispP95,
-		mode, sync, tearing, api, presentChanged, encodeStrings(b.Quality))
+		mode, sync, tearing, api, presentChanged,
+		stutterCount, stutterExcess,
+		procCPU, procWS, procPriv, encodeStrings(b.Quality))
 	if err != nil {
 		return false, err
 	}
@@ -257,8 +282,11 @@ type runDelta struct {
 	hist               []uint32
 	presented          int64
 	displayed, dropped int64
+	stutterCount       int64
+	stutterExcess      float64
 	sawDisplayed       bool
 	sawDropped         bool
+	sawStutter         bool
 }
 
 // fold adds one newly stored second to its run's delta.
@@ -281,6 +309,19 @@ func fold(deltas map[string]*runDelta, b gamesense.Bucket) {
 		d.dropped += int64(*b.Frames.Dropped)
 		d.sawDropped = true
 	}
+	// The same rule one measurement further out: a second nothing watched for long
+	// frames contributes nothing AND leaves the run's totals absent, while a second
+	// that watched and saw none contributes its zero and establishes them. Only the
+	// second kind can support the sentence "this session never hitched".
+	if b.Stutter != nil {
+		d.stutterCount += int64(b.Stutter.Count)
+		d.stutterExcess += b.Stutter.ExcessMs
+		d.sawStutter = true
+	}
+	// ProcRes is deliberately not folded. CPU is a rate and memory is a level, and
+	// neither has a whole-run sum; the run-level questions about them are a peak or
+	// an average, which are different figures and are asked of the seconds
+	// themselves while those are still there.
 	gamesense.HistAdd(d.hist, b.Hist.Counts)
 }
 
@@ -296,12 +337,15 @@ func writeAggregates(ctx context.Context, tx *sql.Tx, deltas map[string]*runDelt
 		var (
 			presented          int64
 			displayed, dropped sql.NullInt64
+			stutterCount       sql.NullInt64
+			stutterExcess      sql.NullFloat64
 			layout             sql.NullString
 			blob               []byte
 		)
-		if err := tx.QueryRowContext(ctx,
-			`SELECT presented, displayed, dropped, hist_layout, hist FROM game_runs WHERE id=?`, id).
-			Scan(&presented, &displayed, &dropped, &layout, &blob); err != nil {
+		if err := tx.QueryRowContext(ctx, `
+			SELECT presented, displayed, dropped, stutter_count, stutter_excess_ms, hist_layout, hist
+			  FROM game_runs WHERE id=?`, id).
+			Scan(&presented, &displayed, &dropped, &stutterCount, &stutterExcess, &layout, &blob); err != nil {
 			return err
 		}
 		a := newRunAggregate(presented, displayed, dropped, layout, blob)
@@ -319,9 +363,19 @@ func writeAggregates(ctx context.Context, tx *sql.Tx, deltas map[string]*runDelt
 		if d.sawDropped {
 			a.dropped = sql.NullInt64{Int64: a.dropped.Int64 + d.dropped, Valid: true}
 		}
+		// The stutter pair moves together for the same reason it is stored together:
+		// the count and the time it cost are one measurement, and a total that had
+		// only one of them could not be read as either.
+		if d.sawStutter {
+			stutterCount = sql.NullInt64{Int64: stutterCount.Int64 + d.stutterCount, Valid: true}
+			stutterExcess = sql.NullFloat64{Float64: stutterExcess.Float64 + d.stutterExcess, Valid: true}
+		}
 		if _, err := tx.ExecContext(ctx, `
-			UPDATE game_runs SET presented=?, displayed=?, dropped=?, hist_layout=?, hist=? WHERE id=?`,
+			UPDATE game_runs SET presented=?, displayed=?, dropped=?,
+			                     stutter_count=?, stutter_excess_ms=?, hist_layout=?, hist=?
+			 WHERE id=?`,
 			a.presented+d.presented, a.displayed, a.dropped,
+			stutterCount, stutterExcess,
 			gamesense.HistLayoutLog24V1, encodeHist(merged), id); err != nil {
 			return err
 		}

@@ -3,6 +3,7 @@ package gamedata
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"reflect"
 	"testing"
 	"time"
@@ -58,8 +59,9 @@ func apply(t *testing.T, db *store.DB, agentID string, runs []gamesense.Run, buc
 	return res
 }
 
-func intp(v int) *int    { return &v }
-func boolp(v bool) *bool { return &v }
+func intp(v int) *int       { return &v }
+func boolp(v bool) *bool    { return &v }
+func u64p(v uint64) *uint64 { return &v }
 
 // hist builds a log24_v1 histogram from (frame time, count) pairs.
 func hist(pairs ...[2]float64) gamesense.Histogram {
@@ -277,6 +279,228 @@ func TestNullMeansNotMeasured(t *testing.T) {
 	}
 	if !dropped.Valid || dropped.Int64 != 0 {
 		t.Fatalf("dropped total = %v, want a measured 0 rather than NULL", dropped)
+	}
+}
+
+// TestBucketStutterAndProcRes covers the two blocks a second can carry beyond its
+// frame statistics. Both are optional in a way a plain column cannot express: a
+// second that was watched and held no hitch is a real zero, and a process whose
+// CPU could not be sampled yet may still have reported its memory.
+func TestBucketStutterAndProcRes(t *testing.T) {
+	db, svc := openGameDB(t)
+	ctx := context.Background()
+	start := time.Now().UTC().Add(-time.Hour).Truncate(time.Second)
+	h := hist([2]float64{5, 100})
+
+	both := bucket("run_1", start, 100, h)
+	both.Stutter = &gamesense.Stutter{Count: 2, ExcessMs: 118.4}
+	both.ProcRes = &gamesense.ProcRes{
+		CPUPct: floatPtr(14.5), WSBytes: u64p(3 << 30), PrivBytes: u64p(4 << 30),
+	}
+
+	// Watched, and nothing hitched — the observation a smooth run is made of.
+	quiet := bucket("run_1", start.Add(time.Second), 100, h)
+	quiet.Stutter = &gamesense.Stutter{}
+
+	// The first observed second of a run has no CPU delta yet; memory is a level
+	// and is readable at once. The reverse happens when the memory query fails.
+	cpuOnly := bucket("run_1", start.Add(2*time.Second), 100, h)
+	cpuOnly.ProcRes = &gamesense.ProcRes{CPUPct: floatPtr(0)} // an idle 0, not "unknown"
+	memOnly := bucket("run_1", start.Add(3*time.Second), 100, h)
+	memOnly.ProcRes = &gamesense.ProcRes{WSBytes: u64p(2 << 30)}
+
+	bare := bucket("run_1", start.Add(4*time.Second), 100, h) // neither block
+
+	apply(t, db, "agent_game", []gamesense.Run{run("run_1", start, 4)},
+		[]gamesense.Bucket{both, quiet, cpuOnly, memOnly, bare})
+
+	got, err := svc.ListBuckets(ctx, "run_1", BucketFilter{})
+	if err != nil || len(got) != 5 {
+		t.Fatalf("ListBuckets = %d err=%v, want 5", len(got), err)
+	}
+
+	if got[0].Stutter == nil || *got[0].Stutter != *both.Stutter {
+		t.Fatalf("stutter = %+v, want %+v", got[0].Stutter, both.Stutter)
+	}
+	p := got[0].ProcRes
+	if p == nil || p.CPUPct == nil || *p.CPUPct != 14.5 ||
+		p.WSBytes == nil || *p.WSBytes != 3<<30 || p.PrivBytes == nil || *p.PrivBytes != 4<<30 {
+		t.Fatalf("proc_res = %+v, want all three readings back", p)
+	}
+
+	if got[1].Stutter == nil || *got[1].Stutter != (gamesense.Stutter{}) {
+		t.Fatalf("a watched second with no hitch came back as %+v, want a zeroed block",
+			got[1].Stutter)
+	}
+	if got[1].ProcRes != nil {
+		t.Fatalf("an unsampled process acquired a resource block: %+v", got[1].ProcRes)
+	}
+
+	// Half a block must stay half a block. Filling the missing reading in with a 0
+	// would report a game using no CPU or no memory at all.
+	if p = got[2].ProcRes; p == nil || p.CPUPct == nil || *p.CPUPct != 0 {
+		t.Fatalf("cpu-only proc_res = %+v, want a measured 0%%", p)
+	}
+	if p.WSBytes != nil || p.PrivBytes != nil {
+		t.Fatalf("cpu-only proc_res invented memory readings: %+v", p)
+	}
+	if got[2].Stutter != nil {
+		t.Fatalf("an unwatched second acquired a stutter block: %+v", got[2].Stutter)
+	}
+	if p = got[3].ProcRes; p == nil || p.WSBytes == nil || *p.WSBytes != 2<<30 {
+		t.Fatalf("mem-only proc_res = %+v", p)
+	}
+	if p.CPUPct != nil || p.PrivBytes != nil {
+		t.Fatalf("mem-only proc_res invented readings: %+v", p)
+	}
+
+	if got[4].Stutter != nil || got[4].ProcRes != nil {
+		t.Fatalf("a second carrying neither block came back with %+v / %+v",
+			got[4].Stutter, got[4].ProcRes)
+	}
+
+	// The columns must draw the same distinction the structs do, since they are
+	// what a later reader actually sees.
+	var count sql.NullInt64
+	var excess sql.NullFloat64
+	if err := db.QueryRowContext(ctx,
+		`SELECT stutter_count, stutter_excess_ms FROM game_buckets WHERE run_id='run_1' AND ts=?`,
+		quiet.TS.Unix()).Scan(&count, &excess); err != nil {
+		t.Fatal(err)
+	}
+	if !count.Valid || count.Int64 != 0 || !excess.Valid || excess.Float64 != 0 {
+		t.Fatalf("a watched, hitch-free second stored count=%v excess=%v, want a measured 0/0",
+			count, excess)
+	}
+	if err := db.QueryRowContext(ctx,
+		`SELECT stutter_count, stutter_excess_ms FROM game_buckets WHERE run_id='run_1' AND ts=?`,
+		bare.TS.Unix()).Scan(&count, &excess); err != nil {
+		t.Fatal(err)
+	}
+	if count.Valid || excess.Valid {
+		t.Fatalf("an unwatched second stored count=%v excess=%v, want NULL", count, excess)
+	}
+	var ws, priv sql.NullInt64
+	if err := db.QueryRowContext(ctx,
+		`SELECT proc_ws_bytes, proc_priv_bytes FROM game_buckets WHERE run_id='run_1' AND ts=?`,
+		cpuOnly.TS.Unix()).Scan(&ws, &priv); err != nil {
+		t.Fatal(err)
+	}
+	if ws.Valid || priv.Valid {
+		t.Fatalf("a cpu-only sample stored ws=%v priv=%v, want NULL", ws, priv)
+	}
+}
+
+// TestRunStutterTotals pins the whole-run fold. The totals accumulate across
+// packets and outlive the seconds behind them, so a replayed second folded twice
+// is wrong forever with nothing left to check it against — and a run nothing
+// watched must stay NULL rather than claim it never hitched, which is the single
+// most misleading zero this package could produce.
+func TestRunStutterTotals(t *testing.T) {
+	db, svc := openGameDB(t)
+	ctx := context.Background()
+	start := time.Now().UTC().Add(-time.Hour).Truncate(time.Second)
+	h := hist([2]float64{5, 100})
+
+	hitched := bucket("run_1", start, 100, h)
+	hitched.Stutter = &gamesense.Stutter{Count: 2, ExcessMs: 100}
+	unwatched := bucket("run_1", start.Add(time.Second), 100, h) // no block at all
+	first := []gamesense.Bucket{hitched, unwatched}
+
+	again := bucket("run_1", start.Add(2*time.Second), 100, h)
+	again.Stutter = &gamesense.Stutter{Count: 1, ExcessMs: 60.5}
+	smooth := bucket("run_1", start.Add(3*time.Second), 100, h)
+	smooth.Stutter = &gamesense.Stutter{} // contributes nothing but the fact it looked
+	second := []gamesense.Bucket{again, smooth}
+
+	runs := []gamesense.Run{run("run_1", start, 3)}
+	apply(t, db, "agent_game", runs, first)
+	apply(t, db, "agent_game", runs, second)
+
+	got, err := svc.GetRun(ctx, "run_1")
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if got.StutterCount == nil || *got.StutterCount != 3 {
+		t.Fatalf("stutter_count = %v, want the 3 events across both packets", got.StutterCount)
+	}
+	if got.StutterExcessMs == nil || *got.StutterExcessMs != 160.5 {
+		t.Fatalf("stutter_excess_ms = %v, want 160.5", got.StutterExcessMs)
+	}
+
+	// The WAL redelivers both packets. Every second is already recorded, so none of
+	// them may reach the totals a second time.
+	apply(t, db, "agent_game", runs, first)
+	apply(t, db, "agent_game", runs, second)
+	replayed, err := svc.GetRun(ctx, "run_1")
+	if err != nil {
+		t.Fatalf("GetRun after replay: %v", err)
+	}
+	if *replayed.StutterCount != 3 || *replayed.StutterExcessMs != 160.5 {
+		t.Fatalf("totals after a replay = %d / %.1f, want 3 / 160.5",
+			*replayed.StutterCount, *replayed.StutterExcessMs)
+	}
+
+	// A run whose every watched second was smooth reports a measured zero, which is
+	// the whole point of watching.
+	quiet := bucket("run_quiet", start, 100, h)
+	quiet.Stutter = &gamesense.Stutter{}
+	apply(t, db, "agent_game", []gamesense.Run{run("run_quiet", start, 0)},
+		[]gamesense.Bucket{quiet})
+	quietRun, err := svc.GetRun(ctx, "run_quiet")
+	if err != nil {
+		t.Fatalf("GetRun run_quiet: %v", err)
+	}
+	if quietRun.StutterCount == nil || *quietRun.StutterCount != 0 {
+		t.Fatalf("a watched, hitch-free run = %v, want a measured 0", quietRun.StutterCount)
+	}
+	if quietRun.StutterExcessMs == nil || *quietRun.StutterExcessMs != 0 {
+		t.Fatalf("excess = %v, want a measured 0", quietRun.StutterExcessMs)
+	}
+
+	// ...and a run nothing ever watched reports nothing. This is what outlives the
+	// buckets: once retention has taken the seconds, a zero written here is
+	// indistinguishable from a measurement and nothing is left to correct it from.
+	apply(t, db, "agent_game", []gamesense.Run{run("run_blind", start, 0)},
+		[]gamesense.Bucket{bucket("run_blind", start, 100, h)})
+	blind, err := svc.GetRun(ctx, "run_blind")
+	if err != nil {
+		t.Fatalf("GetRun run_blind: %v", err)
+	}
+	if blind.StutterCount != nil || blind.StutterExcessMs != nil {
+		t.Fatalf("a run nothing watched reported %v / %v, want both null",
+			blind.StutterCount, blind.StutterExcessMs)
+	}
+	var count sql.NullInt64
+	var excess sql.NullFloat64
+	if err := db.QueryRowContext(ctx,
+		`SELECT stutter_count, stutter_excess_ms FROM game_runs WHERE id='run_blind'`).
+		Scan(&count, &excess); err != nil {
+		t.Fatal(err)
+	}
+	if count.Valid || excess.Valid {
+		t.Fatalf("a run nothing watched stored count=%v excess=%v, want NULL", count, excess)
+	}
+
+	// On the wire the absence has to be an explicit null rather than a missing key:
+	// a console that reads the field as undefined and one that reads it as 0 must
+	// not be able to disagree about whether the run hitched.
+	raw := map[string]any{}
+	body, err := json.Marshal(blind)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(body, &raw); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"stutter_count", "stutter_excess_ms"} {
+		v, present := raw[key]
+		if !present {
+			t.Fatalf("run JSON is missing %q entirely; it must be present as null (%s)", key, body)
+		}
+		if v != nil {
+			t.Fatalf("%s = %v on a run nothing watched, want null", key, v)
+		}
 	}
 }
 
