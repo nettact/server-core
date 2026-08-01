@@ -154,17 +154,24 @@ func upsertRun(ctx context.Context, tx *sql.Tx, agentID, siteID string, run game
 	// last_seen_at is what keeps that from also letting a replayed old packet
 	// reopen a run that genuinely finished: a stale report has, by definition,
 	// seen less.
+	// The profile stamp is mutable under the same guard as proc and title: a
+	// profile created while a session is already running re-classifies it on the
+	// agent's next report, and an empty id is a session that matches none — stored
+	// as NULL, never as the empty string, so "other process" is one value rather
+	// than two that readers would have to test for separately.
 	_, err := tx.ExecContext(ctx, `
-		INSERT INTO game_runs(id, agent_id, site_id, proc, title, started_at, last_seen_at, ended_at, source, caps)
-		VALUES(?,?,?,?,?,?,?,?,?,?)
+		INSERT INTO game_runs(id, agent_id, site_id, proc, title, profile_id, started_at, last_seen_at, ended_at, source, caps)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(id) DO UPDATE SET
 			proc = CASE WHEN excluded.last_seen_at >= game_runs.last_seen_at THEN excluded.proc ELSE game_runs.proc END,
 			title = CASE WHEN excluded.last_seen_at >= game_runs.last_seen_at THEN excluded.title ELSE game_runs.title END,
+			profile_id = CASE WHEN excluded.last_seen_at >= game_runs.last_seen_at
+			                  THEN excluded.profile_id ELSE game_runs.profile_id END,
 			last_seen_at = max(game_runs.last_seen_at, excluded.last_seen_at),
 			ended_at = CASE WHEN excluded.last_seen_at >= game_runs.last_seen_at
 			                THEN excluded.ended_at ELSE game_runs.ended_at END
 		WHERE game_runs.agent_id = excluded.agent_id`,
-		run.ID, agentID, siteID, run.Proc, run.Title,
+		run.ID, agentID, siteID, run.Proc, run.Title, nullStr(run.ProfileID),
 		run.StartedAt.Unix(), run.LastSeenAt.Unix(), ended, run.Source,
 		string(mustJSON(run.Caps)))
 	return err

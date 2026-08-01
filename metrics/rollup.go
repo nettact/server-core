@@ -29,6 +29,45 @@ func DefaultRetention() RetentionConfig {
 	}
 }
 
+// keepFor returns a tier's retention window in seconds; 0 = keep forever. It is
+// the single mapping from table name to configured window, shared by the pruner
+// and by the reader's tier selection so the two can never disagree about which
+// tier still holds a given moment.
+func (c RetentionConfig) keepFor(table string) int64 {
+	switch table {
+	case "samples":
+		return c.RawSeconds
+	case "rollup_1m":
+		return c.M1Seconds
+	case "rollup_1h":
+		return c.H1Seconds
+	default:
+		return c.D1Seconds
+	}
+}
+
+// covers reports whether a tier still holds data from ts, given the retention
+// the pruner deletes by (ts < now − keep). A disabled window (0) keeps forever.
+//
+// The margin is what keeps the answer stable: the cutoff advances continuously
+// while the pruner runs periodically, so rows within a margin of the edge are
+// about to disappear — possibly between two refreshes of the same chart. Reading
+// one tier coarser slightly early costs resolution; trusting a tier the pruner
+// is about to empty costs the whole chart.
+func (c RetentionConfig) covers(table string, ts, now int64) bool {
+	keep := c.keepFor(table)
+	if keep <= 0 {
+		return true
+	}
+	return ts >= now-keep+retentionSafetyMargin
+}
+
+// retentionSafetyMargin is how far inside a tier's retention window a range must
+// start before that tier is trusted to still hold it. Sized to one prune cycle
+// (the host runs retention hourly), so a range near the edge does not alternate
+// between tiers as the cutoff creeps past it.
+const retentionSafetyMargin = 3600
+
 // Reprocess a trailing window each run so late samples (agent upload interval +
 // retry, tens of seconds) are still captured. The window start is aligned DOWN
 // to the destination bucket so every recomputed bucket is recomputed in full —

@@ -58,6 +58,11 @@ type Store struct {
 	latest  map[int64]latestVal               // series id -> newest sample
 	warmed  map[string]bool                   // agent -> identities+latest loaded from DB
 	purged  map[int64]purgeWindow             // series id -> last purged range; see UpdateLatest
+	// retention is the window set the PRUNER deletes by, kept here so reads can
+	// tell which tier still holds a given moment. It is the same value the host
+	// passes to Retention; SetRetention exists so a host that configures
+	// non-default windows keeps the two in agreement.
+	retention RetentionConfig
 }
 
 // purgeWindow is a deleted [from, to) sample range. An UpdateLatest fold whose
@@ -79,13 +84,33 @@ const purgeGuardSeconds = 30
 
 func New(db *store.DB) *Store {
 	return &Store{
-		db:      db,
-		cache:   make(map[string]int64),
-		byAgent: make(map[string]map[int64]*seriesIdent),
-		latest:  make(map[int64]latestVal),
-		warmed:  make(map[string]bool),
-		purged:  make(map[int64]purgeWindow),
+		db:        db,
+		cache:     make(map[string]int64),
+		byAgent:   make(map[string]map[int64]*seriesIdent),
+		latest:    make(map[int64]latestVal),
+		warmed:    make(map[string]bool),
+		purged:    make(map[int64]purgeWindow),
+		retention: DefaultRetention(),
 	}
+}
+
+// SetRetention tells reads which windows the pruner is actually deleting by.
+// Hosts that leave retention at the defaults need not call it — New starts from
+// the same DefaultRetention the pruner falls back to. A host that CONFIGURES
+// retention must, or the reader would keep selecting a tier the pruner empties
+// on a schedule the reader does not know about. Call it at startup, before
+// serving.
+func (s *Store) SetRetention(cfg RetentionConfig) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.retention = cfg
+}
+
+// retentionCfg reads the configured windows under the lock.
+func (s *Store) retentionCfg() RetentionConfig {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.retention
 }
 
 func seriesKey(agentID, monitorID, kind, target string, configSerial int) string {
@@ -283,17 +308,39 @@ type Point struct {
 }
 
 // Query filters a read. SinceUnix=0 defaults to the last 2h.
+//
+// UntilUnix bounds the window at the top (inclusive); 0 or any value at/after
+// now means "up to now", which is the unbounded behavior. It is not merely a
+// filter: the resolution tier is chosen from the window's SIZE, so without an
+// upper bound every window reaches now and a two-hour slice of a five-day-old
+// session is served from the daily rollups — coarse buckets that describe days
+// the caller did not ask about. Bounding the window is what lets a historical
+// range be read at the same resolution a live one would be.
 type Query struct {
 	AgentID   string
 	Kind      string
 	Target    string // optional; empty = all targets for the kind
 	MonitorID string // optional; set = only that monitor's series
 	SinceUnix int64
+	UntilUnix int64
 	Limit     int
 }
 
+// tierLadder is the resolution ladder, finest first. Selection only ever moves
+// DOWN it (coarser), so "the finest tier that still works" is one pass.
+var tierLadder = []struct {
+	table string
+	raw   bool
+}{
+	{"samples", true},
+	{"rollup_1m", false},
+	{"rollup_1h", false},
+	{"rollup_1d", false},
+}
+
 // pickTier chooses a resolution table for a range (seconds) so the point count
-// stays bounded while respecting each tier's retention.
+// stays bounded. It answers on WIDTH alone; pickTierFor adds the second half of
+// the question.
 func pickTier(rangeSec int64) (table string, raw bool) {
 	switch {
 	case rangeSec <= 2*3600:
@@ -305,6 +352,37 @@ func pickTier(rangeSec int64) (table string, raw bool) {
 	default:
 		return "rollup_1d", false
 	}
+}
+
+// pickTierFor chooses the finest tier that suits BOTH the window's width and its
+// AGE: a tier whose retention no longer covers the window's start has already
+// been pruned there, so reading it returns nothing.
+//
+// Width alone was enough while every window ended at now — a narrow window was
+// necessarily recent. An upper bound breaks that: a one-hour window three days
+// old is narrow enough for raw samples and older than the two days raw is kept,
+// so the width-only answer is an empty chart standing next to minute rollups
+// that have the data. Falling to the next coarser tier is what makes bounded
+// historical reads work at all.
+func pickTierFor(rangeSec, windowStart, now int64, ret RetentionConfig) (table string, raw bool) {
+	start, _ := pickTier(rangeSec)
+	from := 0
+	for i, t := range tierLadder {
+		if t.table == start {
+			from = i
+			break
+		}
+	}
+	for _, t := range tierLadder[from:] {
+		if ret.covers(t.table, windowStart, now) {
+			return t.table, t.raw
+		}
+	}
+	// Every tier's retention has passed the window: answer from the coarsest one,
+	// which is the only place anything could still be, and let the caller see the
+	// empty result honestly rather than reading a tier that certainly has nothing.
+	last := tierLadder[len(tierLadder)-1]
+	return last.table, last.raw
 }
 
 type seriesMeta struct {
@@ -321,11 +399,35 @@ type seriesMeta struct {
 // pool so a long chart query never stalls ingest. Series are matched across ALL
 // generations (config_serial is ignored) and the merged points are ordered by
 // (kind, target, monitor, ts) so history stays continuous across material edits.
+//
+// The window is [since, until] with both ends inclusive, and the tier follows
+// its width rather than the distance to now — see Query.UntilUnix. An inverted
+// window (until before since) selects nothing and is answered with no points
+// rather than an error: it is an empty range, not a malformed one.
 func (s *Store) Query(ctx context.Context, q Query) ([]Point, error) {
 	now := time.Now().Unix()
 	since := q.SinceUnix
 	if since == 0 {
 		since = now - 2*3600
+	}
+	// A bound is honored only when it is in the PAST; at or after now it is treated
+	// as absent and no upper bound is applied at all.
+	//
+	// That is not just a shortcut for "there is nothing past now" — there is.
+	// Agent device clocks run ahead of the server's, so samples arrive stamped
+	// slightly (occasionally wildly) in the future, and this store deliberately
+	// keeps them as history. Clamping every unbounded read to now would hide them,
+	// silently changing what a live chart shows.
+	until := int64(0)
+	if q.UntilUnix > 0 && q.UntilUnix < now {
+		until = q.UntilUnix
+	}
+	// The tier still follows the window's width, with a future bound contributing
+	// nothing beyond now — otherwise "until = next week" would select a coarser
+	// resolution than the data behind it warrants.
+	tierEnd := now
+	if until > 0 {
+		tierEnd = until
 	}
 	limit := q.Limit
 	if limit <= 0 {
@@ -360,16 +462,26 @@ func (s *Store) Query(ctx context.Context, q Query) ([]Point, error) {
 		return nil, err
 	}
 
-	table, raw := pickTier(now - since)
+	table, raw := pickTierFor(tierEnd-since, since, now, s.retentionCfg())
+	valueExpr := `ts, total/cnt`
+	if raw {
+		table, valueExpr = "samples", `ts, value`
+	}
+	sqlPts := `SELECT ` + valueExpr + ` FROM ` + table + ` WHERE series_id=? AND ts>=?`
+	ptArgs := []any{int64(0), since}
+	if until > 0 {
+		sqlPts += ` AND ts<=?`
+		ptArgs = append(ptArgs, until)
+	}
+	// The limit still takes the EARLIEST points of the range, now counted within
+	// the bounded window rather than against everything after since.
+	sqlPts += ` ORDER BY ts LIMIT ?`
+	ptArgs = append(ptArgs, limit)
+
 	var out []Point
 	for _, sm := range series {
-		var sqlPts string
-		if raw {
-			sqlPts = `SELECT ts, value FROM samples WHERE series_id=? AND ts>=? ORDER BY ts LIMIT ?`
-		} else {
-			sqlPts = `SELECT ts, total/cnt FROM ` + table + ` WHERE series_id=? AND ts>=? ORDER BY ts LIMIT ?`
-		}
-		prows, err := s.db.Read().QueryContext(ctx, sqlPts, sm.id, since, limit)
+		ptArgs[0] = sm.id
+		prows, err := s.db.Read().QueryContext(ctx, sqlPts, ptArgs...)
 		if err != nil {
 			return nil, err
 		}

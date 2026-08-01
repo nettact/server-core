@@ -21,6 +21,11 @@ import (
 // handleListGameRuns lists an agent's game runs newest first. The optional
 // since/until pair (unix seconds) selects runs OVERLAPPING that window, so a
 // session still in progress when the window opened is included.
+//
+// runs=all|profiled|other splits the list by whether the session matched a game
+// profile. An unrecognized value is refused rather than silently treated as
+// "all": a console asking for one half of the data and being handed both would
+// present other processes as games without anything saying so.
 func (d Deps) handleListGameRuns(w http.ResponseWriter, r *http.Request) {
 	if d.GameData == nil {
 		writeError(w, http.StatusServiceUnavailable, "game data not available")
@@ -30,6 +35,14 @@ func (d Deps) handleListGameRuns(w http.ResponseWriter, r *http.Request) {
 	f := gamedata.RunFilter{
 		AgentID: chi.URLParam(r, "id"),
 		SiteID:  siteParam(r),
+	}
+	switch runs := q.Get("runs"); runs {
+	case "", gamedata.RunsAll:
+	case gamedata.RunsProfiled, gamedata.RunsOther:
+		f.Runs = runs
+	default:
+		writeError(w, http.StatusBadRequest, "runs must be all, profiled or other")
+		return
 	}
 	if n, err := strconv.ParseInt(q.Get("since"), 10, 64); err == nil && n > 0 {
 		f.Since = n

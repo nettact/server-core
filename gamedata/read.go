@@ -24,8 +24,21 @@ type RunFilter struct {
 	SiteID  string
 	Since   int64
 	Until   int64
-	Limit   int // default 50, max 200
+	// Runs selects by profile stamp: "" / RunsAll for everything, RunsProfiled for
+	// sessions that matched a game profile, RunsOther for the ones that matched
+	// none. The split exists because the two are different questions — "how did my
+	// games run" and "what else was presenting frames on this machine" — and a
+	// single list mixing them buries the first under browsers and video players.
+	Runs  string
+	Limit int // default 50, max 200
 }
+
+// RunFilter.Runs values.
+const (
+	RunsAll      = "all"
+	RunsProfiled = "profiled"
+	RunsOther    = "other"
+)
 
 // RunPage is a listing plus the filter's total match count, which is not
 // len(Items) once the limit bites.
@@ -44,7 +57,7 @@ func (s *Service) ListRuns(ctx context.Context, f RunFilter) (RunPage, error) {
 	where, args := f.where()
 	page := RunPage{Items: []Run{}}
 
-	q := `SELECT COUNT(*) FROM game_runs`
+	q := `SELECT COUNT(*) FROM game_runs r`
 	if where != "" {
 		q += ` WHERE ` + where
 	}
@@ -52,11 +65,11 @@ func (s *Service) ListRuns(ctx context.Context, f RunFilter) (RunPage, error) {
 		return page, err
 	}
 
-	q = `SELECT ` + runCols + ` FROM game_runs`
+	q = `SELECT ` + runCols + runFrom
 	if where != "" {
 		q += ` WHERE ` + where
 	}
-	q += ` ORDER BY started_at DESC, id DESC LIMIT ?`
+	q += ` ORDER BY r.started_at DESC, r.id DESC LIMIT ?`
 	runs, err := s.queryRuns(ctx, q, append(args, limit)...)
 	if err != nil {
 		return page, err
@@ -67,7 +80,7 @@ func (s *Service) ListRuns(ctx context.Context, f RunFilter) (RunPage, error) {
 
 // GetRun returns one run and its summary. ErrNotFound when the id is unknown.
 func (s *Service) GetRun(ctx context.Context, id string) (Run, error) {
-	runs, err := s.queryRuns(ctx, `SELECT `+runCols+` FROM game_runs WHERE id=?`, id)
+	runs, err := s.queryRuns(ctx, `SELECT `+runCols+runFrom+` WHERE r.id=?`, id)
 	if err != nil {
 		return Run{}, err
 	}
@@ -100,27 +113,40 @@ func (s *Service) DeleteRun(ctx context.Context, id string) error {
 	return tx.Commit()
 }
 
-const runCols = `id, agent_id, site_id, proc, title, started_at, last_seen_at, ended_at, source, caps,
-	presented, displayed, dropped, hist_layout, hist`
+const runCols = `r.id, r.agent_id, r.site_id, r.proc, r.title, r.profile_id, gp.name,
+	r.started_at, r.last_seen_at, r.ended_at, r.source, r.caps,
+	r.presented, r.displayed, r.dropped, r.hist_layout, r.hist`
+
+// runFrom joins the profile a run was stamped with, when it still exists. The
+// join is LEFT and same-site: a deleted profile must leave the run readable with
+// its id intact and no name, which is exactly what a stamp outliving its
+// configuration looks like.
+const runFrom = ` FROM game_runs r LEFT JOIN game_profiles gp ON gp.id = r.profile_id AND gp.site_id = r.site_id`
 
 func (f RunFilter) where() (string, []any) {
 	var where []string
 	var args []any
 	if f.AgentID != "" {
-		where = append(where, "agent_id=?")
+		where = append(where, "r.agent_id=?")
 		args = append(args, f.AgentID)
 	}
 	if f.SiteID != "" {
-		where = append(where, "site_id=?")
+		where = append(where, "r.site_id=?")
 		args = append(args, f.SiteID)
 	}
 	if f.Since > 0 {
-		where = append(where, "last_seen_at >= ?")
+		where = append(where, "r.last_seen_at >= ?")
 		args = append(args, f.Since)
 	}
 	if f.Until > 0 {
-		where = append(where, "started_at < ?")
+		where = append(where, "r.started_at < ?")
 		args = append(args, f.Until)
+	}
+	switch f.Runs {
+	case RunsProfiled:
+		where = append(where, "r.profile_id IS NOT NULL")
+	case RunsOther:
+		where = append(where, "r.profile_id IS NULL")
 	}
 	return strings.Join(where, " AND "), args
 }
@@ -134,20 +160,23 @@ func (s *Service) queryRuns(ctx context.Context, q string, args ...any) ([]Run, 
 	out := []Run{}
 	for rows.Next() {
 		var (
-			r                  Run
-			started, lastSeen  int64
-			ended              sql.NullInt64
-			caps               string
-			presented          int64
-			displayed, dropped sql.NullInt64
-			layout             sql.NullString
-			blob               []byte
+			r                      Run
+			profileID, profileName sql.NullString
+			started, lastSeen      int64
+			ended                  sql.NullInt64
+			caps                   string
+			presented              int64
+			displayed, dropped     sql.NullInt64
+			layout                 sql.NullString
+			blob                   []byte
 		)
-		if err := rows.Scan(&r.ID, &r.AgentID, &r.SiteID, &r.Proc, &r.Title,
+		if err := rows.Scan(&r.ID, &r.AgentID, &r.SiteID, &r.Proc, &r.Title, &profileID, &profileName,
 			&started, &lastSeen, &ended, &r.Source, &caps,
 			&presented, &displayed, &dropped, &layout, &blob); err != nil {
 			return nil, err
 		}
+		r.ProfileID = strPtr(profileID)
+		r.ProfileName = strPtr(profileName)
 		r.StartedAt = unixTime(started)
 		r.LastSeenAt = unixTime(lastSeen)
 		if ended.Valid {

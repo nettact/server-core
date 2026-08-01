@@ -1016,6 +1016,16 @@ func (s *Service) DesiredStateFor(ctx context.Context, agentID string) (pcfg.Des
 		return pcfg.DesiredState{}, err
 	}
 	ds.Proxies = proxies
+	// The game block is ALWAYS present, even with no profiles defined: its absence
+	// would be indistinguishable from a server that has nothing to say about game
+	// capture, and the agent would have no way to learn that the last profile was
+	// deleted. It carries its own version, so a probe-only edit re-pushes it
+	// unchanged and the sensor is left alone (see gameprofiles.go).
+	game, err := s.gameConfigFor(ctx, st.SiteID)
+	if err != nil {
+		return pcfg.DesiredState{}, err
+	}
+	ds.Game = game
 	return ds, nil
 }
 

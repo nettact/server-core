@@ -200,6 +200,284 @@ func TestRollupTiersAndQuery(t *testing.T) {
 	}
 }
 
+// seedHistoricalRun ingests ten minutes of 1-second samples ending `age` before
+// now and builds every rollup tier over them. The stretch is hour-aligned so the
+// hourly bucket covering it is stamped at the window's own start — rollup rows
+// carry the BUCKET's timestamp, which can otherwise precede the range asking for
+// them. One spike survives only at raw resolution; the minute bucket containing
+// it averages to exactly 5.0, which is how a test tells the tiers apart.
+func seedHistoricalRun(t *testing.T, db *store.DB, s *Store, age time.Duration) (start, end int64) {
+	t.Helper()
+	const span = 600
+	start = alignDown(time.Now().Unix()-int64(age.Seconds()), 3600)
+	end = start + span
+	var ms []telemetry.Metric
+	for ts := start; ts < end; ts++ {
+		v := 4.0
+		if ts == start+30 {
+			v = 64.0
+		}
+		ms = append(ms, telemetry.Metric{
+			TS: time.Unix(ts, 0), Kind: telemetry.ICMPRTTms, Target: "1.1.1.1",
+			Value: v, Unit: "ms", MonitorID: "probe_m1",
+		})
+	}
+	ingestBatch(t, db, s, "agent_a", ms)
+	if err := s.Rollup(context.Background()); err != nil {
+		t.Fatalf("Rollup: %v", err)
+	}
+	return start, end
+}
+
+// TestQueryUntilBoundsTheWindow covers what the upper bound does to the SET of
+// points, at one fixed resolution. Tier selection is TestTierSelectionByWidthAndAge.
+func TestQueryUntilBoundsTheWindow(t *testing.T) {
+	db, s := openStore(t)
+	ctx := context.Background()
+
+	// Ten minutes of 1-second samples ending now: recent and narrow, so every query
+	// below reads raw samples and the counts are exact.
+	const span = 600
+	end := time.Now().Unix()
+	start := end - span
+	var ms []telemetry.Metric
+	for ts := start; ts < end; ts++ {
+		ms = append(ms, telemetry.Metric{
+			TS: time.Unix(ts, 0), Kind: telemetry.ICMPRTTms, Target: "1.1.1.1",
+			Value: 4, Unit: "ms", MonitorID: "probe_m1",
+		})
+	}
+	ingestBatch(t, db, s, "agent_a", ms)
+
+	base := Query{AgentID: "agent_a", Kind: string(telemetry.ICMPRTTms), MonitorID: "probe_m1", SinceUnix: start}
+	all, err := s.Query(ctx, base)
+	if err != nil {
+		t.Fatalf("unbounded Query: %v", err)
+	}
+	if len(all) != span {
+		t.Fatalf("unbounded window = %d points, want %d", len(all), span)
+	}
+
+	// Both ends are inclusive, so half the window is half the points plus the
+	// boundary second itself.
+	q := base
+	q.UntilUnix = start + span/2
+	half, err := s.Query(ctx, q)
+	if err != nil {
+		t.Fatalf("half-window Query: %v", err)
+	}
+	if len(half) != span/2+1 {
+		t.Fatalf("half window = %d points, want %d", len(half), span/2+1)
+	}
+	for _, p := range half {
+		if p.TS.Unix() < start || p.TS.Unix() > q.UntilUnix {
+			t.Fatalf("point at %d escapes the window [%d,%d]", p.TS.Unix(), start, q.UntilUnix)
+		}
+	}
+
+	// The limit counts WITHIN the bounded window, still taking its earliest points.
+	q.Limit = 10
+	if capped, err := s.Query(ctx, q); err != nil || len(capped) != 10 {
+		t.Fatalf("limited window = %d points (%v), want 10", len(capped), err)
+	}
+
+	// An inverted window is empty, not an error: it is a range containing no
+	// seconds, which is a legitimate thing for a caller to ask about.
+	q = base
+	q.UntilUnix = start - 3600
+	if empty, err := s.Query(ctx, q); err != nil || len(empty) != 0 {
+		t.Fatalf("inverted window = %d points (%v), want none", len(empty), err)
+	}
+
+	// Agent device clocks run ahead of the server's, so a sample can legitimately
+	// be stamped in the future — and this store keeps it as history. An unbounded
+	// read must still return it, which is why an absent (or future) bound applies
+	// NO upper bound rather than clamping the window to now.
+	ahead := time.Now().Unix() + 600
+	ingestBatch(t, db, s, "agent_a", []telemetry.Metric{{
+		TS: time.Unix(ahead, 0), Kind: telemetry.ICMPRTTms, Target: "1.1.1.1",
+		Value: 99, Unit: "ms", MonitorID: "probe_m1",
+	}})
+	q = base
+	q.SinceUnix = time.Now().Unix() - 60
+	skewed, err := s.Query(ctx, q)
+	if err != nil {
+		t.Fatalf("unbounded Query over skewed sample: %v", err)
+	}
+	if len(skewed) == 0 || skewed[len(skewed)-1].Value != 99 {
+		t.Fatalf("unbounded read = %+v, want the clock-skewed sample", skewed)
+	}
+	q.UntilUnix = time.Now().Unix() + 3600
+	if bounded, err := s.Query(ctx, q); err != nil || len(bounded) != len(skewed) {
+		t.Fatalf("future bound = %d points (%v), want the unbounded %d", len(bounded), err, len(skewed))
+	}
+	// A bound in the past, however, is applied — and excludes it.
+	q.UntilUnix = time.Now().Unix() - 1
+	past, err := s.Query(ctx, q)
+	if err != nil {
+		t.Fatalf("past bound: %v", err)
+	}
+	for _, p := range past {
+		if p.Value == 99 {
+			t.Fatal("a past bound returned the future-stamped sample")
+		}
+	}
+}
+
+// TestTierSelectionByWidthAndAge is the rule bounded historical reads depend on:
+// the finest tier that suits the window's width AND is still retained at the
+// window's start.
+//
+// Width alone is a trap once an upper bound exists. A one-hour window three days
+// old is narrow enough for raw samples and older than the two days raw is kept,
+// so a width-only answer reads an already-pruned table and returns nothing —
+// while the minute rollups covering that same hour sit right there.
+func TestTierSelectionByWidthAndAge(t *testing.T) {
+	db, s := openStore(t)
+	ctx := context.Background()
+	start, end := seedHistoricalRun(t, db, s, 3*24*time.Hour)
+
+	base := Query{AgentID: "agent_a", Kind: string(telemetry.ICMPRTTms), MonitorID: "probe_m1", SinceUnix: start}
+
+	// Unbounded: three days of width, answered hourly — one bucket for the lot.
+	coarse, err := s.Query(ctx, base)
+	if err != nil {
+		t.Fatalf("unbounded Query: %v", err)
+	}
+	if len(coarse) != 1 {
+		t.Fatalf("unbounded query = %d points, want the single hourly bucket", len(coarse))
+	}
+
+	// Bounded to the ten minutes recorded: narrow enough for raw, but three days
+	// past raw retention, so the minute tier answers — ten buckets, the first
+	// carrying the spike as an average (59×4 + 64)/60 = 5.0.
+	q := base
+	q.UntilUnix = end
+	fine, err := s.Query(ctx, q)
+	if err != nil {
+		t.Fatalf("bounded Query: %v", err)
+	}
+	if len(fine) != 10 {
+		t.Fatalf("bounded query = %d points, want 10 minute buckets", len(fine))
+	}
+	if fine[0].Value != 5.0 || fine[1].Value != 4.0 {
+		t.Fatalf("bucket values = %v/%v, want the minute tier's 5.0/4.0", fine[0].Value, fine[1].Value)
+	}
+
+	// Retention disabled everywhere means nothing has been pruned, so width alone
+	// decides again and the same window reads raw — spike intact.
+	s.SetRetention(RetentionConfig{})
+	raw, err := s.Query(ctx, q)
+	if err != nil {
+		t.Fatalf("no-retention Query: %v", err)
+	}
+	if len(raw) != 600 {
+		t.Fatalf("no-retention query = %d points, want 600 raw samples", len(raw))
+	}
+	sawSpike := false
+	for _, p := range raw {
+		if p.Value == 64 {
+			sawSpike = true
+		}
+	}
+	if !sawSpike {
+		t.Fatal("no-retention query lost the spike; it did not read the raw tier")
+	}
+
+	// A minute tier that no longer reaches back this far pushes the same window one
+	// rung further down, to the hourly bucket.
+	s.SetRetention(RetentionConfig{RawSeconds: 2 * 86400, M1Seconds: 86400, H1Seconds: 2 * 365 * 86400})
+	hourly, err := s.Query(ctx, q)
+	if err != nil {
+		t.Fatalf("short-1m-retention Query: %v", err)
+	}
+	if len(hourly) != 1 {
+		t.Fatalf("short 1m retention = %d points, want the hourly bucket", len(hourly))
+	}
+
+	// A RECENT window of the same width is unaffected: age is what disqualified the
+	// raw tier, not width.
+	s.SetRetention(DefaultRetention())
+	recentStart := time.Now().Unix() - 300
+	ingestBatch(t, db, s, "agent_a", []telemetry.Metric{{
+		TS: time.Unix(recentStart+10, 0), Kind: telemetry.ICMPRTTms, Target: "1.1.1.1",
+		Value: 7, Unit: "ms", MonitorID: "probe_m1",
+	}})
+	q = base
+	q.SinceUnix = recentStart
+	q.UntilUnix = time.Now().Unix()
+	recent, err := s.Query(ctx, q)
+	if err != nil {
+		t.Fatalf("recent Query: %v", err)
+	}
+	if len(recent) != 1 || recent[0].Value != 7 {
+		t.Fatalf("recent window = %+v, want the raw sample", recent)
+	}
+
+	// The production case, end to end: run the REAL pruner over the fixture so the
+	// raw rows a width-only rule would have read are actually gone, then ask for
+	// the same bounded historical window again. This is the assertion that cannot
+	// pass by accident — a test DB that never prunes would let the broken rule look
+	// correct.
+	if err := s.Retention(ctx, DefaultRetention()); err != nil {
+		t.Fatalf("Retention: %v", err)
+	}
+	var survivingRaw int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM samples WHERE ts<=?`, end).Scan(&survivingRaw); err != nil {
+		t.Fatal(err)
+	}
+	if survivingRaw != 0 {
+		t.Fatalf("%d raw samples survived the prune; the fixture is not exercising the real case", survivingRaw)
+	}
+	q = base
+	q.UntilUnix = end
+	afterPrune, err := s.Query(ctx, q)
+	if err != nil {
+		t.Fatalf("Query after prune: %v", err)
+	}
+	if len(afterPrune) != 10 || afterPrune[0].Value != 5.0 {
+		t.Fatalf("post-prune bounded query = %+v, want the 10 surviving minute buckets", afterPrune)
+	}
+}
+
+// TestPickTierForLadder pins the selection rule directly, including the ends of
+// the ladder that are awkward to reach through stored data.
+func TestPickTierForLadder(t *testing.T) {
+	now := time.Now().Unix()
+	def := DefaultRetention()
+	hour := int64(3600)
+
+	cases := []struct {
+		name  string
+		width int64
+		start int64
+		ret   RetentionConfig
+		want  string
+	}{
+		{"narrow and recent reads raw", hour, now - 2*hour, def, "samples"},
+		{"narrow but past raw retention falls to 1m", hour, now - 3*86400, def, "rollup_1m"},
+		{"narrow but past 1m retention falls to 1h", hour, now - 60*86400, def, "rollup_1h"},
+		{"narrow but past 1h retention falls to 1d", hour, now - 3*365*86400, def, "rollup_1d"},
+		{"retention disabled keeps the width answer", hour, now - 3*365*86400, RetentionConfig{}, "samples"},
+		{"width still coarsens a recent range", 30 * 86400, now - 30*86400, def, "rollup_1h"},
+		// The margin makes a range starting just inside the raw window read one tier
+		// coarser, so a chart does not flap as the cutoff creeps past it.
+		{"just inside raw retention is not trusted", hour, now - def.RawSeconds + 60, def, "rollup_1m"},
+		{"comfortably inside raw retention is", hour, now - def.RawSeconds + 4*hour, def, "samples"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, raw := pickTierFor(c.width, c.start, now, c.ret)
+			if got != c.want {
+				t.Fatalf("pickTierFor = %q, want %q", got, c.want)
+			}
+			if raw != (got == "samples") {
+				t.Fatalf("raw flag = %v for table %q", raw, got)
+			}
+		})
+	}
+}
+
 // TestRetentionPrunes verifies old raw samples are pruned while rollups stay.
 func TestRetentionPrunes(t *testing.T) {
 	db, s := openStore(t)

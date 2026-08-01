@@ -165,6 +165,15 @@ func Router(d Deps) http.Handler {
 			r.Get("/game-runs/{id}", d.handleGetGameRun)
 			r.Get("/game-runs/{id}/buckets", d.handleGameRunBuckets)
 			r.Delete("/game-runs/{id}", d.handleDeleteGameRun)
+			// Game profiles: which processes count as which game, pushed to agents
+			// on their own config axis. game-collection is the site-wide choice of
+			// whether processes matching no profile are recorded at all.
+			r.Get("/sites/{id}/game-profiles", d.handleListGameProfiles)
+			r.Post("/sites/{id}/game-profiles", d.handleCreateGameProfile)
+			r.Put("/game-profiles/{id}", d.handleUpdateGameProfile)
+			r.Delete("/game-profiles/{id}", d.handleDeleteGameProfile)
+			r.Get("/sites/{id}/game-collection", d.handleGetGameCollection)
+			r.Put("/sites/{id}/game-collection", d.handleUpdateGameCollection)
 			r.Get("/enrollment-tokens", d.handleListTokens)
 			r.Post("/enrollment-tokens", d.handleCreateToken)
 			r.Get("/sites/{id}/targets", d.handleListTargets)
@@ -692,6 +701,21 @@ func (d Deps) handleDeleteAgent(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// handleAgentMetrics serves a series window for charting. since_seconds is a
+// RELATIVE lookback (seconds before now) while the optional until is an ABSOLUTE
+// unix timestamp, so the effective window is
+// [now − since_seconds, min(now, until)].
+//
+// until exists for reading history rather than for filtering: the store picks
+// its resolution tier from the window's width, so an unbounded query about a
+// five-day-old game session spans five days and comes back as daily rollup
+// buckets. Bounding the top lets that session be charted at the resolution it
+// was recorded at.
+//
+// Omitting until keeps the previous behavior exactly — no upper bound at all —
+// and an until at or after now means the same, deliberately: agent clocks run
+// ahead of the server's, so samples stamped slightly in the future are real
+// history and a live chart must keep showing them.
 func (d Deps) handleAgentMetrics(w http.ResponseWriter, r *http.Request) {
 	q := metrics.Query{
 		AgentID:   chi.URLParam(r, "id"),
@@ -708,6 +732,18 @@ func (d Deps) handleAgentMetrics(w http.ResponseWriter, r *http.Request) {
 		if n, err := strconv.Atoi(s); err == nil && n > 0 {
 			q.SinceUnix = time.Now().Unix() - int64(n)
 		}
+	}
+	// Unlike the older params, a malformed until is REFUSED rather than ignored: it
+	// is the bound that decides the resolution, so silently dropping it would answer
+	// a request for one afternoon with a week of daily averages and nothing in the
+	// response would say the bound was never applied.
+	if s := r.URL.Query().Get("until"); s != "" {
+		n, err := strconv.ParseInt(s, 10, 64)
+		if err != nil || n <= 0 {
+			writeError(w, http.StatusBadRequest, "until must be a positive unix timestamp (seconds)")
+			return
+		}
+		q.UntilUnix = n
 	}
 	points, err := d.Metrics.Query(r.Context(), q)
 	if err != nil {

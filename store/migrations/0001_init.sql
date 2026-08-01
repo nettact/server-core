@@ -30,10 +30,25 @@ CREATE TABLE sites(
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  -- Site-level monotonic config serial: the single desired-config axis. Every
+  -- Site-level monotonic config serial: the probe desired-config axis. Every
   -- push stamps it, and every sample/status the agents return echoes the serial
   -- it was produced under, so obsolete-generation data can never roll status back.
-  config_serial INTEGER NOT NULL DEFAULT 0
+  config_serial INTEGER NOT NULL DEFAULT 0,
+  -- The game-capture config's OWN serial, deliberately a second axis rather than
+  -- a share of config_serial. The two describe unrelated things: renaming a game
+  -- profile has nothing to say to a ping monitor, and bumping the probe serial
+  -- for it would make every agent re-evaluate every target and restart the ones
+  -- whose generation it cannot prove unchanged. Kept apart, a profile edit
+  -- re-pushes DesiredState with an unchanged ConfigVersion (the probe side
+  -- no-ops) and a probe edit leaves this one alone (the sensor is not restarted
+  -- for a change it cannot see).
+  game_config_serial INTEGER NOT NULL DEFAULT 0,
+  -- What happens to a presenting process matching no game profile: recorded as
+  -- an "other process" run, or ignored. Default 1 = record everything, which is
+  -- what makes the feature work out of the box before anyone defines a profile.
+  -- A site setting rather than a per-profile one because it is a privacy choice
+  -- about the machine, not a measurement choice about a game.
+  game_record_unmatched INTEGER NOT NULL DEFAULT 1
 );
 
 CREATE TABLE enrollment_tokens(
@@ -396,12 +411,38 @@ CREATE INDEX idx_events_site_ts ON events(site_id, ts);
 -- unrecoverable — every chart would then render a source's blind spot as a
 -- flawless result. Readers must restore the absent value as absent.
 
+-- A named game: the process names that count as it, and how closely it is
+-- measured. Profiles are configuration, not history — they are pushed to agents
+-- as part of DesiredState (bumping sites.game_config_serial) and are what turns
+-- "chrome.exe presented frames" into "this is Counter-Strike".
+CREATE TABLE game_profiles(
+  id TEXT PRIMARY KEY,
+  site_id TEXT NOT NULL REFERENCES sites(id),
+  name TEXT NOT NULL,
+  exe_match TEXT NOT NULL DEFAULT '[]',   -- JSON array of case-insensitive process names ("cs2.exe")
+  target_fps INTEGER,                     -- NULL = unset
+  tier TEXT NOT NULL DEFAULT 'diag',      -- base | diag
+  -- probe_tasks ids this game is charted against on its run detail. Console-only
+  -- and deliberately never pushed to agents: the link changes how a run is drawn,
+  -- and an agent carrying the list on every push would never read it.
+  monitor_ids TEXT NOT NULL DEFAULT '[]',
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE INDEX idx_game_profiles_site ON game_profiles(site_id);
+
 CREATE TABLE game_runs(
   id TEXT PRIMARY KEY,
   agent_id TEXT NOT NULL REFERENCES agents(id),
   site_id TEXT NOT NULL,
   proc TEXT NOT NULL DEFAULT '',
   title TEXT NOT NULL DEFAULT '',
+  -- The game profile this session matched; NULL means it matched none and was
+  -- recorded as an "other process" run. Plain TEXT with NO foreign key on
+  -- purpose: the stamp records what the profile set said WHEN the run happened,
+  -- so deleting a profile must not delete history or blank the runs it explains.
+  -- Readers join it optionally and show a name only while the profile still exists.
+  profile_id TEXT,
   started_at INTEGER NOT NULL,     -- unix seconds, first second captured
   last_seen_at INTEGER NOT NULL,   -- unix seconds, newest second captured
   -- Set only once the run is KNOWN to be over, so a session cut short by an agent

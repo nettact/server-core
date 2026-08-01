@@ -44,18 +44,26 @@ func New(db *store.DB, st *settings.Service) *Service {
 // Run is one recorded game session together with the whole-run figures a reader
 // compares runs by. Caps and Source say how it was measured, which is what makes
 // two runs comparable at all.
+//
+// ProfileID is the game profile the session matched, null for one that matched
+// none ("other process"). ProfileName is resolved on read and is null both for
+// those AND for a run whose profile has since been deleted — the stamp is history
+// and outlives the configuration, so they are two fields rather than one that
+// would have to lie about one of the cases.
 type Run struct {
-	ID         string     `json:"id"`
-	AgentID    string     `json:"agent_id"`
-	SiteID     string     `json:"site_id"`
-	Proc       string     `json:"proc"`
-	Title      string     `json:"title,omitempty"`
-	StartedAt  time.Time  `json:"started_at"`
-	LastSeenAt time.Time  `json:"last_seen_at"`
-	EndedAt    *time.Time `json:"ended_at"`
-	Source     string     `json:"source,omitempty"`
-	Caps       []string   `json:"caps"`
-	Summary    Summary    `json:"summary"`
+	ID          string     `json:"id"`
+	AgentID     string     `json:"agent_id"`
+	SiteID      string     `json:"site_id"`
+	Proc        string     `json:"proc"`
+	Title       string     `json:"title,omitempty"`
+	ProfileID   *string    `json:"profile_id"`
+	ProfileName *string    `json:"profile_name"`
+	StartedAt   time.Time  `json:"started_at"`
+	LastSeenAt  time.Time  `json:"last_seen_at"`
+	EndedAt     *time.Time `json:"ended_at"`
+	Source      string     `json:"source,omitempty"`
+	Caps        []string   `json:"caps"`
+	Summary     Summary    `json:"summary"`
 }
 
 // Summary is a run's whole-run figures, derived by summing its buckets'
@@ -180,6 +188,17 @@ func int64Ptr(v sql.NullInt64) *int64 {
 	}
 	n := v.Int64
 	return &n
+}
+
+// strPtr keeps an absent text column absent. A NULL profile stamp is "this
+// session matched no game", which the empty string could not say without also
+// being a legitimate id of nothing.
+func strPtr(v sql.NullString) *string {
+	if !v.Valid {
+		return nil
+	}
+	s := v.String
+	return &s
 }
 
 func boolPtr(v sql.NullInt64) *bool {

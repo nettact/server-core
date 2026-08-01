@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -13,6 +15,99 @@ import (
 	"github.com/nettact/protocol/telemetry"
 	"github.com/nettact/server-core/metrics"
 )
+
+// TestAgentMetricsUntilWindow covers the optional absolute upper bound on the
+// series endpoint. since_seconds stays RELATIVE (seconds before now) while until
+// is an ABSOLUTE unix timestamp, so the effective window is
+// [now − since_seconds, min(now, until)] — which is what lets the console chart a
+// historical game run without the range silently stretching to now.
+func TestAgentMetricsUntilWindow(t *testing.T) {
+	db := openStatusDB(t)
+	ctx := context.Background()
+	ms := metrics.New(db)
+	d := Deps{Metrics: ms}
+
+	now := time.Now()
+	batch := []telemetry.Metric{
+		{TS: now.Add(-50 * time.Minute), Kind: telemetry.ICMPRTTms, Target: "1.1.1.1", Layer: "internet", Value: 10, Unit: "ms", MonitorID: "target-1"},
+		{TS: now.Add(-40 * time.Minute), Kind: telemetry.ICMPRTTms, Target: "1.1.1.1", Layer: "internet", Value: 20, Unit: "ms", MonitorID: "target-1"},
+		{TS: now.Add(-30 * time.Minute), Kind: telemetry.ICMPRTTms, Target: "1.1.1.1", Layer: "internet", Value: 30, Unit: "ms", MonitorID: "target-1"},
+	}
+	ids, err := ms.EnsureSeries(ctx, "agent-1", "site_default", batch)
+	if err != nil {
+		t.Fatalf("EnsureSeries: %v", err)
+	}
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("BeginTx: %v", err)
+	}
+	if err := ms.InsertSamples(ctx, tx, "agent-1", ids, batch); err != nil {
+		t.Fatalf("InsertSamples: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+
+	get := func(query string) *httptest.ResponseRecorder {
+		t.Helper()
+		r := httptest.NewRequest(http.MethodGet, "/api/v1/agents/agent-1/metrics"+query, nil)
+		rctx := chi.NewRouteContext()
+		rctx.URLParams.Add("id", "agent-1")
+		r = r.WithContext(context.WithValue(r.Context(), chi.RouteCtxKey, rctx))
+		w := httptest.NewRecorder()
+		d.handleAgentMetrics(w, r)
+		return w
+	}
+	points := func(query string) []metrics.Point {
+		t.Helper()
+		w := get(query)
+		if w.Code != http.StatusOK {
+			t.Fatalf("%s: status=%d body=%s", query, w.Code, w.Body.String())
+		}
+		var pts []metrics.Point
+		if err := json.Unmarshal(w.Body.Bytes(), &pts); err != nil {
+			t.Fatalf("%s: decode: %v body=%s", query, err, w.Body.String())
+		}
+		return pts
+	}
+
+	const base = "?kind=probe.icmp.rtt_ms&monitor=target-1&since_seconds=3600"
+	if pts := points(base); len(pts) != 3 {
+		t.Fatalf("unbounded window = %d points, want 3", len(pts))
+	}
+
+	// Bounded to the middle sample: inclusive at the top, so two points.
+	mid := now.Add(-40 * time.Minute).Unix()
+	pts := points(base + "&until=" + strconv.FormatInt(mid, 10))
+	if len(pts) != 2 {
+		t.Fatalf("until=mid gave %d points, want 2 (inclusive bound)", len(pts))
+	}
+	if pts[len(pts)-1].Value != 20 {
+		t.Fatalf("last point = %v, want the sample at the bound", pts[len(pts)-1].Value)
+	}
+
+	// An until in the future is the same as no until: nothing exists past now.
+	if pts := points(base + "&until=" + strconv.FormatInt(now.Add(time.Hour).Unix(), 10)); len(pts) != 3 {
+		t.Fatalf("future until = %d points, want the unbounded 3", len(pts))
+	}
+
+	// An until BEFORE the window start is an empty range, not a bad request.
+	w := get(base + "&until=" + strconv.FormatInt(now.Add(-2*time.Hour).Unix(), 10))
+	if w.Code != http.StatusOK {
+		t.Fatalf("until before the window: status=%d body=%s", w.Code, w.Body.String())
+	}
+	if body := strings.TrimSpace(w.Body.String()); body != "[]" {
+		t.Fatalf("until before the window = %s, want an empty array", body)
+	}
+
+	// A malformed bound is refused rather than ignored — silently dropping it would
+	// answer with a window the caller did not ask for and nothing would say so.
+	for _, bad := range []string{"abc", "0", "-5", "1.5"} {
+		if w := get(base + "&until=" + bad); w.Code != http.StatusBadRequest {
+			t.Fatalf("until=%s: status=%d, want 400", bad, w.Code)
+		}
+	}
+}
 
 // TestAgentMetricsSummary covers the PERF-001 aggregation endpoint: JSON shape
 // (including nulls for kinds with no samples) and the 400 guards.
