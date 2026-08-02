@@ -47,6 +47,16 @@ func TestUpdateAndDeleteAgent(t *testing.T) {
 	mustExec(t, db, `INSERT INTO monitor_groups(id,site_id,name,all_agents) VALUES('mg1','site_default','all',1)`)
 	mustExec(t, db, `INSERT INTO probe_tasks(id,site_id,group_id,kind,target,params,enabled) VALUES('mon1','site_default','mg1','http','https://example.test','{}',1)`)
 	mustExec(t, db, `INSERT INTO detector_state(target_id,agent_id,detector_key,fail_rounds,updated_at) VALUES('mon1','agent_x','availability',2,?)`, now)
+	// The game tables, all three. game_host_seconds is the one that matters most
+	// here: it references agents directly and does NOT cascade, so leaving it out
+	// of the purge makes the final DELETE FROM agents fail on the foreign key —
+	// after the caller has already purged the agent's metrics, which leaves the
+	// agent on screen with part of its history gone.
+	mustExec(t, db, `INSERT INTO game_runs(id,agent_id,site_id,started_at,last_seen_at) VALUES('run1','agent_x','site_default',1,2)`)
+	mustExec(t, db, `INSERT INTO game_buckets(run_id,ts,presented,ft_avg,ft_p50,ft_p95,ft_p99,ft_max,ft_sd,hist_layout,hist)
+		VALUES('run1',1,60,16.6,16.5,17.2,18.1,20,0.4,'log24_v1',x'00')`)
+	mustExec(t, db, `INSERT INTO game_run_gaps(id,run_id,reason,started_at,ended_at) VALUES('gap1','run1','background',2,9)`)
+	mustExec(t, db, `INSERT INTO game_host_seconds(agent_id,site_id,ts,cpu_total_pct,cpu_busiest_pct) VALUES('agent_x','site_default',1,20,80)`)
 	// A recorded fault is history, not agent-owned state: it must SURVIVE the
 	// delete, carrying the frozen names that make it readable afterwards.
 	mustExec(t, db, `INSERT INTO incidents(id,site_id,group_id,open_key,state,severity,opened_at) VALUES('inc1','site_default','mg1','sig:sig1','open','warn',?)`, now)
@@ -81,7 +91,7 @@ func TestUpdateAndDeleteAgent(t *testing.T) {
 	}
 	for _, tbl := range []string{
 		"interfaces", "agent_wifi", "agent_status_history", "agent_group_members",
-		"agent_packets", "events", "detector_state",
+		"agent_packets", "events", "detector_state", "game_runs", "game_host_seconds",
 	} {
 		var n int
 		if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM `+tbl+` WHERE agent_id='agent_x'`).Scan(&n); err != nil {
@@ -89,6 +99,19 @@ func TestUpdateAndDeleteAgent(t *testing.T) {
 		}
 		if n != 0 {
 			t.Errorf("%s still has %d rows for deleted agent", tbl, n)
+		}
+	}
+	// The two that hang off the run rather than off the agent go with it.
+	for _, q := range []string{
+		`SELECT COUNT(*) FROM game_buckets WHERE run_id='run1'`,
+		`SELECT COUNT(*) FROM game_run_gaps WHERE run_id='run1'`,
+	} {
+		var n int
+		if err := db.QueryRowContext(ctx, q).Scan(&n); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+		if n != 0 {
+			t.Errorf("%s left %d rows behind", q, n)
 		}
 	}
 	// The fault history survives, still naming the agent that detected it.

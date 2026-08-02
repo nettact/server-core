@@ -90,9 +90,15 @@ func (s *Service) GetRun(ctx context.Context, id string) (Run, error) {
 	return runs[0], nil
 }
 
-// DeleteRun removes a run and every bucket under it. The buckets go first and
-// explicitly rather than by relying on the cascade, so the delete does not depend
-// on a connection-level pragma being set.
+// DeleteRun removes a run, every bucket under it, and every gap that explained
+// the blanks between them. All three go explicitly rather than by relying on the
+// cascade, so the delete does not depend on a connection-level pragma being set.
+//
+// It deliberately does NOT touch game_host_seconds. That stream belongs to the
+// machine, not to this run: the surrounding code deletes the run's own rows one
+// by one and the symmetry invites adding a fourth statement here, which would
+// blank the machine curves of every OTHER run overlapping the same seconds —
+// including runs on other games that have nothing to do with this deletion.
 func (s *Service) DeleteRun(ctx context.Context, id string) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -101,6 +107,9 @@ func (s *Service) DeleteRun(ctx context.Context, id string) error {
 	defer tx.Rollback()
 
 	if _, err := tx.ExecContext(ctx, `DELETE FROM game_buckets WHERE run_id=?`, id); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM game_run_gaps WHERE run_id=?`, id); err != nil {
 		return err
 	}
 	res, err := tx.ExecContext(ctx, `DELETE FROM game_runs WHERE id=?`, id)
@@ -311,8 +320,7 @@ func (s *Service) ListBuckets(ctx context.Context, runID string, f BucketFilter)
 		         gpu_latency_avg, gpu_time_avg, gpu_time_p95, gpu_busy_avg, gpu_busy_p95,
 		         gpu_wait_avg, gpu_in_present_avg, gpu_render_latency_avg,
 		         lat_display_avg, lat_anim_err_avg, lat_anim_err_p95,
-		         gpu_util_pct, gpu_mem_used, gpu_mem_size,
-		         proc_vram_used, proc_vram_budget, busiest_core_pct, quality
+		         proc_vram_used, proc_vram_budget, quality
 		    FROM game_buckets WHERE run_id=?`
 	args := []any{runID}
 	if f.Since > 0 {
@@ -350,10 +358,7 @@ func (s *Service) ListBuckets(ctx context.Context, runID string, f BucketFilter)
 			gpuBusyAvg, gpuBusyP95, gpuWaitAvg             sql.NullFloat64
 			gpuInPresentAvg, gpuRenderLatencyAvg           sql.NullFloat64
 			latDisplayAvg, latAnimErrAvg, latAnimErrP95    sql.NullFloat64
-			gpuUtilPct                                     sql.NullFloat64
-			gpuMemUsed, gpuMemSize                         sql.NullInt64
 			vramUsed, vramBudget                           sql.NullInt64
-			busiestCore                                    sql.NullFloat64
 		)
 		if err := rows.Scan(&ts, &b.Frames.Presented, &displayed, &dropped, &app, &gen,
 			&b.FT.Avg, &b.FT.P50, &b.FT.P95, &b.FT.P99, &b.FT.Max, &b.FT.SD,
@@ -365,8 +370,7 @@ func (s *Service) ListBuckets(ctx context.Context, runID string, f BucketFilter)
 			&gpuLatencyAvg, &gpuTimeAvg, &gpuTimeP95, &gpuBusyAvg, &gpuBusyP95,
 			&gpuWaitAvg, &gpuInPresentAvg, &gpuRenderLatencyAvg,
 			&latDisplayAvg, &latAnimErrAvg, &latAnimErrP95,
-			&gpuUtilPct, &gpuMemUsed, &gpuMemSize,
-			&vramUsed, &vramBudget, &busiestCore, &quality); err != nil {
+			&vramUsed, &vramBudget, &quality); err != nil {
 			return nil, err
 		}
 		b.RunID = runID
@@ -439,18 +443,6 @@ func (s *Service) ListBuckets(ctx context.Context, runID string, f BucketFilter)
 				AnimErrP95: latAnimErrP95.Float64,
 			}
 		}
-		// Adapter telemetry has no discriminator column and needs none, exactly like
-		// the resource block above: its three readings are independent, so ANY of them
-		// says the poll happened. A poll that returned nothing at all told us nothing
-		// and comes back as the absence it was — which is also what an agent without
-		// game.gpu.read stores.
-		if gpuUtilPct.Valid || gpuMemUsed.Valid || gpuMemSize.Valid {
-			b.GPUTel = &gamesense.GPUTel{
-				UtilPct: float64Ptr(gpuUtilPct),
-				MemUsed: uint64Ptr(gpuMemUsed),
-				MemSize: uint64Ptr(gpuMemSize),
-			}
-		}
 		// The used level is the block: a budget alone would describe headroom against
 		// an unknown occupancy, which is not a reading of anything.
 		if vramUsed.Valid {
@@ -459,9 +451,141 @@ func (s *Service) ListBuckets(ctx context.Context, runID string, f BucketFilter)
 				Budget: uint64Ptr(vramBudget),
 			}
 		}
-		b.BusiestCorePct = float64Ptr(busiestCore)
 		b.Quality = decodeStrings(quality.String)
 		out = append(out, b)
+	}
+	return out, rows.Err()
+}
+
+// ListGaps returns a run's frameless stretches in time order.
+//
+// Unbounded, unlike the buckets beside them: a gap is one row per interruption
+// rather than one per second, so even a session spent mostly alt-tabbed produces
+// a handful. Bounding them would mean a chart could draw the seconds of a run
+// while silently omitting the explanation for the blank between them, which is
+// the one thing this record exists to prevent.
+//
+// The window is deliberately not filtered either. A gap can start before a
+// charted segment and end after it, and clipping it to the segment would report
+// a fifty-minute absence as however much of it happened to be on screen.
+func (s *Service) ListGaps(ctx context.Context, runID string) ([]Gap, error) {
+	rows, err := s.db.Read().QueryContext(ctx,
+		`SELECT id, reason, started_at, ended_at FROM game_run_gaps WHERE run_id=? ORDER BY started_at`, runID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []Gap{}
+	for rows.Next() {
+		g := Gap{RunID: runID}
+		var started, ended int64
+		if err := rows.Scan(&g.ID, &g.Reason, &started, &ended); err != nil {
+			return nil, err
+		}
+		g.StartedAt = unixTime(started)
+		g.EndedAt = unixTime(ended)
+		out = append(out, g)
+	}
+	return out, rows.Err()
+}
+
+// HostFilter bounds an agent's machine-level seconds. Since/Until are unix
+// seconds over the reading timestamps.
+//
+// SiteID is the ownership check and is required of every caller. It is a column
+// on this table rather than a join to agents for the reason the DDL gives — the
+// query stays self-contained — and it is in the filter rather than in the
+// handler so a caller cannot forget it and serve another site's machine load to
+// anyone who guessed an agent id.
+type HostFilter struct {
+	SiteID string
+	Since  int64
+	Until  int64
+	Limit  int // default 3600 (an hour of seconds), max 86400
+}
+
+// ListHostSeconds returns one agent's machine seconds in time order.
+//
+// The window is the caller's, and a run detail passes its own [started_at,
+// ended_at]. Nothing here joins a run, and nothing should: the stream is the
+// machine's, so two runs overlapping a second read the same rows and a second
+// covered by no run at all is still readable by whatever window asks for it.
+//
+// Each block is rebuilt on its own discriminator, and every figure comes back as
+// stored — zeros included. An idle machine really was at 0%, and dropping the
+// block over it would erase the finding "the box was not the problem".
+func (s *Service) ListHostSeconds(ctx context.Context, agentID string, f HostFilter) ([]HostSecond, error) {
+	limit := f.Limit
+	if limit <= 0 || limit > 86400 {
+		limit = 3600
+	}
+	q := `SELECT ts, cpu_total_pct, cpu_busiest_pct, cpu_mhz, cpu_max_mhz,
+		         mem_used, mem_total,
+		         gpu_util_pct, gpu_mem_used, gpu_mem_size, gpu_core_mhz, gpu_mem_mhz, quality
+		    FROM game_host_seconds WHERE agent_id=? AND site_id=?`
+	args := []any{agentID, f.SiteID}
+	if f.Since > 0 {
+		q += ` AND ts >= ?`
+		args = append(args, f.Since)
+	}
+	if f.Until > 0 {
+		q += ` AND ts < ?`
+		args = append(args, f.Until)
+	}
+	q += ` ORDER BY ts LIMIT ?`
+	args = append(args, limit)
+
+	rows, err := s.db.Read().QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []HostSecond{}
+	for rows.Next() {
+		var (
+			h                    HostSecond
+			ts                   int64
+			cpuTotal, cpuBusiest sql.NullFloat64
+			cpuMHz, cpuMaxMHz    sql.NullFloat64
+			memUsed, memTotal    sql.NullInt64
+			gpuUtil              sql.NullFloat64
+			gpuMemUsed, gpuMemSz sql.NullInt64
+			gpuCoreMHz, gpuMemHz sql.NullFloat64
+			quality              sql.NullString
+		)
+		if err := rows.Scan(&ts, &cpuTotal, &cpuBusiest, &cpuMHz, &cpuMaxMHz,
+			&memUsed, &memTotal,
+			&gpuUtil, &gpuMemUsed, &gpuMemSz, &gpuCoreMHz, &gpuMemHz, &quality); err != nil {
+			return nil, err
+		}
+		h.TS = unixTime(ts)
+		// cpu_total_pct is the pair's discriminator: one counter read is differenced
+		// into both columns, so they are written and left NULL together.
+		if cpuTotal.Valid {
+			h.CPU = &gamesense.HostCPU{TotalPct: cpuTotal.Float64, BusiestPct: cpuBusiest.Float64}
+		}
+		// cpu_mhz is its pair's discriminator: one call returns both.
+		if cpuMHz.Valid {
+			h.CPUClock = &gamesense.HostCPUClock{CurrentMHz: cpuMHz.Float64, MaxMHz: cpuMaxMHz.Float64}
+		}
+		if memUsed.Valid {
+			h.Mem = &gamesense.HostMem{Used: uint64(memUsed.Int64), Total: uint64(memTotal.Int64)}
+		}
+		// The adapter block has no discriminator column and needs none: its three
+		// readings are independent, so ANY of them says the poll happened. A poll
+		// that returned nothing told us nothing and comes back as the absence it was
+		// — which is also what an agent without game.gpu.read stores.
+		if gpuUtil.Valid || gpuMemUsed.Valid || gpuMemSz.Valid || gpuCoreMHz.Valid || gpuMemHz.Valid {
+			h.GPU = &gamesense.GPUTel{
+				UtilPct: float64Ptr(gpuUtil),
+				MemUsed: uint64Ptr(gpuMemUsed),
+				MemSize: uint64Ptr(gpuMemSz),
+				CoreMHz: float64Ptr(gpuCoreMHz),
+				MemMHz:  float64Ptr(gpuMemHz),
+			}
+		}
+		h.Quality = decodeStrings(quality.String)
+		out = append(out, h)
 	}
 	return out, rows.Err()
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"reflect"
 	"testing"
 	"time"
@@ -40,15 +41,21 @@ func seedAgent(t *testing.T, db *store.DB, id, effective string) {
 }
 
 // apply runs one payload through the ingest write path in its own transaction,
-// the way a packet does.
+// the way a packet does. Most tests carry no gaps and no machine seconds, so
+// they go through this rather than restating two empty slices apiece.
 func apply(t *testing.T, db *store.DB, agentID string, runs []gamesense.Run, buckets []gamesense.Bucket) Result {
+	t.Helper()
+	return applyAll(t, db, agentID, runs, buckets, nil, nil)
+}
+
+func applyAll(t *testing.T, db *store.DB, agentID string, runs []gamesense.Run, buckets []gamesense.Bucket, gaps []gamesense.Gap, hosts []gamesense.HostSecond) Result {
 	t.Helper()
 	ctx := context.Background()
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		t.Fatalf("begin: %v", err)
 	}
-	res, err := Apply(ctx, tx, agentID, "site_default", runs, buckets)
+	res, err := Apply(ctx, tx, agentID, "site_default", runs, buckets, gaps, hosts)
 	if err != nil {
 		tx.Rollback()
 		t.Fatalf("apply: %v", err)
@@ -401,9 +408,7 @@ func diagSample(b *gamesense.Bucket) {
 		InPresentAvg: 0.9, RenderLatencyAvg: 5.2,
 	}
 	b.Latency = &gamesense.Latency{DisplayAvg: 12.5, AnimErrAvg: 0.8, AnimErrP95: 2.1}
-	b.GPUTel = &gamesense.GPUTel{UtilPct: floatPtr(87.5), MemUsed: u64p(6 << 30), MemSize: u64p(8 << 30)}
 	b.ProcVRAM = &gamesense.ProcVRAM{Used: 5 << 30, Budget: u64p(7 << 30)}
-	b.BusiestCorePct = floatPtr(99.5)
 }
 
 // TestBucketDiagBlocksRoundTrip covers the deeper breakdowns a diag-tier profile
@@ -428,13 +433,6 @@ func TestBucketDiagBlocksRoundTrip(t *testing.T) {
 	zeroed.CPUSplit = &gamesense.CPUSplit{}
 	zeroed.GPUSplit = &gamesense.GPUSplit{}
 	zeroed.Latency = &gamesense.Latency{}
-	zeroed.BusiestCorePct = floatPtr(0)
-
-	// The two halves of a card that publishes only part of its telemetry.
-	utilOnly := bucket("run_1", start.Add(2*time.Second), 100, h)
-	utilOnly.GPUTel = &gamesense.GPUTel{UtilPct: floatPtr(41)}
-	memOnly := bucket("run_1", start.Add(3*time.Second), 100, h)
-	memOnly.GPUTel = &gamesense.GPUTel{MemUsed: u64p(2 << 30), MemSize: u64p(8 << 30)}
 
 	// An OS that publishes no per-process budget. The level is still the reading.
 	noBudget := bucket("run_1", start.Add(4*time.Second), 100, h)
@@ -449,11 +447,11 @@ func TestBucketDiagBlocksRoundTrip(t *testing.T) {
 	bare := bucket("run_1", start.Add(6*time.Second), 100, h) // a base-tier second
 
 	apply(t, db, "agent_game", []gamesense.Run{run("run_1", start, 6)},
-		[]gamesense.Bucket{full, zeroed, utilOnly, memOnly, noBudget, degraded, bare})
+		[]gamesense.Bucket{full, zeroed, noBudget, degraded, bare})
 
 	got, err := svc.ListBuckets(ctx, "run_1", BucketFilter{})
-	if err != nil || len(got) != 7 {
-		t.Fatalf("ListBuckets = %d err=%v, want 7", len(got), err)
+	if err != nil || len(got) != 5 {
+		t.Fatalf("ListBuckets = %d err=%v, want 5", len(got), err)
 	}
 
 	// Everything present comes back byte for byte. The group-atomic blocks are
@@ -469,17 +467,9 @@ func TestBucketDiagBlocksRoundTrip(t *testing.T) {
 	if g.Latency == nil || *g.Latency != *full.Latency {
 		t.Fatalf("lat = %+v, want %+v", g.Latency, full.Latency)
 	}
-	if g.GPUTel == nil || g.GPUTel.UtilPct == nil || *g.GPUTel.UtilPct != 87.5 ||
-		g.GPUTel.MemUsed == nil || *g.GPUTel.MemUsed != 6<<30 ||
-		g.GPUTel.MemSize == nil || *g.GPUTel.MemSize != 8<<30 {
-		t.Fatalf("gpu_tel = %+v, want all three readings back", g.GPUTel)
-	}
 	if g.ProcVRAM == nil || g.ProcVRAM.Used != 5<<30 ||
 		g.ProcVRAM.Budget == nil || *g.ProcVRAM.Budget != 7<<30 {
 		t.Fatalf("proc_vram = %+v", g.ProcVRAM)
-	}
-	if g.BusiestCorePct == nil || *g.BusiestCorePct != 99.5 {
-		t.Fatalf("busiest_core_pct = %v, want 99.5", g.BusiestCorePct)
 	}
 
 	z := got[1]
@@ -492,31 +482,11 @@ func TestBucketDiagBlocksRoundTrip(t *testing.T) {
 	if z.Latency == nil || *z.Latency != (gamesense.Latency{}) {
 		t.Fatalf("a measured all-zero latency block came back as %+v", z.Latency)
 	}
-	if z.BusiestCorePct == nil || *z.BusiestCorePct != 0 {
-		t.Fatalf("busiest core = %v, want a measured 0%%", z.BusiestCorePct)
-	}
-	if z.GPUTel != nil || z.ProcVRAM != nil {
-		t.Fatalf("an unpolled second acquired %+v / %+v", z.GPUTel, z.ProcVRAM)
+	if z.ProcVRAM != nil {
+		t.Fatalf("an unpolled second acquired %+v", z.ProcVRAM)
 	}
 
-	// Half a card's telemetry stays half. Filling the rest in with zeros would
-	// report a card at no load or with no memory installed.
-	u := got[2].GPUTel
-	if u == nil || u.UtilPct == nil || *u.UtilPct != 41 {
-		t.Fatalf("util-only gpu_tel = %+v", u)
-	}
-	if u.MemUsed != nil || u.MemSize != nil {
-		t.Fatalf("util-only gpu_tel invented memory readings: %+v", u)
-	}
-	m := got[3].GPUTel
-	if m == nil || m.MemUsed == nil || *m.MemUsed != 2<<30 || m.MemSize == nil || *m.MemSize != 8<<30 {
-		t.Fatalf("mem-only gpu_tel = %+v", m)
-	}
-	if m.UtilPct != nil {
-		t.Fatalf("mem-only gpu_tel invented a utilization: %+v", m)
-	}
-
-	v := got[4].ProcVRAM
+	v := got[2].ProcVRAM
 	if v == nil || v.Used != 1<<30 {
 		t.Fatalf("budget-less proc_vram = %+v, want the level kept", v)
 	}
@@ -524,18 +494,17 @@ func TestBucketDiagBlocksRoundTrip(t *testing.T) {
 		t.Fatalf("proc_vram invented a budget: %v", *v.Budget)
 	}
 
-	d := got[5]
-	if d.CPUSplit == nil || d.GPUTel != nil || d.ProcVRAM != nil {
-		t.Fatalf("degraded second = cpu:%+v gpu_tel:%+v vram:%+v, want only the frame-derived block",
-			d.CPUSplit, d.GPUTel, d.ProcVRAM)
+	d := got[3]
+	if d.CPUSplit == nil || d.ProcVRAM != nil {
+		t.Fatalf("degraded second = cpu:%+v vram:%+v, want only the frame-derived block",
+			d.CPUSplit, d.ProcVRAM)
 	}
 	if len(d.Quality) != 1 || d.Quality[0] != gamesense.QualityDiagDegraded {
 		t.Fatalf("quality = %+v, want the degradation flag on the existing array", d.Quality)
 	}
 
-	b := got[6]
-	if b.CPUSplit != nil || b.GPUSplit != nil || b.Latency != nil ||
-		b.GPUTel != nil || b.ProcVRAM != nil || b.BusiestCorePct != nil {
+	b := got[4]
+	if b.CPUSplit != nil || b.GPUSplit != nil || b.Latency != nil || b.ProcVRAM != nil {
 		t.Fatalf("a base-tier second came back carrying diag blocks: %+v", b)
 	}
 
@@ -543,32 +512,30 @@ func TestBucketDiagBlocksRoundTrip(t *testing.T) {
 	// a base-tier second leaves every diag column NULL rather than storing the
 	// zeros its struct fields hold.
 	var (
-		cpuBusy, gpuLatency, latDisplay, util, core sql.NullFloat64
-		memUsed, vramUsed                           sql.NullInt64
+		cpuBusy, gpuLatency, latDisplay sql.NullFloat64
+		vramUsed                        sql.NullInt64
 	)
 	scanDiag := func(ts time.Time) {
 		t.Helper()
 		if err := db.QueryRowContext(ctx, `
-			SELECT cpu_busy_avg, gpu_latency_avg, lat_display_avg, gpu_util_pct,
-			       busiest_core_pct, gpu_mem_used, proc_vram_used
+			SELECT cpu_busy_avg, gpu_latency_avg, lat_display_avg, proc_vram_used
 			  FROM game_buckets WHERE run_id='run_1' AND ts=?`, ts.Unix()).
-			Scan(&cpuBusy, &gpuLatency, &latDisplay, &util, &core, &memUsed, &vramUsed); err != nil {
+			Scan(&cpuBusy, &gpuLatency, &latDisplay, &vramUsed); err != nil {
 			t.Fatal(err)
 		}
 	}
 	scanDiag(bare.TS)
-	if cpuBusy.Valid || gpuLatency.Valid || latDisplay.Valid || util.Valid ||
-		core.Valid || memUsed.Valid || vramUsed.Valid {
-		t.Fatalf("a base-tier second stored diag values instead of NULL: %v %v %v %v %v %v %v",
-			cpuBusy, gpuLatency, latDisplay, util, core, memUsed, vramUsed)
+	if cpuBusy.Valid || gpuLatency.Valid || latDisplay.Valid || vramUsed.Valid {
+		t.Fatalf("a base-tier second stored diag values instead of NULL: %v %v %v %v",
+			cpuBusy, gpuLatency, latDisplay, vramUsed)
 	}
 	scanDiag(zeroed.TS)
-	if !cpuBusy.Valid || cpuBusy.Float64 != 0 || !gpuLatency.Valid || !latDisplay.Valid || !core.Valid {
-		t.Fatalf("a measured-zero second stored %v / %v / %v / %v, want real 0s",
-			cpuBusy, gpuLatency, latDisplay, core)
+	if !cpuBusy.Valid || cpuBusy.Float64 != 0 || !gpuLatency.Valid || !latDisplay.Valid {
+		t.Fatalf("a measured-zero second stored %v / %v / %v, want real 0s",
+			cpuBusy, gpuLatency, latDisplay)
 	}
-	if util.Valid || memUsed.Valid || vramUsed.Valid {
-		t.Fatalf("an unpolled second stored adapter readings: %v %v %v", util, memUsed, vramUsed)
+	if vramUsed.Valid {
+		t.Fatalf("an unpolled second stored a vram reading: %v", vramUsed)
 	}
 	scanDiag(noBudget.TS)
 	var budget sql.NullInt64
@@ -583,12 +550,29 @@ func TestBucketDiagBlocksRoundTrip(t *testing.T) {
 	}
 }
 
+// hostSecond builds one machine second with every block filled.
+func hostSecond(ts time.Time) gamesense.HostSecond {
+	return gamesense.HostSecond{
+		TS: ts,
+		HostSample: gamesense.HostSample{
+			CPU:      &gamesense.HostCPU{TotalPct: 41.5, BusiestPct: 99.25},
+			CPUClock: &gamesense.HostCPUClock{CurrentMHz: 4900, MaxMHz: 3600},
+			Mem:      &gamesense.HostMem{Used: 12 << 30, Total: 32 << 30},
+			GPU: &gamesense.GPUTel{
+				UtilPct: floatPtr(87.5), MemUsed: u64p(6 << 30), MemSize: u64p(8 << 30),
+				CoreMHz: floatPtr(2610.5), MemMHz: floatPtr(1313.3),
+			},
+		},
+	}
+}
+
 // TestGPUTelemetryNeedsItsOwnPermission is the second half of the ingest gate.
 // game.performance.read buys the game's own frame stream; the adapter's
 // utilization and its video memory describe the card and every process sharing
 // it, which is a different read an operator can withhold on its own. A WAL that
 // drained after that narrowing must not smuggle it in — and must not take the
-// frame-derived breakdowns down with it, since those were never gated on it.
+// frame-derived breakdowns, or the machine's CPU and memory, down with it. None
+// of those is the graphics device.
 func TestGPUTelemetryNeedsItsOwnPermission(t *testing.T) {
 	db, svc := openGameDB(t)
 	ctx := context.Background()
@@ -598,27 +582,26 @@ func TestGPUTelemetryNeedsItsOwnPermission(t *testing.T) {
 
 	gated := bucket("run_nogpu", start, 100, h)
 	diagSample(&gated)
-	res := apply(t, db, "agent_nogpu", []gamesense.Run{run("run_nogpu", start, 0)},
-		[]gamesense.Bucket{gated})
-	// The second itself is permitted: only the withheld part goes missing, and the
-	// bucket is stored rather than refused.
-	if res.Denied || res.Buckets != 1 || res.Rejected != 0 {
-		t.Fatalf("apply = %+v, want the second stored with its GPU readings dropped", res)
+	res := applyAll(t, db, "agent_nogpu", []gamesense.Run{run("run_nogpu", start, 0)},
+		[]gamesense.Bucket{gated}, nil, []gamesense.HostSecond{hostSecond(start)})
+	// The records themselves are permitted: only the withheld part goes missing,
+	// and both are stored rather than refused.
+	if res.Denied || res.Buckets != 1 || res.HostSeconds != 1 || res.Rejected != 0 {
+		t.Fatalf("apply = %+v, want both stored with their GPU readings dropped", res)
 	}
 
 	allowed := bucket("run_gpu", start, 100, h)
 	diagSample(&allowed)
-	apply(t, db, "agent_game", []gamesense.Run{run("run_gpu", start, 0)},
-		[]gamesense.Bucket{allowed})
+	applyAll(t, db, "agent_game", []gamesense.Run{run("run_gpu", start, 0)},
+		[]gamesense.Bucket{allowed}, nil, []gamesense.HostSecond{hostSecond(start)})
 
 	stripped, err := svc.ListBuckets(ctx, "run_nogpu", BucketFilter{})
 	if err != nil || len(stripped) != 1 {
 		t.Fatalf("ListBuckets run_nogpu = %d err=%v", len(stripped), err)
 	}
 	s := stripped[0]
-	if s.GPUTel != nil || s.ProcVRAM != nil {
-		t.Fatalf("gpu_tel=%+v proc_vram=%+v landed for an agent without game.gpu.read",
-			s.GPUTel, s.ProcVRAM)
+	if s.ProcVRAM != nil {
+		t.Fatalf("proc_vram=%+v landed for an agent without game.gpu.read", s.ProcVRAM)
 	}
 	// Everything derived from the frame stream rides the permission the agent does
 	// hold, including the GPU-side frame breakdown — it comes from the game's own
@@ -632,25 +615,47 @@ func TestGPUTelemetryNeedsItsOwnPermission(t *testing.T) {
 	if s.Latency == nil || *s.Latency != *gated.Latency {
 		t.Fatalf("lat = %+v, want the frame-derived block kept", s.Latency)
 	}
-	if s.BusiestCorePct == nil || *s.BusiestCorePct != 99.5 {
-		t.Fatalf("busiest_core_pct = %v, want the host reading kept", s.BusiestCorePct)
+
+	// The machine second loses its adapter block and keeps the rest. This is the
+	// part most easily broken by "strip the GPU stuff": the processor and the RAM
+	// are not the graphics device, and withholding them would remove the readings
+	// that explain a stutter for a reason that has nothing to do with them.
+	host, err := svc.ListHostSeconds(ctx, "agent_nogpu", HostFilter{SiteID: "site_default"})
+	if err != nil || len(host) != 1 {
+		t.Fatalf("ListHostSeconds agent_nogpu = %d err=%v", len(host), err)
+	}
+	if host[0].GPU != nil {
+		t.Fatalf("adapter telemetry = %+v for an agent without game.gpu.read", host[0].GPU)
+	}
+	if host[0].CPU == nil || host[0].CPU.BusiestPct != 99.25 {
+		t.Fatalf("machine cpu = %+v, want it kept", host[0].CPU)
+	}
+	if host[0].Mem == nil || host[0].Mem.Total != 32<<30 {
+		t.Fatalf("machine memory = %+v, want it kept", host[0].Mem)
 	}
 
 	// The columns, not just the structs: this is what a later reader sees.
-	var util, core sql.NullFloat64
-	var memUsed, memSize, vramUsed, vramBudget sql.NullInt64
+	var vramUsed, vramBudget sql.NullInt64
 	if err := db.QueryRowContext(ctx, `
-		SELECT gpu_util_pct, gpu_mem_used, gpu_mem_size, proc_vram_used, proc_vram_budget, busiest_core_pct
-		  FROM game_buckets WHERE run_id='run_nogpu'`).
-		Scan(&util, &memUsed, &memSize, &vramUsed, &vramBudget, &core); err != nil {
+		SELECT proc_vram_used, proc_vram_budget FROM game_buckets WHERE run_id='run_nogpu'`).
+		Scan(&vramUsed, &vramBudget); err != nil {
 		t.Fatal(err)
 	}
-	if util.Valid || memUsed.Valid || memSize.Valid || vramUsed.Valid || vramBudget.Valid {
-		t.Fatalf("gated columns stored %v %v %v %v %v, want all NULL",
-			util, memUsed, memSize, vramUsed, vramBudget)
+	if vramUsed.Valid || vramBudget.Valid {
+		t.Fatalf("gated vram columns stored %v %v, want NULL", vramUsed, vramBudget)
 	}
-	if !core.Valid {
-		t.Fatalf("busiest_core_pct was stripped along with the adapter readings")
+	var util sql.NullFloat64
+	var memUsed, cpuTotal sql.NullFloat64
+	if err := db.QueryRowContext(ctx, `
+		SELECT gpu_util_pct, cpu_total_pct, mem_used FROM game_host_seconds WHERE agent_id='agent_nogpu'`).
+		Scan(&util, &cpuTotal, &memUsed); err != nil {
+		t.Fatal(err)
+	}
+	if util.Valid {
+		t.Fatalf("gated adapter column stored %v, want NULL", util)
+	}
+	if !cpuTotal.Valid || !memUsed.Valid {
+		t.Fatalf("the machine's own readings were stripped with the adapter's: cpu=%v mem=%v", cpuTotal, memUsed)
 	}
 
 	// The agent holding both keeps everything, which is what makes the difference
@@ -659,12 +664,295 @@ func TestGPUTelemetryNeedsItsOwnPermission(t *testing.T) {
 	if err != nil || len(kept) != 1 {
 		t.Fatalf("ListBuckets run_gpu = %d err=%v", len(kept), err)
 	}
-	k := kept[0]
-	if k.GPUTel == nil || k.GPUTel.UtilPct == nil || *k.GPUTel.UtilPct != 87.5 {
-		t.Fatalf("gpu_tel = %+v for an agent holding game.gpu.read", k.GPUTel)
-	}
-	if k.ProcVRAM == nil || k.ProcVRAM.Used != 5<<30 {
+	if k := kept[0]; k.ProcVRAM == nil || k.ProcVRAM.Used != 5<<30 {
 		t.Fatalf("proc_vram = %+v for an agent holding game.gpu.read", k.ProcVRAM)
+	}
+	keptHost, err := svc.ListHostSeconds(ctx, "agent_game", HostFilter{SiteID: "site_default"})
+	if err != nil || len(keptHost) != 1 {
+		t.Fatalf("ListHostSeconds agent_game = %d err=%v", len(keptHost), err)
+	}
+	if g := keptHost[0].GPU; g == nil || g.UtilPct == nil || *g.UtilPct != 87.5 {
+		t.Fatalf("adapter telemetry = %+v for an agent holding game.gpu.read", g)
+	}
+}
+
+// A machine second that carried nothing but an adapter block is dropped when the
+// permission strips it, rather than stored as an all-NULL row.
+//
+// An all-NULL row asserts "this second was covered and nothing was readable",
+// which a reader has to interpret as evidence of something — a card that stopped
+// reporting, most likely. It would be evidence of a setting.
+func TestStrippedHostSecondWithNothingLeftIsNotStored(t *testing.T) {
+	db, svc := openGameDB(t)
+	ctx := context.Background()
+	seedAgent(t, db, "agent_nogpu", `["game.process.detect","game.performance.read"]`)
+	start := time.Now().UTC().Add(-time.Hour).Truncate(time.Second)
+
+	gpuOnly := gamesense.HostSecond{
+		TS:         start,
+		HostSample: gamesense.HostSample{GPU: &gamesense.GPUTel{UtilPct: floatPtr(80)}},
+	}
+	// One that also carries a flag survives: the flag is the explanation the empty
+	// row was missing.
+	flagged := gamesense.HostSecond{
+		TS: start.Add(time.Second),
+		HostSample: gamesense.HostSample{
+			GPU:     &gamesense.GPUTel{UtilPct: floatPtr(80)},
+			Quality: []string{gamesense.QualityHostDegraded},
+		},
+	}
+
+	res := applyAll(t, db, "agent_nogpu", nil, nil, nil,
+		[]gamesense.HostSecond{gpuOnly, flagged})
+	if res.HostSeconds != 1 {
+		t.Fatalf("stored %d machine second(s), want only the one with an explanation", res.HostSeconds)
+	}
+	got, err := svc.ListHostSeconds(ctx, "agent_nogpu", HostFilter{SiteID: "site_default"})
+	if err != nil || len(got) != 1 {
+		t.Fatalf("ListHostSeconds = %d err=%v, want 1", len(got), err)
+	}
+	if !got[0].TS.Equal(flagged.TS) {
+		t.Fatalf("kept the second at %s, want the flagged one at %s", got[0].TS, flagged.TS)
+	}
+	if got[0].GPU != nil {
+		t.Fatalf("adapter block survived the strip: %+v", got[0].GPU)
+	}
+}
+
+// The machine stream is keyed by (agent, second) and belongs to the machine, so
+// two runs overlapping a second read the same rows — and deleting one run must
+// not blank the other's curves. The surrounding DeleteRun deletes the run's own
+// rows one statement at a time, which is exactly what invites adding a fourth.
+func TestDeleteRunLeavesTheMachineStreamAlone(t *testing.T) {
+	db, svc := openGameDB(t)
+	ctx := context.Background()
+	start := time.Now().UTC().Add(-time.Hour).Truncate(time.Second)
+	h := hist([2]float64{5, 100})
+
+	applyAll(t, db, "agent_game",
+		[]gamesense.Run{run("run_a", start, 1), run("run_b", start, 1)},
+		[]gamesense.Bucket{bucket("run_a", start, 100, h), bucket("run_b", start, 100, h)},
+		[]gamesense.Gap{{
+			ID: "gap_a", RunID: "run_a", Reason: gamesense.GapBackground,
+			StartedAt: start.Add(time.Second), EndedAt: start.Add(5 * time.Second),
+		}},
+		[]gamesense.HostSecond{hostSecond(start), hostSecond(start.Add(time.Second))})
+
+	if err := svc.DeleteRun(ctx, "run_a"); err != nil {
+		t.Fatalf("DeleteRun: %v", err)
+	}
+
+	host, err := svc.ListHostSeconds(ctx, "agent_game", HostFilter{SiteID: "site_default"})
+	if err != nil || len(host) != 2 {
+		t.Fatalf("ListHostSeconds = %d err=%v, want both machine seconds intact", len(host), err)
+	}
+	// The run's own records do go, gaps included.
+	gaps, err := svc.ListGaps(ctx, "run_a")
+	if err != nil || len(gaps) != 0 {
+		t.Fatalf("ListGaps(run_a) = %d err=%v, want the deleted run's gaps gone", len(gaps), err)
+	}
+	if _, err := svc.GetRun(ctx, "run_a"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("GetRun(run_a) err = %v, want ErrNotFound", err)
+	}
+	if _, err := svc.GetRun(ctx, "run_b"); err != nil {
+		t.Fatalf("the surviving run went with it: %v", err)
+	}
+}
+
+// Gaps are re-sent as they grow, and a retried batch can carry a stale copy. The
+// stored end therefore takes max() rather than last-writer-wins: a redelivered
+// older copy must not rewind a stretch that has since grown.
+func TestGapUpsertKeepsTheLaterEnd(t *testing.T) {
+	db, svc := openGameDB(t)
+	ctx := context.Background()
+	start := time.Now().UTC().Add(-time.Hour).Truncate(time.Second)
+
+	short := gamesense.Gap{
+		ID: "gap_1", RunID: "run_1", Reason: gamesense.GapBackground,
+		StartedAt: start.Add(time.Second), EndedAt: start.Add(10 * time.Second),
+	}
+	grown := short
+	grown.EndedAt = start.Add(90 * time.Second)
+
+	applyAll(t, db, "agent_game", []gamesense.Run{run("run_1", start, 1)}, nil,
+		[]gamesense.Gap{short}, nil)
+	applyAll(t, db, "agent_game", nil, nil, []gamesense.Gap{grown}, nil)
+	// The stale copy arrives last, as a retried batch would.
+	applyAll(t, db, "agent_game", nil, nil, []gamesense.Gap{short}, nil)
+
+	got, err := svc.ListGaps(ctx, "run_1")
+	if err != nil || len(got) != 1 {
+		t.Fatalf("ListGaps = %d err=%v, want one interval", len(got), err)
+	}
+	if !got[0].EndedAt.Equal(grown.EndedAt) {
+		t.Fatalf("gap ends at %s, want %s — a stale redelivery rewound it", got[0].EndedAt, grown.EndedAt)
+	}
+	if !got[0].StartedAt.Equal(short.StartedAt) {
+		t.Fatalf("gap starts at %s, want %s", got[0].StartedAt, short.StartedAt)
+	}
+	if got[0].Reason != gamesense.GapBackground {
+		t.Fatalf("gap reason = %q", got[0].Reason)
+	}
+}
+
+// A gap can outlive its run: a player who minimizes a game and never comes back
+// leaves a stretch of silence after the last frame. Clamping it to the run's end
+// would erase the difference between that and quitting, which is the question
+// the record answers.
+func TestGapMayOutliveItsRun(t *testing.T) {
+	db, svc := openGameDB(t)
+	ctx := context.Background()
+	start := time.Now().UTC().Add(-2 * time.Hour).Truncate(time.Second)
+	h := hist([2]float64{5, 100})
+
+	r := run("run_1", start, 10)
+	ended := start.Add(10 * time.Second)
+	r.EndedAt = &ended
+	applyAll(t, db, "agent_game", []gamesense.Run{r},
+		[]gamesense.Bucket{bucket("run_1", start, 100, h)},
+		[]gamesense.Gap{{
+			ID: "gap_1", RunID: "run_1", Reason: gamesense.GapBackground,
+			StartedAt: start.Add(11 * time.Second), EndedAt: start.Add(time.Hour),
+		}}, nil)
+
+	got, err := svc.ListGaps(ctx, "run_1")
+	if err != nil || len(got) != 1 {
+		t.Fatalf("ListGaps = %d err=%v", len(got), err)
+	}
+	if !got[0].EndedAt.After(ended) {
+		t.Fatalf("gap ends at %s, want it kept past the run's end at %s", got[0].EndedAt, ended)
+	}
+
+	// And the run itself is untouched by it: a minimized game is not a game still
+	// being played, so the gap must not have advanced last_seen_at or reopened it.
+	stored, err := svc.GetRun(ctx, "run_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.EndedAt == nil || !stored.EndedAt.Equal(ended) {
+		t.Fatalf("run ended_at = %v, want %s — the gap rewrote the run", stored.EndedAt, ended)
+	}
+	if stored.LastSeenAt.After(ended) {
+		t.Fatalf("run last_seen_at = %s, want no later than %s — the gap advanced it",
+			stored.LastSeenAt, ended)
+	}
+}
+
+// A gap naming a run this agent does not own is refused, the way a bucket is.
+// Ids are minted by agents, so without the check one agent could attach a
+// fabricated silence to another's session.
+func TestGapForAnUnknownRunIsRejected(t *testing.T) {
+	db, svc := openGameDB(t)
+	ctx := context.Background()
+	seedAgent(t, db, "agent_other", `["game.process.detect","game.performance.read","game.gpu.read"]`)
+	start := time.Now().UTC().Add(-time.Hour).Truncate(time.Second)
+
+	applyAll(t, db, "agent_game", []gamesense.Run{run("run_1", start, 1)}, nil, nil, nil)
+	res := applyAll(t, db, "agent_other", nil, nil, []gamesense.Gap{{
+		ID: "gap_x", RunID: "run_1", Reason: gamesense.GapNoFrames,
+		StartedAt: start, EndedAt: start.Add(time.Minute),
+	}}, nil)
+	if res.Gaps != 0 || res.Rejected != 1 {
+		t.Fatalf("apply = %+v, want the gap refused", res)
+	}
+	got, err := svc.ListGaps(ctx, "run_1")
+	if err != nil || len(got) != 0 {
+		t.Fatalf("ListGaps = %d err=%v, want none", len(got), err)
+	}
+}
+
+// Machine seconds round-trip with each block's presence intact, are keyed by
+// (agent, second) so a replay stores nothing new, and are bounded by the window
+// a run detail asks with.
+func TestHostSecondsRoundTripAndWindow(t *testing.T) {
+	db, svc := openGameDB(t)
+	ctx := context.Background()
+	start := time.Now().UTC().Add(-time.Hour).Truncate(time.Second)
+
+	idle := gamesense.HostSecond{
+		TS: start.Add(time.Second),
+		HostSample: gamesense.HostSample{
+			CPU: &gamesense.HostCPU{},
+			Mem: &gamesense.HostMem{Used: 4 << 30, Total: 32 << 30},
+		},
+	}
+	utilOnly := gamesense.HostSecond{
+		TS:         start.Add(2 * time.Second),
+		HostSample: gamesense.HostSample{GPU: &gamesense.GPUTel{UtilPct: floatPtr(41)}},
+	}
+	res := applyAll(t, db, "agent_game", nil, nil, nil,
+		[]gamesense.HostSecond{hostSecond(start), idle, utilOnly})
+	if res.HostSeconds != 3 {
+		t.Fatalf("stored %d machine second(s), want 3", res.HostSeconds)
+	}
+	// A replayed batch stores nothing new, the way a replayed bucket does.
+	if again := applyAll(t, db, "agent_game", nil, nil, nil,
+		[]gamesense.HostSecond{hostSecond(start), idle, utilOnly}); again.HostSeconds != 0 {
+		t.Fatalf("a replay stored %d machine second(s), want 0", again.HostSeconds)
+	}
+
+	got, err := svc.ListHostSeconds(ctx, "agent_game", HostFilter{SiteID: "site_default"})
+	if err != nil || len(got) != 3 {
+		t.Fatalf("ListHostSeconds = %d err=%v, want 3", len(got), err)
+	}
+	full := got[0]
+	if full.CPU == nil || *full.CPU != (gamesense.HostCPU{TotalPct: 41.5, BusiestPct: 99.25}) {
+		t.Fatalf("cpu = %+v", full.CPU)
+	}
+	if full.Mem == nil || *full.Mem != (gamesense.HostMem{Used: 12 << 30, Total: 32 << 30}) {
+		t.Fatalf("mem = %+v", full.Mem)
+	}
+	if full.GPU == nil || full.GPU.MemSize == nil || *full.GPU.MemSize != 8<<30 {
+		t.Fatalf("gpu = %+v", full.GPU)
+	}
+	// The clocks, which throttle independently of everything above them.
+	if full.GPU.CoreMHz == nil || *full.GPU.CoreMHz != 2610.5 || full.GPU.MemMHz == nil || *full.GPU.MemMHz != 1313.3 {
+		t.Errorf("adapter clocks = %v / %v, want 2610.5 / 1313.3", full.GPU.CoreMHz, full.GPU.MemMHz)
+	}
+	// A boost clock ABOVE the nominal maximum is ordinary rather than wrong, and
+	// must survive as read: clamping it to the maximum would erase the thing a
+	// reader is looking for.
+	if full.CPUClock == nil || *full.CPUClock != (gamesense.HostCPUClock{CurrentMHz: 4900, MaxMHz: 3600}) {
+		t.Errorf("cpu clock = %+v, want the boost kept above the nominal maximum", full.CPUClock)
+	}
+
+	// An idle machine is two measured zeros, not an unread one. Dropping the block
+	// over it would erase the finding "the box was not the problem".
+	if got[1].CPU == nil || *got[1].CPU != (gamesense.HostCPU{}) {
+		t.Fatalf("an idle machine came back as %+v, want a zeroed block", got[1].CPU)
+	}
+	if got[1].GPU != nil {
+		t.Fatalf("a second with no adapter reading acquired one: %+v", got[1].GPU)
+	}
+
+	// Half a card's telemetry stays half. Filling the rest in with zeros would
+	// report a card at no load or with no memory installed.
+	u := got[2].GPU
+	if u == nil || u.UtilPct == nil || *u.UtilPct != 41 {
+		t.Fatalf("util-only telemetry = %+v", u)
+	}
+	if u.MemUsed != nil || u.MemSize != nil {
+		t.Fatalf("util-only telemetry invented memory readings: %+v", u)
+	}
+	if got[2].CPU != nil || got[2].Mem != nil {
+		t.Fatalf("an adapter-only second acquired machine readings: %+v / %+v", got[2].CPU, got[2].Mem)
+	}
+
+	// The window a run detail asks with. Until is exclusive, matching ListBuckets.
+	win, err := svc.ListHostSeconds(ctx, "agent_game", HostFilter{
+		SiteID: "site_default",
+		Since:  start.Add(time.Second).Unix(),
+		Until:  start.Add(2 * time.Second).Unix(),
+	})
+	if err != nil || len(win) != 1 || !win[0].TS.Equal(idle.TS) {
+		t.Fatalf("windowed ListHostSeconds = %d %v err=%v, want only the second at %s",
+			len(win), win, err, idle.TS)
+	}
+
+	// Another site sees nothing, even naming the right agent.
+	none, err := svc.ListHostSeconds(ctx, "agent_game", HostFilter{SiteID: "site_other"})
+	if err != nil || len(none) != 0 {
+		t.Fatalf("cross-site ListHostSeconds = %d err=%v, want none", len(none), err)
 	}
 }
 

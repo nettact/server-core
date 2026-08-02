@@ -164,6 +164,10 @@ func Router(d Deps) http.Handler {
 			r.Get("/agents/{id}/game-runs", d.handleListGameRuns)
 			r.Get("/game-runs/{id}", d.handleGetGameRun)
 			r.Get("/game-runs/{id}/buckets", d.handleGameRunBuckets)
+			r.Get("/game-runs/{id}/gaps", d.handleGameRunGaps)
+			// Agent-scoped, not run-scoped: the machine stream is keyed by (agent,
+			// second) and a run merely reads the window it covers.
+			r.Get("/agents/{id}/host-seconds", d.handleAgentHostSeconds)
 			r.Delete("/game-runs/{id}", d.handleDeleteGameRun)
 			// Game profiles: which processes count as which game, pushed to agents
 			// on their own config axis. game-collection is the site-wide choice of

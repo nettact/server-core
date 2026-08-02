@@ -413,10 +413,10 @@ func (s *Service) UpdateAgent(ctx context.Context, id, displayName string) error
 // DeleteAgent hard-deletes an agent and the rows that belong to it. Foreign keys
 // are enforced (store.Open sets foreign_keys=ON), so FK-constrained child rows
 // (interfaces, agent_status_history, agent_group_members, monitor_status,
-// operational_issues) must go before the agent row; the non-FK per-agent tables
-// (agent_packets, events, detector_state) are cleared too so no orphaned rows
-// survive. detector_state keys on agent_id with no FK cascade, so its live
-// counters must be deleted explicitly here.
+// operational_issues, game_host_seconds) must go before the agent row; the non-FK
+// per-agent tables (agent_packets, events, detector_state) are cleared too so no
+// orphaned rows survive. detector_state keys on agent_id with no FK cascade, so
+// its live counters must be deleted explicitly here.
 //
 // fault_signals and fluctuations are NOT deleted: they are recorded history
 // carrying the agent's frozen name, and a fault (or an availability dip) that
@@ -456,7 +456,17 @@ func (s *Service) DeleteAgent(ctx context.Context, id string) error {
 		`DELETE FROM events WHERE agent_id=?`,
 		`DELETE FROM detector_state WHERE agent_id=?`,
 		`DELETE FROM game_buckets WHERE run_id IN (SELECT id FROM game_runs WHERE agent_id=?)`,
+		`DELETE FROM game_run_gaps WHERE run_id IN (SELECT id FROM game_runs WHERE agent_id=?)`,
 		`DELETE FROM game_runs WHERE agent_id=?`,
+		// The machine's own seconds. They hang off the AGENT rather than off a run,
+		// so deleting the runs above leaves them behind — and their foreign key to
+		// agents then blocks the row delete below outright, failing the whole
+		// deletion after the caller has already purged the agent's metrics.
+		//
+		// This is the one game table that survives DeleteRun on purpose (the stream
+		// is the machine's, and one run must not blank an overlapping run's curves),
+		// which is exactly why deleting the AGENT has to name it explicitly.
+		`DELETE FROM game_host_seconds WHERE agent_id=?`,
 	} {
 		if _, err := tx.ExecContext(ctx, stmt, id); err != nil {
 			return err

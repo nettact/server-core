@@ -16,24 +16,28 @@ import (
 // individual buckets were rejected, and the two must not read alike when someone
 // is working out why a run has no frames.
 type Result struct {
-	Runs     int  // runs upserted
-	Buckets  int  // buckets stored (a replayed second stores nothing)
-	Rejected int  // buckets refused: unknown run or unrecognized histogram layout
-	Denied   bool // the agent does not hold game.performance.read
+	Runs        int  // runs upserted
+	Buckets     int  // buckets stored (a replayed second stores nothing)
+	Gaps        int  // frameless stretches upserted
+	HostSeconds int  // machine-level seconds stored (a replayed second stores nothing)
+	Rejected    int  // buckets or gaps refused: unknown run, or unrecognized histogram layout
+	Denied      bool // the agent does not hold game.performance.read
 }
 
-// Apply stores a packet's runs and buckets inside the caller's ingest
-// transaction, so game data and the telemetry it arrived with reach one committed
-// state together.
+// Apply stores a packet's runs, buckets, gaps and machine-level seconds inside
+// the caller's ingest transaction, so game data and the telemetry it arrived
+// with reach one committed state together.
 //
 // Runs are upserted: the agent re-sends a run whenever its mutable fields change
 // (title, last seen, ending), which is what completes a run that outlived a
-// disconnect. Buckets are INSERT OR IGNORE on (run_id, ts) like every other
-// replay-safe write here — an at-least-once uploader must be able to retry a batch
-// without duplicating or rewriting a second that is already recorded.
-func Apply(ctx context.Context, tx *sql.Tx, agentID, siteID string, runs []gamesense.Run, buckets []gamesense.Bucket) (Result, error) {
+// disconnect. Gaps are upserted by id for the same reason — a silence has to be
+// visible before it ends, so it is re-sent as it grows. Buckets and host seconds
+// are INSERT OR IGNORE on their identity like every other replay-safe write here
+// — an at-least-once uploader must be able to retry a batch without duplicating
+// or rewriting a second that is already recorded.
+func Apply(ctx context.Context, tx *sql.Tx, agentID, siteID string, runs []gamesense.Run, buckets []gamesense.Bucket, gaps []gamesense.Gap, hosts []gamesense.HostSecond) (Result, error) {
 	var res Result
-	if len(runs) == 0 && len(buckets) == 0 {
+	if len(runs) == 0 && len(buckets) == 0 && len(gaps) == 0 && len(hosts) == 0 {
 		return res, nil
 	}
 
@@ -52,17 +56,21 @@ func Apply(ctx context.Context, tx *sql.Tx, agentID, siteID string, runs []games
 	}
 	if !perms.Has(permission.GamePerformanceRead) {
 		res.Denied = true
-		log.Printf("gamedata: dropped %d run(s) and %d bucket(s) from agent %s without %s",
-			len(runs), len(buckets), agentID, permission.GamePerformanceRead)
+		log.Printf("gamedata: dropped %d run(s), %d bucket(s), %d gap(s) and %d machine second(s) from agent %s without %s",
+			len(runs), len(buckets), len(gaps), len(hosts), agentID, permission.GamePerformanceRead)
 		return res, nil
 	}
 	// The adapter telemetry is a second, narrower read. Frame timings come from the
 	// game's own presentation, while GPU utilization and VRAM describe the card and
 	// every process sharing it — so an operator can grant the first and withhold the
 	// second, and a WAL that drained after that narrowing must not smuggle the
-	// difference in. Only those two blocks are stripped: the CPU/GPU splits, the
-	// latency figures and the busiest core are all derived from the frame stream
-	// this agent is already allowed to read.
+	// difference in.
+	//
+	// It strips exactly two things: a bucket's process VRAM, and a machine
+	// second's adapter block. Everything else survives, including the machine's
+	// CPU and memory — the processor and the RAM are not the graphics device, and
+	// gating them on a graphics permission would withhold the readings that
+	// explain a stutter for a reason that has nothing to do with them.
 	gpuOK := perms.Has(permission.GameGPURead)
 
 	for _, run := range runs {
@@ -95,8 +103,7 @@ func Apply(ctx context.Context, tx *sql.Tx, agentID, siteID string, runs []games
 		// second's frame data is permitted and worth keeping — only the part the
 		// policy withholds goes missing, which is exactly the NULL that means "not
 		// measured" everywhere else in this table.
-		if !gpuOK && (b.GPUTel != nil || b.ProcVRAM != nil) {
-			b.GPUTel = nil
+		if !gpuOK && b.ProcVRAM != nil {
 			b.ProcVRAM = nil
 			stripped++
 		}
@@ -116,11 +123,64 @@ func Apply(ctx context.Context, tx *sql.Tx, agentID, siteID string, runs []games
 	if err := writeAggregates(ctx, tx, deltas); err != nil {
 		return res, err
 	}
+
+	// Gaps hang off a run, so they are filtered through the same ownership test
+	// buckets are. `known` was built from the buckets' run ids, which are not the
+	// gaps' — a stretch with no frames in it has no bucket to have been named by —
+	// so the gaps get their own lookup.
+	//
+	// Deliberately NOT folded into the run: a gap must not advance last_seen_at,
+	// must not clear ended_at, and must not touch the summary. A game sitting
+	// minimized is not a game still being played, and advancing the run over it
+	// would make it look alive to the abandoned-run reaper and stretch
+	// duration_seconds across time no frame covered.
+	knownGapRuns, err := ownedGapRuns(ctx, tx, agentID, gaps)
+	if err != nil {
+		return res, err
+	}
+	for _, g := range gaps {
+		if g.ID == "" || !knownGapRuns[g.RunID] {
+			res.Rejected++
+			continue
+		}
+		if err := upsertGap(ctx, tx, g); err != nil {
+			return res, err
+		}
+		res.Gaps++
+	}
+
+	// Machine seconds are keyed by (agent, second) and hang off no run, so they
+	// need no ownership test — the agent id IS the ownership. They are also
+	// stored for agents with no open run at all, which is the point: the seconds
+	// a game drew nothing in are exactly the ones a reader wants the machine's
+	// side of.
+	for _, h := range hosts {
+		if !gpuOK && h.GPU != nil {
+			h.GPU = nil
+			stripped++
+		}
+		// Re-checked after the strip, not before. Removing the only block a second
+		// carried leaves an all-NULL row, which asserts "covered and nothing
+		// readable" — a claim this agent has not earned, and one a reader would
+		// mistake for a card that stopped reporting rather than a permission that
+		// was withheld.
+		if h.Empty() {
+			continue
+		}
+		stored, err := insertHostSecond(ctx, tx, agentID, siteID, h)
+		if err != nil {
+			return res, err
+		}
+		if stored {
+			res.HostSeconds++
+		}
+	}
+
 	if res.Rejected > 0 {
-		log.Printf("gamedata: rejected %d bucket(s) from agent %s (unknown run or histogram layout)", res.Rejected, agentID)
+		log.Printf("gamedata: rejected %d record(s) from agent %s (unknown run or histogram layout)", res.Rejected, agentID)
 	}
 	if stripped > 0 {
-		log.Printf("gamedata: stripped GPU telemetry from %d bucket(s) of agent %s without %s",
+		log.Printf("gamedata: stripped GPU readings from %d record(s) of agent %s without %s",
 			stripped, agentID, permission.GameGPURead)
 	}
 	return res, nil
@@ -291,10 +351,7 @@ func insertBucket(ctx context.Context, tx *sql.Tx, b gamesense.Bucket) (bool, er
 		gpuBusyAvg, gpuBusyP95, gpuWaitAvg             sql.NullFloat64
 		gpuInPresentAvg, gpuRenderLatencyAvg           sql.NullFloat64
 		latDisplayAvg, latAnimErrAvg, latAnimErrP95    sql.NullFloat64
-		gpuUtilPct                                     sql.NullFloat64
-		gpuMemUsed, gpuMemSize                         sql.NullInt64
 		vramUsed, vramBudget                           sql.NullInt64
-		busiestCore                                    sql.NullFloat64
 	)
 	if c := b.CPUSplit; c != nil {
 		cpuBusyAvg = nullFloat(c.BusyAvg, true)
@@ -317,25 +374,12 @@ func insertBucket(ctx context.Context, tx *sql.Tx, b gamesense.Bucket) (bool, er
 		latAnimErrAvg = nullFloat(l.AnimErrAvg, true)
 		latAnimErrP95 = nullFloat(l.AnimErrP95, true)
 	}
-	// Adapter telemetry breaks that rule on purpose: which figures a driver
-	// publishes varies by vendor, so each column carries its own presence the way
-	// the proc_res readings do.
-	if g := b.GPUTel; g != nil {
-		if g.UtilPct != nil {
-			gpuUtilPct = nullFloat(*g.UtilPct, true)
-		}
-		gpuMemUsed = nullUint64(g.MemUsed)
-		gpuMemSize = nullUint64(g.MemSize)
-	}
 	// Used is unconditional for a present block — it is what says the read
 	// happened — while the budget stays optional, since an OS that does not
 	// publish one still leaves the level worth recording.
 	if v := b.ProcVRAM; v != nil {
 		vramUsed = nullUint64(&v.Used)
 		vramBudget = nullUint64(v.Budget)
-	}
-	if b.BusiestCorePct != nil {
-		busiestCore = nullFloat(*b.BusiestCorePct, true)
 	}
 
 	res, err := tx.ExecContext(ctx, `
@@ -350,10 +394,9 @@ func insertBucket(ctx context.Context, tx *sql.Tx, b gamesense.Bucket) (bool, er
 			gpu_latency_avg, gpu_time_avg, gpu_time_p95, gpu_busy_avg, gpu_busy_p95,
 			gpu_wait_avg, gpu_in_present_avg, gpu_render_latency_avg,
 			lat_display_avg, lat_anim_err_avg, lat_anim_err_p95,
-			gpu_util_pct, gpu_mem_used, gpu_mem_size,
-			proc_vram_used, proc_vram_budget, busiest_core_pct, quality)
+			proc_vram_used, proc_vram_budget, quality)
 		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,
-		       ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		       ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		b.RunID, b.TS.Unix(), b.Frames.Presented,
 		nullInt(b.Frames.Displayed), nullInt(b.Frames.Dropped),
 		nullInt(b.Frames.App), nullInt(b.Frames.Generated),
@@ -366,8 +409,137 @@ func insertBucket(ctx context.Context, tx *sql.Tx, b gamesense.Bucket) (bool, er
 		gpuLatencyAvg, gpuTimeAvg, gpuTimeP95, gpuBusyAvg, gpuBusyP95,
 		gpuWaitAvg, gpuInPresentAvg, gpuRenderLatencyAvg,
 		latDisplayAvg, latAnimErrAvg, latAnimErrP95,
-		gpuUtilPct, gpuMemUsed, gpuMemSize,
-		vramUsed, vramBudget, busiestCore, encodeStrings(b.Quality))
+		vramUsed, vramBudget, encodeStrings(b.Quality))
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
+}
+
+// ownedGapRuns is ownedRuns for the run ids gaps name. Separate rather than
+// generic over both because a gap's run and a bucket's run are different sets:
+// the whole point of a gap is a stretch that produced no bucket, so a packet can
+// easily carry a gap whose run no bucket in it mentions.
+func ownedGapRuns(ctx context.Context, tx *sql.Tx, agentID string, gaps []gamesense.Gap) (map[string]bool, error) {
+	want := map[string]bool{}
+	args := []any{agentID}
+	for _, g := range gaps {
+		if g.RunID == "" {
+			continue
+		}
+		if _, seen := want[g.RunID]; !seen {
+			want[g.RunID] = false
+			args = append(args, g.RunID)
+		}
+	}
+	if len(want) == 0 {
+		return want, nil
+	}
+	rows, err := tx.QueryContext(ctx,
+		`SELECT id FROM game_runs WHERE agent_id=? AND id IN (`+placeholders(len(want))+`)`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		if _, referenced := want[id]; referenced {
+			want[id] = true
+		}
+	}
+	return want, rows.Err()
+}
+
+// upsertGap stores one frameless stretch, extending it if a later report has
+// seen it grow.
+//
+// The end takes max() rather than "newest report wins", and the difference is
+// what makes an at-least-once uploader safe: a retried batch can carry a copy of
+// this interval from before it grew, and last-writer-wins would rewind it. A
+// stretch only ever gets longer, so max is also the whole of the merge rule.
+//
+// The run_id guard mirrors upsertRun's agent_id guard one level down. Ids are
+// minted by the agent, and one agent must not be able to re-point another's gap
+// at a run of its own by reusing the id.
+//
+// Nothing here touches game_runs. A gap is evidence the game was NOT presenting,
+// so advancing last_seen_at or clearing ended_at over it would make a minimized
+// game look alive to the reaper and stretch the run's duration across time no
+// frame covered.
+func upsertGap(ctx context.Context, tx *sql.Tx, g gamesense.Gap) error {
+	_, err := tx.ExecContext(ctx, `
+		INSERT INTO game_run_gaps(id, run_id, reason, started_at, ended_at)
+		VALUES(?,?,?,?,?)
+		ON CONFLICT(id) DO UPDATE SET
+			ended_at = max(game_run_gaps.ended_at, excluded.ended_at)
+		WHERE game_run_gaps.run_id = excluded.run_id`,
+		g.ID, g.RunID, g.Reason, g.StartedAt.Unix(), g.EndedAt.Unix())
+	return err
+}
+
+// insertHostSecond stores one machine second, reporting whether it was new.
+//
+// INSERT OR IGNORE on (agent_id, ts) for the reason buckets use it: a replayed
+// batch must neither duplicate a second nor rewrite one. It also handles the
+// clock stepping backwards, which re-offers a second already stored — the first
+// reading wins, which is the one taken while the clock was still monotonic.
+//
+// Each block's columns are written and left NULL together, and each block's
+// first column is what read-back tests. Zeros inside a present block are
+// measurements: an idle machine really was at 0%.
+func insertHostSecond(ctx context.Context, tx *sql.Tx, agentID, siteID string, h gamesense.HostSecond) (bool, error) {
+	var (
+		cpuTotal, cpuBusiest sql.NullFloat64
+		cpuMHz, cpuMaxMHz    sql.NullFloat64
+		memUsed, memTotal    sql.NullInt64
+		gpuUtil              sql.NullFloat64
+		gpuMemUsed, gpuMemSz sql.NullInt64
+		gpuCoreMHz, gpuMemHz sql.NullFloat64
+	)
+	if c := h.CPU; c != nil {
+		cpuTotal = nullFloat(c.TotalPct, true)
+		cpuBusiest = nullFloat(c.BusiestPct, true)
+	}
+	if c := h.CPUClock; c != nil {
+		cpuMHz = nullFloat(c.CurrentMHz, true)
+		cpuMaxMHz = nullFloat(c.MaxMHz, true)
+	}
+	if m := h.Mem; m != nil {
+		memUsed = nullUint64(&m.Used)
+		memTotal = nullUint64(&m.Total)
+	}
+	// The adapter block breaks the pairing rule on purpose: which figures a driver
+	// publishes varies by vendor and by metric, so each column carries its own
+	// presence the way the proc_res readings on a bucket do.
+	if g := h.GPU; g != nil {
+		if g.UtilPct != nil {
+			gpuUtil = nullFloat(*g.UtilPct, true)
+		}
+		gpuMemUsed = nullUint64(g.MemUsed)
+		gpuMemSz = nullUint64(g.MemSize)
+		if g.CoreMHz != nil {
+			gpuCoreMHz = nullFloat(*g.CoreMHz, true)
+		}
+		if g.MemMHz != nil {
+			gpuMemHz = nullFloat(*g.MemMHz, true)
+		}
+	}
+
+	res, err := tx.ExecContext(ctx, `
+		INSERT OR IGNORE INTO game_host_seconds(
+			agent_id, site_id, ts,
+			cpu_total_pct, cpu_busiest_pct, cpu_mhz, cpu_max_mhz,
+			mem_used, mem_total,
+			gpu_util_pct, gpu_mem_used, gpu_mem_size, gpu_core_mhz, gpu_mem_mhz, quality)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		agentID, siteID, h.TS.Unix(),
+		cpuTotal, cpuBusiest, cpuMHz, cpuMaxMHz,
+		memUsed, memTotal,
+		gpuUtil, gpuMemUsed, gpuMemSz, gpuCoreMHz, gpuMemHz, encodeStrings(h.Quality))
 	if err != nil {
 		return false, err
 	}

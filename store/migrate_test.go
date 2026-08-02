@@ -102,7 +102,41 @@ func TestMigrationsApplyToAnExistingDatabase(t *testing.T) {
 		t.Errorf("perm_unsupported_reasons default = %q, want %q", reasons, "{}")
 	}
 
+	// 0004 moves four machine-level readings out of game_buckets and into a table
+	// of their own, and it is the first migration here that DROPS anything. Both
+	// halves are checked, because either alone would leave the schema broken in a
+	// way nothing else notices: columns dropped with no successor loses the data,
+	// and a successor added without the drop leaves two sources for one fact,
+	// disagreeing the moment a run is base-tier.
+	buckets := columnNames(t, db.DB, "game_buckets")
+	for _, col := range []string{"gpu_util_pct", "gpu_mem_used", "gpu_mem_size", "busiest_core_pct"} {
+		if buckets[col] {
+			t.Errorf("game_buckets still has %s; 0004 did not drop it on an existing database", col)
+		}
+	}
+	// The per-process readings stay: they are about a process rather than the
+	// machine, and dropping them with their neighbours is the easy mistake.
+	for _, col := range []string{"proc_vram_used", "proc_cpu_pct", "hist"} {
+		if !buckets[col] {
+			t.Errorf("game_buckets lost %s, which was never machine-level", col)
+		}
+	}
+	host := columnNames(t, db.DB, "game_host_seconds")
+	for _, col := range []string{"agent_id", "site_id", "ts", "cpu_total_pct", "cpu_busiest_pct", "mem_used", "mem_total", "gpu_util_pct", "gpu_mem_used", "gpu_mem_size", "quality"} {
+		if !host[col] {
+			t.Errorf("game_host_seconds has no %s; 0004 did not create it", col)
+		}
+	}
+	gaps := columnNames(t, db.DB, "game_run_gaps")
+	for _, col := range []string{"id", "run_id", "reason", "started_at", "ended_at"} {
+		if !gaps[col] {
+			t.Errorf("game_run_gaps has no %s; 0005 did not create it", col)
+		}
+	}
+
 	// Re-running is a no-op: a second Open must not try to add the column twice.
+	// It is the DROPs in 0004 that make this worth more than it was — a repeat
+	// would fail outright rather than being harmlessly redundant.
 	// (sql.DB.Close is idempotent, so the deferred close above stays correct.)
 	if err := db.Close(); err != nil {
 		t.Fatalf("close: %v", err)
@@ -112,6 +146,31 @@ func TestMigrationsApplyToAnExistingDatabase(t *testing.T) {
 		t.Fatalf("reopen after migrating: %v", err)
 	}
 	db2.Close()
+}
+
+// The same schema, reached the other way. A fresh install runs 0001 — which
+// still DECLARES the four moved columns, because 0004's DROPs would fail against
+// a table that never had them — and then drops them in 0004, so it must arrive
+// at exactly what the incremental path above arrives at.
+func TestAFreshDatabaseReachesTheSameGameSchema(t *testing.T) {
+	db, err := store.Open(filepath.Join(storetest.Dir(t), "fresh.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+
+	buckets := columnNames(t, db.DB, "game_buckets")
+	for _, col := range []string{"gpu_util_pct", "gpu_mem_used", "gpu_mem_size", "busiest_core_pct"} {
+		if buckets[col] {
+			t.Errorf("a fresh game_buckets still has %s", col)
+		}
+	}
+	if !columnNames(t, db.DB, "game_host_seconds")["cpu_total_pct"] {
+		t.Error("a fresh database has no game_host_seconds")
+	}
+	if !columnNames(t, db.DB, "game_run_gaps")["reason"] {
+		t.Error("a fresh database has no game_run_gaps")
+	}
 }
 
 func columnNames(t *testing.T, db *sql.DB, table string) map[string]bool {

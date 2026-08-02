@@ -170,7 +170,8 @@ func (s *Service) Ingest(ctx context.Context, agentID, siteID string, pkt teleme
 		// because a second of frames is a distribution and not a value. It is written
 		// in the same transaction so a committed packet never leaves a run without the
 		// seconds that arrived with it. Its own permission gate lives in gamedata.Apply.
-		if _, err := gamedata.Apply(ctx, tx, agentID, siteID, pkt.GameRuns, pkt.GameBuckets); err != nil {
+		if _, err := gamedata.Apply(ctx, tx, agentID, siteID,
+			pkt.GameRuns, pkt.GameBuckets, pkt.GameGaps, pkt.GameHostSeconds); err != nil {
 			return Ack{}, err
 		}
 		// Fault evaluation runs INSIDE this sample transaction so samples, detector

@@ -1,6 +1,7 @@
 // Package gamedata stores and serves game presentation data: runs (one
-// continuous stretch of a game presenting frames) and the per-second buckets
-// hanging from them.
+// continuous stretch of a game presenting frames), the per-second buckets
+// hanging from them, the stretches in which they produced no frames, and the
+// machine-level seconds that run underneath all of it.
 //
 // It is deliberately outside the time-series store. A second of rendering is a
 // distribution rather than a scalar, and the figures players compare sessions by
@@ -27,9 +28,10 @@ import (
 	"github.com/nettact/server-core/store"
 )
 
-// Service owns the game_runs / game_buckets tables: the read surface the console
-// charts from, and the retention that bounds them. The write path is Apply, which
-// runs inside the ingest transaction and therefore takes a *sql.Tx instead.
+// Service owns the game_runs / game_buckets / game_run_gaps / game_host_seconds
+// tables: the read surface the console charts from, and the retention that
+// bounds them. The write path is Apply, which runs inside the ingest transaction
+// and therefore takes a *sql.Tx instead.
 type Service struct {
 	db       *store.DB
 	settings *settings.Service
@@ -95,6 +97,47 @@ type Summary struct {
 	Presented       int64    `json:"presented"`
 	Displayed       *int64   `json:"displayed"`
 	Dropped         *int64   `json:"dropped"`
+}
+
+// Gap is one stretch of a run that produced no frames, and which silence it was.
+//
+// Reason is an open vocabulary owned by the sensor (gamesense.GapBackground /
+// GapNoFrames today). A console meeting a code it does not recognize must draw
+// the band unlabelled rather than drop it: the stretch happened either way, and
+// hiding it puts back the blank this record exists to explain.
+//
+// EndedAt may fall after the run's own end and is served unclamped. A run ends
+// at its last frame; a game left minimized for fifty minutes afterwards is
+// exactly the thing that separates "stopped playing" from "walked away".
+type Gap struct {
+	ID        string    `json:"id"`
+	RunID     string    `json:"run_id"`
+	Reason    string    `json:"reason"`
+	StartedAt time.Time `json:"started_at"`
+	EndedAt   time.Time `json:"ended_at"`
+}
+
+// HostSecond is one second of machine-level readings, keyed by the agent and the
+// second rather than by any run.
+//
+// It is served to a run detail by time window, so two runs overlapping a second
+// read the same record. Every block is independently absent because their
+// sources fail apart, and each stays nil when its columns were NULL — a machine
+// whose driver publishes no adapter telemetry still reports its CPU, and
+// substituting a zero for either would invent an idle card or an idle box.
+//
+// CPU's two figures and Mem's two are group-atomic: one read produces both, so
+// they arrive and vanish together.
+type HostSecond struct {
+	TS  time.Time          `json:"ts"`
+	CPU *gamesense.HostCPU `json:"cpu"`
+	// CPUClock is separate from CPU because the two come from different calls
+	// that fail independently: one differences performance counters, the other
+	// reads power management.
+	CPUClock *gamesense.HostCPUClock `json:"cpu_clock"`
+	Mem      *gamesense.HostMem      `json:"mem"`
+	GPU      *gamesense.GPUTel       `json:"gpu"`
+	Quality  []string                `json:"quality,omitempty"`
 }
 
 // histBytes is the stored width of a log24_v1 histogram blob.

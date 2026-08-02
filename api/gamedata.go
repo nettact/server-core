@@ -96,6 +96,63 @@ func (d Deps) handleGameRunBuckets(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, buckets)
 }
 
+// handleGameRunGaps returns one run's frameless stretches — the alt-tabs, the
+// loading screens — so a console can shade the blanks between its seconds
+// instead of leaving a reader to conclude the data went missing.
+//
+// Unwindowed on purpose: the list is one row per interruption rather than per
+// second, and a stretch that begins before a charted segment or ends after it
+// has to arrive whole. A gap clipped to the window would report a fifty-minute
+// absence as however much of it happened to be on screen.
+func (d Deps) handleGameRunGaps(w http.ResponseWriter, r *http.Request) {
+	run, ok := d.gameRun(w, r)
+	if !ok {
+		return
+	}
+	gaps, err := d.GameData.ListGaps(r.Context(), run.ID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, gaps)
+}
+
+// handleAgentHostSeconds returns an agent's machine-level seconds over a window.
+//
+// Agent-scoped rather than run-scoped, because the stream is: it is keyed by
+// (agent, second), it exists for seconds no run covers, and two runs overlapping
+// a second read the same rows. A run detail asks for its own [started_at,
+// ended_at]; nothing here knows or cares that it did.
+func (d Deps) handleAgentHostSeconds(w http.ResponseWriter, r *http.Request) {
+	if d.GameData == nil {
+		writeError(w, http.StatusServiceUnavailable, "game data not available")
+		return
+	}
+	agentID := chi.URLParam(r, "id")
+	q := r.URL.Query()
+	// Ownership rides in the filter and is enforced in SQL, the way ListRuns does
+	// it: an agent from another site matches no rows rather than being detected
+	// and refused. There is nothing to distinguish here — "no such agent" and "an
+	// agent you cannot see" are the same empty answer, and that is the answer that
+	// leaks nothing.
+	f := gamedata.HostFilter{SiteID: siteParam(r)}
+	if n, err := strconv.ParseInt(q.Get("since"), 10, 64); err == nil && n > 0 {
+		f.Since = n
+	}
+	if n, err := strconv.ParseInt(q.Get("until"), 10, 64); err == nil && n > 0 {
+		f.Until = n
+	}
+	if n, err := strconv.Atoi(q.Get("limit")); err == nil && n > 0 {
+		f.Limit = n
+	}
+	seconds, err := d.GameData.ListHostSeconds(r.Context(), agentID, f)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, seconds)
+}
+
 func (d Deps) handleDeleteGameRun(w http.ResponseWriter, r *http.Request) {
 	run, ok := d.gameRun(w, r)
 	if !ok {

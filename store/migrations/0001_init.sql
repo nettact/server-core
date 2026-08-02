@@ -553,8 +553,9 @@ CREATE TABLE game_buckets(
   cpu_wait_avg REAL,               -- ms per frame spent waiting on something else
   cpu_wait_p95 REAL,
   -- The frame's GPU side, scoped to the tracked process: this is the game's own
-  -- work from the frame events, NOT the card's total load. gpu_util_pct below is
-  -- the other half of that comparison and comes from somewhere else entirely.
+  -- work from the frame events, NOT the card's total load. The other half of
+  -- that comparison lives in game_host_seconds (added in 0004), which is keyed
+  -- by the machine rather than by a run because the card is shared.
   gpu_latency_avg REAL,            -- frame start -> GPU work start
   gpu_time_avg REAL,               -- GPU total duration per frame
   gpu_time_p95 REAL,
@@ -570,31 +571,31 @@ CREATE TABLE game_buckets(
   lat_anim_err_avg REAL,           -- |animation error|; the source is signed, the absolute value is stored
   lat_anim_err_p95 REAL,
   -- Whole-adapter telemetry, polled once at the second boundary rather than
-  -- derived from frames. These three are EACH independent, like the proc_*
-  -- readings and unlike the frame-derived groups above: which figures a driver
-  -- publishes varies by vendor and by metric, so a card reporting utilization
-  -- and no memory is an ordinary card rather than a failed read. Read-back
-  -- rebuilds the block when ANY of them is non-NULL.
+  -- derived from frames.
   --
-  -- These two blocks (gpu_* telemetry and proc_vram_*) are also the ones gated
-  -- by game.gpu.read: they describe the adapter and every process sharing it,
-  -- not just the game whose frames the run is about, so ingest NULLs them for an
-  -- agent that holds only game.performance.read.
-  gpu_util_pct REAL,               -- whole-GPU utilization 0-100 (NOT this process)
-  gpu_mem_used INTEGER,            -- whole-GPU dedicated memory used, bytes
-  gpu_mem_size INTEGER,            -- dedicated memory capacity, bytes
-  -- The game process's own dedicated video memory, which is what gpu_mem_used
-  -- cannot say: a full card says nothing about who filled it. used is the
-  -- discriminator for the block; budget is independently NULL because the OS
-  -- does not always expose a per-process budget, and the level is still the
-  -- measurement without it.
+  -- These four columns are DROPPED by 0004 and no writer fills them on any
+  -- database past that migration. They are declared here and nowhere else
+  -- because this file is the baseline a fresh install creates before 0004 runs,
+  -- and deleting them would make that migration's DROP COLUMN fail. Their
+  -- successors are in game_host_seconds, keyed by (agent, second): they describe
+  -- the machine rather than the run, and filing them under whichever process
+  -- happened to draw meant they existed only for the seconds one game was
+  -- drawing in — never for the alt-tabbed minute a reader most wants explained.
+  gpu_util_pct REAL,               -- moved to game_host_seconds in 0004
+  gpu_mem_used INTEGER,            -- moved to game_host_seconds in 0004
+  gpu_mem_size INTEGER,            -- moved to game_host_seconds in 0004
+  -- The game process's own dedicated video memory, which is what a whole-card
+  -- figure cannot say: a full card says nothing about who filled it. This one
+  -- IS per-process and stays. used is the discriminator for the block; budget is
+  -- independently NULL because the OS does not always expose a per-process
+  -- budget, and the level is still the measurement without it.
+  --
+  -- It is also the block gated by game.gpu.read on this table: it reads the
+  -- adapter, not just the game's frames, so ingest NULLs it for an agent that
+  -- holds only game.performance.read.
   proc_vram_used INTEGER,
   proc_vram_budget INTEGER,
-  -- The busiest logical core, % 0-100. It stands alone rather than joining the
-  -- proc_* group because it describes the machine and not the process: a
-  -- single-threaded game pins one core while proc_cpu_pct — a share of all
-  -- cores — reads low, and that gap is the whole finding.
-  busiest_core_pct REAL,
+  busiest_core_pct REAL,           -- moved to game_host_seconds in 0004
   quality TEXT,                    -- JSON array of flags; NULL when none apply
   PRIMARY KEY(run_id, ts)
 ) WITHOUT ROWID;
