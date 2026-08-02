@@ -1,0 +1,16 @@
+-- The index the abandoned-run reaper sweeps (gamedata.CloseAbandonedRuns).
+--
+-- A new numbered file rather than an edit to 0001 for the reason 0002 spells out
+-- at length: 0001 is already recorded in schema_migrations of a live development
+-- database holding real game data, so an edit there would silently never run.
+-- Post-baseline schema changes append from here.
+--
+-- Partial on ended_at IS NULL, and that is the whole point of it. The reaper asks
+-- once a minute which runs have not ended, and on a machine that is not playing
+-- anything right now the answer is none — so the index it walks is EMPTY, while a
+-- full index on last_seen_at would grow with the ninety-day run history the sweep
+-- has no interest in and cost a scan proportional to it every minute. last_seen_at
+-- is the key so the staleness bound narrows the walk rather than filtering after
+-- it, and entries leave the index the moment a run is ended, which is what keeps
+-- it the size of "sessions in progress" (normally zero or one) forever.
+CREATE INDEX idx_game_runs_open ON game_runs(last_seen_at) WHERE ended_at IS NULL;
