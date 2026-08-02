@@ -2,9 +2,11 @@ package incidentops
 
 import (
 	"context"
+	"encoding/json"
 	"time"
 
 	"github.com/google/uuid"
+	pcfg "github.com/nettact/protocol/config"
 )
 
 // Recover restores in-flight state after a restart: it finalizes snapshots whose
@@ -216,8 +218,12 @@ func (s *Service) OnAgentConnected(ctx context.Context, agentID string) {
 	now := time.Now().UTC()
 
 	// Snapshot: re-push each still-collecting in-deadline request for this agent.
+	// The target refs come from the entry, frozen when it was created — NOT from
+	// probe_tasks. An agent can be offline for the whole collection window, and
+	// re-deriving here would collect the scene against whatever the monitor was
+	// edited into meanwhile (or, for a deleted one, against nothing at all).
 	srows, err := s.db.Read().QueryContext(ctx, `
-		SELECT e.request_id, sn.incident_id, sn.deadline_at
+		SELECT e.request_id, e.targets, sn.incident_id, sn.deadline_at
 		FROM incident_snapshot_entries e
 		JOIN incident_snapshots sn ON sn.id = e.snapshot_id
 		WHERE e.agent_id=? AND e.status='collecting' AND sn.deadline_at > ?`, agentID, now)
@@ -225,18 +231,25 @@ func (s *Service) OnAgentConnected(ctx context.Context, agentID string) {
 		type pend struct {
 			reqID, incidentID string
 			deadline          time.Time
+			targets           []pcfg.SnapshotTargetRef
 		}
 		var pends []pend
 		for srows.Next() {
 			var p pend
-			if err := srows.Scan(&p.reqID, &p.incidentID, &p.deadline); err != nil {
+			var targets string
+			if err := srows.Scan(&p.reqID, &targets, &p.incidentID, &p.deadline); err != nil {
 				break
+			}
+			// A malformed or empty blob yields no targets: the scene still collects
+			// its network/agent/resource groups rather than the push being skipped.
+			if targets != "" {
+				_ = json.Unmarshal([]byte(targets), &p.targets)
 			}
 			pends = append(pends, p)
 		}
 		srows.Close()
 		for _, p := range pends {
-			s.dispatchSnapshot(ctx, agentID, p.incidentID, p.reqID, p.deadline)
+			s.dispatchSnapshot(agentID, p.incidentID, p.reqID, p.deadline, p.targets)
 		}
 	}
 

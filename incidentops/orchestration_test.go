@@ -52,6 +52,184 @@ func seedIncidentSignal(t *testing.T, db *store.DB, incidentID, signalID, agentI
 	}
 }
 
+// The refs pushed to the agent decide how it interprets each target. A gateway
+// monitor's target is the sentinel "gateway", so the NIC selection has to travel
+// with it — that is the only thing that lets the agent resolve the right gateway
+// from its routing table instead of handing the sentinel to DNS. Host anchors
+// name a metric series, not a destination, so they must not be sent at all.
+func TestSnapshotTargetsCarryIfaceAndDropHostAnchors(t *testing.T) {
+	db, ctx := openIncidentOpsTest(t)
+	seedIncidentSignal(t, db, "inc_st", "sig_gw", "agent_a", "firing")
+	seedIncidentSignal(t, db, "inc_st2", "sig_host", "agent_a", "firing")
+	seedIncidentSignal(t, db, "inc_st3", "sig_tcp", "agent_a", "firing")
+	// seedIncidentSignal derives target_id as "probe_"+signalID.
+	for _, q := range []string{
+		`INSERT INTO monitor_groups(id,site_id,name,all_agents) VALUES('mg','site_default','all',1)`,
+		`INSERT INTO probe_tasks(id,site_id,group_id,kind,name,target,params,enabled,config_serial)
+		 VALUES('probe_sig_gw','site_default','mg','gateway','LAN gateway','gateway','{"interface":"以太网"}',1,1)`,
+		`INSERT INTO probe_tasks(id,site_id,group_id,kind,name,target,params,enabled,config_serial)
+		 VALUES('probe_sig_host','site_default','mg','host','Host CPU','host','{}',1,1)`,
+		`INSERT INTO probe_tasks(id,site_id,group_id,kind,name,target,params,enabled,config_serial)
+		 VALUES('probe_sig_tcp','site_default','mg','tcp','TLS port','1.1.1.1','{"port":443}',1,1)`,
+	} {
+		if _, err := db.ExecContext(ctx, q); err != nil {
+			t.Fatalf("seed probe task: %v", err)
+		}
+	}
+	svc := New(db, nil, settings.New(db), nil)
+
+	got := map[string]pcfg.SnapshotTargetRef{}
+	for _, incidentID := range []string{"inc_st", "inc_st2", "inc_st3"} {
+		// nil frozen base: this exercises the live-config fallback path.
+		for _, ref := range svc.snapshotTargets(ctx, incidentID, "agent_a", nil) {
+			got[ref.MonitorID] = ref
+		}
+	}
+
+	gw, ok := got["probe_sig_gw"]
+	if !ok {
+		t.Fatalf("gateway target missing from %v", got)
+	}
+	if gw.Iface != "以太网" {
+		t.Errorf("gateway iface = %q, want 以太网", gw.Iface)
+	}
+	if _, ok := got["probe_sig_host"]; ok {
+		t.Error("host anchor was sent to the agent; it has nothing to resolve")
+	}
+	if tcp := got["probe_sig_tcp"]; tcp.Port != 443 || tcp.Iface != "" {
+		t.Errorf("tcp ref = port:%d iface:%q, want port 443 and no iface", tcp.Port, tcp.Iface)
+	}
+}
+
+// An agent can be offline for the whole collection window. The refs it finally
+// receives on reconnect must be the ones frozen when the incident opened — not
+// re-derived from probe_tasks, which the operator may have edited or deleted
+// meanwhile. Re-deriving collected the scene against the NEW config: a retyped
+// host monitor slipped past the host exclusion, and an edited gateway monitor
+// sent a different NIC, so the agent resolved a gateway unrelated to the fault.
+func TestReconnectRePushUsesFrozenTargetRefs(t *testing.T) {
+	db, ctx := openIncidentOpsTest(t)
+	seedIncidentSignal(t, db, "inc_frz", "sig_frz", "agent_a", "firing")
+	for _, q := range []string{
+		`INSERT INTO monitor_groups(id,site_id,name,all_agents) VALUES('mg','site_default','all',1)`,
+		`INSERT INTO probe_tasks(id,site_id,group_id,kind,name,target,params,enabled,config_serial)
+		 VALUES('probe_sig_frz','site_default','mg','gateway','LAN gateway','gateway','{"interface":"以太网"}',1,1)`,
+	} {
+		if _, err := db.ExecContext(ctx, q); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+	}
+	// Give the snapshot a live deadline so the reconnect path considers it.
+	if _, err := db.ExecContext(ctx, `
+		INSERT INTO incident_snapshots(id,incident_id,status,base,total_bytes,deadline_at,created_at)
+		VALUES('isnap_frz','inc_frz','collecting','',0,?,?)`,
+		time.Now().UTC().Add(10*time.Minute), time.Now().UTC()); err != nil {
+		t.Fatalf("seed snapshot: %v", err)
+	}
+
+	svc := New(db, nil, settings.New(db), nil)
+	pusher := &capturePusher{}
+	svc.SetPusher(pusher)
+	if err := svc.OnIncidentOpened(ctx, eventbus.IncidentEvent{IncidentID: "inc_frz", SiteID: "site_default"}); err != nil {
+		t.Fatalf("on incident opened: %v", err)
+	}
+	if len(pusher.snapReq) != 1 || len(pusher.snapReq[0].Targets) != 1 {
+		t.Fatalf("initial push = %+v, want one request with one target", pusher.snapReq)
+	}
+	if got := pusher.snapReq[0].Targets[0].Iface; got != "以太网" {
+		t.Fatalf("initial iface = %q, want 以太网", got)
+	}
+
+	// The operator now retargets the monitor at another NIC — and a second
+	// operator deletes a different one entirely. Neither may reach the re-push.
+	if _, err := db.ExecContext(ctx,
+		`UPDATE probe_tasks SET params='{"interface":"Wi-Fi"}' WHERE id='probe_sig_frz'`); err != nil {
+		t.Fatalf("edit monitor: %v", err)
+	}
+
+	svc.OnAgentConnected(ctx, "agent_a")
+	if len(pusher.snapReq) != 2 {
+		t.Fatalf("re-push count = %d, want 2", len(pusher.snapReq))
+	}
+	re := pusher.snapReq[1]
+	if len(re.Targets) != 1 {
+		t.Fatalf("re-pushed targets = %+v, want 1", re.Targets)
+	}
+	if re.Targets[0].Iface != "以太网" {
+		t.Errorf("re-pushed iface = %q, want the frozen 以太网 (config was edited to Wi-Fi)", re.Targets[0].Iface)
+	}
+	if re.RequestID != pusher.snapReq[0].RequestID {
+		t.Errorf("re-push minted a new request id %q, want %q", re.RequestID, pusher.snapReq[0].RequestID)
+	}
+
+	// Deleting the monitor outright must not empty the frozen refs either.
+	if _, err := db.ExecContext(ctx, `DELETE FROM probe_tasks WHERE id='probe_sig_frz'`); err != nil {
+		t.Fatalf("delete monitor: %v", err)
+	}
+	svc.OnAgentConnected(ctx, "agent_a")
+	if len(pusher.snapReq) != 3 {
+		t.Fatalf("second re-push count = %d, want 3", len(pusher.snapReq))
+	}
+	if got := pusher.snapReq[2].Targets; len(got) != 1 || got[0].Iface != "以太网" {
+		t.Errorf("after delete, re-pushed targets = %+v, want the frozen gateway ref", got)
+	}
+}
+
+// OnIncidentOpened runs post-commit, so a monitor edit can land between the
+// incident transaction and the entry-creation read. The refs frozen onto the
+// entry must come from the base captured INSIDE the transaction — reading live
+// probe_tasks here froze the edited config permanently: a re-NIC'd gateway
+// resolved the wrong gateway, and a monitor retyped to "host" vanished from the
+// scene entirely, with the base right next to it still showing the config that
+// raised the incident.
+func TestEntryTargetsFrozenAgainstPostCommitEdit(t *testing.T) {
+	db, ctx := openIncidentOpsTest(t)
+	seedIncidentSignal(t, db, "inc_gap", "sig_gap", "agent_a", "firing")
+	for _, q := range []string{
+		`INSERT INTO monitor_groups(id,site_id,name,all_agents) VALUES('mg','site_default','all',1)`,
+		`INSERT INTO probe_tasks(id,site_id,group_id,kind,name,target,params,enabled,config_serial)
+		 VALUES('probe_sig_gap','site_default','mg','gateway','LAN gateway','gateway','{"interface":"以太网"}',1,1)`,
+	} {
+		if _, err := db.ExecContext(ctx, q); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+	}
+	svc := New(db, nil, settings.New(db), nil)
+
+	// The incident transaction: the base freezes the gateway's NIC selection.
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin tx: %v", err)
+	}
+	if err := svc.WriteIncidentBase(ctx, tx, "inc_gap", time.Now().UTC()); err != nil {
+		_ = tx.Rollback()
+		t.Fatalf("write incident base: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+
+	// The gap: an edit commits before the post-commit handler runs. Retyping to
+	// "host" is the harshest edit — under live reads it excluded the target.
+	if _, err := db.ExecContext(ctx,
+		`UPDATE probe_tasks SET kind='host', params='{"interface":"Wi-Fi"}' WHERE id='probe_sig_gap'`); err != nil {
+		t.Fatalf("edit monitor: %v", err)
+	}
+
+	pusher := &capturePusher{}
+	svc.SetPusher(pusher)
+	if err := svc.OnIncidentOpened(ctx, eventbus.IncidentEvent{IncidentID: "inc_gap", SiteID: "site_default"}); err != nil {
+		t.Fatalf("on incident opened: %v", err)
+	}
+	if len(pusher.snapReq) != 1 || len(pusher.snapReq[0].Targets) != 1 {
+		t.Fatalf("push = %+v, want one request with the frozen gateway target", pusher.snapReq)
+	}
+	ref := pusher.snapReq[0].Targets[0]
+	if ref.Kind != "gateway" || ref.Iface != "以太网" {
+		t.Errorf("pushed ref = kind:%q iface:%q, want the tx-frozen gateway/以太网", ref.Kind, ref.Iface)
+	}
+}
+
 func TestTraceCohortClosesAfterMissedResolutionCallback(t *testing.T) {
 	db, ctx := openIncidentOpsTest(t)
 	seedIncidentSignal(t, db, "inc_1", "sig_1", "agent_a", "firing")

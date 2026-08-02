@@ -88,6 +88,11 @@ type baseTarget struct {
 	Kind      string `json:"kind,omitempty"`
 	Target    string `json:"target,omitempty"`
 	Port      int    `json:"port,omitempty"`
+	// Iface is a gateway monitor's NIC selection. It is frozen here for the same
+	// reason kind/target/port are — and because the entry target refs are derived
+	// from this section, where a gateway ref without its NIC would make the agent
+	// resolve the default NIC's gateway instead of the monitored one.
+	Iface string `json:"iface,omitempty"`
 }
 
 // recentSampleLimit bounds how many recent points the base freezes per condition.
@@ -240,10 +245,10 @@ func (s *Service) baseAgents(ctx context.Context, agentIDs []string) []baseAgent
 	return out
 }
 
-// baseTargets freezes the involved targets' kind/target/port from probe_tasks
-// (read through tx so an in-flight target edit is not seen mid-open). A target
-// deleted after the fact simply drops out — the frozen evidence still carries its
-// name/address.
+// baseTargets freezes the involved targets' kind/target/port/iface from
+// probe_tasks (read through tx so an in-flight target edit is not seen
+// mid-open). A target deleted after the fact simply drops out — the frozen
+// evidence still carries its name/address.
 func (s *Service) baseTargets(ctx context.Context, tx *sql.Tx, targetIDs []string) []baseTarget {
 	out := make([]baseTarget, 0, len(targetIDs))
 	for _, id := range targetIDs {
@@ -255,22 +260,28 @@ func (s *Service) baseTargets(ctx context.Context, tx *sql.Tx, targetIDs []strin
 			Scan(&t.Kind, &t.Target, &params); err != nil {
 			continue
 		}
-		t.Port = portFromParams(params)
+		p := parseParams(params)
+		t.Port = p.Port
+		if t.Kind == "gateway" {
+			t.Iface = p.Interface
+		}
 		out = append(out, t)
 	}
 	return out
 }
 
-// portFromParams extracts the TCP/target port from a probe_tasks.params JSON blob.
-func portFromParams(params string) int {
+// parseParams decodes a probe_tasks.params JSON blob. An absent or malformed blob
+// yields the zero value: params are validated on write, so a decode failure means
+// junk, not something worth failing the whole snapshot over.
+func parseParams(params string) pcfg.ProbeParams {
 	if params == "" {
-		return 0
+		return pcfg.ProbeParams{}
 	}
 	var p pcfg.ProbeParams
 	if json.Unmarshal([]byte(params), &p) != nil {
-		return 0
+		return pcfg.ProbeParams{}
 	}
-	return p.Port
+	return p
 }
 
 // ---- post-commit dispatch (one collecting entry + request per involved Agent) ----
@@ -281,7 +292,7 @@ func portFromParams(params string) int {
 // fault transaction. Idempotent: entries are keyed UNIQUE(snapshot_id, agent_id),
 // and a re-delivered event re-pushes only to still-collecting in-deadline agents.
 func (s *Service) OnIncidentOpened(ctx context.Context, ev eventbus.IncidentEvent) error {
-	snapID, deadline, err := s.ensureSnapshot(ctx, ev.IncidentID)
+	snapID, deadline, frozen, err := s.ensureSnapshot(ctx, ev.IncidentID)
 	if err != nil {
 		return err
 	}
@@ -308,36 +319,45 @@ func (s *Service) OnIncidentOpened(ctx context.Context, ev eventbus.IncidentEven
 	now := time.Now().UTC()
 	for _, agentID := range agents {
 		reqID := "isnapreq_" + uuid.NewString()
+		// Derive the target refs ONCE, here, and freeze them onto the entry; every
+		// later push (reconnect re-delivery) replays these bytes rather than
+		// re-reading mutable probe_tasks. The values come from the base frozen
+		// inside the incident transaction, so a monitor edit committing between
+		// that transaction and this post-commit handler cannot leak in either.
+		targets := s.snapshotTargets(ctx, ev.IncidentID, agentID, frozen)
 		res, err := s.db.ExecContext(ctx,
-			`INSERT OR IGNORE INTO incident_snapshot_entries(id, snapshot_id, request_id, agent_id, agent_name, status, requested_at)
-			 VALUES(?,?,?,?,?, 'collecting', ?)`,
-			"isne_"+uuid.NewString(), snapID, reqID, agentID, s.agentName(ctx, agentID), now)
+			`INSERT OR IGNORE INTO incident_snapshot_entries(id, snapshot_id, request_id, agent_id, agent_name, status, targets, requested_at)
+			 VALUES(?,?,?,?,?, 'collecting', ?, ?)`,
+			"isne_"+uuid.NewString(), snapID, reqID, agentID, s.agentName(ctx, agentID), mustJSON(targets), now)
 		if err != nil {
 			return err
 		}
 		if n, _ := res.RowsAffected(); n == 0 {
 			continue // entry already exists (idempotent re-delivery)
 		}
-		s.dispatchSnapshot(ctx, agentID, ev.IncidentID, reqID, deadline)
+		s.dispatchSnapshot(agentID, ev.IncidentID, reqID, deadline, targets)
 	}
 	// A snapshot with no agent entries (should not happen: an incident always has a
 	// member alert) is finalized immediately so it never hangs collecting.
 	return s.finalizeSnapshot(ctx, snapID, false)
 }
 
-// ensureSnapshot returns the snapshot id and deadline for an incident, creating a
-// minimal collecting row when WriteIncidentBase did not run (base build failed in
-// the fault tx). Deterministic fallback so scene collection can still proceed.
-func (s *Service) ensureSnapshot(ctx context.Context, incidentID string) (string, time.Time, error) {
-	var id string
+// ensureSnapshot returns the snapshot id, deadline and tx-frozen base targets
+// for an incident, creating a minimal collecting row when WriteIncidentBase did
+// not run (base build failed in the fault tx). Deterministic fallback so scene
+// collection can still proceed — on that path (and when truncation dropped the
+// base's target section) the returned map is empty and snapshotTargets falls
+// back to the live config.
+func (s *Service) ensureSnapshot(ctx context.Context, incidentID string) (string, time.Time, map[string]baseTarget, error) {
+	var id, base string
 	var deadline time.Time
 	err := s.db.Read().QueryRowContext(ctx,
-		`SELECT id, deadline_at FROM incident_snapshots WHERE incident_id=?`, incidentID).Scan(&id, &deadline)
+		`SELECT id, deadline_at, base FROM incident_snapshots WHERE incident_id=?`, incidentID).Scan(&id, &deadline, &base)
 	if err == nil {
-		return id, deadline, nil
+		return id, deadline, frozenBaseTargets(base), nil
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
-		return "", time.Time{}, err
+		return "", time.Time{}, nil, err
 	}
 	now := time.Now().UTC()
 	deadline = now.Add(s.snapshotDeadline(ctx))
@@ -345,19 +365,43 @@ func (s *Service) ensureSnapshot(ctx context.Context, incidentID string) (string
 	if _, err := s.db.ExecContext(ctx,
 		`INSERT OR IGNORE INTO incident_snapshots(id, incident_id, status, base, total_bytes, truncated, deadline_at, created_at)
 		 VALUES(?,?, 'collecting', '', 0, 0, ?, ?)`, id, incidentID, deadline, now); err != nil {
-		return "", time.Time{}, err
+		return "", time.Time{}, nil, err
 	}
 	// Re-read to resolve a race where a concurrent writer inserted first.
 	if err := s.db.Read().QueryRowContext(ctx,
-		`SELECT id, deadline_at FROM incident_snapshots WHERE incident_id=?`, incidentID).Scan(&id, &deadline); err != nil {
-		return "", time.Time{}, err
+		`SELECT id, deadline_at, base FROM incident_snapshots WHERE incident_id=?`, incidentID).Scan(&id, &deadline, &base); err != nil {
+		return "", time.Time{}, nil, err
 	}
-	return id, deadline, nil
+	return id, deadline, frozenBaseTargets(base), nil
 }
 
-// dispatchSnapshot builds and pushes one agent's IncidentSnapshotRequest. Offline
-// agents simply do not receive it (the entry stays collecting until the deadline
-// or a reconnect re-push).
+// frozenBaseTargets indexes a stored snapshot base's target section by monitor
+// id. An empty, truncated-away or (impossible for our own JSON) unparseable
+// base yields an empty map, which downgrades snapshotTargets to its live-config
+// fallback rather than failing the dispatch.
+func frozenBaseTargets(base string) map[string]baseTarget {
+	if base == "" {
+		return nil
+	}
+	var b struct {
+		Targets []baseTarget `json:"targets"`
+	}
+	if json.Unmarshal([]byte(base), &b) != nil {
+		return nil
+	}
+	m := make(map[string]baseTarget, len(b.Targets))
+	for _, t := range b.Targets {
+		m[t.MonitorID] = t
+	}
+	return m
+}
+
+// dispatchSnapshot pushes one agent's IncidentSnapshotRequest. Offline agents
+// simply do not receive it (the entry stays collecting until the deadline or a
+// reconnect re-push).
+//
+// targets are the refs frozen onto the entry at creation, passed in rather than
+// re-derived: see OnIncidentOpened.
 //
 // The collection window travels as the remaining budget at push time, never as
 // this server's absolute deadline: the agent's clock is independent of ours and
@@ -366,14 +410,10 @@ func (s *Service) ensureSnapshot(ctx context.Context, incidentID string) (string
 // absolute deadline_at for our own reaping, so the only slack the agent gains is
 // the push latency. An already-spent window is not pushed at all — finalize's
 // deadline sweep terminalizes the entry.
-func (s *Service) dispatchSnapshot(ctx context.Context, agentID, incidentID, reqID string, deadline time.Time) {
+func (s *Service) dispatchSnapshot(agentID, incidentID, reqID string, deadline time.Time, targets []pcfg.SnapshotTargetRef) {
 	if s.pusher == nil {
 		return
 	}
-	// Targets first: that query is what makes the budget worth measuring late, and
-	// computing the budget before it would push a window the query itself had
-	// already consumed.
-	targets := s.snapshotTargets(ctx, incidentID, agentID)
 	budgetMs := int(time.Until(deadline).Milliseconds())
 	if budgetMs <= 0 {
 		return
@@ -386,9 +426,28 @@ func (s *Service) dispatchSnapshot(ctx context.Context, agentID, incidentID, req
 	})
 }
 
-// snapshotTargets returns the monitor targets one agent should resolve for the
-// scene, derived from the incident's frozen evidence for that agent.
-func (s *Service) snapshotTargets(ctx context.Context, incidentID, agentID string) []pcfg.SnapshotTargetRef {
+// snapshotTargets derives the monitor targets one agent should resolve for the
+// scene. It is called EXACTLY ONCE per entry — at creation, in OnIncidentOpened.
+// The result is frozen onto the entry and replayed from there on every later
+// push; nothing downstream may call this again.
+//
+// frozen is the base's target section as captured INSIDE the incident-open
+// transaction, and it wins over the live probe_tasks row: this runs post-commit,
+// so a monitor edit landing in the gap would otherwise be frozen onto the entry
+// and the agent would collect evidence for a config that never raised the
+// incident (while the base right next to it shows the one that did). The live
+// row (then the signal's own frozen columns) remains the fallback for targets
+// the base does not carry — a base-less fallback snapshot, or one whose target
+// section was truncated away.
+//
+// Host-anchor monitors are excluded: their target names a metric series ("host",
+// "*", a mount like "C:"), not a network destination, so there is nothing to
+// resolve and asking the agent to try would only produce a bogus lookup failure.
+// The exclusion tests the frozen kind, so a monitor retyped in the gap can
+// neither slip in nor knock its target out. Gateway monitors ARE included, but
+// carry the NIC selection instead of a resolvable host — the agent reads its
+// routing table, not DNS.
+func (s *Service) snapshotTargets(ctx context.Context, incidentID, agentID string, frozen map[string]baseTarget) []pcfg.SnapshotTargetRef {
 	rows, err := s.db.Read().QueryContext(ctx, `
 		SELECT DISTINCT s.target_id, COALESCE(pt.kind, s.probe_kind), COALESCE(pt.target, s.target_addr), COALESCE(pt.params,'')
 		FROM fault_signals s
@@ -405,7 +464,18 @@ func (s *Service) snapshotTargets(ctx context.Context, incidentID, agentID strin
 		if err := rows.Scan(&ref.MonitorID, &ref.Kind, &ref.Target, &params); err != nil {
 			return out
 		}
-		ref.Port = portFromParams(params)
+		if bt, ok := frozen[ref.MonitorID]; ok {
+			ref.Kind, ref.Target, ref.Port, ref.Iface = bt.Kind, bt.Target, bt.Port, bt.Iface
+		} else {
+			p := parseParams(params)
+			ref.Port = p.Port
+			if ref.Kind == "gateway" {
+				ref.Iface = p.Interface
+			}
+		}
+		if ref.Kind == "host" {
+			continue
+		}
 		out = append(out, ref)
 	}
 	return out

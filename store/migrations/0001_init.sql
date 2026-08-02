@@ -1013,6 +1013,13 @@ CREATE TABLE incident_snapshot_entries(
   clock_skew_ms INTEGER NOT NULL DEFAULT 0,
   skewed        INTEGER NOT NULL DEFAULT 0,
   payload       TEXT NOT NULL DEFAULT '',           -- field-group JSON
+  -- The target refs this agent was asked to resolve, frozen as JSON when the
+  -- entry is created. A reconnect re-push reads them from here instead of
+  -- re-deriving from probe_tasks, which is mutable: an operator who retypes or
+  -- deletes a monitor while the agent is offline would otherwise have the scene
+  -- collected against the NEW config (a gateway monitor's NIC selection above
+  -- all), producing evidence unrelated to the fault that opened the incident.
+  targets       TEXT NOT NULL DEFAULT '',           -- []config.SnapshotTargetRef JSON
   requested_at  TIMESTAMP NOT NULL,
   received_at   TIMESTAMP,
   UNIQUE(snapshot_id, agent_id)
