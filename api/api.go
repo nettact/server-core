@@ -109,6 +109,14 @@ type ListenStatus struct {
 	PendingAddr   string `json:"pending_addr,omitempty"`  // stored setting differing from the effective bind
 	FallbackFrom  string `json:"fallback_from,omitempty"` // configured addr that failed to bind at startup
 	OverridesFlag bool   `json:"overrides_flag"`          // Source=="db" while an explicit -addr flag was passed
+	// Container reports that the server runs inside a container, and NetworkMode
+	// how that container is attached to the network: "host" (the host's namespace
+	// is shared, so the bind address means what it does on bare metal),
+	// "isolated" (reached through a published port — the bind address belongs to
+	// the runtime, and the console hides the control), or "unknown" (the console
+	// keeps the control but warns). NetworkMode is empty when Container is false.
+	Container   bool   `json:"container"`
+	NetworkMode string `json:"network_mode,omitempty"`
 }
 
 func Router(d Deps) http.Handler {
