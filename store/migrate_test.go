@@ -2,10 +2,8 @@ package store_test
 
 import (
 	"database/sql"
-	"os"
 	"path/filepath"
 	"testing"
-	"time"
 
 	_ "modernc.org/sqlite"
 
@@ -13,105 +11,31 @@ import (
 	"github.com/nettact/server-core/store/storetest"
 )
 
-// TestMigrationsApplyToAnExistingDatabase is about the migrations being
-// INCREMENTAL, which a test that only ever opens a fresh file cannot show: every
-// migration passes trivially against an empty directory, including one that was
-// edited into 0001 after 0001 had already been applied somewhere and would
-// therefore never run again on a real database.
-//
-// So this builds a database at the 0001 baseline by hand — schema applied,
-// version 1 recorded, rows present — closes it, and reopens it through
-// store.Open. Everything after 0001 must apply on top, leaving the existing data
-// alone. The 0002 column is checked concretely because it is the one whose
-// absence on a live dev database would break the permission endpoints.
-func TestMigrationsApplyToAnExistingDatabase(t *testing.T) {
-	path := filepath.Join(storetest.Dir(t), "existing.db")
-
-	// --- a database that has only ever seen 0001 ---
-	baseline, err := os.ReadFile(filepath.Join("migrations", "0001_init.sql"))
-	if err != nil {
-		t.Fatalf("read baseline migration: %v", err)
-	}
-	old, err := sql.Open("sqlite", path)
+// The baseline is now the whole schema — the 0002–0005 chain was squashed back
+// into it — so what needs checking is that nothing was lost in the squash. Each
+// column below is one the chain added or removed, and each is the kind of thing
+// a hand-merge drops silently: a column that arrived as an ALTER, a partial
+// index, two whole tables, and four columns that a DROP had taken back out.
+func TestTheBaselineCreatesTheWholeSchema(t *testing.T) {
+	db, err := store.Open(filepath.Join(storetest.Dir(t), "fresh.db"))
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	for _, stmt := range []string{
-		`CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TIMESTAMP NOT NULL)`,
-		string(baseline),
-	} {
-		if _, err := old.Exec(stmt); err != nil {
-			old.Close()
-			t.Fatalf("build baseline: %v", err)
-		}
-	}
-	if _, err := old.Exec(`INSERT INTO schema_migrations(version, applied_at) VALUES(1, ?)`, time.Now().UTC()); err != nil {
-		old.Close()
-		t.Fatalf("record baseline version: %v", err)
-	}
-	// Real data, as a live dev database has: a migration that silently dropped and
-	// recreated the table would pass every schema assertion below.
-	if _, err := old.Exec(
-		`INSERT INTO sites(id,name,created_at) VALUES('site_default','Default',?)`, time.Now().UTC()); err != nil {
-		old.Close()
-		t.Fatalf("seed site: %v", err)
-	}
-	if _, err := old.Exec(
-		`INSERT INTO agents(id,site_id,public_key,token_hash,hostname,status,perm_supported)
-		 VALUES('agent_old','site_default',x'00','h','box-1','online','["probe.dns"]')`); err != nil {
-		old.Close()
-		t.Fatalf("seed agent: %v", err)
-	}
-	if got := columnNames(t, old, "agents"); got["perm_unsupported_reasons"] {
-		old.Close()
-		t.Fatal("precondition: the baseline must not already have perm_unsupported_reasons")
-	}
-	if err := old.Close(); err != nil {
-		t.Fatalf("close baseline: %v", err)
-	}
-
-	// --- reopening runs everything after 0001 ---
-	db, err := store.Open(path)
-	if err != nil {
-		t.Fatalf("open existing database: %v", err)
-	}
 	defer db.Close()
 
+	// Arrived as an ALTER on agents; its absence breaks the permission endpoints.
 	if !columnNames(t, db.DB, "agents")["perm_unsupported_reasons"] {
-		t.Fatal("0002 did not apply to the existing database")
-	}
-	var versions int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM schema_migrations`).Scan(&versions); err != nil {
-		t.Fatalf("count migrations: %v", err)
-	}
-	if versions < 2 {
-		t.Fatalf("schema_migrations has %d rows, want every migration recorded", versions)
+		t.Error("agents has no perm_unsupported_reasons")
 	}
 
-	// The pre-existing row survived and picked up the column default — an empty
-	// object, meaning "nothing was probed", not "everything is supported".
-	var hostname, reasons string
-	if err := db.QueryRow(
-		`SELECT hostname, perm_unsupported_reasons FROM agents WHERE id='agent_old'`).Scan(&hostname, &reasons); err != nil {
-		t.Fatalf("read migrated agent: %v", err)
-	}
-	if hostname != "box-1" {
-		t.Errorf("hostname = %q, want the pre-migration value", hostname)
-	}
-	if reasons != "{}" {
-		t.Errorf("perm_unsupported_reasons default = %q, want %q", reasons, "{}")
-	}
-
-	// 0004 moves four machine-level readings out of game_buckets and into a table
-	// of their own, and it is the first migration here that DROPS anything. Both
-	// halves are checked, because either alone would leave the schema broken in a
-	// way nothing else notices: columns dropped with no successor loses the data,
-	// and a successor added without the drop leaves two sources for one fact,
-	// disagreeing the moment a run is base-tier.
+	// The machine-level readings live in their own table, keyed by (agent,
+	// second), and must NOT also be in game_buckets. Two sources for one fact is
+	// the exact outcome the move existed to prevent, and it is what a squash that
+	// kept the original CREATE would produce.
 	buckets := columnNames(t, db.DB, "game_buckets")
 	for _, col := range []string{"gpu_util_pct", "gpu_mem_used", "gpu_mem_size", "busiest_core_pct"} {
 		if buckets[col] {
-			t.Errorf("game_buckets still has %s; 0004 did not drop it on an existing database", col)
+			t.Errorf("game_buckets still has %s, which belongs to game_host_seconds", col)
 		}
 	}
 	// The per-process readings stay: they are about a process rather than the
@@ -121,75 +45,113 @@ func TestMigrationsApplyToAnExistingDatabase(t *testing.T) {
 			t.Errorf("game_buckets lost %s, which was never machine-level", col)
 		}
 	}
+
 	host := columnNames(t, db.DB, "game_host_seconds")
 	for _, col := range []string{"agent_id", "site_id", "ts", "cpu_total_pct", "cpu_busiest_pct", "mem_used", "mem_total", "gpu_util_pct", "gpu_mem_used", "gpu_mem_size", "quality"} {
 		if !host[col] {
-			t.Errorf("game_host_seconds has no %s; 0004 did not create it", col)
+			t.Errorf("game_host_seconds has no %s", col)
 		}
 	}
 	gaps := columnNames(t, db.DB, "game_run_gaps")
 	for _, col := range []string{"id", "run_id", "reason", "started_at", "ended_at"} {
 		if !gaps[col] {
-			t.Errorf("game_run_gaps has no %s; 0005 did not create it", col)
+			t.Errorf("game_run_gaps has no %s", col)
 		}
 	}
 
-	// Re-running is a no-op: a second Open must not try to add the column twice.
-	// It is the DROPs in 0004 that make this worth more than it was — a repeat
-	// would fail outright rather than being harmlessly redundant.
-	// (sql.DB.Close is idempotent, so the deferred close above stays correct.)
-	if err := db.Close(); err != nil {
-		t.Fatalf("close: %v", err)
+	// The reaper's partial index. An index is invisible to every query that would
+	// otherwise pass, so nothing else here would notice it missing.
+	if !indexNames(t, db.DB, "game_runs")["idx_game_runs_open"] {
+		t.Error("game_runs has no idx_game_runs_open")
 	}
-	db2, err := store.Open(path)
-	if err != nil {
-		t.Fatalf("reopen after migrating: %v", err)
+	if !indexNames(t, db.DB, "game_run_gaps")["idx_game_run_gaps_run"] {
+		t.Error("game_run_gaps has no idx_game_run_gaps_run")
 	}
-	db2.Close()
+	if !indexNames(t, db.DB, "game_host_seconds")["idx_game_host_seconds_ts"] {
+		t.Error("game_host_seconds has no idx_game_host_seconds_ts")
+	}
 }
 
-// The same schema, reached the other way. A fresh install runs 0001 — which
-// still DECLARES the four moved columns, because 0004's DROPs would fail against
-// a table that never had them — and then drops them in 0004, so it must arrive
-// at exactly what the incremental path above arrives at.
-func TestAFreshDatabaseReachesTheSameGameSchema(t *testing.T) {
-	db, err := store.Open(filepath.Join(storetest.Dir(t), "fresh.db"))
+// Reopening an existing database must be a no-op that leaves its rows alone. The
+// migrator skips a version already recorded, so a second Open must neither
+// re-run the baseline (every CREATE would fail) nor recreate the file.
+func TestReopeningAnExistingDatabaseChangesNothing(t *testing.T) {
+	path := filepath.Join(storetest.Dir(t), "existing.db")
+	db, err := store.Open(path)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	defer db.Close()
+	if _, err := db.Exec(
+		`INSERT INTO sites(id,name) VALUES('site_default','Default')`); err != nil {
+		db.Close()
+		t.Fatalf("seed site: %v", err)
+	}
+	if _, err := db.Exec(
+		`INSERT INTO agents(id,site_id,public_key,token_hash,hostname,status,perm_supported)
+		 VALUES('agent_old','site_default',x'00','h','box-1','online','["probe.dns"]')`); err != nil {
+		db.Close()
+		t.Fatalf("seed agent: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
 
-	buckets := columnNames(t, db.DB, "game_buckets")
-	for _, col := range []string{"gpu_util_pct", "gpu_mem_used", "gpu_mem_size", "busiest_core_pct"} {
-		if buckets[col] {
-			t.Errorf("a fresh game_buckets still has %s", col)
-		}
+	db2, err := store.Open(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
 	}
-	if !columnNames(t, db.DB, "game_host_seconds")["cpu_total_pct"] {
-		t.Error("a fresh database has no game_host_seconds")
+	defer db2.Close()
+
+	var hostname, reasons string
+	if err := db2.QueryRow(
+		`SELECT hostname, perm_unsupported_reasons FROM agents WHERE id='agent_old'`).Scan(&hostname, &reasons); err != nil {
+		t.Fatalf("read seeded agent: %v", err)
 	}
-	if !columnNames(t, db.DB, "game_run_gaps")["reason"] {
-		t.Error("a fresh database has no game_run_gaps")
+	if hostname != "box-1" {
+		t.Errorf("hostname = %q, want the value written before the reopen", hostname)
+	}
+	// The default is an empty object: "nothing was probed", not "everything is
+	// supported".
+	if reasons != "{}" {
+		t.Errorf("perm_unsupported_reasons default = %q, want %q", reasons, "{}")
+	}
+
+	var versions int
+	if err := db2.QueryRow(`SELECT COUNT(*) FROM schema_migrations`).Scan(&versions); err != nil {
+		t.Fatalf("count migrations: %v", err)
+	}
+	if versions != 1 {
+		t.Errorf("schema_migrations has %d rows, want 1 for the squashed baseline", versions)
 	}
 }
 
 func columnNames(t *testing.T, db *sql.DB, table string) map[string]bool {
 	t.Helper()
-	rows, err := db.Query(`SELECT name FROM pragma_table_info(?)`, table)
+	return namesFrom(t, db, `SELECT name FROM pragma_table_info(?)`, table)
+}
+
+func indexNames(t *testing.T, db *sql.DB, table string) map[string]bool {
+	t.Helper()
+	return namesFrom(t, db, `SELECT name FROM pragma_index_list(?)`, table)
+}
+
+func namesFrom(t *testing.T, db *sql.DB, query, table string) map[string]bool {
+	t.Helper()
+	rows, err := db.Query(query, table)
 	if err != nil {
-		t.Fatalf("table_info(%s): %v", table, err)
+		t.Fatalf("%s(%s): %v", query, table, err)
 	}
 	defer rows.Close()
 	names := map[string]bool{}
 	for rows.Next() {
 		var name string
 		if err := rows.Scan(&name); err != nil {
-			t.Fatalf("scan column name: %v", err)
+			t.Fatalf("scan name: %v", err)
 		}
 		names[name] = true
 	}
 	if err := rows.Err(); err != nil {
-		t.Fatalf("table_info(%s): %v", table, err)
+		t.Fatalf("%s(%s): %v", query, table, err)
 	}
 	return names
 }

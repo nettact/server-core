@@ -1,13 +1,19 @@
 -- NetTact release baseline schema.
 --
--- This is the squashed equivalent of the pre-release migration chain (the old
--- 0001–0026, which carried the development history: tables created then dropped,
--- columns renamed, one-off data repairs). Pre-release with zero users, so that
--- history has no one to migrate and was collapsed into this single baseline.
--- Post-release changes append 0002_*.sql onward and are never squashed again.
+-- The single squashed baseline for the entire pre-release schema history: the
+-- original 0001–0026 development chain (tables created then dropped, columns
+-- renamed, one-off data repairs) collapsed once into 0001, and then the
+-- post-baseline 0002–0005 folded in here too. Pre-release with zero users, so
+-- none of that history has anyone to migrate.
+--
+-- Squashing is safe for a development database that already ran 0002–0005:
+-- version 1 is recorded there, so this file is skipped, and the schema it
+-- already holds is exactly what this file creates. A database still at version 1
+-- that never ran 0002–0005 is NOT caught up by this file and must be recreated.
 --
 -- The schema_migrations table is created by the migrator itself, not here.
--- Column ORDER is deliberately preserved from the chain it replaces.
+-- Column ORDER is deliberately preserved from the chain it replaces, including
+-- the columns that arrived there as ALTER TABLE ADD COLUMN.
 
 -- ===== metadata (single user, no tenant) =====
 
@@ -107,7 +113,25 @@ CREATE TABLE agents(
   -- how its most recent session ended.
   first_connected_at TIMESTAMP,
   last_disconnect_kind TEXT NOT NULL DEFAULT '',   -- '' | unexpected | clean_shutdown | version_incompatible
-  connectivity_alerts_muted INTEGER NOT NULL DEFAULT 0
+  connectivity_alerts_muted INTEGER NOT NULL DEFAULT 0,
+  -- WHY a permission is not supported, alongside the three sets above that say
+  -- only that it isn't: a JSON OBJECT keyed by permission ID, values stable
+  -- reason codes owned by whichever capability probe answered
+  -- ({"game.gpu.read":"version_mismatch"}). Reported whole on every Hello like
+  -- perm_supported/granted/effective, so each report replaces this column
+  -- outright; it carries no history. It only ever holds ids ABSENT from
+  -- perm_supported — a supported permission has nothing to explain — and the
+  -- registry drops any contradicting key when writing, so no reader has to
+  -- reconcile a row that claims both.
+  --
+  -- An absent key is NOT "no problem": it means the probe never ran, typically
+  -- because nothing granted the capability and an agent refuses to probe what it
+  -- was not granted. '{}' therefore reads as "nothing was probed", never as
+  -- "everything is fine", and a reader must render a missing entry as unprobed
+  -- rather than as an unexplained failure. The value vocabulary belongs to the
+  -- probes (protocol/gamesense for game capture) and is never validated here, so
+  -- readers must tolerate codes they do not know.
+  perm_unsupported_reasons TEXT NOT NULL DEFAULT '{}'
 );
 CREATE INDEX idx_agents_site ON agents(site_id);
 
@@ -486,6 +510,17 @@ CREATE TABLE game_runs(
   stutter_excess_ms REAL
 );
 CREATE INDEX idx_game_runs_agent ON game_runs(agent_id, started_at DESC);
+-- The index the abandoned-run reaper sweeps (gamedata.CloseAbandonedRuns).
+--
+-- Partial on ended_at IS NULL, and that is the whole point of it. The reaper asks
+-- once a minute which runs have not ended, and on a machine that is not playing
+-- anything right now the answer is none — so the index it walks is EMPTY, while a
+-- full index on last_seen_at would grow with the ninety-day run history the sweep
+-- has no interest in and cost a scan proportional to it every minute. last_seen_at
+-- is the key so the staleness bound narrows the walk rather than filtering after
+-- it, and entries leave the index the moment a run is ended, which is what keeps
+-- it the size of "sessions in progress" (normally zero or one) forever.
+CREATE INDEX idx_game_runs_open ON game_runs(last_seen_at) WHERE ended_at IS NULL;
 
 CREATE TABLE game_buckets(
   run_id TEXT NOT NULL REFERENCES game_runs(id) ON DELETE CASCADE,
@@ -554,8 +589,8 @@ CREATE TABLE game_buckets(
   cpu_wait_p95 REAL,
   -- The frame's GPU side, scoped to the tracked process: this is the game's own
   -- work from the frame events, NOT the card's total load. The other half of
-  -- that comparison lives in game_host_seconds (added in 0004), which is keyed
-  -- by the machine rather than by a run because the card is shared.
+  -- that comparison lives in game_host_seconds below, which is keyed by the
+  -- machine rather than by a run because the card is shared.
   gpu_latency_avg REAL,            -- frame start -> GPU work start
   gpu_time_avg REAL,               -- GPU total duration per frame
   gpu_time_p95 REAL,
@@ -570,32 +605,18 @@ CREATE TABLE game_buckets(
   lat_display_avg REAL,
   lat_anim_err_avg REAL,           -- |animation error|; the source is signed, the absolute value is stored
   lat_anim_err_p95 REAL,
-  -- Whole-adapter telemetry, polled once at the second boundary rather than
-  -- derived from frames.
-  --
-  -- These four columns are DROPPED by 0004 and no writer fills them on any
-  -- database past that migration. They are declared here and nowhere else
-  -- because this file is the baseline a fresh install creates before 0004 runs,
-  -- and deleting them would make that migration's DROP COLUMN fail. Their
-  -- successors are in game_host_seconds, keyed by (agent, second): they describe
-  -- the machine rather than the run, and filing them under whichever process
-  -- happened to draw meant they existed only for the seconds one game was
-  -- drawing in — never for the alt-tabbed minute a reader most wants explained.
-  gpu_util_pct REAL,               -- moved to game_host_seconds in 0004
-  gpu_mem_used INTEGER,            -- moved to game_host_seconds in 0004
-  gpu_mem_size INTEGER,            -- moved to game_host_seconds in 0004
-  -- The game process's own dedicated video memory, which is what a whole-card
-  -- figure cannot say: a full card says nothing about who filled it. This one
-  -- IS per-process and stays. used is the discriminator for the block; budget is
-  -- independently NULL because the OS does not always expose a per-process
-  -- budget, and the level is still the measurement without it.
+  -- The game process's own dedicated video memory, which is what the whole-card
+  -- figure in game_host_seconds cannot say: a full card says nothing about who
+  -- filled it. This one IS per-process and so belongs here rather than there.
+  -- used is the discriminator for the block; budget is independently NULL
+  -- because the OS does not always expose a per-process budget, and the level is
+  -- still the measurement without it.
   --
   -- It is also the block gated by game.gpu.read on this table: it reads the
   -- adapter, not just the game's frames, so ingest NULLs it for an agent that
   -- holds only game.performance.read.
   proc_vram_used INTEGER,
   proc_vram_budget INTEGER,
-  busiest_core_pct REAL,           -- moved to game_host_seconds in 0004
   quality TEXT,                    -- JSON array of flags; NULL when none apply
   PRIMARY KEY(run_id, ts)
 ) WITHOUT ROWID;
@@ -603,6 +624,155 @@ CREATE TABLE game_buckets(
 -- fastest-growing table in the store (one row per second of play), so the age
 -- sweep gets its own index rather than scanning the whole table hourly.
 CREATE INDEX idx_game_buckets_ts ON game_buckets(ts);
+
+-- Machine-level per-second telemetry, keyed by the agent and the second rather
+-- than by a run.
+--
+-- The adapter's load and the processor's describe every process on the machine.
+-- Stored per-run-per-second they would exist only for the seconds a diag-tier
+-- game happened to win, so a machine-level question — "was something else taking
+-- the card" — could only be asked of the seconds one particular game was drawing
+-- in. Worse, the seconds with no frames at all (a minimized game, a loading
+-- screen) produce no bucket, so the stretch a reader most wants explained would
+-- be the stretch with no data.
+--
+-- Here they are collected for every second the sensor is watching anything,
+-- frames or not, and a run reads whichever of them its window covers. Two runs
+-- overlapping a second share one row instead of each holding a private copy of
+-- one machine's load, and deleting a run does not take the machine's history
+-- with it.
+--
+-- NULL means NOT MEASURED here as everywhere else in this schema.
+CREATE TABLE game_host_seconds(
+  agent_id TEXT NOT NULL REFERENCES agents(id),
+  -- Denormalized from agents exactly as game_runs.site_id is, so the read and
+  -- retention queries are self-contained and a site-ownership check costs no join.
+  site_id TEXT NOT NULL,
+  ts INTEGER NOT NULL,             -- unix seconds, the second this reading closed
+  -- The busy share of every logical core, and of the busiest one. Written and
+  -- left NULL together: one counter read is differenced into both, so a machine
+  -- that answered has both figures and one that did not has neither, and
+  -- cpu_total_pct is the pair's discriminator.
+  --
+  -- Both are stored because either alone misleads. A single-threaded game pins
+  -- one core at 100% while a sixteen-thread machine reports 6% busy: the total
+  -- alone says the machine is idle while the game is starved, and the busiest
+  -- alone says it is saturated while fifteen cores sit free. The GAP between
+  -- them is the finding, and a gap is only visible when both are recorded.
+  --
+  -- Two zeros is a genuinely idle machine and a real measurement. Only NULL
+  -- means the counters could not be read.
+  cpu_total_pct REAL,
+  cpu_busiest_pct REAL,
+  -- The processor's clock, MHz, and its nominal maximum. Written and left NULL
+  -- together: one power-management call returns both.
+  --
+  -- cpu_mhz is the HIGHEST clock any logical core is at, not a mean. Processors
+  -- boost a few cores well past the all-core clock and the game's own thread is
+  -- often one of them, so an average reports a processor coasting at its base
+  -- clock while the thread that matters is at its ceiling — the same argument
+  -- cpu_busiest_pct makes about utilization, and read alongside it.
+  --
+  -- The maximum is stored per second rather than once per machine for the reason
+  -- mem_total is: 3.2 GHz is a processor coasting on one machine and one pinned
+  -- at its ceiling on another, and nothing else in the row says which.
+  --
+  -- Separate from the pair above because they come from different calls that
+  -- fail independently: one differences performance counters, the other reads
+  -- power management. Needs no graphics permission — the processor is not the
+  -- graphics device.
+  cpu_mhz REAL,
+  cpu_max_mhz REAL,
+  -- Physical memory in use, and installed. The capacity is stored per second
+  -- rather than once per machine because it is what makes the level readable: 12
+  -- GB in use is comfortable on a 32 GB box and terminal on a 16 GB one, and a
+  -- reader looking at a stored second months later has nothing else to tell them
+  -- apart. Written and left NULL together; one call returns both, and mem_used
+  -- is the pair's discriminator.
+  mem_used INTEGER,
+  mem_total INTEGER,
+  -- Whole-adapter telemetry. These three are EACH independent, unlike the pairs
+  -- above: which figures a driver publishes varies by vendor and by metric, so a
+  -- card reporting utilization and no memory is an ordinary card rather than a
+  -- failed read. Read-back rebuilds the block when ANY of them is non-NULL.
+  --
+  -- This is the only block here gated by game.gpu.read — it describes the card
+  -- every process on the machine shares. The CPU and memory readings above need
+  -- no graphics permission at all and are never stripped: the busiest core is a
+  -- fact about the processor, and so is the rest of it.
+  gpu_util_pct REAL,               -- whole-GPU utilization 0-100
+  gpu_mem_used INTEGER,            -- whole-GPU dedicated memory used, bytes
+  gpu_mem_size INTEGER,            -- dedicated memory capacity, bytes
+  -- The card's two clocks, MHz. Two of them because they throttle for different
+  -- reasons and independently: the core drops on power and thermal limits while
+  -- memory holds its clock through most of that. A frame rate that fell while
+  -- the core clock fell with it is a card that ran out of headroom; one that
+  -- fell while both clocks held is not, and that is the fork these decide.
+  gpu_core_mhz REAL,
+  gpu_mem_mhz REAL,
+  -- JSON array of flags; NULL when none apply. A row with every reading NULL and
+  -- no flag is never written: an all-NULL row asserts "this second was covered
+  -- and nothing was readable", which has to be earned by an explanation, or a
+  -- reader is left treating the row as evidence of something with nothing behind
+  -- it.
+  quality TEXT,
+  -- (agent_id, ts) is the identity, so a replayed upload overwrites nothing —
+  -- and it is also the read pattern: a run detail asks for one agent's window
+  -- and gets a primary-key range scan rather than a filter over every machine.
+  PRIMARY KEY(agent_id, ts)
+) WITHOUT ROWID;
+-- Retention sweeps by age across every agent at once, and this table grows at
+-- one row per second of play — faster than game_buckets, since it also covers
+-- the frameless seconds. The age sweep gets its own index rather than scanning.
+CREATE INDEX idx_game_host_seconds_ts ON game_host_seconds(ts);
+
+-- The stretches of a run that produced no frames, and which silence each was.
+--
+-- A game that is minimized, alt-tabbed, sitting on a loading screen or building
+-- a shader cache presents nothing, and a second with no frames produces no
+-- bucket — "nothing was rendering" and "rendering happened at zero" are
+-- different facts and only one of them can be plotted. The result was a blank
+-- stretch across every chart that a reader could only interpret as lost data.
+-- This records what the blank was.
+--
+-- Two reasons rather than one, because the remedies are opposite. 'background'
+-- is time nobody was playing: nothing is wrong and the figures around it must
+-- not be read as a stall. 'no_frames' is the player sitting in front of the
+-- game waiting for it, which is an experience worth measuring. Recording only
+-- "no frames" would be the same as recording nothing — the blank is already
+-- visible, and what a reader cannot see is which kind it was. The vocabulary is
+-- open: the sensor owns it, and a reader meeting a code it does not know must
+-- render the band unlabelled rather than drop it.
+CREATE TABLE game_run_gaps(
+  -- Minted by the agent, which is the only party that can attribute a silence to
+  -- a run: run ids are its to make, and it is what knows a session parked after
+  -- thirty frameless seconds is still the same session ten minutes later.
+  id TEXT PRIMARY KEY,
+  -- CASCADE, unlike game_runs.profile_id's deliberate lack of a foreign key. A
+  -- gap is part of the run's own record rather than a stamp of separate
+  -- configuration, so deleting the run deletes it — and retention then needs no
+  -- sweep of its own here.
+  run_id TEXT NOT NULL REFERENCES game_runs(id) ON DELETE CASCADE,
+  reason TEXT NOT NULL,            -- 'background' | 'no_frames'; open vocabulary
+  -- Unix seconds. started_at is the moment the first frameless second BEGAN and
+  -- ended_at the moment the last one closed, so an interval sits on the same
+  -- axis a bucket's ts does and a single frameless second spans exactly one.
+  --
+  -- ended_at is NOT NULL even while the stretch is still growing: the agent
+  -- re-sends the interval with a later end as it accumulates, and an "open"
+  -- state would add a case no reader would draw differently from "ends here for
+  -- now" while costing every reader a branch.
+  --
+  -- It may fall AFTER the run's own ended_at, and must not be clamped. A run
+  -- ends at its last frame; a player who minimized the game and never came back
+  -- leaves fifty minutes of silence after it, and "did they stop playing or just
+  -- alt-tab" is exactly the question this table answers.
+  started_at INTEGER NOT NULL,
+  ended_at INTEGER NOT NULL
+);
+-- The read pattern: one run's gaps in time order, for the bands drawn under its
+-- charts.
+CREATE INDEX idx_game_run_gaps_run ON game_run_gaps(run_id, started_at);
 
 -- ===== fault detection & incidents =====
 
