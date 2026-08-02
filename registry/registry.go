@@ -29,13 +29,20 @@ type Agent struct {
 	// what the build+platform can do, granted = the local policy, effective = the
 	// usable intersection. These gate host/process/connection views and drive the
 	// monitor pre-check + remediation surface.
-	Supported    []string   `json:"supported"`
-	Granted      []string   `json:"granted"`
-	Effective    []string   `json:"effective"`
-	PolicySource string     `json:"policy_source"`
-	PolicyHash   string     `json:"policy_hash"`
-	LastSeenAt   *time.Time `json:"last_seen_at"`
-	CreatedAt    time.Time  `json:"created_at"`
+	Supported []string `json:"supported"`
+	Granted   []string `json:"granted"`
+	Effective []string `json:"effective"`
+	// UnsupportedReasons explains, per permission ID, why a capability probe
+	// concluded the permission is unsupported here — without it "supported: false"
+	// leaves the console guessing the one remediation it happens to know. Keys are
+	// always absent from Supported; an absent key means the probe never ran, not
+	// that nothing is wrong. Replaced wholesale by every report, like the sets
+	// above.
+	UnsupportedReasons map[string]string `json:"unsupported_reasons,omitempty"`
+	PolicySource       string            `json:"policy_source"`
+	PolicyHash         string            `json:"policy_hash"`
+	LastSeenAt         *time.Time        `json:"last_seen_at"`
+	CreatedAt          time.Time         `json:"created_at"`
 	// Connectivity provenance (AGENT-001/002): FirstConnectedAt is nil until the
 	// agent completes its first Hello (nil = never connected, distinct from
 	// offline). LastDisconnectKind annotates why the most recent session ended.
@@ -150,19 +157,23 @@ func boolToInt(b bool) int {
 }
 
 // UpdatePermissions refreshes an agent's reported local permission policy
-// (supported / granted / effective sets, source, hash) from its WebSocket Hello,
-// so restarting an agent with a different NETTACT_AGENT_PERMISSIONS policy is
+// (supported / granted / effective sets, the per-permission unsupported reasons,
+// source, hash) from its WebSocket Hello, so restarting an agent with a different
+// NETTACT_AGENT_PERMISSIONS policy — or after fixing a broken capability — is
 // reflected server-side (enrollment happens only once). The conditional WHERE
 // makes it a no-op write when nothing changed.
 func (s *Service) UpdatePermissions(ctx context.Context, id string, report permission.PermissionReport) error {
 	sup := marshalStrings(report.Supported)
 	gr := marshalStrings(report.Granted)
 	eff := marshalStrings(report.Effective)
+	reasons := marshalReasons(report.UnsupportedReasons, report.Supported)
 	_, err := s.db.ExecContext(ctx, `
-		UPDATE agents SET perm_supported=?, perm_granted=?, perm_effective=?, policy_source=?, policy_hash=?
-		WHERE id=? AND (perm_supported<>? OR perm_granted<>? OR perm_effective<>? OR policy_source<>? OR policy_hash<>?)`,
-		sup, gr, eff, report.Source, report.PolicyHash,
-		id, sup, gr, eff, report.Source, report.PolicyHash)
+		UPDATE agents SET perm_supported=?, perm_granted=?, perm_effective=?, perm_unsupported_reasons=?,
+		                  policy_source=?, policy_hash=?
+		WHERE id=? AND (perm_supported<>? OR perm_granted<>? OR perm_effective<>? OR perm_unsupported_reasons<>?
+		                OR policy_source<>? OR policy_hash<>?)`,
+		sup, gr, eff, reasons, report.Source, report.PolicyHash,
+		id, sup, gr, eff, reasons, report.Source, report.PolicyHash)
 	return err
 }
 
@@ -173,6 +184,34 @@ func marshalStrings(ss []string) string {
 		ss = []string{}
 	}
 	b, _ := json.Marshal(ss)
+	return string(b)
+}
+
+// marshalReasons encodes the unsupported-reason map as a JSON object,
+// normalizing nil to "{}" like marshalStrings does for the sets. encoding/json
+// emits map keys in sorted order, so the same reasons always encode to the same
+// text and the conditional UPDATE above stays a true no-op across reconnects.
+//
+// It also ENFORCES the contract that the map only ever holds ids absent from
+// supported, dropping any key that contradicts it. A buggy or version-mismatched
+// agent could report a permission as both supported and failed; storing that
+// would let List/Get serialize an Agent claiming the capability works AND naming
+// why it doesn't, in the same payload. Enforcing it once here, at the write
+// boundary, means no reader has to reconcile it — and readers that serialize the
+// Agent struct wholesale (the agents list and detail endpoints) get no chance to
+// forget.
+func marshalReasons(m map[string]string, supported []string) string {
+	clean := make(map[string]string, len(m))
+	isSupported := make(map[string]bool, len(supported))
+	for _, id := range supported {
+		isSupported[id] = true
+	}
+	for id, reason := range m {
+		if !isSupported[id] {
+			clean[id] = reason
+		}
+	}
+	b, _ := json.Marshal(clean)
 	return string(b)
 }
 
@@ -269,6 +308,7 @@ func (s *Service) List(ctx context.Context) ([]Agent, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, site_id, COALESCE(display_name,''), COALESCE(hostname,''), COALESCE(platform,''), COALESCE(agent_version,''),
 		       status, COALESCE(perm_supported,'[]'), COALESCE(perm_granted,'[]'), COALESCE(perm_effective,'[]'),
+		       COALESCE(perm_unsupported_reasons,'{}'),
 		       COALESCE(policy_source,''), COALESCE(policy_hash,''), last_seen_at, created_at,
 		       first_connected_at, COALESCE(last_disconnect_kind,''), connectivity_alerts_muted
 		FROM agents WHERE revoked=0 ORDER BY created_at`)
@@ -279,17 +319,18 @@ func (s *Service) List(ctx context.Context) ([]Agent, error) {
 	var out []Agent
 	for rows.Next() {
 		var a Agent
-		var sup, gr, eff string
+		var sup, gr, eff, reasons string
 		var lastSeen, firstConn sql.NullTime
 		var muted int
 		if err := rows.Scan(&a.ID, &a.SiteID, &a.DisplayName, &a.Hostname, &a.Platform, &a.AgentVersion,
-			&a.Status, &sup, &gr, &eff, &a.PolicySource, &a.PolicyHash, &lastSeen, &a.CreatedAt,
+			&a.Status, &sup, &gr, &eff, &reasons, &a.PolicySource, &a.PolicyHash, &lastSeen, &a.CreatedAt,
 			&firstConn, &a.LastDisconnectKind, &muted); err != nil {
 			return nil, err
 		}
 		unmarshalStrings(sup, &a.Supported)
 		unmarshalStrings(gr, &a.Granted)
 		unmarshalStrings(eff, &a.Effective)
+		unmarshalReasons(reasons, &a.UnsupportedReasons)
 		if lastSeen.Valid {
 			t := lastSeen.Time
 			a.LastSeenAt = &t
@@ -307,16 +348,17 @@ func (s *Service) List(ctx context.Context) ([]Agent, error) {
 func (s *Service) Get(ctx context.Context, id string) (Agent, error) {
 	var a Agent
 	var lastSeen, firstConn sql.NullTime
-	var sup, gr, eff string
+	var sup, gr, eff, reasons string
 	var muted int
 	err := s.db.QueryRowContext(ctx, `
 		SELECT id, site_id, COALESCE(display_name,''), COALESCE(hostname,''), COALESCE(platform,''), COALESCE(agent_version,''),
 		       status, COALESCE(perm_supported,'[]'), COALESCE(perm_granted,'[]'), COALESCE(perm_effective,'[]'),
+		       COALESCE(perm_unsupported_reasons,'{}'),
 		       COALESCE(policy_source,''), COALESCE(policy_hash,''), last_seen_at, created_at,
 		       first_connected_at, COALESCE(last_disconnect_kind,''), connectivity_alerts_muted
 		FROM agents WHERE id=? AND revoked=0`, id).
 		Scan(&a.ID, &a.SiteID, &a.DisplayName, &a.Hostname, &a.Platform, &a.AgentVersion, &a.Status,
-			&sup, &gr, &eff, &a.PolicySource, &a.PolicyHash, &lastSeen, &a.CreatedAt,
+			&sup, &gr, &eff, &reasons, &a.PolicySource, &a.PolicyHash, &lastSeen, &a.CreatedAt,
 			&firstConn, &a.LastDisconnectKind, &muted)
 	if err != nil {
 		return Agent{}, err
@@ -324,6 +366,7 @@ func (s *Service) Get(ctx context.Context, id string) (Agent, error) {
 	unmarshalStrings(sup, &a.Supported)
 	unmarshalStrings(gr, &a.Granted)
 	unmarshalStrings(eff, &a.Effective)
+	unmarshalReasons(reasons, &a.UnsupportedReasons)
 	if lastSeen.Valid {
 		t := lastSeen.Time
 		a.LastSeenAt = &t
@@ -338,6 +381,15 @@ func (s *Service) Get(ctx context.Context, id string) (Agent, error) {
 
 // unmarshalStrings decodes a stored JSON array into dst, leaving it nil on empty.
 func unmarshalStrings(s string, dst *[]string) {
+	if s != "" {
+		_ = json.Unmarshal([]byte(s), dst)
+	}
+}
+
+// unmarshalReasons decodes the stored JSON object into dst. A stored "{}" yields
+// an empty map, which reads the same as nil at every call site: no permission has
+// an explanation, because none was ever probed.
+func unmarshalReasons(s string, dst *map[string]string) {
 	if s != "" {
 		_ = json.Unmarshal([]byte(s), dst)
 	}

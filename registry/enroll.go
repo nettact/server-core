@@ -127,15 +127,22 @@ func (s *Service) Enroll(ctx context.Context, req enroll.EnrollRequest) (enroll.
 	agentToken := randToken()
 	now := time.Now().UTC()
 
+	// The enrollment report's unsupported reasons are stored like the sets beside
+	// them: a first-time agent whose sensor is broken is precisely when an operator
+	// is looking at the page, so the "why" must be there from the first report and
+	// not only after the first reconnect refreshes it.
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO agents(id, site_id, public_key, token_hash, hostname, platform, agent_version,
-		                   perm_supported, perm_granted, perm_effective, policy_source, policy_hash,
+		                   perm_supported, perm_granted, perm_effective, perm_unsupported_reasons,
+		                   policy_source, policy_hash,
 		                   status, reported_config_version, last_seen_at, created_at)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?, 'online', 0, ?, ?)`,
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?, 'online', 0, ?, ?)`,
 		agentID, siteID, []byte(req.PublicKey), sha256hex(agentToken),
 		req.Hostname, req.Platform, req.AgentVersion,
 		marshalStrings(req.Permissions.Supported), marshalStrings(req.Permissions.Granted),
-		marshalStrings(req.Permissions.Effective), req.Permissions.Source, req.Permissions.PolicyHash,
+		marshalStrings(req.Permissions.Effective),
+		marshalReasons(req.Permissions.UnsupportedReasons, req.Permissions.Supported),
+		req.Permissions.Source, req.Permissions.PolicyHash,
 		now, now); err != nil {
 		return enroll.EnrollResponse{}, err
 	}

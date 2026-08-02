@@ -11,6 +11,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
+	"github.com/nettact/protocol/gamesense"
 	"github.com/nettact/protocol/permission"
 	"github.com/nettact/server-core/eventbus"
 	"github.com/nettact/server-core/registry"
@@ -37,7 +38,24 @@ func seedPermAgent(t *testing.T, db *store.DB, id string, supported, granted, ef
 	}
 }
 
-func getAgentPermissions(t *testing.T, db *store.DB, id string) agentPermissionsResponse {
+// seedPermReasons stores an already-seeded agent's per-permission "why not
+// supported" map, the half of the report the three sets cannot express.
+func seedPermReasons(t *testing.T, db *store.DB, id string, reasons map[string]string) {
+	t.Helper()
+	b, err := json.Marshal(reasons)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(context.Background(),
+		`UPDATE agents SET perm_unsupported_reasons=? WHERE id=?`, string(b), id); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// agentPermissionsBody returns the raw response, for assertions about whether a
+// field is present at all — which the typed struct erases, since an omitted
+// string and an empty one decode identically.
+func agentPermissionsBody(t *testing.T, db *store.DB, id string) []byte {
 	t.Helper()
 	d := Deps{Registry: registry.New(db, 0, eventbus.New())}
 	r := httptest.NewRequest(http.MethodGet, "/api/v1/agents/"+id+"/permissions", nil)
@@ -49,9 +67,15 @@ func getAgentPermissions(t *testing.T, db *store.DB, id string) agentPermissions
 	if w.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
 	}
+	return w.Body.Bytes()
+}
+
+func getAgentPermissions(t *testing.T, db *store.DB, id string) agentPermissionsResponse {
+	t.Helper()
+	body := agentPermissionsBody(t, db, id)
 	var got agentPermissionsResponse
-	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
-		t.Fatalf("decode: %v (body=%s)", err, w.Body.String())
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatalf("decode: %v (body=%s)", err, body)
 	}
 	return got
 }
@@ -202,6 +226,111 @@ func TestAgentPermissionsUnknownAgent404(t *testing.T) {
 	}
 }
 
+// TestAgentPermissionsCarriesUnsupportedReason is the fix for a console that
+// answered every unsupported game permission with "install PresentMon": the row
+// now names the cause the agent actually observed, so a version-mismatched
+// sensor stops being reported as missing software.
+//
+// The absence rules matter as much as the presence one, so they are asserted on
+// the raw JSON: no field for a supported permission, and no field for an
+// unsupported one whose probe never ran — there is no placeholder for "we never
+// asked", because a console must be able to tell that apart from a diagnosis.
+func TestAgentPermissionsCarriesUnsupportedReason(t *testing.T) {
+	db := openStatusDB(t)
+	seedPermAgent(t, db, "agent-reasons",
+		[]string{"probe.dns"},
+		[]string{"probe.dns", "game.process.detect", "game.performance.read", "game.gpu.read"},
+		[]string{"probe.dns"})
+	seedPermReasons(t, db, "agent-reasons", map[string]string{
+		"game.performance.read": gamesense.ReasonVersionMismatch,
+		"game.gpu.read":         gamesense.ReasonGPUTelemetryUnavailable,
+		// A permission explained AND reported as supported. The registry drops this
+		// at the write boundary, so it is written straight to the column here to
+		// bypass that and pin the read-side guard as defense in depth: the handler
+		// must not emit a failure code next to supported=true.
+		"probe.dns": gamesense.ReasonInternalError,
+	})
+
+	resp := getAgentPermissions(t, db, "agent-reasons")
+	for id, want := range map[permission.ID]string{
+		permission.GamePerformanceRead: gamesense.ReasonVersionMismatch,
+		permission.GameGPURead:         gamesense.ReasonGPUTelemetryUnavailable,
+	} {
+		p := findPerm(t, resp, id)
+		if p.Supported {
+			t.Fatalf("precondition: %s must be unsupported, got %+v", id, p)
+		}
+		if p.UnsupportedReason != want {
+			t.Errorf("%s unsupported_reason = %q, want %q", id, p.UnsupportedReason, want)
+		}
+	}
+
+	// Presence is a property of the JSON, not of the decoded struct.
+	var raw struct {
+		Permissions []map[string]json.RawMessage `json:"permissions"`
+	}
+	if err := json.Unmarshal(agentPermissionsBody(t, db, "agent-reasons"), &raw); err != nil {
+		t.Fatalf("decode raw: %v", err)
+	}
+	hasReason := map[string]bool{}
+	for _, p := range raw.Permissions {
+		var id string
+		if err := json.Unmarshal(p["id"], &id); err != nil {
+			t.Fatalf("decode id: %v", err)
+		}
+		_, ok := p["unsupported_reason"]
+		hasReason[id] = ok
+	}
+	for id, want := range map[permission.ID]bool{
+		permission.GamePerformanceRead: true,  // unsupported, explained
+		permission.GameGPURead:         true,  // unsupported, explained
+		permission.ProbeDNS:            false, // supported: nothing to explain
+		permission.GameProcessDetect:   false, // unsupported, never probed
+		permission.HostDiskRead:        false, // unsupported, never probed
+	} {
+		if hasReason[string(id)] != want {
+			t.Errorf("%s: unsupported_reason present = %v, want %v", id, hasReason[string(id)], want)
+		}
+	}
+}
+
+// TestAgentPermissionsListsReasonOnlyIDs: a permission this build doesn't
+// compile, which a newer agent found unsupported and nothing granted, appears in
+// NONE of the three reported sets — it exists only as a key in the reason map.
+// Assembling the rows from the sets alone would drop the ID together with its
+// diagnosis, reintroducing the silence this whole field removes, so the reason
+// map is part of what defines the row set.
+func TestAgentPermissionsListsReasonOnlyIDs(t *testing.T) {
+	db := openStatusDB(t)
+	seedPermAgent(t, db, "agent-reason-only",
+		[]string{"probe.dns"},
+		[]string{"probe.dns"},
+		[]string{"probe.dns"})
+	seedPermReasons(t, db, "agent-reason-only", map[string]string{
+		"future.sensor.read": "proto_mismatch",
+	})
+
+	resp := getAgentPermissions(t, db, "agent-reason-only")
+	p := findPerm(t, resp, "future.sensor.read")
+	if p.Granted || p.Supported || p.Effective {
+		t.Errorf("a reason-only permission is by definition ungranted/unsupported/ineffective: %+v", p)
+	}
+	if p.UnsupportedReason != "proto_mismatch" {
+		t.Errorf("unsupported_reason = %q, want the reported code", p.UnsupportedReason)
+	}
+	// This build can't see its dependencies, so it still gets no policy line.
+	if p.PermissionsEnv != "" {
+		t.Errorf("unknown permission must carry no policy line, got %q", p.PermissionsEnv)
+	}
+	// Unknown IDs sort after every known one (Set.Sorted contract).
+	if last := resp.Permissions[len(resp.Permissions)-1].ID; last != "future.sensor.read" {
+		t.Errorf("unknown ID should sort last, got %q", last)
+	}
+	if len(resp.Permissions) != len(permission.All().Sorted())+1 {
+		t.Errorf("inventory = %d rows, want the catalog plus the reason-only ID", len(resp.Permissions))
+	}
+}
+
 // TestPermissionCatalogIsSelfContained: the enrollment screen builds a policy
 // from this payload alone, before any agent exists. Every compiled permission
 // must be present, each `implies` must be the full transitive requirement set
@@ -241,8 +370,8 @@ func TestPermissionCatalogIsSelfContained(t *testing.T) {
 		t.Fatalf("ssid requires = %v, want the direct parent only", ssid.Requires)
 	}
 	wantImplies := map[string]bool{
-		string(permission.NetWiFiStatusRead):   true,
-		string(permission.NetIfaceStatusRead):  true,
+		string(permission.NetWiFiStatusRead):  true,
+		string(permission.NetIfaceStatusRead): true,
 	}
 	if len(ssid.Implies) != len(wantImplies) {
 		t.Fatalf("ssid implies = %v, want the transitive closure %v", ssid.Implies, wantImplies)

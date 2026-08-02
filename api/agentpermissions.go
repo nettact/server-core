@@ -31,6 +31,23 @@ type agentPermission struct {
 	// Full `NETTACT_AGENT_PERMISSIONS=…` replacement line that grants this
 	// permission (granted ∪ {id}, dependency-closed). Absent when already granted.
 	PermissionsEnv string `json:"permissions_env,omitempty"`
+	// Stable code naming why the agent's capability probe concluded this
+	// permission is unsupported here (`version_mismatch`, `presentmon_missing`,
+	// `gpu_telemetry_unavailable`, …). Supported:false alone says nothing about
+	// the cause, which leaves a console offering the one remedy it happens to know
+	// — telling a user to install software they already have when the real fault
+	// was elsewhere.
+	//
+	// Absent in two distinct cases: the permission IS supported (nothing to
+	// explain), and the probe never ran. There is deliberately no placeholder for
+	// the second — "we never asked" is not a diagnosis, and dressing it up as one
+	// would recreate the guessing this field exists to end.
+	//
+	// The vocabulary belongs to whichever probe answered, not to this server, so a
+	// console must tolerate codes it does not know (a newer agent reporting to an
+	// older console is ordinary) and fall back to its own generic text rather than
+	// showing a raw identifier.
+	UnsupportedReason string `json:"unsupported_reason,omitempty"`
 }
 
 // agentPermissionsResponse is the whole inventory for one agent: every compiled
@@ -124,6 +141,16 @@ func (d Deps) handleAgentPermissions(w http.ResponseWriter, r *http.Request) {
 			catalog.Add(id)
 		}
 	}
+	// A permission can exist ONLY as a reason. An ID a newer agent compiles and
+	// this build doesn't, which that agent found unsupported, is by definition
+	// absent from Supported — and if nothing granted it, absent from Granted and
+	// Effective too. It then appears in none of the three sets, so building the
+	// row set from them alone would drop the ID and, with it, the one thing that
+	// explains the gap: exactly the "the console can't say why" silence this
+	// field exists to end.
+	for id := range a.UnsupportedReasons {
+		catalog.Add(permission.ID(id))
+	}
 
 	known := permission.All()
 	ids := catalog.Sorted()
@@ -142,6 +169,14 @@ func (d Deps) handleAgentPermissions(w http.ResponseWriter, r *http.Request) {
 		}
 		for _, parent := range permission.Dependencies(id) {
 			p.Requires = append(p.Requires, string(parent))
+		}
+		// The reason map only ever describes unsupported permissions; reading it
+		// only for those keeps a misreporting agent from producing the nonsense of
+		// a supported permission that also carries a failure code. A missing entry
+		// stays the empty string, which omitempty drops — the console reads that as
+		// "never probed", not as a reason it failed to recognize.
+		if !p.Supported {
+			p.UnsupportedReason = a.UnsupportedReasons[string(id)]
 		}
 		// A policy line is only offered for permissions this build compiles. For an
 		// ID only a newer agent knows, this server cannot see its dependencies, so

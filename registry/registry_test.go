@@ -2,12 +2,18 @@ package registry
 
 import (
 	"context"
+	"crypto/ed25519"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"testing"
 	"time"
 
+	"github.com/nettact/protocol"
+	"github.com/nettact/protocol/enroll"
+	"github.com/nettact/protocol/gamesense"
+	"github.com/nettact/protocol/permission"
 	"github.com/nettact/server-core/eventbus"
 	"github.com/nettact/server-core/store"
 	"github.com/nettact/server-core/store/storetest"
@@ -107,6 +113,190 @@ func TestUpdateAndDeleteAgent(t *testing.T) {
 	}
 	if err := reg.UpdateAgent(ctx, "nope", "x"); !errors.Is(err, sql.ErrNoRows) {
 		t.Errorf("UpdateAgent(missing) = %v, want sql.ErrNoRows", err)
+	}
+}
+
+// TestUpdatePermissionsStoresUnsupportedReasons round-trips the per-permission
+// "why not supported" map. It is full-state like the three sets beside it, so a
+// later report that explains nothing must ERASE what an earlier one explained —
+// otherwise a fixed sensor would keep reporting its old failure forever.
+func TestUpdatePermissionsStoresUnsupportedReasons(t *testing.T) {
+	db := storetest.Open(t)
+	ctx := context.Background()
+
+	mustExec(t, db, `INSERT INTO sites(id,name,created_at) VALUES('site_default','def',?)`, time.Now().UTC())
+	mustExec(t, db, `INSERT INTO agents(id,site_id,public_key,token_hash,status) VALUES('agent_p','site_default',x'00','h','online')`)
+	reg := New(db, 0, nil)
+
+	// Nothing reported yet: the column defaults to an empty object, which reads
+	// back as "no permission has an explanation".
+	a, err := reg.Get(ctx, "agent_p")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if len(a.UnsupportedReasons) != 0 {
+		t.Fatalf("fresh agent reasons = %v, want none", a.UnsupportedReasons)
+	}
+
+	// A multi-entry report: two permissions, two different causes.
+	reasons := map[string]string{
+		"game.performance.read": gamesense.ReasonVersionMismatch,
+		"game.gpu.read":         gamesense.ReasonGPUTelemetryUnavailable,
+	}
+	if err := reg.UpdatePermissions(ctx, "agent_p", permission.PermissionReport{
+		Supported: []string{"probe.dns"}, Granted: []string{"probe.dns"}, Effective: []string{"probe.dns"},
+		Source: "environment", PolicyHash: "h1", UnsupportedReasons: reasons,
+	}); err != nil {
+		t.Fatalf("UpdatePermissions: %v", err)
+	}
+	a, err = reg.Get(ctx, "agent_p")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if len(a.UnsupportedReasons) != len(reasons) {
+		t.Fatalf("reasons = %v, want %v", a.UnsupportedReasons, reasons)
+	}
+	for id, want := range reasons {
+		if got := a.UnsupportedReasons[id]; got != want {
+			t.Errorf("reason[%s] = %q, want %q", id, got, want)
+		}
+	}
+	// List reads the same column, so the agents list carries the reasons too.
+	list, err := reg.List(ctx)
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(list) != 1 || list[0].UnsupportedReasons["game.gpu.read"] != gamesense.ReasonGPUTelemetryUnavailable {
+		t.Fatalf("List reasons = %+v, want the stored map", list)
+	}
+
+	// Full-state replacement: an empty report clears them, and a nil map is stored
+	// identically (both mean "nothing to explain").
+	for name, report := range map[string]permission.PermissionReport{
+		"empty map": {Source: "environment", PolicyHash: "h2", UnsupportedReasons: map[string]string{}},
+		"nil map":   {Source: "environment", PolicyHash: "h3"},
+	} {
+		if err := reg.UpdatePermissions(ctx, "agent_p", report); err != nil {
+			t.Fatalf("UpdatePermissions(%s): %v", name, err)
+		}
+		if a, err = reg.Get(ctx, "agent_p"); err != nil {
+			t.Fatalf("Get after %s: %v", name, err)
+		}
+		if len(a.UnsupportedReasons) != 0 {
+			t.Errorf("%s left reasons = %v, want cleared", name, a.UnsupportedReasons)
+		}
+		var stored string
+		if err := db.QueryRowContext(ctx, `SELECT perm_unsupported_reasons FROM agents WHERE id='agent_p'`).Scan(&stored); err != nil {
+			t.Fatalf("read column after %s: %v", name, err)
+		}
+		if stored != "{}" {
+			t.Errorf("%s stored %q, want the empty object", name, stored)
+		}
+	}
+}
+
+// TestUpdatePermissionsDropsContradictoryReasons: a buggy or version-mismatched
+// agent can report a permission as supported AND explain why it failed. Storing
+// that would let the agents list and detail endpoints — which serialize
+// registry.Agent wholesale — emit a payload claiming the capability works and
+// naming why it doesn't at once. The contract is enforced once, here at the
+// write boundary, so no reader has to reconcile it.
+func TestUpdatePermissionsDropsContradictoryReasons(t *testing.T) {
+	db := storetest.Open(t)
+	ctx := context.Background()
+
+	mustExec(t, db, `INSERT INTO sites(id,name,created_at) VALUES('site_default','def',?)`, time.Now().UTC())
+	mustExec(t, db, `INSERT INTO agents(id,site_id,public_key,token_hash,status) VALUES('agent_q','site_default',x'00','h','online')`)
+	reg := New(db, 0, nil)
+
+	if err := reg.UpdatePermissions(ctx, "agent_q", permission.PermissionReport{
+		Supported: []string{"probe.dns", "game.process.detect"},
+		Granted:   []string{"probe.dns", "game.process.detect"},
+		Effective: []string{"probe.dns", "game.process.detect"},
+		Source:    "environment", PolicyHash: "h1",
+		UnsupportedReasons: map[string]string{
+			"game.process.detect":   gamesense.ReasonInternalError,   // contradicts Supported
+			"game.performance.read": gamesense.ReasonVersionMismatch, // legitimate
+		},
+	}); err != nil {
+		t.Fatalf("UpdatePermissions: %v", err)
+	}
+
+	a, err := reg.Get(ctx, "agent_q")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if _, ok := a.UnsupportedReasons["game.process.detect"]; ok {
+		t.Errorf("a supported permission must carry no reason, got %v", a.UnsupportedReasons)
+	}
+	if got := a.UnsupportedReasons["game.performance.read"]; got != gamesense.ReasonVersionMismatch {
+		t.Errorf("the legitimate reason must survive, got %q", got)
+	}
+
+	// The agents list/detail endpoints marshal this struct directly, so the
+	// contradiction must be impossible in the serialized form too.
+	blob, err := json.Marshal(a)
+	if err != nil {
+		t.Fatalf("marshal agent: %v", err)
+	}
+	var payload struct {
+		Supported          []string          `json:"supported"`
+		UnsupportedReasons map[string]string `json:"unsupported_reasons"`
+	}
+	if err := json.Unmarshal(blob, &payload); err != nil {
+		t.Fatalf("decode agent: %v", err)
+	}
+	for _, id := range payload.Supported {
+		if reason, ok := payload.UnsupportedReasons[id]; ok {
+			t.Errorf("serialized agent claims %s is supported and failed (%q)", id, reason)
+		}
+	}
+}
+
+// TestEnrollStoresUnsupportedReasons: the very first report is when a broken
+// sensor is most likely to be what an operator is staring at, so enrollment must
+// persist the reasons rather than leave the agent unexplained until it reconnects.
+func TestEnrollStoresUnsupportedReasons(t *testing.T) {
+	db := storetest.Open(t)
+	ctx := context.Background()
+
+	mustExec(t, db, `INSERT INTO sites(id,name,created_at,config_serial) VALUES('site_default','def',?,3)`, time.Now().UTC())
+	reg := New(db, 0, nil)
+	token, err := reg.CreateEnrollmentToken(ctx, "site_default", "test", time.Hour)
+	if err != nil {
+		t.Fatalf("CreateEnrollmentToken: %v", err)
+	}
+
+	pub, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("keygen: %v", err)
+	}
+	const nonce = "nonce-1"
+	resp, err := reg.Enroll(ctx, enroll.EnrollRequest{
+		SchemaVersion:   protocol.SchemaVersion,
+		PublicKey:       pub,
+		Nonce:           nonce,
+		Signature:       ed25519.Sign(priv, []byte(nonce)),
+		EnrollmentToken: token,
+		Hostname:        "host-1",
+		Platform:        "windows",
+		AgentVersion:    "0.1.0",
+		Permissions: permission.PermissionReport{
+			Supported: []string{"probe.dns"}, Granted: []string{"probe.dns"}, Effective: []string{"probe.dns"},
+			Source:             "environment",
+			UnsupportedReasons: map[string]string{"game.performance.read": gamesense.ReasonVersionMismatch},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Enroll: %v", err)
+	}
+
+	a, err := reg.Get(ctx, resp.AgentID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got := a.UnsupportedReasons["game.performance.read"]; got != gamesense.ReasonVersionMismatch {
+		t.Fatalf("enrolled reason = %q, want %q", got, gamesense.ReasonVersionMismatch)
 	}
 }
 
