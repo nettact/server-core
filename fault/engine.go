@@ -182,6 +182,21 @@ func (s *Service) advanceDetector(ctx context.Context, tx *sql.Tx, agentID, site
 		}
 	}
 
+	// The row is written on every pass, including one where every round was green
+	// and only last_round_ts moved. Skipping that write was tried and reverted:
+	// last_round_ts is the watermark that rejects a round at or before the newest
+	// already-folded one, so a watermark left behind re-opens the window it
+	// closes — a packet carrying FAILING rounds inside the un-persisted lag would
+	// be folded a second time and could confirm a fault the target has already
+	// recovered from. Bounding the lag does not fix it either: a bound wide enough
+	// to save writes still fits more than fail_threshold rounds.
+	//
+	// It is also not worth much. detector_state is a rowid table, so a row lives
+	// where it was inserted, and one agent's targets are inserted together when it
+	// first reports — its whole per-batch update lands in one or two pages, not one
+	// page per target. The write this would have saved is a small fraction of
+	// ingest's page traffic, against a defect class (fabricated incidents and the
+	// notifications they send) that is expensive to even detect.
 	return saveDetectorState(ctx, tx, targetID, agentID, DetectorAvailability, cur.ConfigSerial, cur.Det.Revision, st, now)
 }
 

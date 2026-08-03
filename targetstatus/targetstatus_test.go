@@ -108,15 +108,15 @@ func TestStaleWindowFoldsReportedUploadInterval(t *testing.T) {
 		t.Fatalf("reported upload=8s window = %ds, want 61", got)
 	}
 	// NULL upload (a pre-STATUS-003 agent, or a frame that reported none) falls back
-	// to DefaultUploadInterval (5s) inside StaleAfter → 55s.
-	if got := windowFor(confirmed(sql.NullInt64{})); got != 55 {
-		t.Fatalf("null upload window = %ds, want 55 (default fallback)", got)
+	// to DefaultUploadInterval (30s) inside StaleAfter → 45 + 2×30 = 105s.
+	if got := windowFor(confirmed(sql.NullInt64{})); got != 105 {
+		t.Fatalf("null upload window = %ds, want 105 (default fallback)", got)
 	}
 	// Unconfirmed (predicted) uses the desired-config fallback with the default
-	// upload: StaleAfter(30s, 10s, 5s) = max(90, 50) + 10 = 100s.
+	// upload: StaleAfter(30s, 10s, 30s) = max(90, 50) + 60 = 150s.
 	predicted := &msRow{status: wire.MonitorStatusActive, source: "predicted", targetConfigSerial: 2}
-	if got := windowFor(predicted); got != 100 {
-		t.Fatalf("desired-config fallback window = %ds, want 100", got)
+	if got := windowFor(predicted); got != 150 {
+		t.Fatalf("desired-config fallback window = %ds, want 150", got)
 	}
 }
 
@@ -126,15 +126,15 @@ func TestPendingGraceExpiresToNoDataWithoutChangingExecution(t *testing.T) {
 	pair := applicablePair{agentID: "agent", online: true}
 	svc := &Service{}
 
-	// http target, desired-config fallback window = StaleAfter(30s, 10s, default 5s)
-	// = max(90, 50) + 2×5 = 100s, so the pending grace boundary sits at 100s.
+	// http target, desired-config fallback window = StaleAfter(30s, 10s, default 30s)
+	// = max(90, 50) + 2×30 = 150s, so the pending grace boundary sits at 150s.
 	for _, tt := range []struct {
 		name     string
 		assigned time.Time
 		display  string
 	}{
-		{"within grace", now.Add(-99 * time.Second), displayPending},
-		{"expired", now.Add(-101 * time.Second), displayNoData},
+		{"within grace", now.Add(-149 * time.Second), displayPending},
+		{"expired", now.Add(-151 * time.Second), displayNoData},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			ms := &msRow{status: wire.MonitorStatusActive, source: "predicted", targetConfigSerial: 2,

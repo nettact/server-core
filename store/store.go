@@ -24,9 +24,16 @@ type DB struct {
 // Shared PRAGMAs (DSN form so every pooled connection gets them):
 // cache_size is negative-KiB (64 MiB) and mmap_size 256 MiB — the defaults
 // (~2 MiB cache, no mmap) thrash once the samples table grows to GBs.
+// wal_autocheckpoint is raised from the default 1000 pages (4 MiB) to 8192
+// (32 MiB): ingest rewrites the same hot pages — every series' b-tree tail,
+// the dedup and detector rows — on every commit, and each checkpoint copies
+// each distinct hot page into the main file once more. Checkpointing 8× less
+// often coalesces 8× more of those rewrites into one back-copy, cutting total
+// block writes roughly in half for the cost of a WAL that can reach ~32 MiB.
 const dsnPragmas = "?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)" +
 	"&_pragma=foreign_keys(ON)&_pragma=synchronous(NORMAL)&_pragma=auto_vacuum(INCREMENTAL)" +
-	"&_pragma=cache_size(-65536)&_pragma=mmap_size(268435456)&_pragma=temp_store(MEMORY)"
+	"&_pragma=cache_size(-65536)&_pragma=mmap_size(268435456)&_pragma=temp_store(MEMORY)" +
+	"&_pragma=wal_autocheckpoint(8192)"
 
 // Open opens (creating if needed) the SQLite database at path, applies pending
 // migrations, and returns a ready DB with separate write and read handles.

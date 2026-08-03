@@ -567,3 +567,45 @@ func TestSignalTitleIsLiteralInBothLanguages(t *testing.T) {
 		t.Fatalf("zh agent title = %q", got)
 	}
 }
+
+// TestHealthyRoundsStillPersistTheWatermark guards a write optimization that was
+// tried and reverted: skipping the detector row write when a batch was all green
+// and only last_round_ts moved. It saves little (rowid table, one agent's rows
+// are clustered) and costs correctness, because the un-persisted watermark is
+// what the next batch uses to reject rounds it has already folded.
+func TestHealthyRoundsStillPersistTheWatermark(t *testing.T) {
+	h := newHarness(t)
+	det := DefaultDetection()
+
+	for _, ts := range []int64{1000, 1010, 1020, 1030} {
+		h.evaluate(det, loss(ts, 0))
+		if _, _, got := h.detector(); got != ts {
+			t.Fatalf("watermark after green round %d = %d, want %d", ts, got, ts)
+		}
+	}
+}
+
+// TestHistoricalRoundsAreNotFoldedTwice is what the persisted watermark buys: a
+// round at or before the newest already-folded one is history, not news. Folding
+// failures the target has already been observed to recover from is how a dropped
+// watermark turns into a fabricated incident — and a notification for it.
+func TestHistoricalRoundsAreNotFoldedTwice(t *testing.T) {
+	h := newHarness(t)
+	det := DefaultDetection() // FailRounds = 3
+
+	for _, ts := range []int64{1000, 1010, 1020, 1030} {
+		h.evaluate(det, loss(ts, 0))
+	}
+
+	// A delayed packet carrying three failing rounds that are all at or before the
+	// newest round already folded. They are history, not news: folding them would
+	// confirm a fault for a window that has already been observed healthy.
+	h.evaluate(det, loss(1000, 100), loss(1010, 100), loss(1020, 100))
+
+	if got := h.countSignals(); got != 0 {
+		t.Fatalf("re-folded historical rounds must not confirm a fault, got %d signals", got)
+	}
+	if fails, _, _ := h.detector(); fails != 0 {
+		t.Fatalf("re-folded historical rounds must not start a streak, failRounds=%d", fails)
+	}
+}

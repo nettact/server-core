@@ -211,7 +211,9 @@ CREATE TABLE agent_wifi(
   sampled_at        TIMESTAMP NOT NULL,      -- freshness only (agent wall-clock)
   last_sequence     INTEGER NOT NULL DEFAULT 0,  -- last applied packet sequence (delivery-order guard)
   default_gateway   TEXT,
-  default_interface TEXT
+  default_interface TEXT,
+  iface_hash        INTEGER NOT NULL DEFAULT 0   -- content hash of the applied interfaces rows; an
+                                                 -- identical next snapshot skips their delete+reinsert
 );
 
 -- ===== monitoring configuration =====

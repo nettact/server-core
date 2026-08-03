@@ -9,6 +9,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"hash/fnv"
 	"log"
 	"net"
 	"strconv"
@@ -527,8 +528,8 @@ func applyInventory(ctx context.Context, tx *sql.Tx, agentID, siteID string, it 
 // NULL, never an earlier round's value. With several snapshots in one packet
 // only the last snapshot is applied, and only its exact-timestamp metrics match.
 func applyInterfaceSnapshot(ctx context.Context, tx *sql.Tx, agentID string, snap telemetry.InterfaceSnapshot, metrics []telemetry.Metric, seq uint64, now time.Time) error {
-	var storedSeq sql.NullInt64
-	err := tx.QueryRowContext(ctx, `SELECT last_sequence FROM agent_wifi WHERE agent_id=?`, agentID).Scan(&storedSeq)
+	var storedSeq, storedHash sql.NullInt64
+	err := tx.QueryRowContext(ctx, `SELECT last_sequence, iface_hash FROM agent_wifi WHERE agent_id=?`, agentID).Scan(&storedSeq, &storedHash)
 	if err != nil && err != sql.ErrNoRows {
 		return err
 	}
@@ -538,37 +539,48 @@ func applyInterfaceSnapshot(ctx context.Context, tx *sql.Tx, agentID string, sna
 
 	nums := wifiNumericsForRound(metrics, snap.SampledAt)
 
-	if _, err := tx.ExecContext(ctx, `DELETE FROM interfaces WHERE agent_id=?`, agentID); err != nil {
-		return err
-	}
-	for _, ifc := range snap.Interfaces {
-		up := 0
-		if ifc.Up {
-			up = 1
-		}
-		isw := 0
-		if ifc.IsWireless {
-			isw = 1
-		}
-		var wState, wReason, wSSID, wBand sql.NullString
-		var wChannel sql.NullInt64
-		if ifc.WiFi != nil {
-			wState = nullStr(string(ifc.WiFi.State))
-			wReason = nullStr(string(ifc.WiFi.Reason))
-			wSSID = nullStr(ifc.WiFi.SSID)
-			wBand = nullStr(string(ifc.WiFi.Band))
-			wChannel = sql.NullInt64{Int64: int64(ifc.WiFi.Channel), Valid: true}
-		}
-		n := nums[ifc.Name] // zero value: all-NULL when the round had no numerics for this iface
-		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO interfaces(id, agent_id, name, addrs, gateway, dns, up, is_wireless,
-				wifi_state, wifi_reason, wifi_ssid, wifi_band, wifi_channel,
-				wifi_signal_dbm, wifi_quality_pct, wifi_rx_mbps, wifi_tx_mbps, updated_at)
-			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-			agentID+"/"+ifc.Name, agentID, ifc.Name, encodeSlice(ifc.Addrs), ifc.Gateway, encodeSlice(ifc.DNS),
-			up, isw, wState, wReason, wSSID, wBand, wChannel,
-			n.signalDBm, n.qualityPct, n.rxMbps, n.txMbps, now); err != nil {
+	// A wired agent's interface set — and even a wireless one's between roams —
+	// is byte-identical round after round, yet the authoritative-full-set
+	// replacement below rewrites every row (and thus every touched SQLite page)
+	// on every packet. Hash the exact content the rows would carry and skip the
+	// replacement when nothing changed; the agent_wifi upsert still runs so the
+	// freshness clock (sampled_at) and the sequence guard stay current. The hash
+	// is stored in the same row, so it commits or rolls back with the data it
+	// describes and disappears with the agent — no cache to invalidate.
+	hash := int64(ifaceContentHash(snap.Interfaces, nums))
+	if !storedHash.Valid || storedHash.Int64 != hash {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM interfaces WHERE agent_id=?`, agentID); err != nil {
 			return err
+		}
+		for _, ifc := range snap.Interfaces {
+			up := 0
+			if ifc.Up {
+				up = 1
+			}
+			isw := 0
+			if ifc.IsWireless {
+				isw = 1
+			}
+			var wState, wReason, wSSID, wBand sql.NullString
+			var wChannel sql.NullInt64
+			if ifc.WiFi != nil {
+				wState = nullStr(string(ifc.WiFi.State))
+				wReason = nullStr(string(ifc.WiFi.Reason))
+				wSSID = nullStr(ifc.WiFi.SSID)
+				wBand = nullStr(string(ifc.WiFi.Band))
+				wChannel = sql.NullInt64{Int64: int64(ifc.WiFi.Channel), Valid: true}
+			}
+			n := nums[ifc.Name] // zero value: all-NULL when the round had no numerics for this iface
+			if _, err := tx.ExecContext(ctx, `
+				INSERT INTO interfaces(id, agent_id, name, addrs, gateway, dns, up, is_wireless,
+					wifi_state, wifi_reason, wifi_ssid, wifi_band, wifi_channel,
+					wifi_signal_dbm, wifi_quality_pct, wifi_rx_mbps, wifi_tx_mbps, updated_at)
+				VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+				agentID+"/"+ifc.Name, agentID, ifc.Name, encodeSlice(ifc.Addrs), ifc.Gateway, encodeSlice(ifc.DNS),
+				up, isw, wState, wReason, wSSID, wBand, wChannel,
+				n.signalDBm, n.qualityPct, n.rxMbps, n.txMbps, now); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -578,15 +590,60 @@ func applyInterfaceSnapshot(ctx context.Context, tx *sql.Tx, agentID string, sna
 		defaultInterface = nullStr(snap.DefaultRoute.Interface)
 	}
 	_, err = tx.ExecContext(ctx, `
-		INSERT INTO agent_wifi(agent_id, state, reason, sampled_at, last_sequence, default_gateway, default_interface)
-		VALUES(?,?,?,?,?,?,?)
+		INSERT INTO agent_wifi(agent_id, state, reason, sampled_at, last_sequence, default_gateway, default_interface, iface_hash)
+		VALUES(?,?,?,?,?,?,?,?)
 		ON CONFLICT(agent_id) DO UPDATE SET
 			state=excluded.state, reason=excluded.reason,
 			sampled_at=excluded.sampled_at, last_sequence=excluded.last_sequence,
-			default_gateway=excluded.default_gateway, default_interface=excluded.default_interface`,
+			default_gateway=excluded.default_gateway, default_interface=excluded.default_interface,
+			iface_hash=excluded.iface_hash`,
 		agentID, string(snap.WiFiState), nullStr(string(snap.WiFiReason)), snap.SampledAt.UTC(), int64(seq),
-		defaultGateway, defaultInterface)
+		defaultGateway, defaultInterface, hash)
 	return err
+}
+
+// ifaceContentHash digests exactly the fields the interfaces rows persist —
+// the snapshot's per-interface facts plus the projected current-round numerics
+// — in a fixed field order with length-unambiguous framing. updated_at is
+// deliberately outside the hash: it is a consequence of writing, not content,
+// and hashing it would defeat the skip.
+func ifaceContentHash(ifaces []telemetry.InterfaceState, nums map[string]wifiNumeric) uint64 {
+	h := fnv.New64a()
+	w := func(parts ...string) {
+		for _, p := range parts {
+			_, _ = h.Write([]byte(strconv.Itoa(len(p))))
+			_, _ = h.Write([]byte{':'})
+			_, _ = h.Write([]byte(p))
+		}
+	}
+	for _, ifc := range ifaces {
+		w(ifc.Name, encodeSlice(ifc.Addrs), ifc.Gateway, encodeSlice(ifc.DNS),
+			strconv.FormatBool(ifc.Up), strconv.FormatBool(ifc.IsWireless))
+		if ifc.WiFi != nil {
+			w(string(ifc.WiFi.State), string(ifc.WiFi.Reason), ifc.WiFi.SSID,
+				string(ifc.WiFi.Band), strconv.Itoa(ifc.WiFi.Channel))
+		} else {
+			w("-")
+		}
+		n := nums[ifc.Name]
+		w(nullInt64Key(n.signalDBm), nullInt64Key(n.qualityPct),
+			nullFloat64Key(n.rxMbps), nullFloat64Key(n.txMbps))
+	}
+	return h.Sum64()
+}
+
+func nullInt64Key(v sql.NullInt64) string {
+	if !v.Valid {
+		return "-"
+	}
+	return strconv.FormatInt(v.Int64, 10)
+}
+
+func nullFloat64Key(v sql.NullFloat64) string {
+	if !v.Valid {
+		return "-"
+	}
+	return strconv.FormatFloat(v.Float64, 'g', -1, 64)
 }
 
 // wifiNumeric holds the projected current-round numeric columns for one

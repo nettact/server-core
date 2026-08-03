@@ -74,6 +74,17 @@ const retentionSafetyMargin = 3600
 // an unaligned start would REPLACE a complete bucket with a partial aggregate.
 const rollupOverlap = 120 // seconds
 
+// idleWatermarkAdvance is how far a series with no new source rows may fall
+// behind before its rollup_state watermark is still written. Advancing the
+// watermark on every empty run would rewrite one row per series per tier per
+// run — for an idle series that is pure page churn (SQLite rewrites the whole
+// 4 KiB page into the WAL for a one-column update), and at fleet scale the
+// rollup_state rewrites rival the samples themselves. Deferring the advance
+// costs only a wider (still empty, still index-seeked) aggregation range on
+// subsequent runs, so the bound trades one row-write per hour against at most
+// an hour of empty range per probe.
+const idleWatermarkAdvance = 3600 // seconds
+
 func alignDown(ts, bucket int64) int64 { return (ts / bucket) * bucket }
 
 // Rollup performs incremental downsampling raw→1m→1h→1d. Each tier iterates
@@ -240,10 +251,14 @@ func (s *Store) rollupBatch(ctx context.Context, ids []int64, states map[int64]i
 				return err
 			}
 		}
-		// Advance the watermark even when the range was empty, so an idle series
-		// costs one empty index probe per run instead of rescanning history.
-		if _, err := setState.ExecContext(ctx, res, id, upTo); err != nil {
-			return err
+		// Advance the watermark when there was data, and for an idle series only
+		// once it has fallen idleWatermarkAdvance behind — often enough that a
+		// dead series never rescans deep history, rarely enough that idle series
+		// stop rewriting their rollup_state row on every run.
+		if len(buckets) > 0 || upTo-states[id] >= idleWatermarkAdvance {
+			if _, err := setState.ExecContext(ctx, res, id, upTo); err != nil {
+				return err
+			}
 		}
 	}
 	if err := tx.Commit(); err != nil {
