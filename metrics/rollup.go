@@ -2,6 +2,7 @@ package metrics
 
 import (
 	"context"
+	"database/sql"
 	"strconv"
 	"time"
 )
@@ -102,13 +103,16 @@ func (s *Store) Rollup(ctx context.Context) error {
 	if len(ids) == 0 {
 		return nil
 	}
-	if err := s.rollupTier(ctx, ids, "1m", "rollup_1m", "samples", true, 60, now); err != nil {
+	// Each tier names the tier above it: repairing an old bucket has to drag that
+	// tier's watermark back down with it, or the repair stops here (see
+	// cascadeParent).
+	if err := s.rollupTier(ctx, ids, "1m", "rollup_1m", "samples", true, 60, now, "1h", 3600); err != nil {
 		return err
 	}
-	if err := s.rollupTier(ctx, ids, "1h", "rollup_1h", "rollup_1m", false, 3600, now); err != nil {
+	if err := s.rollupTier(ctx, ids, "1h", "rollup_1h", "rollup_1m", false, 3600, now, "1d", 86400); err != nil {
 		return err
 	}
-	return s.rollupTier(ctx, ids, "1d", "rollup_1d", "rollup_1h", false, 86400, now)
+	return s.rollupTier(ctx, ids, "1d", "rollup_1d", "rollup_1h", false, 86400, now, "", 0)
 }
 
 func (s *Store) allSeriesIDs(ctx context.Context) ([]int64, error) {
@@ -133,7 +137,7 @@ func (s *Store) allSeriesIDs(ctx context.Context) ([]int64, error) {
 // the whole catch-up after downtime — minutes of aggregation during which every
 // write-handle query (and thus much of the HTTP API) stalls; chunking releases
 // the writer between batches, exactly like Retention.
-func (s *Store) rollupTier(ctx context.Context, ids []int64, res, dst, src string, srcRaw bool, bucket, now int64) error {
+func (s *Store) rollupTier(ctx context.Context, ids []int64, res, dst, src string, srcRaw bool, bucket, now int64, parentRes string, parentBucket int64) error {
 	upTo := alignDown(now, bucket)
 	if upTo <= 0 {
 		return nil
@@ -175,7 +179,7 @@ func (s *Store) rollupTier(ctx context.Context, ids []int64, res, dst, src strin
 		if end > len(ids) {
 			end = len(ids)
 		}
-		if err := s.rollupBatch(ctx, ids[start:end], states, res, dst, aggSQL, bucket, upTo); err != nil {
+		if err := s.rollupBatch(ctx, ids[start:end], states, res, dst, aggSQL, bucket, upTo, parentRes, parentBucket); err != nil {
 			return err
 		}
 	}
@@ -184,7 +188,7 @@ func (s *Store) rollupTier(ctx context.Context, ids []int64, res, dst, src strin
 
 // rollupBatch downsamples one batch of series inside a single transaction with
 // prepared statements reused across the batch.
-func (s *Store) rollupBatch(ctx context.Context, ids []int64, states map[int64]int64, res, dst, aggSQL string, bucket, upTo int64) error {
+func (s *Store) rollupBatch(ctx context.Context, ids []int64, states map[int64]int64, res, dst, aggSQL string, bucket, upTo int64, parentRes string, parentBucket int64) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -201,18 +205,53 @@ func (s *Store) rollupBatch(ctx context.Context, ids []int64, states map[int64]i
 		return err
 	}
 	defer agg.Close()
-	upsert, err := tx.PrepareContext(ctx, `INSERT OR REPLACE INTO `+dst+`(series_id, ts, cnt, total, vmin, vmax) VALUES(?,?,?,?,?,?)`)
+	// DO UPDATE … WHERE changed, not INSERT OR REPLACE: a REPLACE rewrites the
+	// row (and dirties its page) even when the recomputed aggregate is identical,
+	// which is exactly what a backfill rewind produces for every bucket the late
+	// samples did NOT land in — re-aggregating the same source rows in the same
+	// scan order is bit-for-bit deterministic, so the guard is exact, and hours
+	// of rewound history then cost writes only where history actually changed.
+	upsert, err := tx.PrepareContext(ctx, `
+		INSERT INTO `+dst+`(series_id, ts, cnt, total, vmin, vmax) VALUES(?,?,?,?,?,?)
+		ON CONFLICT(series_id, ts) DO UPDATE SET
+			cnt=excluded.cnt, total=excluded.total, vmin=excluded.vmin, vmax=excluded.vmax
+		WHERE cnt<>excluded.cnt OR total<>excluded.total
+		   OR vmin<>excluded.vmin OR vmax<>excluded.vmax`)
 	if err != nil {
 		return err
 	}
 	defer upsert.Close()
+	// Compare-and-set against the watermark this pass actually read. Ingest can
+	// rewind a series mid-pass (a backlog commit lands between the snapshot above
+	// and this write), and an unconditional write would erase that rewind — the
+	// repair would then never happen, because every later pass reads only the
+	// advanced value. Losing the CAS means someone moved the watermark backwards
+	// on purpose; leaving it alone is exactly right, and the next pass picks it up.
 	setState, err := tx.PrepareContext(ctx, `
 		INSERT INTO rollup_state(resolution, series_id, last_ts) VALUES(?,?,?)
-		ON CONFLICT(resolution, series_id) DO UPDATE SET last_ts=excluded.last_ts`)
+		ON CONFLICT(resolution, series_id) DO UPDATE SET last_ts=excluded.last_ts
+		WHERE last_ts=?`)
 	if err != nil {
 		return err
 	}
 	defer setState.Close()
+
+	// Dragging the tier above back down to a repaired bucket. Ingest rewinds only
+	// the 1m tier, because it is the only one that reads raw samples; each coarser
+	// tier is pulled back here, by the tier below it, in the SAME transaction that
+	// writes the repair. That ordering is what makes the cascade safe under a
+	// concurrent pass: a tier can never be advanced past data that has not been
+	// aggregated into it, because the row that would let it skip ahead is written
+	// only alongside the repair itself.
+	var cascade *sql.Stmt
+	if parentRes != "" {
+		cascade, err = tx.PrepareContext(ctx, `
+			UPDATE rollup_state SET last_ts=? WHERE resolution=? AND series_id=? AND last_ts>?`)
+		if err != nil {
+			return err
+		}
+		defer cascade.Close()
+	}
 
 	type bucketAgg struct {
 		ts   int64
@@ -246,8 +285,24 @@ func (s *Store) rollupBatch(ctx context.Context, ids []int64, states map[int64]i
 		if err := rows.Err(); err != nil {
 			return err
 		}
+		// oldestChanged is the earliest bucket this pass actually altered. The
+		// WHERE-changed guard on the upsert makes that precise: re-aggregating a
+		// window whose history did not move reports zero rows affected and leaves
+		// the tier above untouched, so a rewind cascades exactly as far as the
+		// data really changed and no further.
+		var oldestChanged int64 = -1
 		for _, b := range buckets {
-			if _, err := upsert.ExecContext(ctx, id, b.ts, b.cnt, b.tot, b.vmin, b.vmax); err != nil {
+			wrote, err := upsert.ExecContext(ctx, id, b.ts, b.cnt, b.tot, b.vmin, b.vmax)
+			if err != nil {
+				return err
+			}
+			if n, _ := wrote.RowsAffected(); n > 0 && (oldestChanged < 0 || b.ts < oldestChanged) {
+				oldestChanged = b.ts
+			}
+		}
+		if cascade != nil && oldestChanged >= 0 {
+			if _, err := cascade.ExecContext(ctx,
+				alignDown(oldestChanged, parentBucket), parentRes, id, alignDown(oldestChanged, parentBucket)); err != nil {
 				return err
 			}
 		}
@@ -256,7 +311,7 @@ func (s *Store) rollupBatch(ctx context.Context, ids []int64, states map[int64]i
 		// dead series never rescans deep history, rarely enough that idle series
 		// stop rewriting their rollup_state row on every run.
 		if len(buckets) > 0 || upTo-states[id] >= idleWatermarkAdvance {
-			if _, err := setState.ExecContext(ctx, res, id, upTo); err != nil {
+			if _, err := setState.ExecContext(ctx, res, id, upTo, states[id]); err != nil {
 				return err
 			}
 		}
@@ -320,8 +375,12 @@ func (s *Store) Retention(ctx context.Context, cfg RetentionConfig) error {
 			}
 		}
 	}
-	// Reclaim a bounded number of freed pages per run (auto_vacuum=incremental
-	// is set at open); unbounded vacuums after a big prune stall the writer.
-	_, _ = s.db.ExecContext(ctx, `PRAGMA incremental_vacuum(2000)`)
+	// No incremental_vacuum here, deliberately. At steady state this hourly prune
+	// deletes roughly what ingest inserted, so moving freed pages to the end of
+	// the file just rewrites up to 2000 pages (8 MiB) an hour that the next hour's
+	// samples would have reused in place — the file's high-water mark is the
+	// steady state, and shrinking below it buys nothing but disk writes. The
+	// user-initiated deletion paths (history cleanup, monitor purge) still
+	// vacuum: those are one-off deletes where the space genuinely comes back.
 	return nil
 }

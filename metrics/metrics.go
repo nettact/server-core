@@ -226,13 +226,66 @@ func (s *Store) InsertSamples(ctx context.Context, tx *sql.Tx, agentID string, i
 		return err
 	}
 	defer stmt.Close()
+	oldest := make(map[int64]int64, len(ids))
 	for i := range ms {
 		m := &ms[i]
 		id, ok := ids[seriesKey(agentID, m.MonitorID, string(m.Kind), m.Target, m.ConfigSerial)]
 		if !ok {
 			continue
 		}
-		if _, err := stmt.ExecContext(ctx, id, m.TS.Unix(), m.Value); err != nil {
+		ts := m.TS.Unix()
+		wrote, err := stmt.ExecContext(ctx, id, ts, m.Value)
+		if err != nil {
+			return err
+		}
+		// Only a sample that actually landed can change history. INSERT OR IGNORE
+		// reports zero rows for one that was already stored — a replayed packet
+		// under a fresh sequence, or a retry — and rewinding for those would drag
+		// the watermark back over months of unchanged history for nothing.
+		if n, _ := wrote.RowsAffected(); n == 0 {
+			continue
+		}
+		if cur, ok := oldest[id]; !ok || ts < cur {
+			oldest[id] = ts
+		}
+	}
+	return rewindRollups(ctx, tx, oldest)
+}
+
+// rewindRollups pulls a series' 1m rollup watermark back behind any sample that
+// arrived from the past — an offline agent draining hours of WAL backlog. The
+// watermarks advance with wall time whether or not a series receives anything,
+// and each pass re-reads only rollupOverlap behind them, so backlog inserted
+// below that line would otherwise NEVER be aggregated: invisible to every chart
+// wider than the raw tier and to the availability math, and deleted with the
+// raw tier two days later.
+//
+// ONLY the 1m tier is rewound here, deliberately. It is the only tier that reads
+// raw samples, so it is the only one this function can speak for; 1h and 1d are
+// dragged down by the tier below them, inside the transaction that writes the
+// repair (rollupBatch's cascade). Rewinding all three from here instead looks
+// equivalent and is not: a rollup pass already in flight has snapshotted the
+// coarse watermarks, and would write them forward again over this rewind — the
+// repair would be lost with nothing left to re-trigger it.
+//
+// This runs on the hot ingest path, so the cost matters: live samples sit AHEAD
+// of the watermark (rollup lags the present by up to its cadence, and the
+// overlap absorbs ordinary upload jitter), so for them the guarded UPDATE
+// matches nothing and dirties no page. Only a genuine backfill writes, and then
+// only one small rollup_state row per affected series.
+func rewindRollups(ctx context.Context, tx *sql.Tx, oldest map[int64]int64) error {
+	if len(oldest) == 0 {
+		return nil
+	}
+	stmt, err := tx.PrepareContext(ctx, `
+		UPDATE rollup_state SET last_ts=? WHERE resolution='1m' AND series_id=? AND last_ts > ? + `+
+		strconv.Itoa(rollupOverlap))
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+	for id, ts := range oldest {
+		if _, err := stmt.ExecContext(ctx, ts, id, ts); err != nil {
 			return err
 		}
 	}

@@ -12,6 +12,7 @@ import (
 	"hash/fnv"
 	"log"
 	"net"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -607,7 +608,17 @@ func applyInterfaceSnapshot(ctx context.Context, tx *sql.Tx, agentID string, sna
 // — in a fixed field order with length-unambiguous framing. updated_at is
 // deliberately outside the hash: it is a consequence of writing, not content,
 // and hashing it would defeat the skip.
+//
+// Interfaces are hashed in name order, not snapshot order. The OS does not
+// promise a stable enumeration order across rounds, and the stored rows are
+// order-free anyway (keyed agent_id+name, read back ORDER BY name) — so an
+// order-sensitive hash would flap on identical content and quietly turn the
+// skip off for exactly the agents it was built for.
 func ifaceContentHash(ifaces []telemetry.InterfaceState, nums map[string]wifiNumeric) uint64 {
+	if !sort.SliceIsSorted(ifaces, func(i, j int) bool { return ifaces[i].Name < ifaces[j].Name }) {
+		ifaces = append([]telemetry.InterfaceState(nil), ifaces...)
+		sort.Slice(ifaces, func(i, j int) bool { return ifaces[i].Name < ifaces[j].Name })
+	}
 	h := fnv.New64a()
 	w := func(parts ...string) {
 		for _, p := range parts {
