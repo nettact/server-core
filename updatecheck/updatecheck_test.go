@@ -68,7 +68,7 @@ func catalog(t *testing.T, tags map[string]string) *httptest.Server {
 
 func TestCheckServerInstall(t *testing.T) {
 	srv := catalog(t, map[string]string{
-		"server-lite": "v0.4.0",
+		"server": "v0.4.0",
 		"desktop":     "v9.9.9", // must not be consulted for a server install
 		"agent":       "v0.3.1",
 	})
@@ -217,7 +217,7 @@ func TestStoreInstallWithoutCheckerDoesNotUseCatalog(t *testing.T) {
 
 func TestCheckCatalogFailureKeepsPreviousStatus(t *testing.T) {
 	var fail atomic.Bool
-	inner := catalog(t, map[string]string{"server-lite": "v0.4.0", "agent": "v0.3.1"})
+	inner := catalog(t, map[string]string{"server": "v0.4.0", "agent": "v0.3.1"})
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if fail.Load() {
 			http.Error(w, "boom", http.StatusInternalServerError)
@@ -242,7 +242,7 @@ func TestCheckCatalogFailureKeepsPreviousStatus(t *testing.T) {
 }
 
 func TestCheckMissingProductIsAnError(t *testing.T) {
-	srv := catalog(t, map[string]string{"server-lite": "", "agent": "v1.0.0"})
+	srv := catalog(t, map[string]string{"server": "", "agent": "v1.0.0"})
 	s := New(Config{InstallType: InstallServer, CurrentVersion: "v0.1.0", BaseURL: srv.URL})
 	if _, err := s.CheckNow(context.Background()); err == nil {
 		t.Fatal("CheckNow: want an error when the product has no published release")
@@ -277,7 +277,7 @@ func TestStatusPublishedBeforeFirstSuccess(t *testing.T) {
 }
 
 func TestRunOnceFiresOnUpdateOnlyWhenNewer(t *testing.T) {
-	srv := catalog(t, map[string]string{"server-lite": "v1.0.0", "agent": "v1.0.0"})
+	srv := catalog(t, map[string]string{"server": "v1.0.0", "agent": "v1.0.0"})
 	var fired atomic.Int32
 	newSvc := func(current string) *Service {
 		return New(Config{
@@ -300,7 +300,7 @@ func TestRunOnceFiresOnUpdateOnlyWhenNewer(t *testing.T) {
 // CheckNow is a person clicking "check for updates"; the result is already on
 // screen, so it must not also fire the background notification path.
 func TestCheckNowDoesNotFireOnUpdate(t *testing.T) {
-	srv := catalog(t, map[string]string{"server-lite": "v2.0.0", "agent": "v1.0.0"})
+	srv := catalog(t, map[string]string{"server": "v2.0.0", "agent": "v1.0.0"})
 	var fired atomic.Int32
 	s := New(Config{
 		InstallType:    InstallServer,
@@ -336,7 +336,7 @@ func TestNewDisabledByEnv(t *testing.T) {
 }
 
 func TestNewReadsEnvBaseURL(t *testing.T) {
-	srv := catalog(t, map[string]string{"server-lite": "v3.0.0", "agent": "v1.0.0"})
+	srv := catalog(t, map[string]string{"server": "v3.0.0", "agent": "v1.0.0"})
 	t.Setenv(EnvBaseURL, srv.URL+"/")
 	s := New(Config{InstallType: InstallServer, CurrentVersion: "v1.0.0"})
 	st, err := s.CheckNow(context.Background())
@@ -349,7 +349,7 @@ func TestNewReadsEnvBaseURL(t *testing.T) {
 }
 
 func TestCheckedAtUsesClockSeam(t *testing.T) {
-	srv := catalog(t, map[string]string{"server-lite": "v1.0.0", "agent": "v1.0.0"})
+	srv := catalog(t, map[string]string{"server": "v1.0.0", "agent": "v1.0.0"})
 	want := time.Date(2026, 7, 31, 12, 0, 0, 0, time.UTC)
 	s := New(Config{
 		InstallType:    InstallServer,

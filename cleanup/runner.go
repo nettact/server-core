@@ -26,7 +26,7 @@ func (s *Service) Recover(ctx context.Context) error {
 }
 
 // Tick claims the oldest queued job and runs it to completion, item by item. It
-// is the single-job-at-a-time executor driven on a timer by server-lite; when no
+// is the single-job-at-a-time executor driven on a timer by the server; when no
 // job is queued it returns immediately. Each item's deletes run as autocommit
 // statements (like the metrics purge path), releasing the single writer between
 // items so ingest is never starved, and a per-item failure is recorded and the

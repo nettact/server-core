@@ -2510,7 +2510,7 @@ func (d Deps) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 // 1-65535. When the requested port differs from the currently bound one it also
 // probes with a real bind so "port in use" and "permission denied" fail at save
 // time (best-effort: the port can still be taken before the restart — the
-// startup fallback in liteserver covers that). Returns "" when valid, else a
+// startup fallback in the server covers that). Returns "" when valid, else a
 // user-facing error message.
 func validateListenAddr(v, effectiveAddr string) string {
 	host, portStr, err := net.SplitHostPort(v)

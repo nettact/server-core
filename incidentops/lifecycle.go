@@ -13,7 +13,7 @@ import (
 // deadline elapsed while the server was down, times out queued/running traces
 // past their deadline, reconciles active trace references against alert state,
 // closes cohorts left orphaned, and re-dispatches the still-eligible trace queue.
-// It spawns no goroutine — server-lite calls it once during startup.
+// It spawns no goroutine — the server calls it once during startup.
 func (s *Service) Recover(ctx context.Context) error {
 	if err := s.finalizeExpiredSnapshots(ctx); err != nil {
 		return err
@@ -31,7 +31,7 @@ func (s *Service) Recover(ctx context.Context) error {
 	return nil
 }
 
-// Tick is the callable periodic maintenance pass (server-lite drives it on a
+// Tick is the callable periodic maintenance pass (the server drives it on a
 // timer): finalize expired snapshots, time out expired traces, reconcile active
 // trace references against alert state, close orphaned cohorts, and rehydrate the
 // eligible trace queue. Idempotent and cheap when there is nothing to do.
@@ -283,7 +283,7 @@ func (s *Service) OnAgentConnected(ctx context.Context, agentID string) {
 // Open incidents are never touched. Trace hops are deleted only when it is safe
 // across all shared references — the report's cohort is closed and every incident
 // still referencing it is itself resolved-and-expired — so a report shared with a
-// still-live incident is preserved. Idempotent; server-lite drives it hourly.
+// still-live incident is preserved. Idempotent; the server drives it hourly.
 func (s *Service) Retention(ctx context.Context) error {
 	days := s.retentionDays(ctx)
 	cutoff := time.Now().UTC().Add(-time.Duration(days) * 24 * time.Hour)

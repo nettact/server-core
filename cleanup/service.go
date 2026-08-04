@@ -2,7 +2,7 @@
 // job deletes selected time-series history (whole series, or a time range of
 // each) either from an explicit user selection or from the set of orphaned series
 // left by deleted monitors/agents ("orphans" mode). The API layer creates and
-// reads jobs; a server-lite worker drives Tick to execute the queued one, and
+// reads jobs; a server worker drives Tick to execute the queued one, and
 // Recover requeues a job interrupted by a restart.
 //
 // Only metrics tables are touched. Incidents, alerts, snapshots and the audit log

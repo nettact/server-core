@@ -4,7 +4,7 @@ English | [简体中文](./README-zh.md)
 
 NetTact Server Core is the reusable Go module behind the NetTact server. It receives Agent data, stores metrics and configuration, detects faults, organizes incidents and notifications, and exposes the HTTP API and live updates consumed by the web console.
 
-This repository is a library and does not contain a standalone `main` program. End users should follow the [deployment guide](https://nettact.org/en/deploy) to install NetTact Lite, or use [NetTact Desktop](https://nettact.org/en/desktop) for an all-in-one local experience. Both products use this repository and therefore provide the same core server behavior.
+This repository is a library and does not contain a standalone `main` program. End users should follow the [deployment guide](https://nettact.org/en/deploy) to install NetTact Server, or use [NetTact Desktop](https://nettact.org/en/desktop) for an all-in-one local experience. Both products use this repository and therefore provide the same core server behavior.
 
 ## Capabilities
 
@@ -62,7 +62,7 @@ func main() {
 }
 ```
 
-A complete server must wire together enrollment, metrics, configuration, the Agent WebSocket, faults, notifications, background workers, and `api.Router`. These components have lifecycle and dependency ordering requirements. Use [server-lite's `liteserver`](https://github.com/nettact/server-lite/tree/main/liteserver) as the reference assembly instead of copying wiring into an empty HTTP server.
+A complete server must wire together enrollment, metrics, configuration, the Agent WebSocket, faults, notifications, background workers, and `api.Router`. These components have lifecycle and dependency ordering requirements. Use [server's `server` package](https://github.com/nettact/server/tree/main/server) as the reference assembly instead of copying wiring into an empty HTTP server.
 
 Main packages:
 
@@ -93,7 +93,7 @@ go test ./...
 go build ./...
 ```
 
-The root `go.work` resolves local dependencies during multi-repository development. To run the complete product, start `nettact-lite` from `server-lite` rather than trying to execute this repository directly.
+The root `go.work` resolves local dependencies during multi-repository development. To run the complete product, start `nettact-server` from `server` rather than trying to execute this repository directly.
 
 ## License
 

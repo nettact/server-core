@@ -861,7 +861,7 @@ func TestTraceReadsIncludeFallbackFields(t *testing.T) {
 }
 
 // TestWriteIncidentBaseDoesNotSelfDeadlockWithProductionSettings exercises the
-// real server-lite wiring shape: a non-nil settings service is consulted while
+// real server wiring shape: a non-nil settings service is consulted while
 // the fault engine already owns the database's single write connection. Settings
 // reads must use the read pool; using the write handle waits forever for the
 // surrounding transaction to release its own connection.

@@ -40,7 +40,7 @@ import (
 const (
 	InstallStore   = "store"   // desktop app installed from the Microsoft Store (MSIX)
 	InstallDesktop = "desktop" // desktop app installed from the download center
-	InstallServer  = "server"  // standalone server-lite (binary or container)
+	InstallServer  = "server"  // standalone server (binary or container)
 )
 
 const (
@@ -64,7 +64,7 @@ const (
 // Catalog product ids, as served by GET {base}/api/releases.
 const (
 	productDesktop = "desktop"
-	productServer  = "server-lite"
+	productServer  = "server"
 	productAgent   = "agent"
 )
 

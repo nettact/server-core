@@ -11,7 +11,7 @@
 // agentws) routes inbound IncidentSnapshot/TraceResult frames here and pushes
 // outbound requests through the injected Pusher (satisfied by *agentws.Hub) so
 // this package never imports agentws. Post-commit triggers (OnIncidentOpened /
-// OnEvidence / OnAlertResolved) are wired by server-lite onto the event bus — no
+// OnEvidence / OnAlertResolved) are wired by the server onto the event bus — no
 // goroutine is spawned here and no DB-writing bus handler runs inside the open
 // fault transition transaction.
 package incidentops

@@ -4,7 +4,7 @@
 
 NetTact Server Core 是 NetTact 服务端的核心 Go 模块。它负责接收 Agent 数据、保存指标与配置、判断故障、组织事件和通知，并向 Web 控制台提供 HTTP API 与实时更新。
 
-这个仓库是可复用的服务端库，不包含独立的 `main` 程序。希望直接使用 NetTact 的用户应按照[部署文档](https://nettact.org/zh/deploy)安装 NetTact Lite；希望免部署体验的个人用户可使用 [NetTact Desktop](https://nettact.org/zh/desktop)。两者都基于本仓库提供相同的服务端能力。
+这个仓库是可复用的服务端库，不包含独立的 `main` 程序。希望直接使用 NetTact 的用户应按照[部署文档](https://nettact.org/zh/deploy)安装 NetTact Server；希望免部署体验的个人用户可使用 [NetTact Desktop](https://nettact.org/zh/desktop)。两者都基于本仓库提供相同的服务端能力。
 
 ## 提供的能力
 
@@ -62,7 +62,7 @@ func main() {
 }
 ```
 
-完整服务需要组合注册、指标、配置、Agent WebSocket、故障、通知、后台任务和 `api.Router`。这些组件存在生命周期和依赖顺序，建议参考 [server-lite 的 `liteserver`](https://github.com/nettact/server-lite/tree/main/liteserver) 作为标准装配方式，而不是从一个空的 HTTP Server 开始复制接线代码。
+完整服务需要组合注册、指标、配置、Agent WebSocket、故障、通知、后台任务和 `api.Router`。这些组件存在生命周期和依赖顺序，建议参考 [server 的 `server` 包](https://github.com/nettact/server/tree/main/server) 作为标准装配方式，而不是从一个空的 HTTP Server 开始复制接线代码。
 
 主要包：
 
@@ -93,7 +93,7 @@ go test ./...
 go build ./...
 ```
 
-NetTact 多仓开发时由根目录 `go.work` 解析本地依赖。要运行完整产品，请在 `server-lite` 中启动 `nettact-lite`，而不是直接运行本仓库。
+NetTact 多仓开发时由根目录 `go.work` 解析本地依赖。要运行完整产品，请在 `server` 中启动 `nettact-server`，而不是直接运行本仓库。
 
 ## 许可证
 

@@ -40,8 +40,8 @@ func Open(t testing.TB) *store.DB {
 
 // Dir returns a temporary directory with the same forgiving cleanup, for tests
 // that need a path to put a database at rather than an already-open handle —
-// server-lite's, which hand a DBPath to a whole server and cannot close its
-// handles themselves.
+// the server module's, which hand a DBPath to a whole server and cannot close
+// its handles themselves.
 func Dir(t testing.TB) string {
 	t.Helper()
 	dir, err := os.MkdirTemp("", "nettact-test-")
