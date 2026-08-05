@@ -92,6 +92,11 @@ type Deps struct {
 	// rides along on server-info.
 	Update *updatecheck.Service
 
+	// Version is the running build's version string ("dev" or "vX.Y.Z"). Reported
+	// on server-info independently of update-check status, so the console can
+	// always name the build that produced a report footer.
+	Version string
+
 	// ListenStatus reports how the running server is actually bound (nil when the
 	// host doesn't provide one, e.g. bare server-core tests).
 	ListenStatus func(ctx context.Context) *ListenStatus
@@ -392,6 +397,7 @@ func (d Deps) handleServerInfo(w http.ResponseWriter, r *http.Request) {
 	out := map[string]any{
 		"os":            runtime.GOOS,
 		"native_notify": notification.NativeSupported(),
+		"version":       d.Version,
 	}
 	if st, ok := d.Update.Status(); ok {
 		out["update"] = st
