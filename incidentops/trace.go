@@ -16,6 +16,7 @@ import (
 	pcfg "github.com/nettact/protocol/config"
 	"github.com/nettact/protocol/permission"
 	"github.com/nettact/protocol/telemetry"
+	"github.com/nettact/server-core/eventbus"
 	"github.com/nettact/server-core/fault"
 )
 
@@ -745,10 +746,41 @@ func (s *Service) OnSignalConfirmed(ctx context.Context, ev fault.SignalEvent) e
 			s.addTraceTimeline(ctx, ev.IncidentID, "diag.started", reportID)
 		}
 	}
+	// INCIDENT-003: this incident may have just attached to a single-flight cohort
+	// that is ALREADY terminal (a sibling's trace shared by the same plan key). The
+	// incident was confirmed and recomputed before the reference existed, and no
+	// further terminal ingest will arrive, so fold the shared evidence in now.
+	var status string
+	if err := s.db.Read().QueryRowContext(ctx, `SELECT status FROM trace_reports WHERE id=?`, reportID).Scan(&status); err == nil && !nonterminalTrace(status) {
+		s.recomputeAfterTerminalTrace(ctx, ev.IncidentID)
+	}
 	if dispatchable {
 		s.dispatchAgent(ctx, ev.AgentID)
 	}
 	return nil
+}
+
+// recomputeAfterTerminalTrace re-reads an incident's attribution after it
+// attached to an already-terminal trace cohort, publishing the console-refresh
+// events only when the attribution actually changed. Best-effort: a failure here
+// leaves the incident at its previous (confirm-time) attribution and is no worse
+// than not having the shared trace.
+func (s *Service) recomputeAfterTerminalTrace(ctx context.Context, incidentID string) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return
+	}
+	changed, siteID, err := fault.RecomputeAttributionTx(ctx, tx, incidentID)
+	if err != nil {
+		_ = tx.Rollback()
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		return
+	}
+	if changed {
+		s.publishAttributionRefresh(ctx, siteID, incidentID)
+	}
 }
 
 // openCohortQuery finds the open-cohort report for a plan's key. It MUST match
@@ -1098,14 +1130,62 @@ func (s *Service) IngestTrace(ctx context.Context, agentID string, res telemetry
 	if err := insertHops(ctx, tx, res.ReportID, res.Hops, maxHops, attempts); err != nil {
 		return err
 	}
-	if err := s.emitTraceCompletion(ctx, tx, res.ReportID, now); err != nil {
+	refIncidents, err := s.emitTraceCompletion(ctx, tx, res.ReportID, now)
+	if err != nil {
 		return err
+	}
+	// INCIDENT-003 second stage: the trace's reached-point is the strongest
+	// attribution evidence, so recompute each referencing incident's attribution
+	// in this same tx (the terminal transition above guarantees exactly-once).
+	// Only incidents whose attribution actually changed are published after
+	// commit, so a trace that confirms the current guess stays quiet.
+	var attributed []eventbus.IncidentEvent
+	for _, id := range refIncidents {
+		changed, siteID, err := fault.RecomputeAttributionTx(ctx, tx, id)
+		if err != nil {
+			return err
+		}
+		if changed {
+			attributed = append(attributed, eventbus.IncidentEvent{IncidentID: id, SiteID: siteID})
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return err
 	}
 	committed = true
+	for _, ev := range attributed {
+		s.publishAttributionRefresh(ctx, ev.SiteID, ev.IncidentID)
+	}
 	return nil
+}
+
+// publishAttributionRefresh lets the console converge after an incident's
+// attribution changed. incident.changed refreshes the fault centre AND the open
+// incident drawer; target.status.changed refreshes the target-status page, whose
+// per-agent FaultRef now carries the same attribution. Both are needed because
+// the target-status store only listens to the latter.
+func (s *Service) publishAttributionRefresh(ctx context.Context, siteID, incidentID string) {
+	if s.bus == nil {
+		return
+	}
+	s.bus.Publish(eventbus.TopicIncidentUpdated, eventbus.IncidentEvent{IncidentID: incidentID, SiteID: siteID})
+	rows, err := s.db.Read().QueryContext(ctx,
+		`SELECT DISTINCT target_id FROM fault_signals WHERE incident_id=? AND state='firing' AND target_id<>''`,
+		incidentID)
+	if err != nil {
+		return
+	}
+	var targetIDs []string
+	for rows.Next() {
+		var id string
+		if rows.Scan(&id) == nil {
+			targetIDs = append(targetIDs, id)
+		}
+	}
+	rows.Close()
+	if len(targetIDs) > 0 {
+		s.bus.Publish(eventbus.TopicTargetStatusChanged, eventbus.TargetStatusChanged{SiteID: siteID, TargetIDs: targetIDs})
+	}
 }
 
 // attestationMatches reports whether a result's self-attested execution path is
@@ -1171,34 +1251,36 @@ func insertHops(ctx context.Context, tx *sql.Tx, reportID string, hops []telemet
 }
 
 // emitTraceCompletion appends a diag.completed timeline entry to every incident
-// that still references the report, inside the ingest transaction.
-func (s *Service) emitTraceCompletion(ctx context.Context, tx *sql.Tx, reportID string, now time.Time) error {
+// that still references the report, inside the ingest transaction, and returns
+// those incident ids so the caller can run post-commit work (the second-stage
+// attribution recompute) against the same set.
+func (s *Service) emitTraceCompletion(ctx context.Context, tx *sql.Tx, reportID string, now time.Time) ([]string, error) {
 	rows, err := tx.QueryContext(ctx,
 		`SELECT DISTINCT incident_id FROM trace_report_refs WHERE report_id=?`, reportID)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	var incs []string
 	for rows.Next() {
 		var id string
 		if err := rows.Scan(&id); err != nil {
 			rows.Close()
-			return err
+			return nil, err
 		}
 		incs = append(incs, id)
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
-		return err
+		return nil, err
 	}
 	for _, incidentID := range incs {
 		if _, err := tx.ExecContext(ctx,
 			`INSERT INTO incident_timeline(id, incident_id, ts, kind, message, ref) VALUES(?,?,?,?,?,?)`,
 			"tl_"+uuid.NewString(), incidentID, now, "diag.completed", "", reportID); err != nil {
-			return err
+			return nil, err
 		}
 	}
-	return nil
+	return incs, nil
 }
 
 // addTraceTimeline appends one trace lifecycle timeline entry (best-effort).

@@ -19,6 +19,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/nettact/protocol/telemetry"
 	"github.com/nettact/server-core/store"
 )
 
@@ -31,12 +32,18 @@ type Payload struct {
 	IncidentID     string `json:"incident_id"`
 	StormID        string `json:"storm_id,omitempty"`
 	SiteID         string `json:"site_id"`
-	State          string `json:"state"`                // open | resolved | terminated
-	Severity       string `json:"severity"`             // worst firing severity
-	Scope          string `json:"scope"`                // "single" | "site"
-	AgentCount     int    `json:"agent_count"`          // distinct agents alerting
-	SuspectedLayer string `json:"suspected_layer"`      // root-cause layer code
-	GroupName      string `json:"group_name,omitempty"` // incident's frozen alert-group name
+	State          string `json:"state"`           // open | resolved | terminated
+	Severity       string `json:"severity"`        // worst firing severity
+	Scope          string `json:"scope"`           // "single" | "site"
+	AgentCount     int    `json:"agent_count"`     // distinct agents alerting
+	SuspectedLayer string `json:"suspected_layer"` // root-cause layer code
+	// Attribution is the one-line user-language position ('' when evidence is
+	// insufficient, e.g. merged multi-agent incidents); AttributionEvidence is
+	// the typed clues behind it. Both travel structurally so the webhook carries
+	// the raw data and every renderer picks its own wording/language.
+	Attribution         string            `json:"attribution,omitempty"`
+	AttributionEvidence []AttributionClue `json:"attribution_evidence,omitempty"`
+	GroupName           string            `json:"group_name,omitempty"` // incident's frozen alert-group name
 	// GroupMerged is true when the incident merges the whole group's alerts
 	// (monitor_groups.merge_enabled), so a terminal notice may speak for the group
 	// ("all alerts recovered"). False ⇒ a per-alert incident: sibling alerts in the
@@ -328,7 +335,13 @@ func (s *Service) deliverWebhook(ctx context.Context, cfg map[string]string, p P
 			Payload: p,
 			Title:   RenderTitle(p, lang),
 			Text:    RenderScope(p, lang),
-			Lines:   RenderLines(p, lang),
+			// Attribution clue lines lead so the recipient sees the reasoning
+			// ("网关探测正常 ✓ …") without parsing the JSON; a storm or an
+			// unattributed incident contributes no lines. A RESOLVED incident's
+			// payload still carries the frozen outage evidence, and leading a
+			// recovery notice with "gateway unreachable ✗" would contradict the
+			// recovery it announces — clues only lead open/test fault events.
+			Lines: append(clueLines(p, lang), RenderLines(p, lang)...),
 		})
 	}
 
@@ -394,6 +407,14 @@ func SampleWebhookPayload(consoleBase string) Payload {
 		Scope:          "single",
 		AgentCount:     1,
 		SuspectedLayer: "service",
+		Attribution:    "service",
+		AttributionEvidence: []AttributionClue{{
+			Kind:    ClueOnlyTargetFailing,
+			Targets: []string{"Example Site"},
+		}, {
+			Kind:       ClueReason,
+			ReasonCode: telemetry.ProbeReasonHTTPStatus,
+		}},
 		Details: []FaultDetail{{
 			ProbeKind:  "http",
 			MetricKind: "probe.http.status",

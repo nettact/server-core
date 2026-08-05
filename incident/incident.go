@@ -9,6 +9,7 @@ package incident
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"strings"
 	"time"
@@ -43,9 +44,14 @@ type Incident struct {
 	// once as a whole (ALERT-001). It says only that the fault is PART of a burst;
 	// whether anyone was actually told is the counts above, which already fold the
 	// storm's records in.
-	StormID    string     `json:"storm_id,omitempty"`
-	OpenedAt   time.Time  `json:"opened_at"`
-	ResolvedAt *time.Time `json:"resolved_at"`
+	// Attribution is the user-language "problem most likely at …" code (''
+	// when evidence is insufficient); AttributionEvidence is the raw typed JSON
+	// behind it, passed through so the console renders it with its own wording.
+	Attribution         string          `json:"attribution"`
+	AttributionEvidence json.RawMessage `json:"attribution_evidence,omitempty"`
+	StormID             string          `json:"storm_id,omitempty"`
+	OpenedAt            time.Time       `json:"opened_at"`
+	ResolvedAt          *time.Time      `json:"resolved_at"`
 }
 
 // TimelineEntry is one incident timeline row, including the entity ref the fault
@@ -74,6 +80,7 @@ func New(db *store.DB) *Service { return &Service{db: db} }
 const incidentCols = `i.id, i.site_id, i.group_id, COALESCE(i.group_name,''), COALESCE(i.title,''),
 	COALESCE(i.suspected_layer,''), i.state, i.severity, COALESCE(i.summary,''),
 	COALESCE(i.resolve_reason,''), i.evidence_expired, i.opened_at, i.resolved_at,
+	COALESCE(i.attribution,''), COALESCE(i.attribution_evidence,'[]'),
 	(SELECT COUNT(*) FROM fault_signals s WHERE s.incident_id=i.id),
 	(SELECT COUNT(*) FROM fault_signals s WHERE s.incident_id=i.id AND s.state='firing'),
 	COALESCE((SELECT status FROM incident_snapshots sn WHERE sn.incident_id=i.id),''),
@@ -256,9 +263,11 @@ func scanIncident(row scanner) (Incident, error) {
 	var inc Incident
 	var resolved sql.NullTime
 	var evidenceExpired int
+	var attrEv string
 	err := row.Scan(&inc.ID, &inc.SiteID, &inc.GroupID, &inc.GroupName, &inc.Title, &inc.SuspectedLayer,
 		&inc.State, &inc.Severity, &inc.Summary, &inc.ResolveReason, &evidenceExpired,
-		&inc.OpenedAt, &resolved, &inc.MemberCount, &inc.ActiveMemberCount, &inc.SnapshotStatus, &inc.TraceCount,
+		&inc.OpenedAt, &resolved, &inc.Attribution, &attrEv,
+		&inc.MemberCount, &inc.ActiveMemberCount, &inc.SnapshotStatus, &inc.TraceCount,
 		&inc.NotifiedCount, &inc.PendingNotifyCount, &inc.StormID)
 	if err != nil {
 		return Incident{}, err
@@ -267,6 +276,9 @@ func scanIncident(row scanner) (Incident, error) {
 	if resolved.Valid {
 		t := resolved.Time
 		inc.ResolvedAt = &t
+	}
+	if attrEv != "" && attrEv != "[]" {
+		inc.AttributionEvidence = json.RawMessage(attrEv)
 	}
 	return inc, nil
 }

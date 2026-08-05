@@ -3,6 +3,7 @@ package notifypolicy
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"log"
 	"net/url"
 	"strings"
@@ -530,12 +531,12 @@ func (s *Service) stormGroups(ctx context.Context, stormID, member string) ([]no
 // "agent:…") is rendered through the agent wording; everything else through the
 // per-target fault wording.
 func (s *Service) buildIncidentPayload(ctx context.Context, incidentID, event string) (notification.Payload, bool) {
-	var siteID, severity, suspected, groupName, openKey, state string
+	var siteID, severity, suspected, groupName, openKey, state, attribution, attrEv string
 	if err := s.db.Read().QueryRowContext(ctx, `
 		SELECT site_id, severity, COALESCE(suspected_layer,''), COALESCE(group_name,''),
-		       COALESCE(open_key,''), state
+		       COALESCE(open_key,''), state, COALESCE(attribution,''), COALESCE(attribution_evidence,'[]')
 		FROM incidents WHERE id=?`, incidentID).
-		Scan(&siteID, &severity, &suspected, &groupName, &openKey, &state); err != nil {
+		Scan(&siteID, &severity, &suspected, &groupName, &openKey, &state, &attribution, &attrEv); err != nil {
 		return notification.Payload{}, false
 	}
 	p := notification.Payload{
@@ -545,10 +546,17 @@ func (s *Service) buildIncidentPayload(ctx context.Context, incidentID, event st
 		State:          state,
 		Severity:       severity,
 		SuspectedLayer: suspected,
+		Attribution:    attribution,
 		GroupName:      groupName,
 		GroupMerged:    strings.HasPrefix(openKey, "grp:"),
 		URL:            s.incidentURL(ctx, incidentID),
 		At:             time.Now().UTC(),
+	}
+	if p.Attribution != "" && attrEv != "" && attrEv != "[]" {
+		var clues []notification.AttributionClue
+		if json.Unmarshal([]byte(attrEv), &clues) == nil {
+			p.AttributionEvidence = clues
+		}
 	}
 	if strings.HasPrefix(openKey, "agent:") {
 		p.Event = "agent.offline"

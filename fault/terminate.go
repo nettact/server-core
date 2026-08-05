@@ -40,23 +40,42 @@ func (s *Service) TerminateForTargetsTx(ctx context.Context, tx *sql.Tx, targetI
 		args[i] = id
 	}
 	in := placeholders(len(targetIDs))
-	ids, pub, err := s.terminateTx(ctx, tx, reason, `target_id IN (`+in+`)`, args...)
+	targets, agents, siteID, out, err := s.terminateTx(ctx, tx, reason, `target_id IN (`+in+`)`, args...)
 	if err != nil {
 		return nil, nil, err
 	}
-	// Counters are per (target, agent): drop them all so the next round starts a
-	// fresh streak under the new configuration.
+	// Capture the agents for which these targets were a possible healthy
+	// reference BEFORE clearing their counters.
+	refAgents, err := s.detectorAgentsForTargets(ctx, tx, targetIDs)
+	if err != nil {
+		return nil, nil, err
+	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM detector_state WHERE target_id IN (`+in+`)`, args...); err != nil {
 		return nil, nil, err
 	}
-	return ids, pub, nil
+	return s.terminationPub(ctx, tx, targets, agents, siteID, out, refAgents)
 }
 
 // TerminateForGroupTx force-resolves the firing signals of every target in a
 // monitor group (group deletion or merge-policy flip, which changes the incident
 // grouping identity). Same contract as TerminateForTargetsTx.
 func (s *Service) TerminateForGroupTx(ctx context.Context, tx *sql.Tx, groupID string) ([]string, postCommit, error) {
-	ids, pub, err := s.terminateTx(ctx, tx, ReasonConfigChanged, `group_id = ?`, groupID)
+	targets, agents, siteID, out, err := s.terminateTx(ctx, tx, ReasonConfigChanged, `group_id = ?`, groupID)
+	if err != nil {
+		return nil, nil, err
+	}
+	var groupTargets []string
+	rows, err := tx.QueryContext(ctx, `SELECT id FROM probe_tasks WHERE group_id=?`, groupID)
+	if err == nil {
+		for rows.Next() {
+			var id string
+			if rows.Scan(&id) == nil {
+				groupTargets = append(groupTargets, id)
+			}
+		}
+		rows.Close()
+	}
+	refAgents, err := s.detectorAgentsForTargets(ctx, tx, groupTargets)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -64,7 +83,78 @@ func (s *Service) TerminateForGroupTx(ctx context.Context, tx *sql.Tx, groupID s
 		`DELETE FROM detector_state WHERE target_id IN (SELECT id FROM probe_tasks WHERE group_id=?)`, groupID); err != nil {
 		return nil, nil, err
 	}
-	return ids, pub, nil
+	return s.terminationPub(ctx, tx, targets, agents, siteID, out, refAgents)
+}
+
+// terminationPub recomputes the sibling attributions of every affected agent
+// AFTER the caller has cleared the targets' detector_state (so a removed healthy
+// reference is not still treated as healthy), and builds the merged post-commit
+// publisher for the resolved signals plus the recomputed siblings. refAgents are
+// the agents whose detector_state was just cleared and must have been captured
+// BEFORE the delete.
+func (s *Service) terminationPub(ctx context.Context, tx *sql.Tx, targets, agents []string, siteID string, out *txOut, refAgents []string) ([]string, postCommit, error) {
+	statusTargets, err := s.recomputeSiblingAttributions(ctx, tx, siteID, append(agents, refAgents...), out)
+	if err != nil {
+		return nil, nil, err
+	}
+	captured := dedupeStrings(append(targets, statusTargets...))
+	pub := postCommit(func(ctx context.Context) {
+		s.publish(out)
+		s.publishTargetStatus(siteID, captured)
+	})
+	return targets, pub, nil
+}
+
+// detectorAgentsForTargets returns the distinct agents that have detector_state
+// for the given targets — i.e. the agents for which those targets were a
+// possible healthy reference before being cleared.
+func (s *Service) detectorAgentsForTargets(ctx context.Context, tx *sql.Tx, targetIDs []string) ([]string, error) {
+	if len(targetIDs) == 0 {
+		return nil, nil
+	}
+	rows, err := tx.QueryContext(ctx,
+		`SELECT DISTINCT agent_id FROM detector_state WHERE target_id IN (`+placeholders(len(targetIDs))+`)`,
+		anySlice(targetIDs)...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var agents []string
+	for rows.Next() {
+		var a string
+		if err := rows.Scan(&a); err != nil {
+			return nil, err
+		}
+		agents = append(agents, a)
+	}
+	return agents, rows.Err()
+}
+
+func anySlice(ss []string) []any {
+	out := make([]any, len(ss))
+	for i, s := range ss {
+		out[i] = s
+	}
+	return out
+}
+
+// recomputeSiblingAttributions refreshes the attribution of every open incident
+// on the given agents after a mutation shrank the agent-wide firing/reference
+// set, appending the changed incidents' events to out and returning the targets
+// whose status changed.
+func (s *Service) recomputeSiblingAttributions(ctx context.Context, tx *sql.Tx, siteID string, agents []string, out *txOut) ([]string, error) {
+	var changedTargets []string
+	for _, agentID := range dedupeStrings(agents) {
+		changedIncidents, targets, err := recomputeAgentAttributions(ctx, tx, agentID)
+		if err != nil {
+			return nil, err
+		}
+		for _, id := range changedIncidents {
+			out.incidentUpdated = append(out.incidentUpdated, incidentEvent(id, siteID, "", "", false))
+		}
+		changedTargets = append(changedTargets, targets...)
+	}
+	return dedupeStrings(changedTargets), nil
 }
 
 // TerminateForAgent force-resolves every signal detected by one agent, in its own
@@ -107,7 +197,7 @@ func (s *Service) terminate(ctx context.Context, reason string, extra func(conte
 			_ = tx.Rollback()
 		}
 	}()
-	_, pub, err := s.terminateTx(ctx, tx, reason, whereSQL, args...)
+	targets, agents, siteID, out, err := s.terminateTx(ctx, tx, reason, whereSQL, args...)
 	if err != nil {
 		return err
 	}
@@ -116,62 +206,70 @@ func (s *Service) terminate(ctx context.Context, reason string, extra func(conte
 			return err
 		}
 	}
+	// Recompute sibling attributions for the affected agents AFTER the extra
+	// cleanup (e.g. an agent's detector_state being deleted), so a removed
+	// healthy reference is not still treated as healthy.
+	statusTargets, err := s.recomputeSiblingAttributions(ctx, tx, siteID, agents, out)
+	if err != nil {
+		return err
+	}
+	captured := dedupeStrings(append(targets, statusTargets...))
 	if err := tx.Commit(); err != nil {
 		return err
 	}
 	committed = true
-	if pub != nil {
-		pub(ctx)
-	}
+	s.publish(out)
+	s.publishTargetStatus(siteID, captured)
 	return nil
 }
 
 // terminateTx closes every firing signal matched by whereSQL (correlated to the
 // fault_signals row) inside the caller's open write tx. Rows are collected before
-// any write so no read cursor stays open across the closes.
-func (s *Service) terminateTx(ctx context.Context, tx *sql.Tx, reason, whereSQL string, args ...any) ([]string, postCommit, error) {
+// any write so no read cursor stays open across the closes. It returns the
+// closed targets, the affected agents, the site id and the accumulated lifecycle
+// events; sibling-attribution recomputation is deliberately deferred to the
+// caller (terminationPub) so it runs AFTER any detector_state is cleared.
+func (s *Service) terminateTx(ctx context.Context, tx *sql.Tx, reason, whereSQL string, args ...any) ([]string, []string, string, *txOut, error) {
 	rows, err := tx.QueryContext(ctx,
-		`SELECT id, site_id, target_id FROM fault_signals WHERE state='firing' AND (`+whereSQL+`)`, args...)
+		`SELECT id, site_id, target_id, agent_id FROM fault_signals WHERE state='firing' AND (`+whereSQL+`)`, args...)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, "", nil, err
 	}
-	type row struct{ id, siteID, targetID string }
+	type row struct{ id, siteID, targetID, agentID string }
 	var list []row
 	for rows.Next() {
 		var r row
-		if err := rows.Scan(&r.id, &r.siteID, &r.targetID); err != nil {
+		if err := rows.Scan(&r.id, &r.siteID, &r.targetID, &r.agentID); err != nil {
 			rows.Close()
-			return nil, nil, err
+			return nil, nil, "", nil, err
 		}
 		list = append(list, r)
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
-		return nil, nil, err
+		return nil, nil, "", nil, err
 	}
+	out := &txOut{}
 	if len(list) == 0 {
-		return nil, nil, nil
+		return nil, nil, "", out, nil
 	}
 
 	now := time.Now().UTC()
-	out := &txOut{}
 	targets := make([]string, 0, len(list))
+	agents := make([]string, 0, len(list))
 	siteID := list[0].siteID
 	for _, r := range list {
 		if err := s.resolveSignal(ctx, tx, r.id, reason, now, now, out); err != nil {
-			return nil, nil, err
+			return nil, nil, "", nil, err
 		}
 		if r.targetID != "" {
 			targets = append(targets, r.targetID)
 		}
+		if r.agentID != "" {
+			agents = append(agents, r.agentID)
+		}
 	}
-	targets = dedupeStrings(targets)
-	captured := targets
-	pub := postCommit(func(ctx context.Context) {
-		s.publish(out)
-		s.publishTargetStatus(siteID, captured)
-	})
-	return targets, pub, nil
+	return dedupeStrings(targets), dedupeStrings(agents), siteID, out, nil
 }
 
 // ClearDetectorStateTx drops the detector counters for the given targets inside

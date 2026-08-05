@@ -24,7 +24,7 @@ var varPattern = regexp.MustCompile(`\{\{\s*([a-z_]+)\s*\}\}`)
 //	target           worst-first primary target name (storm: first monitor group)
 //	targets          distinct target names, worst-first, comma-joined (storm: group names)
 //	agents           agent names for a connectivity event, comma-joined (storm: the observing agent)
-//	event/state/severity/scope/incident_id/storm_id/site_id/suspected_layer/url  raw Payload fields
+//	event/state/severity/scope/incident_id/storm_id/site_id/suspected_layer/attribution/url  raw Payload fields
 //	agent_count      number of distinct alerting agents
 //	at               incident time, RFC3339
 //
@@ -95,6 +95,7 @@ func buildVars(p Payload, lang string) map[string]string {
 		"storm_id":        p.StormID,
 		"site_id":         p.SiteID,
 		"suspected_layer": p.SuspectedLayer,
+		"attribution":     p.Attribution,
 		"url":             p.URL,
 		"agent_count":     strconv.Itoa(p.AgentCount),
 		"at":              p.At.Local().Format(time.RFC3339),

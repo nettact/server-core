@@ -24,16 +24,21 @@ import (
 // later renames, edits or deletions can never rewrite the scene. Agent-collected
 // scene evidence lands separately in incident_snapshot_entries.
 type SnapshotBase struct {
-	IncidentID     string       `json:"incident_id"`
-	SiteID         string       `json:"site_id"`
-	Group          baseGroup    `json:"group"`
-	Severity       string       `json:"severity"`
-	SuspectedLayer string       `json:"suspected_layer,omitempty"`
-	TriggeredAt    time.Time    `json:"triggered_at"` // incident opened_at
-	ReceivedAt     time.Time    `json:"received_at"`  // server base-write time
-	Members        []baseMember `json:"members"`
-	Agents         []baseAgent  `json:"agents"`
-	Targets        []baseTarget `json:"targets"`
+	IncidentID     string    `json:"incident_id"`
+	SiteID         string    `json:"site_id"`
+	Group          baseGroup `json:"group"`
+	Severity       string    `json:"severity"`
+	SuspectedLayer string    `json:"suspected_layer,omitempty"`
+	// Attribution is frozen like the rest of the base: the incident's one-line
+	// position at snapshot time, so a snapshot that outlives a later recompute
+	// still says what the evidence said when it was taken.
+	Attribution         string          `json:"attribution,omitempty"`
+	AttributionEvidence json.RawMessage `json:"attribution_evidence,omitempty"`
+	TriggeredAt         time.Time       `json:"triggered_at"` // incident opened_at
+	ReceivedAt          time.Time       `json:"received_at"`  // server base-write time
+	Members             []baseMember    `json:"members"`
+	Agents              []baseAgent     `json:"agents"`
+	Targets             []baseTarget    `json:"targets"`
 }
 
 type baseGroup struct {
@@ -132,11 +137,13 @@ func (s *Service) WriteIncidentBase(ctx context.Context, tx *sql.Tx, incidentID 
 // 'failed' when the incident row itself cannot be read.
 func (s *Service) buildBase(ctx context.Context, tx *sql.Tx, incidentID string, now time.Time) (SnapshotBase, string, error) {
 	base := SnapshotBase{IncidentID: incidentID, ReceivedAt: now}
-	var siteID, groupID, groupName, severity, suspected string
+	var siteID, groupID, groupName, severity, suspected, attribution, attrEv string
 	var openedAt time.Time
 	err := tx.QueryRowContext(ctx,
-		`SELECT site_id, group_id, COALESCE(group_name,''), severity, COALESCE(suspected_layer,''), opened_at
-		 FROM incidents WHERE id=?`, incidentID).Scan(&siteID, &groupID, &groupName, &severity, &suspected, &openedAt)
+		`SELECT site_id, group_id, COALESCE(group_name,''), severity, COALESCE(suspected_layer,''), opened_at,
+		        COALESCE(attribution,''), COALESCE(attribution_evidence,'[]')
+		 FROM incidents WHERE id=?`, incidentID).
+		Scan(&siteID, &groupID, &groupName, &severity, &suspected, &openedAt, &attribution, &attrEv)
 	if err != nil {
 		return base, statusFailed, err
 	}
@@ -144,6 +151,10 @@ func (s *Service) buildBase(ctx context.Context, tx *sql.Tx, incidentID string, 
 	base.Group = baseGroup{ID: groupID, Name: groupName}
 	base.Severity = severity
 	base.SuspectedLayer = suspected
+	base.Attribution = attribution
+	if attrEv != "" && attrEv != "[]" {
+		base.AttributionEvidence = json.RawMessage(attrEv)
+	}
 	base.TriggeredAt = openedAt
 
 	members, agentIDs, targetIDs, err := s.baseMembers(ctx, tx, incidentID)

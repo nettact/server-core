@@ -81,6 +81,24 @@ func (s *Service) EvaluateAgentTx(ctx context.Context, tx *sql.Tx, agentID, site
 		}
 		i = j
 	}
+	// INCIDENT-003: attribution reads the whole agent's state — the firing set
+	// AND the healthy-reference set (gateway and others). A batch that processes
+	// rounds changes that state even without a lifecycle transition (a reference
+	// entering an unconfirmed failing streak, or a round refreshing its
+	// freshness), so every open incident on the agent is recomputed together after
+	// every non-empty batch. An incident whose own members did not move can thus
+	// converge to a sibling confirm/resolve or a changed reference; changed
+	// incidents are surfaced as incident updates AND as target-status refreshes
+	// for their firing targets (their FaultRef attribution moved too, even though
+	// no round ran for them in this batch).
+	changedIncidents, changedTargets, err := recomputeAgentAttributions(ctx, tx, agentID)
+	if err != nil {
+		return nil, err
+	}
+	for _, id := range changedIncidents {
+		out.incidentUpdated = append(out.incidentUpdated, incidentEvent(id, siteID, "", "", false))
+	}
+	changed = append(changed, changedTargets...)
 	return &Outcome{out: out, siteID: siteID, ChangedTargetIDs: changed}, nil
 }
 
@@ -503,36 +521,30 @@ func findOrCreateIncident(ctx context.Context, tx *sql.Tx, openKey, siteID, grou
 	return id, true, "", nil
 }
 
-// recomputeIncident recomputes an incident's severity, suspected layer and
-// summary from its currently-firing members, returning the new severity.
+// recomputeIncident recomputes an incident's severity, suspected layer, summary
+// and attribution from its currently-firing members, returning the new severity.
+//
+// Attribution is read from the same tx as the members, so a batch that is still
+// being walked sees a mix of already-updated and not-yet-updated sibling detector
+// state (EvaluateAgentTx processes targets in (targetID, ts) order). That
+// ordering skew is advisory only — attribution is recomputed on every recompute
+// and converges on the next one.
 func recomputeIncident(ctx context.Context, tx *sql.Tx, incidentID string) (string, error) {
-	rows, err := tx.QueryContext(ctx,
-		`SELECT severity, COALESCE(layer,'') FROM fault_signals WHERE incident_id=? AND state='firing'`, incidentID)
+	members, err := loadMembers(ctx, tx, incidentID)
 	if err != nil {
 		return "", err
 	}
 	worst := SeverityWarn
 	layers := map[string]bool{}
-	any := false
-	for rows.Next() {
-		var sev, l string
-		if err := rows.Scan(&sev, &l); err != nil {
-			rows.Close()
-			return "", err
+	for _, m := range members {
+		if severityRank[m.severity] > severityRank[worst] {
+			worst = m.severity
 		}
-		any = true
-		if severityRank[sev] > severityRank[worst] {
-			worst = sev
-		}
-		if l != "" {
-			layers[l] = true
+		if m.layer != "" {
+			layers[m.layer] = true
 		}
 	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return "", err
-	}
-	if !any {
+	if len(members) == 0 {
 		return worst, nil
 	}
 	suspected := ""
@@ -546,8 +558,17 @@ func recomputeIncident(ctx context.Context, tx *sql.Tx, incidentID string) (stri
 	if err != nil {
 		return "", err
 	}
+	traces, err := loadTraceFacts(ctx, tx, incidentID)
+	if err != nil {
+		return "", err
+	}
+	loc, clues, err := computeAttribution(ctx, tx, members, traces)
+	if err != nil {
+		return "", err
+	}
 	_, err = tx.ExecContext(ctx,
-		`UPDATE incidents SET severity=?, suspected_layer=?, summary=? WHERE id=?`, worst, suspected, summary, incidentID)
+		`UPDATE incidents SET severity=?, suspected_layer=?, summary=?, attribution=?, attribution_evidence=? WHERE id=?`,
+		worst, suspected, summary, loc, marshalClues(clues), incidentID)
 	return worst, err
 }
 

@@ -192,6 +192,13 @@ type FaultRef struct {
 	Title       string    `json:"title"`
 	ObservedAt  time.Time `json:"observed_at"`
 	ConfirmedAt time.Time `json:"confirmed_at"`
+	// Attribution is the owning incident's one-line position ('' when none), so
+	// the per-agent fault panel can say "likely at the ISP line" without another
+	// incident lookup per row.
+	Attribution string `json:"attribution,omitempty"`
+	// AttributionEvidence is the raw typed JSON behind the attribution, passed
+	// through for the console's own rendering.
+	AttributionEvidence json.RawMessage `json:"attribution_evidence,omitempty"`
 }
 
 // Service reads the authoritative current status. It owns no persisted state.
@@ -249,8 +256,8 @@ type detState struct {
 
 // firingSignal is one (target, agent) confirmed fault.
 type firingSignal struct {
-	signalID, incidentID, severity, title string
-	observedAt, confirmedAt               time.Time
+	signalID, incidentID, severity, title, attribution, attrEv string
+	observedAt, confirmedAt                                    time.Time
 }
 
 // agentAgg is the per-agent classification fed to the target-level decision table.
@@ -573,6 +580,10 @@ func (s *Service) deriveAgent(t *targetRow, p applicablePair, now time.Time,
 		as.Fault = &FaultRef{
 			SignalID: sig.signalID, IncidentID: sig.incidentID, Severity: sig.severity,
 			Title: sig.title, ObservedAt: sig.observedAt, ConfirmedAt: sig.confirmedAt,
+			Attribution: sig.attribution,
+		}
+		if sig.attrEv != "" && sig.attrEv != "[]" {
+			as.Fault.AttributionEvidence = json.RawMessage(sig.attrEv)
 		}
 	} else if as.Confirm != nil {
 		as.FaultState = faultConfirming
@@ -864,10 +875,12 @@ func (s *Service) loadDetectorState(ctx context.Context, tx *sql.Tx, siteID stri
 // an offline Agent is its own fault, not every target's.
 func (s *Service) loadFiringSignals(ctx context.Context, tx *sql.Tx, siteID string) (map[string]firingSignal, error) {
 	rows, err := tx.QueryContext(ctx, `
-		SELECT target_id, agent_id, id, incident_id, severity, target_name, target_addr,
-		       target_port, probe_kind, detector_key, agent_name, observed_at, confirmed_at
-		FROM fault_signals
-		WHERE site_id=? AND state='firing' AND target_id <> ''`, siteID)
+		SELECT fs.target_id, fs.agent_id, fs.id, fs.incident_id, fs.severity, fs.target_name, fs.target_addr,
+		       fs.target_port, fs.probe_kind, fs.detector_key, fs.agent_name, fs.observed_at, fs.confirmed_at,
+		       COALESCE(i.attribution,''), COALESCE(i.attribution_evidence,'[]')
+		FROM fault_signals fs
+		JOIN incidents i ON i.id = fs.incident_id
+		WHERE fs.site_id=? AND fs.state='firing' AND fs.target_id <> ''`, siteID)
 	if err != nil {
 		return nil, err
 	}
@@ -876,9 +889,10 @@ func (s *Service) loadFiringSignals(ctx context.Context, tx *sql.Tx, siteID stri
 	for rows.Next() {
 		var targetID, agentID string
 		var sig fault.Signal
+		var f firingSignal
 		if err := rows.Scan(&targetID, &agentID, &sig.ID, &sig.IncidentID, &sig.Severity,
 			&sig.TargetName, &sig.TargetAddr, &sig.Port, &sig.ProbeKind, &sig.DetectorKey,
-			&sig.AgentName, &sig.ObservedAt, &sig.ConfirmedAt); err != nil {
+			&sig.AgentName, &sig.ObservedAt, &sig.ConfirmedAt, &f.attribution, &f.attrEv); err != nil {
 			return nil, err
 		}
 		out[targetID+"\x00"+agentID] = firingSignal{
@@ -886,6 +900,8 @@ func (s *Service) loadFiringSignals(ctx context.Context, tx *sql.Tx, siteID stri
 			title:       fault.SignalTitle(sig),
 			observedAt:  sig.ObservedAt.UTC(),
 			confirmedAt: sig.ConfirmedAt.UTC(),
+			attribution: f.attribution,
+			attrEv:      f.attrEv,
 		}
 	}
 	return out, rows.Err()

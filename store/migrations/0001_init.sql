@@ -829,6 +829,14 @@ CREATE TABLE incidents(
   open_key        TEXT NOT NULL,
   title           TEXT NOT NULL DEFAULT '',
   suspected_layer TEXT NOT NULL DEFAULT '',
+  -- INCIDENT-003: user-language fault position + typed evidence, computed by
+  -- recomputeIncident / the trace landing hook from firing members + same-agent
+  -- detector state + trace reached-points. '' = insufficient evidence (renderers
+  -- fall back to layer wording). Never a rendered sentence: attribution renders
+  -- per language at read/delivery time. Frozen once resolved (recompute only
+  -- runs while firing members exist).
+  attribution          TEXT NOT NULL DEFAULT '',   -- router|isp|dns|proxy|service|device
+  attribution_evidence TEXT NOT NULL DEFAULT '[]', -- JSON [{kind,count?,targets?,name?,reason_code?}]
   state           TEXT NOT NULL DEFAULT 'open' CHECK(state IN('open','resolved')),
   severity        TEXT NOT NULL DEFAULT 'warn',
   summary         TEXT NOT NULL DEFAULT '',

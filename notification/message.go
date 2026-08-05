@@ -195,6 +195,13 @@ func RenderScope(p Payload, lang string) string {
 		return "所有故障已恢复。"
 	}
 	layer := layerLabel(p.SuspectedLayer, lang)
+	// INCIDENT-003: when attribution is present, it is the most useful one-liner
+	// ("problem most likely at the router / ISP line / …") and outranks the
+	// engineering layer wording. The desktop system toast picks this up via
+	// sendNative unchanged.
+	if s := RenderAttribution(p, lang); s != "" {
+		return s
+	}
 	if p.Scope == "site" {
 		if en {
 			return fmt.Sprintf("Site-wide fault: %d nodes alerting, likely at the %s layer.", p.AgentCount, layer)

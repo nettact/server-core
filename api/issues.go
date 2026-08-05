@@ -149,8 +149,10 @@ func (d Deps) handleEvents(w http.ResponseWriter, r *http.Request) {
 				return // dropped by the broker (slow consumer)
 			}
 			switch ev.Name {
-			case sse.EventTargetStatusChanged, sse.EventAgentStatusChanged:
+			case sse.EventTargetStatusChanged, sse.EventAgentStatusChanged, sse.EventIncidentChanged:
 				// Precise payload written verbatim; the client coalesces a batch refresh.
+				// Incident events carry {"site_id","incident_id"} so the fault centre and
+				// an open incident drawer can refetch the specific incident.
 				_, _ = io.WriteString(w, "event: "+ev.Name+"\ndata: ")
 				_, _ = w.Write(ev.Data)
 				_, _ = io.WriteString(w, "\n\n")
