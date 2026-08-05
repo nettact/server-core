@@ -348,6 +348,97 @@ func TestNewReadsEnvBaseURL(t *testing.T) {
 	}
 }
 
+// A Docker deployment declares its Watchtower sidecar through these env vars,
+// which the compose file injects from .env. They must reach the console from the
+// moment the service exists — the update panel reads the baseline status before
+// the first catalog check lands.
+func TestNewReadsAutoUpdateEnv(t *testing.T) {
+	t.Setenv(EnvAutoUpdate, "1")
+	t.Setenv(EnvUpdateCron, "0 30 3 * * *")
+	s := New(Config{InstallType: InstallServer, CurrentVersion: "v1.0.0"})
+	st, ok := s.Status()
+	if !ok {
+		t.Fatal("Status ok = false")
+	}
+	if !st.AutoUpdate {
+		t.Error("AutoUpdate = false, want true")
+	}
+	if st.UpdateSchedule != "0 30 3 * * *" {
+		t.Errorf("UpdateSchedule = %q, want %q", st.UpdateSchedule, "0 30 3 * * *")
+	}
+}
+
+// An enabled sidecar with no cron baked still runs — on Watchtower's own 03:00
+// default — so the console must not read "no schedule" for it.
+func TestNewAutoUpdateWithoutCronReportsDefault(t *testing.T) {
+	t.Setenv(EnvAutoUpdate, "true")
+	t.Setenv(EnvUpdateCron, "")
+	s := New(Config{InstallType: InstallServer, CurrentVersion: "v1.0.0"})
+	st, _ := s.Status()
+	if !st.AutoUpdate {
+		t.Error("AutoUpdate = false, want true")
+	}
+	if st.UpdateSchedule != DefaultUpdateCron {
+		t.Errorf("UpdateSchedule = %q, want the default %q", st.UpdateSchedule, DefaultUpdateCron)
+	}
+}
+
+// A disabled sidecar must not report a schedule left over in .env from when it
+// was enabled — the schedule field belongs to an actually-running updater.
+func TestNewDisabledAutoUpdateSuppressesSchedule(t *testing.T) {
+	t.Setenv(EnvAutoUpdate, "false")
+	t.Setenv(EnvUpdateCron, "0 30 3 * * *")
+	s := New(Config{InstallType: InstallServer, CurrentVersion: "v1.0.0"})
+	st, _ := s.Status()
+	if st.AutoUpdate {
+		t.Error("AutoUpdate = true with NETTACT_AUTO_UPDATE=false")
+	}
+	if st.UpdateSchedule != "" {
+		t.Errorf("UpdateSchedule = %q, want empty when auto-update is off", st.UpdateSchedule)
+	}
+}
+
+// The sidecar can only exist in Docker standalone-server installs, so a desktop
+// or Store process that happens to inherit the env vars must not report one.
+func TestNewDesktopIgnoresAutoUpdateEnv(t *testing.T) {
+	t.Setenv(EnvAutoUpdate, "1")
+	t.Setenv(EnvUpdateCron, "0 30 3 * * *")
+	s := New(Config{InstallType: InstallDesktop, CurrentVersion: "v1.0.0"})
+	st, _ := s.Status()
+	if st.AutoUpdate {
+		t.Error("AutoUpdate = true on a desktop install")
+	}
+	if st.UpdateSchedule != "" {
+		t.Errorf("UpdateSchedule = %q, want empty on a desktop install", st.UpdateSchedule)
+	}
+}
+
+func TestNewDefaultsAutoUpdateOff(t *testing.T) {
+	t.Setenv(EnvAutoUpdate, "")
+	t.Setenv(EnvUpdateCron, "")
+	s := New(Config{InstallType: InstallServer, CurrentVersion: "v1.0.0"})
+	st, _ := s.Status()
+	if st.AutoUpdate {
+		t.Error("AutoUpdate = true with the env var unset")
+	}
+	if st.UpdateSchedule != "" {
+		t.Errorf("UpdateSchedule = %q, want empty", st.UpdateSchedule)
+	}
+}
+
+func TestEnvBool(t *testing.T) {
+	for _, v := range []string{"1", "true", "True", " TRUE "} {
+		if !envBool(v) {
+			t.Errorf("envBool(%q) = false, want true", v)
+		}
+	}
+	for _, v := range []string{"", "0", "false", "yes", "on", "garbage"} {
+		if envBool(v) {
+			t.Errorf("envBool(%q) = true, want false", v)
+		}
+	}
+}
+
 func TestCheckedAtUsesClockSeam(t *testing.T) {
 	srv := catalog(t, map[string]string{"server": "v1.0.0", "agent": "v1.0.0"})
 	want := time.Date(2026, 7, 31, 12, 0, 0, 0, time.UTC)
