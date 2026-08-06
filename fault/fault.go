@@ -42,7 +42,24 @@ const (
 	// signals carry no target (target_id ''), so they resolve their notification
 	// policy straight from the site default.
 	DetectorAgentConnectivity = "agent_connectivity"
+	// DetectorLatencyDegradation and DetectorLossDegradation are the ALERT-003
+	// quality detectors: the target still answers, but noticeably worse than it
+	// normally does at this time of day. They are separate keys — and therefore
+	// separate detector_state rows, separate signals and separate incidents — from
+	// availability because "slow" and "unreachable" are different claims with
+	// different remedies, and because the loss one can be silenced on its own when
+	// the operator has already stated a loss tolerance of their own.
+	DetectorLatencyDegradation = "latency_degradation"
+	DetectorLossDegradation    = "loss_degradation"
 )
+
+// IsDegradation reports whether a detector key belongs to the baseline-relative
+// quality family. Used wherever a caller has to distinguish "measurably worse"
+// from "not working", most importantly in the path-diagnostic trigger: a slow
+// target does not warrant a traceroute.
+func IsDegradation(detectorKey string) bool {
+	return detectorKey == DetectorLatencyDegradation || detectorKey == DetectorLossDegradation
+}
 
 // Resolve reasons stored on fault_signals.resolve_reason and mirrored onto the
 // incident. Only ReasonRecovered means the fault actually went away; every other
@@ -57,6 +74,12 @@ const (
 	ReasonAgentDeleted     = "agent_deleted"
 	ReasonMuted            = "muted"
 	ReasonDisabled         = "disabled"
+	// ReasonSuperseded ends a signal that a more fundamental fault took over.
+	// Today that is a quality degradation on a target whose availability detector
+	// has since confirmed an outage: "markedly slower than usual" is not a claim
+	// worth keeping open about a target that has stopped answering, and it is
+	// certainly not a recovery.
+	ReasonSuperseded = "superseded"
 )
 
 // IsRecovery reports whether a resolve reason represents a genuine recovery (the
@@ -100,15 +123,25 @@ func MostFundamentalLayer(layers []string) string {
 	return ""
 }
 
-// WorstSeverity returns the highest-ranked severity in the set, defaulting to
-// SeverityWarn for an empty or wholly unrecognized set (the same floor an
-// incident recomputes to).
+// WorstSeverity returns the highest-ranked severity in the set.
+//
+// The floor is SeverityWarn only when NOTHING in the set is recognizable
+// (including an empty set): unreadable data is announced rather than swallowed.
+// A set that is genuinely all-info stays info — that is what lets an incident or
+// a storm made only of quality degradations sit below the default notification
+// floor instead of being silently promoted into a notification nobody asked for.
 func WorstSeverity(severities []string) string {
-	worst := SeverityWarn
+	worst := ""
 	for _, sev := range severities {
-		if severityRank[sev] > severityRank[worst] {
+		if _, ok := severityRank[sev]; !ok {
+			continue
+		}
+		if worst == "" || severityRank[sev] > severityRank[worst] {
 			worst = sev
 		}
+	}
+	if worst == "" {
+		return SeverityWarn
 	}
 	return worst
 }
@@ -243,6 +276,20 @@ type Signal struct {
 	Threshold        float64 `json:"threshold"`
 	ReasonCode       int     `json:"reason_code"`
 	ReasonDetail     string  `json:"reason_detail"`
+	// BaselineP50/BaselineP95 are the target's own historical band for this
+	// metric and time of day, as it stood at confirmation. Only the degradation
+	// detectors set them (both 0 elsewhere), and only they make the claim legible:
+	// "180ms" is not evidence of anything until it sits next to "usually about
+	// 40ms at this hour". Frozen rather than recomputed on read, because by the
+	// time anybody reads it the rolling baseline has begun absorbing the very
+	// degradation it is meant to explain.
+	//
+	// Deliberately NOT omitempty: a clean target's packet-loss baseline is
+	// legitimately 0/0, and that is the most common loss degradation there is.
+	// Omitting it would make "usually 0% loss" indistinguishable from "no baseline
+	// evidence at all" — the one distinction a reader of this field needs.
+	BaselineP50 float64 `json:"baseline_p50"`
+	BaselineP95 float64 `json:"baseline_p95"`
 	// The endpoint the failing probe actually talked to, frozen alongside the rest
 	// of the evidence. A DNS monitor dials a resolver, a NAT monitor a STUN server,
 	// a pinned monitor its proxy — none of which is TargetAddr — so this is what a
@@ -282,6 +329,11 @@ type SignalEvent struct {
 	AgentID    string
 	TargetID   string
 	Severity   string
+	// DetectorKey lets a consumer act on what KIND of verdict this was without
+	// re-reading the row. The path diagnostic needs it: a degradation signal must
+	// not spend an Agent's traceroute budget on a target that is answering fine,
+	// just slowly.
+	DetectorKey string
 	// Reason is set only on TopicFaultResolved.
 	Reason string
 }

@@ -873,6 +873,15 @@ func (s *Service) loadDetectorState(ctx context.Context, tx *sql.Tx, siteID stri
 // loadFiringSignals returns the site's confirmed target faults, keyed
 // (target, agent). Agent-connectivity signals carry no target and are excluded:
 // an offline Agent is its own fault, not every target's.
+//
+// One (target, agent) pair can now have more than one firing signal — the
+// partial unique index is per DETECTOR, and a target can carry a latency and a
+// packet-loss degradation at once. This map holds one, so which one it holds
+// must be decided rather than left to row order: an arbitrary pick would let the
+// console report an info "slower than usual" for a target whose availability
+// fault is the thing the operator needs to see. Most severe wins; among equals
+// the one that has been firing longest, then by id so the answer is stable
+// across refreshes.
 func (s *Service) loadFiringSignals(ctx context.Context, tx *sql.Tx, siteID string) (map[string]firingSignal, error) {
 	rows, err := tx.QueryContext(ctx, `
 		SELECT fs.target_id, fs.agent_id, fs.id, fs.incident_id, fs.severity, fs.target_name, fs.target_addr,
@@ -880,7 +889,10 @@ func (s *Service) loadFiringSignals(ctx context.Context, tx *sql.Tx, siteID stri
 		       COALESCE(i.attribution,''), COALESCE(i.attribution_evidence,'[]')
 		FROM fault_signals fs
 		JOIN incidents i ON i.id = fs.incident_id
-		WHERE fs.site_id=? AND fs.state='firing' AND fs.target_id <> ''`, siteID)
+		WHERE fs.site_id=? AND fs.state='firing' AND fs.target_id <> ''
+		ORDER BY CASE fs.severity
+		           WHEN 'critical' THEN 0 WHEN 'error' THEN 1 WHEN 'warn' THEN 2 ELSE 3 END,
+		         fs.confirmed_at ASC, fs.id ASC`, siteID)
 	if err != nil {
 		return nil, err
 	}
@@ -895,7 +907,11 @@ func (s *Service) loadFiringSignals(ctx context.Context, tx *sql.Tx, siteID stri
 			&sig.AgentName, &sig.ObservedAt, &sig.ConfirmedAt, &f.attribution, &f.attrEv); err != nil {
 			return nil, err
 		}
-		out[targetID+"\x00"+agentID] = firingSignal{
+		key := targetID + "\x00" + agentID
+		if _, taken := out[key]; taken {
+			continue // the ORDER BY already put the winner first
+		}
+		out[key] = firingSignal{
 			signalID: sig.ID, incidentID: sig.IncidentID, severity: sig.Severity,
 			title:       fault.SignalTitle(sig),
 			observedAt:  sig.ObservedAt.UTC(),

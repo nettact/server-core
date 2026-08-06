@@ -7,8 +7,19 @@ import (
 
 	pcfg "github.com/nettact/protocol/config"
 	"github.com/nettact/protocol/telemetry"
+	"github.com/nettact/server-core/baseline"
 	"github.com/nettact/server-core/metrics"
 )
+
+// baselineKinds is FoldKinds as a set, for the per-metric test BuildRounds runs
+// on every sample of every batch.
+var baselineKinds = func() map[string]bool {
+	m := make(map[string]bool, len(baseline.FoldKinds))
+	for _, k := range baseline.FoldKinds {
+		m[k] = true
+	}
+	return m
+}()
 
 // timeFromUnix rebuilds a round's timestamp in UTC. Sample timestamps are stored
 // as integer Unix seconds, so this round-trips exactly.
@@ -24,6 +35,16 @@ const (
 	ProfileCustom   = "custom"
 )
 
+// Smart (baseline-relative) sensitivity levels for the ALERT-003 degradation
+// detectors. Unlike the availability profiles these are never expressed to the
+// user as numbers: the multipliers and round counts below are an implementation
+// detail of "宽松 / 标准 / 敏感".
+const (
+	SmartLoose     = "loose"
+	SmartStandard  = "standard"
+	SmartSensitive = "sensitive"
+)
+
 // DetectionSettings is one target's built-in detector sensitivity. A target with
 // no stored row uses DefaultDetection, so the zero-config path needs no rows at
 // all.
@@ -35,18 +56,31 @@ type DetectionSettings struct {
 	// counts as a failure. 100 (the default) means "only total loss is a fault";
 	// a lower value turns sustained partial loss into one.
 	ICMPLossPct float64 `json:"icmp_loss_pct"`
+	// SmartEnabled turns on the baseline-relative degradation detectors, which
+	// judge a round against the target's own history instead of a fixed threshold.
+	// On by default for every profile, including "stable": their findings are
+	// recorded at info severity, which is below the default notification floor, so
+	// leaving them on costs a user who chose "stable" precisely nothing in noise.
+	SmartEnabled bool `json:"smart_enabled"`
+	// SmartSensitivity is how far outside its own baseline a target has to go, and
+	// for how long, before a degradation is claimed: loose | standard | sensitive.
+	SmartSensitivity string `json:"smart_sensitivity"`
 	// Revision advances on every edit. The detector's stored counters are pinned to
 	// the revision they accumulated under, so a sensitivity change restarts counting
-	// instead of applying a new threshold to an old streak.
+	// instead of applying a new threshold to an old streak. Shared by every detector
+	// on the target: an operator retuning sensitivity means "start over", not "start
+	// over for one of the two".
 	Revision int `json:"revision"`
 }
 
 // DefaultDetection is the balanced profile every target gets for free: confirm
 // after 3 consecutive failing rounds, recover after 2 consecutive succeeding
-// rounds, and treat only 100% ICMP loss as unreachable.
+// rounds, treat only 100% ICMP loss as unreachable, and watch for quality
+// degradation against the target's own history at standard sensitivity.
 func DefaultDetection() DetectionSettings {
 	return DetectionSettings{
-		Profile: ProfileBalanced, FailRounds: 3, RecoverRounds: 2, ICMPLossPct: 100, Revision: 1,
+		Profile: ProfileBalanced, FailRounds: 3, RecoverRounds: 2, ICMPLossPct: 100,
+		SmartEnabled: true, SmartSensitivity: SmartStandard, Revision: 1,
 	}
 }
 
@@ -63,6 +97,11 @@ func (d DetectionSettings) Normalize() DetectionSettings {
 	}
 	if !(d.ICMPLossPct > 0) || d.ICMPLossPct > 100 || math.IsNaN(d.ICMPLossPct) {
 		d.ICMPLossPct = def.ICMPLossPct
+	}
+	switch d.SmartSensitivity {
+	case SmartLoose, SmartStandard, SmartSensitive:
+	default:
+		d.SmartSensitivity = def.SmartSensitivity
 	}
 	if d.Revision < 1 {
 		d.Revision = 1
@@ -198,7 +237,129 @@ type Round struct {
 	ResolverProtocol string
 	StunAddr         string
 	StunTransport    string
+	// Latencies carries this round's quality metrics (RTT, jitter, loss percentage,
+	// connect/resolve time) keyed by metric kind, taken from the same (monitor,
+	// timestamp) group as the availability verdict above. It exists so the
+	// degradation detectors can judge the same round the availability detector
+	// judged, without a second pass over the batch and without any chance of the
+	// two disagreeing about which round they are looking at.
+	//
+	// Nil for a batch that carried no quality metrics. Never consulted by the
+	// availability path.
+	Latencies map[string]float64
+	// Baselines is the historical band for each judged metric, for THIS round's
+	// own daypart bucket. Filled by ingest before it opens the write transaction;
+	// an absent kind means the target is still learning and nothing is judged.
+	//
+	// The bucket is chosen from the round's timestamp, not from the wall clock, so
+	// a WAL replay of yesterday evening's rounds is measured against yesterday
+	// evening's normal.
+	Baselines map[string]baseline.Band
 }
+
+// DegradationDetectorKey names the detector that judges a metric kind against a
+// baseline, or "" for a kind no degradation detector owns. The two keys are
+// separate detectors rather than one because they answer different questions and
+// a user can silence one of them (see SmartLossSilenced) without losing the other.
+func DegradationDetectorKey(metricKind string) string {
+	switch metricKind {
+	case string(telemetry.ICMPLoss):
+		return DetectorLossDegradation
+	case string(telemetry.ICMPRTTms), string(telemetry.HTTPLat),
+		string(telemetry.TCPConnectMs), string(telemetry.DNSResolve):
+		return DetectorLatencyDegradation
+	}
+	return ""
+}
+
+// SmartLossSilenced reports whether the smart loss detector must stay quiet for a
+// target.
+//
+// A user who moved ICMPLossPct off its default has stated their tolerance for
+// packet loss in the plainest way the product offers. Reporting "loss is higher
+// than usual" at 15% to somebody who explicitly said "tell me at 30%" is arguing
+// with them about a number they already answered. Latency degradation is
+// unaffected: they set a loss threshold, not a latency one.
+func SmartLossSilenced(det DetectionSettings) bool { return det.ICMPLossPct != 100 }
+
+// degMultiplier is how far past the baseline p95 a value must go, per sensitivity.
+func degMultiplier(sensitivity string) float64 {
+	switch sensitivity {
+	case SmartLoose:
+		return 2.0
+	case SmartSensitive:
+		return 1.25
+	}
+	return 1.5
+}
+
+// degFloor is the ABSOLUTE minimum distance above the baseline p50 that a value
+// must also clear, in the metric's own unit (ms for latency, percentage points
+// for loss).
+//
+// Without it the multiplier alone would make a 1ms LAN target report a
+// degradation at 2ms — technically "double its usual", and completely worthless
+// as a statement about somebody's network. The floor is what makes the claim
+// "noticeably slower", not merely "proportionally slower".
+func degFloor(sensitivity, metricKind string) float64 {
+	loss := metricKind == string(telemetry.ICMPLoss)
+	switch sensitivity {
+	case SmartLoose:
+		if loss {
+			return 20
+		}
+		return 30
+	case SmartSensitive:
+		if loss {
+			return 5
+		}
+		return 8
+	}
+	if loss {
+		return 10
+	}
+	return 15
+}
+
+// DegradationThreshold is the value a round must reach to count as degraded:
+// past the usual worst case (p95 × multiplier) AND far enough above the usual
+// typical case (p50 + floor) to be worth a sentence.
+//
+// Taking the max of the two rather than either alone is what makes one formula
+// work across three orders of magnitude of "normal". On a jittery target the p95
+// arm dominates and absorbs its ordinary spread; on a metronomic one the p50 arm
+// dominates and stops a trivial absolute change from looking dramatic.
+//
+// A target whose baseline loss is already very high can produce a threshold above
+// 100, which simply never fires. That is the right answer: "more loss than usual"
+// tells nobody anything about a link that is usually mostly loss, and the
+// availability detector already owns that target.
+func DegradationThreshold(b baseline.Band, sensitivity, metricKind string) float64 {
+	return math.Max(b.P95*degMultiplier(sensitivity), b.P50+degFloor(sensitivity, metricKind))
+}
+
+// DegradationFailRounds is how many consecutive degraded rounds confirm, per
+// sensitivity.
+//
+// Deliberately slower than the availability detector's 2..5. Availability claims
+// an event ("it stopped answering"); degradation claims a trend ("it has been
+// worse than usual for a while"), and a trend asserted from three samples is a
+// guess. The recovery count is fixed rather than tuned: how eager somebody is to
+// hear about a problem says nothing about how long it should take to believe the
+// problem ended.
+func DegradationFailRounds(sensitivity string) int {
+	switch sensitivity {
+	case SmartLoose:
+		return 10
+	case SmartSensitive:
+		return 4
+	}
+	return 6
+}
+
+// DegradationRecoverRounds is how many consecutive in-band rounds clear a
+// degradation.
+const DegradationRecoverRounds = 5
 
 // SuccessMetricKind maps a probe kind to the metric whose value decides whether
 // a round succeeded. This is the single definition shared by the fault engine,
@@ -251,6 +412,12 @@ func comparatorFor(probeKind string) string {
 	}
 	return "lt"
 }
+
+// ComparatorGteBaseline marks evidence whose threshold was DERIVED from the
+// target's own history rather than configured. The console renders it as a
+// sentence ("well above its usual level") instead of as a symbol, because "≥
+// 67.5" is not a number any user chose or would recognise.
+const ComparatorGteBaseline = "gte_baseline"
 
 // thresholdFor returns the numeric failure threshold used for a probe kind.
 func thresholdFor(probeKind string, det DetectionSettings) float64 {
@@ -313,6 +480,10 @@ func BuildRounds(ms []telemetry.Metric, meta map[string]TargetMeta) []Round {
 		resolverProtocol string
 		stunAddr         string
 		stunTransport    string
+		// This cycle's quality metrics, for the degradation detectors. Collected
+		// alongside the verdict rather than in a second pass so both detectors provably
+		// judge the same round.
+		latencies map[string]float64
 	}
 	acc := map[roundKey]*roundAcc{}
 	for i := range ms {
@@ -330,7 +501,10 @@ func BuildRounds(ms []telemetry.Metric, meta map[string]TargetMeta) []Round {
 		}
 		reason, hasReason := reasonMetricKind(tm.Kind)
 		kind := string(m.Kind)
-		if kind != primary && !(hasReason && kind == reason) {
+		isPrimary := kind == primary
+		isReason := hasReason && kind == reason
+		isQuality := baselineKinds[kind]
+		if !isPrimary && !isReason && !isQuality {
 			continue
 		}
 		k := roundKey{targetID: m.MonitorID, ts: m.TS.Unix()}
@@ -339,7 +513,15 @@ func BuildRounds(ms []telemetry.Metric, meta map[string]TargetMeta) []Round {
 			a = &roundAcc{}
 			acc[k] = a
 		}
-		if kind == primary {
+		// A quality metric can also BE the primary one (ICMP loss is both), so this
+		// records first and the primary/reason branches below still run for it.
+		if isQuality && !math.IsNaN(m.Value) && !math.IsInf(m.Value, 0) {
+			if a.latencies == nil {
+				a.latencies = map[string]float64{}
+			}
+			a.latencies[kind] = m.Value
+		}
+		if isPrimary {
 			a.hasPrimary = true
 			a.value = m.Value
 			a.layer = string(m.Layer)
@@ -347,6 +529,9 @@ func BuildRounds(ms []telemetry.Metric, meta map[string]TargetMeta) []Round {
 			a.stunAddr = m.Labels[telemetry.NATServerLabel]
 			a.stunTransport = m.Labels[telemetry.NATTransportLabel]
 			continue
+		}
+		if !isReason {
+			continue // quality-only sample: recorded above, nothing else to do
 		}
 		a.hasReason = true
 		a.reasonCode = int(m.Value)
@@ -371,6 +556,7 @@ func BuildRounds(ms []telemetry.Metric, meta map[string]TargetMeta) []Round {
 			Value: a.value, Threshold: thresholdFor(tm.Kind, tm.Det),
 			ConfigSerial: a.configSerial, Layer: a.layer, Det: tm.Det, Meta: tm,
 			StunAddr: a.stunAddr, StunTransport: a.stunTransport,
+			Latencies: a.latencies,
 		}
 		if r.Layer == "" {
 			r.Layer = builtinLayer(tm.Kind)

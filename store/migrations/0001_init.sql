@@ -342,14 +342,22 @@ CREATE TABLE monitor_status(
 
 -- Per-target detection sensitivity (how many consecutive rounds confirm a fault
 -- and how many clear it). revision is frozen onto each signal it produces.
+--
+-- The smart_* columns tune the ALERT-003 degradation detectors, which judge a
+-- round against the target's OWN history rather than against a fixed threshold.
+-- They share `revision` with the availability columns on purpose: one revision
+-- invalidates every detector's streak consistently, and an operator editing
+-- sensitivity means "start over", not "start over for one of the two".
 CREATE TABLE probe_detection_settings(
-  target_id      TEXT PRIMARY KEY REFERENCES probe_tasks(id) ON DELETE CASCADE,
-  profile        TEXT NOT NULL DEFAULT 'balanced' CHECK(profile IN('balanced','fast','stable','custom')),
-  fail_rounds    INTEGER NOT NULL DEFAULT 3 CHECK(fail_rounds BETWEEN 1 AND 20),
-  recover_rounds INTEGER NOT NULL DEFAULT 2 CHECK(recover_rounds BETWEEN 1 AND 20),
-  icmp_loss_pct  REAL NOT NULL DEFAULT 100 CHECK(icmp_loss_pct > 0 AND icmp_loss_pct <= 100),
-  revision       INTEGER NOT NULL DEFAULT 1,
-  updated_at     TIMESTAMP NOT NULL
+  target_id         TEXT PRIMARY KEY REFERENCES probe_tasks(id) ON DELETE CASCADE,
+  profile           TEXT NOT NULL DEFAULT 'balanced' CHECK(profile IN('balanced','fast','stable','custom')),
+  fail_rounds       INTEGER NOT NULL DEFAULT 3 CHECK(fail_rounds BETWEEN 1 AND 20),
+  recover_rounds    INTEGER NOT NULL DEFAULT 2 CHECK(recover_rounds BETWEEN 1 AND 20),
+  icmp_loss_pct     REAL NOT NULL DEFAULT 100 CHECK(icmp_loss_pct > 0 AND icmp_loss_pct <= 100),
+  smart_enabled     INTEGER NOT NULL DEFAULT 1,
+  smart_sensitivity TEXT NOT NULL DEFAULT 'standard' CHECK(smart_sensitivity IN('loose','standard','sensitive')),
+  revision          INTEGER NOT NULL DEFAULT 1,
+  updated_at        TIMESTAMP NOT NULL
 );
 
 -- ===== time series =====
@@ -414,6 +422,59 @@ CREATE TABLE rollup_state(
   series_id  INTEGER NOT NULL,
   last_ts    INTEGER NOT NULL, -- exclusive upper bound of the last materialized bucket
   PRIMARY KEY(resolution, series_id)
+) WITHOUT ROWID;
+
+-- ===== historical baselines (ALERT-003) =====
+--
+-- What "normal" looks like for one target on one Agent, per time-of-day bucket.
+-- The degradation detectors compare a live round against this instead of against
+-- a fixed threshold, because a 20ms LAN target reaching 100ms is an incident
+-- while a 300ms transcontinental target reaching 350ms is a Tuesday.
+--
+-- Percentiles cannot come from the rollup tiers: those store (cnt, total, vmin,
+-- vmax), and a percentile of bucket averages is not a percentile of
+-- observations. They cannot come from a long raw scan either — raw retention is
+-- two days. So an hourly job folds the raw tier into one row per calendar day
+-- per daypart, and the 14-day band is an aggregate over at most 14 of these
+-- rows. Quantiles are not incrementally updatable, so a fold recomputes each
+-- touched day-bucket whole from raw; the hourly cadence keeps that well inside
+-- raw retention.
+--
+-- Dayparts are SERVER-LOCAL. There is no timezone concept anywhere in the
+-- product, and the two deployment shapes (a desktop app, a self-hosted box in
+-- the household it monitors) both sit in the user's own timezone — where "晚高峰
+-- vs 凌晨" is the whole point of splitting the day at all. A server that changes
+-- timezone shifts the boundaries once and the rolling window reconverges.
+--
+-- config_serial is part of the row rather than a filter afterthought: a material
+-- target edit starts a fresh series generation, reads demand the current serial,
+-- and the previous generation's rows simply age out. That IS the baseline
+-- invalidation mechanism — no separate clear-on-edit path exists or is needed.
+CREATE TABLE baseline_daily(
+  target_id     TEXT NOT NULL REFERENCES probe_tasks(id) ON DELETE CASCADE,
+  agent_id      TEXT NOT NULL,
+  metric_kind   TEXT NOT NULL,
+  day           INTEGER NOT NULL,  -- server-local calendar day as yyyymmdd
+  daypart       INTEGER NOT NULL,  -- 0: 00-06, 1: 06-12, 2: 12-18, 3: 18-24 local
+  weekend       INTEGER NOT NULL,  -- 0/1, derived from `day` (Sat/Sun)
+  config_serial INTEGER NOT NULL,
+  cnt           INTEGER NOT NULL,  -- raw samples behind this row's quantiles
+  p50           REAL NOT NULL,
+  p95           REAL NOT NULL,
+  updated_at    TIMESTAMP NOT NULL,
+  PRIMARY KEY(target_id, agent_id, metric_kind, day, daypart)
+) WITHOUT ROWID;
+CREATE INDEX idx_baseline_daily_day ON baseline_daily(day);
+
+-- Fold watermark, one row per series (the same shape and job as rollup_state):
+-- the newest raw sample timestamp already folded. Samples arriving BEHIND it —
+-- a WAL replay after the fold passed — are not re-folded. That is deliberate:
+-- late data is overwhelmingly outage-period data, which robust statistics want
+-- to discount anyway, and rewinding for it would buy nothing a median across
+-- days does not already provide.
+CREATE TABLE baseline_state(
+  series_id INTEGER PRIMARY KEY,
+  last_ts   INTEGER NOT NULL
 ) WITHOUT ROWID;
 
 CREATE TABLE events(
@@ -868,7 +929,7 @@ CREATE TABLE fault_signals(
   site_id           TEXT NOT NULL,
   agent_id          TEXT NOT NULL,
   target_id         TEXT NOT NULL DEFAULT '',
-  detector_key      TEXT NOT NULL,                      -- availability | agent_connectivity
+  detector_key      TEXT NOT NULL,                      -- availability | agent_connectivity | latency_degradation | loss_degradation
   probe_kind        TEXT NOT NULL DEFAULT '',
   group_id          TEXT NOT NULL DEFAULT '',
   group_name        TEXT NOT NULL DEFAULT '',
@@ -888,6 +949,14 @@ CREATE TABLE fault_signals(
   threshold         REAL NOT NULL DEFAULT 0,
   reason_code       INTEGER NOT NULL DEFAULT 0,         -- classified cause (telemetry.ProbeReason*)
   reason_detail     TEXT NOT NULL DEFAULT '',           -- which cert/status/OS error was behind it
+  -- ALERT-003: the historical band this round was judged against, frozen like
+  -- everything else. A degradation claim is only readable next to what "usual"
+  -- was at the time ("now 180ms, usually about 40ms"), and recomputing the
+  -- baseline at read time would answer with a band that has since absorbed the
+  -- very degradation it is supposed to explain. Both 0 for the availability and
+  -- agent-connectivity detectors, which judge against a fixed threshold.
+  baseline_p50      REAL NOT NULL DEFAULT 0,
+  baseline_p95      REAL NOT NULL DEFAULT 0,
   -- Frozen DIAGNOSIS SUBJECT: the endpoint the failing probe actually talked to,
   -- which is not always the monitored one. A DNS monitor dials a resolver, a
   -- proxied monitor dials its proxy, a tunnelled one dials a WireGuard peer — so

@@ -60,7 +60,7 @@ func newTestEnv(t *testing.T) *testEnv {
 	hostLive := hostlive.New()
 	hub := New(Deps{
 		Registry: reg,
-		Ingest:   ingest.New(db, bus, metrics.New(db), nil),
+		Ingest:   ingest.New(db, bus, metrics.New(db), nil, nil),
 		Config:   cfg,
 		HostLive: hostLive,
 		OpIssue:  opissue.New(db, bus),

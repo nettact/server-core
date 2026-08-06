@@ -26,7 +26,7 @@ func openGameIngest(t *testing.T) (*store.DB, *Service) {
 		 VALUES('agent_game','site_default',x'00','h','online','["game.process.detect","game.performance.read"]')`); err != nil {
 		t.Fatalf("seed agent: %v", err)
 	}
-	return db, New(db, nil, metrics.New(db), nil)
+	return db, New(db, nil, metrics.New(db), nil, nil)
 }
 
 // gamePacket carries one run and two of its seconds, addressed by sequence.

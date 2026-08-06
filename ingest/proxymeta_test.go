@@ -37,7 +37,7 @@ func TestProbeMetaCarriesTheEgressIdentity(t *testing.T) {
 	exec(`INSERT INTO probe_tasks(id,site_id,group_id,kind,name,target,params,enabled,config_serial)
 	      VALUES('t_direct','site_a','mg','icmp','Direct','192.168.1.1','{}',1,1)`)
 
-	svc := New(db, nil, nil, nil)
+	svc := New(db, nil, nil, nil, nil)
 	meta, err := svc.probeMeta(ctx, db.Read(), "agent_a", "site_a", []string{"t_socks", "t_wg", "t_direct"})
 	if err != nil {
 		t.Fatalf("probeMeta: %v", err)

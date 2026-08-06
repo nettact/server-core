@@ -708,6 +708,14 @@ func (s *Service) OnSignalConfirmed(ctx context.Context, ev fault.SignalEvent) e
 	if !s.diagEnabled(ctx) {
 		return nil
 	}
+	// A quality degradation is not a reachability fault. Its target is answering —
+	// just more slowly, or with more loss, than it usually does — so a traceroute
+	// would spend an Agent's diagnostic budget measuring a path that works. The
+	// eligibility test below is by metric-kind PREFIX, and probe.icmp.rtt_ms passes
+	// it, so this has to be an explicit exclusion rather than a happy accident.
+	if fault.IsDegradation(ev.DetectorKey) {
+		return nil
+	}
 	var evd traceEvidence
 	var metricKind string
 	err := s.db.Read().QueryRowContext(ctx,

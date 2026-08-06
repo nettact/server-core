@@ -37,6 +37,22 @@ func SignalTitleLang(s Signal, lang string) string {
 			return fmt.Sprintf("Agent %q is offline", agent)
 		}
 		return fmt.Sprintf("Agent「%s」已离线", agent)
+	// The degradation wording is careful in the opposite direction from the fault
+	// wording above: where a fault must not overclaim ("unreachable", not
+	// "offline"), a degradation must not UNDERclaim its own uncertainty. It says
+	// "higher than usual" — a comparison against this target's own history, which
+	// is exactly what was measured — rather than "the network is congested", which
+	// would be a cause the product did not observe.
+	case DetectorLatencyDegradation:
+		if en {
+			return fmt.Sprintf("%q is markedly slower than usual", name)
+		}
+		return fmt.Sprintf("「%s」延迟明显高于平时", name)
+	case DetectorLossDegradation:
+		if en {
+			return fmt.Sprintf("%q is losing more packets than usual", name)
+		}
+		return fmt.Sprintf("「%s」丢包明显高于平时", name)
 	}
 	if en {
 		return signalTitleEn(s, name)
@@ -93,6 +109,17 @@ func signalTitleEn(s Signal, name string) string {
 		return "The probe failed"
 	}
 	return fmt.Sprintf("The probe for %q failed", name)
+}
+
+// DegradationGroupTitle names a merged degradation incident. A merged
+// availability incident is titled with the bare group name, which would be
+// indistinguishable here: an operator looking at "客厅设备" twice in the incident
+// list, one meaning unreachable and one meaning slow, learns nothing from either.
+func DegradationGroupTitle(groupName, lang string) string {
+	if lang == "en" {
+		return fmt.Sprintf("Network quality in %q has degraded", groupName)
+	}
+	return fmt.Sprintf("「%s」网络质量下降", groupName)
 }
 
 // TargetPortSuffix renders ":port" for a TCP-style target whose address does not

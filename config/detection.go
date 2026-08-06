@@ -41,16 +41,20 @@ func (s *Service) GetDetectionSettings(ctx context.Context, targetID string) (De
 	}
 	var updated sql.NullTime
 	var d fault.DetectionSettings
+	var smartEnabled int
 	err := s.db.Read().QueryRowContext(ctx, `
-		SELECT profile, fail_rounds, recover_rounds, icmp_loss_pct, revision, updated_at
+		SELECT profile, fail_rounds, recover_rounds, icmp_loss_pct,
+		       smart_enabled, smart_sensitivity, revision, updated_at
 		FROM probe_detection_settings WHERE target_id=?`, targetID).
-		Scan(&d.Profile, &d.FailRounds, &d.RecoverRounds, &d.ICMPLossPct, &d.Revision, &updated)
+		Scan(&d.Profile, &d.FailRounds, &d.RecoverRounds, &d.ICMPLossPct,
+			&smartEnabled, &d.SmartSensitivity, &d.Revision, &updated)
 	if errors.Is(err, sql.ErrNoRows) {
 		return out, nil
 	}
 	if err != nil {
 		return DetectionSettings{}, err
 	}
+	d.SmartEnabled = smartEnabled == 1
 	out.DetectionSettings = d.Normalize()
 	if updated.Valid {
 		t := updated.Time.UTC()
@@ -76,6 +80,11 @@ func (s *Service) UpdateDetectionSettings(ctx context.Context, targetID string, 
 	if !(in.ICMPLossPct > 0) || in.ICMPLossPct > 100 {
 		return DetectionSettings{}, fmt.Errorf("icmp_loss_pct must be greater than 0 and at most 100")
 	}
+	switch in.SmartSensitivity {
+	case fault.SmartLoose, fault.SmartStandard, fault.SmartSensitive:
+	default:
+		return DetectionSettings{}, fmt.Errorf("smart_sensitivity must be one of loose, standard, sensitive")
+	}
 	in = in.Normalize()
 
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -99,14 +108,21 @@ func (s *Service) UpdateDetectionSettings(ctx context.Context, targetID string, 
 	}
 
 	now := time.Now().UTC()
+	smartEnabled := 0
+	if in.SmartEnabled {
+		smartEnabled = 1
+	}
 	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO probe_detection_settings(target_id, profile, fail_rounds, recover_rounds, icmp_loss_pct, revision, updated_at)
-		VALUES(?,?,?,?,?,1,?)
+		INSERT INTO probe_detection_settings(target_id, profile, fail_rounds, recover_rounds, icmp_loss_pct,
+		    smart_enabled, smart_sensitivity, revision, updated_at)
+		VALUES(?,?,?,?,?,?,?,1,?)
 		ON CONFLICT(target_id) DO UPDATE SET
 		  profile=excluded.profile, fail_rounds=excluded.fail_rounds,
 		  recover_rounds=excluded.recover_rounds, icmp_loss_pct=excluded.icmp_loss_pct,
+		  smart_enabled=excluded.smart_enabled, smart_sensitivity=excluded.smart_sensitivity,
 		  revision=probe_detection_settings.revision+1, updated_at=excluded.updated_at`,
-		targetID, in.Profile, in.FailRounds, in.RecoverRounds, in.ICMPLossPct, now); err != nil {
+		targetID, in.Profile, in.FailRounds, in.RecoverRounds, in.ICMPLossPct,
+		smartEnabled, in.SmartSensitivity, now); err != nil {
 		return DetectionSettings{}, err
 	}
 

@@ -32,6 +32,7 @@ import (
 	"github.com/nettact/server-core/agentstatus"
 	"github.com/nettact/server-core/agentws"
 	"github.com/nettact/server-core/audit"
+	"github.com/nettact/server-core/baseline"
 	"github.com/nettact/server-core/cleanup"
 	"github.com/nettact/server-core/config"
 	"github.com/nettact/server-core/eventbus"
@@ -63,6 +64,7 @@ type Deps struct {
 	Identity          *identity.Service
 	Registry          *registry.Service
 	Metrics           *metrics.Store
+	Baseline          *baseline.Service // per-target historical latency/loss bands (ALERT-003)
 	Cleanup           *cleanup.Service
 	Config            *config.Service
 	Site              *site.Service
@@ -257,6 +259,7 @@ func Router(d Deps) http.Handler {
 			// Built-in detector sensitivity, per target.
 			r.Get("/targets/{id}/detection-settings", d.handleGetDetectionSettings)
 			r.Patch("/targets/{id}/detection-settings", d.handleUpdateDetectionSettings)
+			r.Get("/targets/{id}/baseline", d.handleGetTargetBaseline)
 			// Notification policies decide whether/when/where a recorded fault is
 			// announced. Exactly one applies per incident: group > site for a probe
 			// fault, agent > site for an Agent-offline one.
@@ -2117,8 +2120,11 @@ func (d Deps) handleAgentConnectivityNotificationPolicy(w http.ResponseWriter, r
 
 // handleGetDetectionSettings returns a target's detector sensitivity, falling
 // back to the balanced defaults for a target that was never tuned. There is no
-// "off" here by design: fault recording is a product guarantee, so the only
-// choices are how quickly it confirms and, for ICMP, how much loss counts.
+// "off" here for availability by design: fault recording is a product guarantee,
+// so the only choices are how quickly it confirms and, for ICMP, how much loss
+// counts. The smart_* fields DO have an off switch, because unlike availability
+// they make a claim about a target's usual behaviour rather than about whether it
+// works, and somebody may reasonably not want that claim made.
 func (d Deps) handleGetDetectionSettings(w http.ResponseWriter, r *http.Request) {
 	ds, err := d.Config.GetDetectionSettings(r.Context(), chi.URLParam(r, "id"))
 	if errors.Is(err, sql.ErrNoRows) {
@@ -2137,10 +2143,12 @@ func (d Deps) handleGetDetectionSettings(w http.ResponseWriter, r *http.Request)
 // could not tell "recover_rounds: 0" from "recover_rounds not sent", and would
 // silently rewrite a field the caller never mentioned.
 type detectionPatch struct {
-	Profile       *string  `json:"profile"`
-	FailRounds    *int     `json:"fail_rounds"`
-	RecoverRounds *int     `json:"recover_rounds"`
-	ICMPLossPct   *float64 `json:"icmp_loss_pct"`
+	Profile          *string  `json:"profile"`
+	FailRounds       *int     `json:"fail_rounds"`
+	RecoverRounds    *int     `json:"recover_rounds"`
+	ICMPLossPct      *float64 `json:"icmp_loss_pct"`
+	SmartEnabled     *bool    `json:"smart_enabled"`
+	SmartSensitivity *string  `json:"smart_sensitivity"`
 }
 
 func (d Deps) handleUpdateDetectionSettings(w http.ResponseWriter, r *http.Request) {
@@ -2172,6 +2180,12 @@ func (d Deps) handleUpdateDetectionSettings(w http.ResponseWriter, r *http.Reque
 	if patch.ICMPLossPct != nil {
 		body.ICMPLossPct = *patch.ICMPLossPct
 	}
+	if patch.SmartEnabled != nil {
+		body.SmartEnabled = *patch.SmartEnabled
+	}
+	if patch.SmartSensitivity != nil {
+		body.SmartSensitivity = *patch.SmartSensitivity
+	}
 	ds, err := d.Config.UpdateDetectionSettings(r.Context(), id, body)
 	if errors.Is(err, sql.ErrNoRows) {
 		writeError(w, http.StatusNotFound, "target not found")
@@ -2183,6 +2197,34 @@ func (d Deps) handleUpdateDetectionSettings(w http.ResponseWriter, r *http.Reque
 	}
 	d.Audit.Log(r.Context(), "admin", "detection_settings.update", id, ds.Profile)
 	writeJSON(w, http.StatusOK, ds)
+}
+
+// handleGetTargetBaseline serves one target's learned baseline as seen from one
+// agent: a band per time-of-day class, or a "still learning" answer.
+//
+// Per-agent rather than aggregated across agents, because the same target probed
+// from two vantage points genuinely has two normals, and averaging them would
+// produce a reference neither agent has ever measured.
+func (d Deps) handleGetTargetBaseline(w http.ResponseWriter, r *http.Request) {
+	if d.Baseline == nil {
+		writeError(w, http.StatusNotFound, "baselines unavailable")
+		return
+	}
+	agentID := r.URL.Query().Get("agent_id")
+	if agentID == "" {
+		writeError(w, http.StatusBadRequest, "agent_id is required")
+		return
+	}
+	view, err := d.Baseline.TargetBaseline(r.Context(), chi.URLParam(r, "id"), agentID, r.URL.Query().Get("metric"))
+	if errors.Is(err, sql.ErrNoRows) {
+		writeError(w, http.StatusNotFound, "target not found")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, view)
 }
 
 // ---- availability ----

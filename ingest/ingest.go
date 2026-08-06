@@ -21,6 +21,7 @@ import (
 	"github.com/nettact/protocol"
 	pcfg "github.com/nettact/protocol/config"
 	"github.com/nettact/protocol/telemetry"
+	"github.com/nettact/server-core/baseline"
 	"github.com/nettact/server-core/config"
 	"github.com/nettact/server-core/eventbus"
 	"github.com/nettact/server-core/fault"
@@ -46,11 +47,22 @@ type Evaluator interface {
 	PublishOutcome(ctx context.Context, out *fault.Outcome)
 }
 
+// Baseliner is the historical-baseline surface ingest consults BEFORE opening its
+// write transaction, so a degradation detector judges each round against the
+// target's own history without the single SQLite writer ever waiting on that
+// lookup. Satisfied by *baseline.Service; nil-safe — with no baseliner the
+// degradation detectors simply never receive a band and judge nothing, which is
+// the same state every target is in for its first few days anyway.
+type Baseliner interface {
+	Bands(ctx context.Context, agentID string, reqs map[baseline.BandKey]int) (map[baseline.BandKey]baseline.Band, error)
+}
+
 type Service struct {
-	db      *store.DB
-	bus     *eventbus.Bus
-	metrics *metrics.Store
-	fault   Evaluator // nil-safe: telemetry then commits without inline evaluation
+	db       *store.DB
+	bus      *eventbus.Bus
+	metrics  *metrics.Store
+	fault    Evaluator // nil-safe: telemetry then commits without inline evaluation
+	baseline Baseliner // nil-safe: degradation detection is then never fed
 
 	// Per-agent highest-sequence watermark, cached so the hot ingest path does
 	// not re-run MAX(sequence) on every packet. Loaded from the DB on first
@@ -59,8 +71,8 @@ type Service struct {
 	highSeq map[string]uint64
 }
 
-func New(db *store.DB, bus *eventbus.Bus, m *metrics.Store, ev Evaluator) *Service {
-	return &Service{db: db, bus: bus, metrics: m, fault: ev, highSeq: make(map[string]uint64)}
+func New(db *store.DB, bus *eventbus.Bus, m *metrics.Store, ev Evaluator, bl Baseliner) *Service {
+	return &Service{db: db, bus: bus, metrics: m, fault: ev, baseline: bl, highSeq: make(map[string]uint64)}
 }
 
 // Ingest stores one telemetry packet idempotently and returns the ack watermark.
@@ -79,6 +91,7 @@ func (s *Service) Ingest(ctx context.Context, agentID, siteID string, pkt teleme
 	// always pass. The authoritative re-check runs inside the write tx below.
 	var accepted []telemetry.Metric
 	var stored []telemetry.Metric
+	var bands map[baseline.BandKey]baseline.Band
 	if len(pkt.Metrics) > 0 {
 		meta, err := s.probeMeta(ctx, s.db.Read(), agentID, siteID, monitorIDs(pkt.Metrics))
 		if err != nil {
@@ -91,7 +104,19 @@ func (s *Service) Ingest(ctx context.Context, agentID, siteID string, pkt teleme
 		}
 		// The derived availability samples are stored alongside the reported ones, so
 		// one EnsureSeries call covers both and their series exist before the tx opens.
-		stored = append(accepted, fault.AvailabilitySamples(fault.BuildRounds(accepted, meta))...)
+		preRounds := fault.BuildRounds(accepted, meta)
+		stored = append(accepted, fault.AvailabilitySamples(preRounds)...)
+		// Historical baselines for the degradation detectors, resolved here for the
+		// same reason series ids are: the write connection is single, and nothing that
+		// can be answered from the read pool should be answered while holding it. The
+		// in-tx re-check can only SHRINK the round set (a target that left scope or
+		// advanced its generation), never grow it, so these keys are a superset of what
+		// the transaction will ask for.
+		if s.baseline != nil {
+			if bands, err = s.baseline.Bands(ctx, agentID, bandRequests(preRounds)); err != nil {
+				return Ack{}, err
+			}
+		}
 	}
 
 	// Resolve series ids before opening the tx (SQLite is single-connection).
@@ -138,6 +163,7 @@ func (s *Service) Ingest(ctx context.Context, agentID, siteID string, pkt teleme
 			}
 			acceptedTx, _ = filterByGeneration(accepted, meta)
 			rounds = fault.BuildRounds(acceptedTx, meta)
+			attachBaselines(rounds, bands)
 			storedTx = append(acceptedTx, fault.AvailabilitySamples(rounds)...)
 		}
 		if err := s.metrics.InsertSamples(ctx, tx, agentID, seriesIDs, storedTx); err != nil {
@@ -299,7 +325,8 @@ func (s *Service) probeMeta(ctx context.Context, q rowQuerier, agentID, siteID s
 		SELECT pt.id, pt.kind, pt.group_id, COALESCE(pt.name,''), COALESCE(pt.target,''),
 		       COALESCE(pt.params,''), pt.enabled, pt.config_serial,
 		       COALESCE(ds.fail_rounds, ?), COALESCE(ds.recover_rounds, ?),
-		       COALESCE(ds.icmp_loss_pct, ?), COALESCE(ds.revision, 1),
+		       COALESCE(ds.icmp_loss_pct, ?), COALESCE(ds.smart_enabled, ?),
+		       COALESCE(ds.smart_sensitivity, ?), COALESCE(ds.revision, 1),
 		       ms.source, ms.target_config_serial, ms.effective_interval_seconds,
 		       ms.cycle_deadline_ms, ms.upload_interval_seconds,
 		       COALESCE(pt.proxy_id,''), COALESCE(px.type,''), COALESCE(px.host,''),
@@ -310,8 +337,13 @@ func (s *Service) probeMeta(ctx context.Context, q rowQuerier, agentID, siteID s
 		LEFT JOIN proxies px ON px.id = pt.proxy_id
 		WHERE pt.site_id = ? AND ` + config.AgentScopePredicate + `
 		  AND pt.id IN (` + placeholders(len(ids)) + `)`
-	args := make([]any, 0, len(ids)+6)
-	args = append(args, def.FailRounds, def.RecoverRounds, def.ICMPLossPct, agentID, siteID, agentID)
+	args := make([]any, 0, len(ids)+8)
+	defSmart := 0
+	if def.SmartEnabled {
+		defSmart = 1
+	}
+	args = append(args, def.FailRounds, def.RecoverRounds, def.ICMPLossPct, defSmart, def.SmartSensitivity,
+		agentID, siteID, agentID)
 	for _, id := range ids {
 		args = append(args, id)
 	}
@@ -323,18 +355,20 @@ func (s *Service) probeMeta(ctx context.Context, q rowQuerier, agentID, siteID s
 	for rows.Next() {
 		var m fault.TargetMeta
 		var params string
-		var enabled int
+		var enabled, smartEnabled int
 		var sched reportedSchedule
 		var proxyHost, wgEndpoint string
 		var proxyPort int
 		if err := rows.Scan(&m.ID, &m.Kind, &m.GroupID, &m.Name, &m.Addr, &params, &enabled, &m.ConfigSerial,
-			&m.Det.FailRounds, &m.Det.RecoverRounds, &m.Det.ICMPLossPct, &m.Det.Revision,
+			&m.Det.FailRounds, &m.Det.RecoverRounds, &m.Det.ICMPLossPct, &smartEnabled,
+			&m.Det.SmartSensitivity, &m.Det.Revision,
 			&sched.source, &sched.configSerial, &sched.intervalSeconds,
 			&sched.cycleDeadlineMs, &sched.uploadSeconds,
 			&m.ProxyID, &m.ProxyType, &proxyHost, &proxyPort, &wgEndpoint, &m.ProxyConfigSerial); err != nil {
 			return nil, err
 		}
 		m.Enabled = enabled == 1
+		m.Det.SmartEnabled = smartEnabled == 1
 		m.Port = portFromParams(params)
 		m.ProxyAddr = proxyAddr(m.ProxyType, proxyHost, proxyPort, wgEndpoint)
 		m.MaxRoundGap = roundGap(m.Kind, params, sched, m.ConfigSerial)
