@@ -28,6 +28,18 @@ func TestTheBaselineCreatesTheWholeSchema(t *testing.T) {
 		t.Error("agents has no perm_unsupported_reasons")
 	}
 
+	// AGENT-006 reinstall tokens: the optional agent binding + revoke flag ride on
+	// enrollment_tokens, and their absence silently breaks the reinstall flow.
+	tokens := columnNames(t, db.DB, "enrollment_tokens")
+	for _, col := range []string{"agent_id", "revoked"} {
+		if !tokens[col] {
+			t.Errorf("enrollment_tokens has no %s", col)
+		}
+	}
+	if !indexNames(t, db.DB, "enrollment_tokens")["idx_enrollment_tokens_agent"] {
+		t.Error("enrollment_tokens has no idx_enrollment_tokens_agent")
+	}
+
 	// The machine-level readings live in their own table, keyed by (agent,
 	// second), and must NOT also be in game_buckets. Two sources for one fact is
 	// the exact outcome the move existed to prevent, and it is what a squash that
@@ -120,6 +132,7 @@ func TestReopeningAnExistingDatabaseChangesNothing(t *testing.T) {
 	if err := db2.QueryRow(`SELECT COUNT(*) FROM schema_migrations`).Scan(&versions); err != nil {
 		t.Fatalf("count migrations: %v", err)
 	}
+	// One squashed baseline — schema additions are edited into 0001, never a chain.
 	if versions != 1 {
 		t.Errorf("schema_migrations has %d rows, want 1 for the squashed baseline", versions)
 	}

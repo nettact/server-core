@@ -1,6 +1,7 @@
 package registry
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"database/sql"
@@ -448,5 +449,406 @@ func TestStatusHistoryReturnsOnlyNewestTwentyEvents(t *testing.T) {
 	}
 	if want := base.Add(5 * time.Minute); !history[len(history)-1].ChangedAt.Equal(want) {
 		t.Errorf("oldest returned event = %v, want %v", history[len(history)-1].ChangedAt, want)
+	}
+}
+
+// enrollReq builds a signed EnrollRequest for the given keypair. The nonce is
+// fixed per call site (Enroll verifies the signature, never the nonce value), so
+// a helper with a single nonce is enough — the point is to vary the KEY.
+func enrollReq(priv ed25519.PrivateKey, pub ed25519.PublicKey, token, hostname string, perms permission.PermissionReport) enroll.EnrollRequest {
+	const nonce = "nonce-1"
+	return enroll.EnrollRequest{
+		SchemaVersion:   protocol.SchemaVersion,
+		PublicKey:       pub,
+		Nonce:           nonce,
+		Signature:       ed25519.Sign(priv, []byte(nonce)),
+		EnrollmentToken: token,
+		Hostname:        hostname,
+		Platform:        "windows",
+		AgentVersion:    "0.1.0",
+		Permissions:     perms,
+	}
+}
+
+// TestReinstallTokenRejoinsSameAgent: AGENT-006. A reinstall token redeemed
+// against an existing agent rejoins that SAME agents row — fresh bearer token and
+// public key, same agent_id — so metrics/incident/status history is inherited and
+// no "old offline + new online" pair is produced.
+func TestReinstallTokenRejoinsSameAgent(t *testing.T) {
+	db := storetest.Open(t)
+	ctx := context.Background()
+	mustExec(t, db, `INSERT INTO sites(id,name,created_at,config_serial) VALUES('site_default','def',?,3)`, time.Now().UTC())
+	reg := New(db, 0, nil)
+	// Reenrollment must notify ingest to drop its in-memory sequence watermark
+	// (the fresh WAL restarts at sequence 1) and fence the old session first; a
+	// plain first enrollment must do neither.
+	var resetCalls, disconnectCalls int
+	reg.ResetSeqWatermark = func(context.Context, string) { resetCalls++ }
+	reg.DisconnectSession = func(context.Context, string) { disconnectCalls++ }
+
+	// First enrollment, machine A.
+	siteToken, err := reg.CreateEnrollmentToken(ctx, "site_default", "first", time.Hour)
+	if err != nil {
+		t.Fatalf("CreateEnrollmentToken: %v", err)
+	}
+	pubA, privA, _ := ed25519.GenerateKey(nil)
+	resp1, err := reg.Enroll(ctx, enrollReq(privA, pubA, siteToken, "host-a", permission.PermissionReport{
+		Supported: []string{"probe.dns"}, Granted: []string{"probe.dns"}, Effective: []string{"probe.dns"},
+		Source: "environment",
+	}))
+	if err != nil {
+		t.Fatalf("Enroll: %v", err)
+	}
+	if resetCalls != 0 {
+		t.Fatalf("first enrollment reset the watermark %d times, want 0", resetCalls)
+	}
+	if disconnectCalls != 0 {
+		t.Fatalf("first enrollment disconnected %d sessions, want 0", disconnectCalls)
+	}
+	agentID := resp1.AgentID
+	var siteBefore, createdAt string
+	if err := db.QueryRowContext(ctx, `SELECT site_id, created_at FROM agents WHERE id=?`, agentID).Scan(&siteBefore, &createdAt); err != nil {
+		t.Fatalf("snapshot agent: %v", err)
+	}
+	// The old installation left telemetry behind: an agent_packets row is the
+	// (agent_id, sequence) dedup watermark that must NOT carry across a reinstall
+	// (the fresh WAL starts again at sequence 1), and an agent_wifi row carries a
+	// SECOND sequence guard that would reject the fresh snapshots until the new
+	// WAL out-paces the old one. Also flip the agent offline, the state the
+	// reinstall target is in.
+	mustExec(t, db, `INSERT INTO agent_packets(agent_id, sequence, received_at, sent_at) VALUES(?,1,?,NULL)`, agentID, time.Now().UTC())
+	mustExec(t, db, `INSERT INTO agent_wifi(agent_id, state, sampled_at, last_sequence) VALUES(?,'ok',?,999)`, agentID, time.Now().UTC())
+	mustExec(t, db, `UPDATE agents SET status='offline' WHERE id=?`, agentID)
+
+	// Mint a reinstall token bound to this agent and redeem it as a fresh machine
+	// (a NEW ed25519 key — this is the "key lost with the old disk" scenario).
+	reToken, err := reg.CreateReinstallToken(ctx, agentID, time.Hour)
+	if err != nil {
+		t.Fatalf("CreateReinstallToken: %v", err)
+	}
+	pubB, privB, _ := ed25519.GenerateKey(nil)
+	resp2, err := reg.Enroll(ctx, enrollReq(privB, pubB, reToken, "host-b", permission.PermissionReport{
+		Supported: []string{"probe.tcp"}, Granted: []string{"probe.tcp"}, Effective: []string{"probe.tcp"},
+		Source: "file",
+	}))
+	if err != nil {
+		t.Fatalf("reinstall Enroll: %v", err)
+	}
+	if resp2.AgentID != agentID {
+		t.Fatalf("reinstall agent_id = %q, want %q", resp2.AgentID, agentID)
+	}
+	if resetCalls != 1 {
+		t.Errorf("reinstall reset the watermark %d times, want 1", resetCalls)
+	}
+	if disconnectCalls != 1 {
+		t.Errorf("reinstall disconnected %d sessions, want 1", disconnectCalls)
+	}
+
+	// Still exactly one agent row: the reinstall re-bound it, it did not add one.
+	var n int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM agents`).Scan(&n); err != nil || n != 1 {
+		t.Fatalf("agent rows = %d (err %v), want 1", n, err)
+	}
+
+	// The row was updated in place: new public key, operator/site provenance kept.
+	var pubNow []byte
+	var siteAfter, createdAtAfter string
+	if err := db.QueryRowContext(ctx, `SELECT public_key, site_id, created_at FROM agents WHERE id=?`, agentID).Scan(&pubNow, &siteAfter, &createdAtAfter); err != nil {
+		t.Fatalf("read agent: %v", err)
+	}
+	if !bytes.Equal(pubNow, pubB) {
+		t.Errorf("public_key = %x, want the new machine's %x", pubNow, pubB)
+	}
+	if siteAfter != siteBefore {
+		t.Errorf("site_id moved from %q to %q on reinstall", siteBefore, siteAfter)
+	}
+	if createdAtAfter != createdAt {
+		t.Errorf("created_at moved from %q to %q on reinstall", createdAt, createdAtAfter)
+	}
+
+	// The freshly issued bearer token authenticates; the old one no longer does.
+	if _, _, err := reg.AuthenticateAgent(ctx, resp2.AgentToken); err != nil {
+		t.Errorf("new bearer token rejected: %v", err)
+	}
+	if _, _, err := reg.AuthenticateAgent(ctx, resp1.AgentToken); err == nil {
+		t.Errorf("old bearer token still authenticates after reinstall")
+	}
+
+	// The reinstall token was consumed. The reinstall itself records NO online
+	// transition — the agent stays offline until its new session connects, so the
+	// liveness event fires then (TouchLastSeen).
+	var used sql.NullTime
+	if err := db.QueryRowContext(ctx, `SELECT used_at FROM enrollment_tokens WHERE token_hash=?`, sha256hex(reToken)).Scan(&used); err != nil {
+		t.Fatalf("read reinstall token: %v", err)
+	}
+	if !used.Valid {
+		t.Errorf("reinstall token not consumed")
+	}
+	// The dedup watermark is gone: the fresh WAL's sequence 1 will be accepted.
+	var packets int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM agent_packets WHERE agent_id=?`, agentID).Scan(&packets); err != nil {
+		t.Fatalf("count packets: %v", err)
+	}
+	if packets != 0 {
+		t.Errorf("agent_packets has %d rows after reinstall, want 0", packets)
+	}
+	// The interface-snapshot sequence guard is gone with it, so the first fresh
+	// snapshot is no longer rejected as older than the previous installation's.
+	var wifi int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM agent_wifi WHERE agent_id=?`, agentID).Scan(&wifi); err != nil {
+		t.Fatalf("count wifi: %v", err)
+	}
+	if wifi != 0 {
+		t.Errorf("agent_wifi has %d rows after reinstall, want 0", wifi)
+	}
+	// Still offline (no pre-connect liveness claim).
+	var statusAfter string
+	if err := db.QueryRowContext(ctx, `SELECT status FROM agents WHERE id=?`, agentID).Scan(&statusAfter); err != nil {
+		t.Fatalf("read status: %v", err)
+	}
+	if statusAfter != "offline" {
+		t.Errorf("status after reinstall = %q, want offline until the session connects", statusAfter)
+	}
+	var joins int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM agent_status_history WHERE agent_id=? AND status='online'`, agentID).Scan(&joins); err != nil {
+		t.Fatalf("count history: %v", err)
+	}
+	if joins != 1 {
+		t.Errorf("online history rows = %d, want 1 (first enroll only; reinstall defers to the session)", joins)
+	}
+
+	// The new session's Hello flips the agent online through the normal path.
+	if err := reg.TouchLastSeen(ctx, agentID); err != nil {
+		t.Fatalf("TouchLastSeen: %v", err)
+	}
+	var statusLive string
+	if err := db.QueryRowContext(ctx, `SELECT status FROM agents WHERE id=?`, agentID).Scan(&statusLive); err != nil {
+		t.Fatalf("read status: %v", err)
+	}
+	if statusLive != "online" {
+		t.Errorf("status after TouchLastSeen = %q, want online", statusLive)
+	}
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM agent_status_history WHERE agent_id=? AND status='online'`, agentID).Scan(&joins); err != nil {
+		t.Fatalf("count history: %v", err)
+	}
+	if joins != 2 {
+		t.Errorf("online history rows after reconnect = %d, want 2", joins)
+	}
+
+	// The permission mirror reflects the NEW machine's report, not the old one.
+	a, err := reg.Get(ctx, agentID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if len(a.Supported) != 1 || a.Supported[0] != "probe.tcp" {
+		t.Errorf("supported = %v, want the new machine's [probe.tcp]", a.Supported)
+	}
+}
+
+// TestReinstallTokenCascadeOnDelete: the reinstall token references its agent with
+// ON DELETE CASCADE, so hard-deleting the agent removes the token with it — a
+// stale token then reads as a plain invalid token rather than stranding a
+// reference to nothing.
+func TestReinstallTokenCascadeOnDelete(t *testing.T) {
+	db := storetest.Open(t)
+	ctx := context.Background()
+	mustExec(t, db, `INSERT INTO sites(id,name,created_at) VALUES('site_default','def',?)`, time.Now().UTC())
+	reg := New(db, 0, nil)
+
+	pub, priv, _ := ed25519.GenerateKey(nil)
+	siteToken, err := reg.CreateEnrollmentToken(ctx, "site_default", "first", time.Hour)
+	if err != nil {
+		t.Fatalf("CreateEnrollmentToken: %v", err)
+	}
+	resp, err := reg.Enroll(ctx, enrollReq(priv, pub, siteToken, "host", permission.PermissionReport{}))
+	if err != nil {
+		t.Fatalf("Enroll: %v", err)
+	}
+	reToken, err := reg.CreateReinstallToken(ctx, resp.AgentID, time.Hour)
+	if err != nil {
+		t.Fatalf("CreateReinstallToken: %v", err)
+	}
+
+	if err := reg.DeleteAgent(ctx, resp.AgentID); err != nil {
+		t.Fatalf("DeleteAgent: %v", err)
+	}
+	var left int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM enrollment_tokens WHERE agent_id=?`, resp.AgentID).Scan(&left); err != nil {
+		t.Fatalf("count reinstall tokens: %v", err)
+	}
+	if left != 0 {
+		t.Fatalf("delete left %d reinstall tokens behind", left)
+	}
+
+	// The stale token is now indistinguishable from a bogus one.
+	pub2, priv2, _ := ed25519.GenerateKey(nil)
+	if _, err := reg.Enroll(ctx, enrollReq(priv2, pub2, reToken, "host2", permission.PermissionReport{})); !errors.Is(err, ErrEnrollToken) {
+		t.Fatalf("Enroll after delete = %v, want ErrEnrollToken", err)
+	}
+}
+
+// TestReinstallTokenRejectedForRevokedAgent: the reenroll guard refuses a
+// soft-revoked (revoked=1) agent too. That state is not produced by the console
+// yet (only hard delete exists), but the token can reference such an agent and
+// the guard must not silently bind a revoked row.
+func TestReinstallTokenRejectedForRevokedAgent(t *testing.T) {
+	db := storetest.Open(t)
+	ctx := context.Background()
+	mustExec(t, db, `INSERT INTO sites(id,name,created_at) VALUES('site_default','def',?)`, time.Now().UTC())
+	mustExec(t, db,
+		`INSERT INTO agents(id,site_id,public_key,token_hash,status,revoked) VALUES('agent_r','site_default',x'00','h','offline',1)`)
+	reg := New(db, 0, nil)
+
+	// CreateReinstallToken itself demands a live agent, so the token is written by
+	// hand — it references a row that exists but is revoked.
+	token := "reinstall-token-handwritten"
+	mustExec(t, db,
+		`INSERT INTO enrollment_tokens(token_hash,site_id,note,expires_at,agent_id)
+		 VALUES(?,'site_default','reinstall:agent_r',?,'agent_r')`,
+		sha256hex(token), time.Now().UTC().Add(time.Hour))
+
+	pub, priv, _ := ed25519.GenerateKey(nil)
+	if _, err := reg.Enroll(ctx, enrollReq(priv, pub, token, "host", permission.PermissionReport{})); !errors.Is(err, ErrReinstallAgent) {
+		t.Fatalf("Enroll for revoked agent = %v, want ErrReinstallAgent", err)
+	}
+	// The failure rolled back with the transaction, so the token stays unused.
+	var used sql.NullTime
+	if err := db.QueryRowContext(ctx, `SELECT used_at FROM enrollment_tokens WHERE token_hash=?`, sha256hex(token)).Scan(&used); err != nil {
+		t.Fatalf("read reinstall token: %v", err)
+	}
+	if used.Valid {
+		t.Errorf("token consumed despite its agent being revoked")
+	}
+}
+
+// TestReinstallTokenRevoked: a revoked token is rejected at enrollment, and
+// revoking an unknown or already-used token is a 404-shaped sql.ErrNoRows.
+func TestReinstallTokenRevoked(t *testing.T) {
+	db := storetest.Open(t)
+	ctx := context.Background()
+	mustExec(t, db, `INSERT INTO sites(id,name,created_at) VALUES('site_default','def',?)`, time.Now().UTC())
+	reg := New(db, 0, nil)
+
+	pub, priv, _ := ed25519.GenerateKey(nil)
+	siteToken, err := reg.CreateEnrollmentToken(ctx, "site_default", "first", time.Hour)
+	if err != nil {
+		t.Fatalf("CreateEnrollmentToken: %v", err)
+	}
+	// Enroll with the site token (consuming it), then revoke it: used tokens are
+	// no-ops for revoke.
+	resp, err := reg.Enroll(ctx, enrollReq(priv, pub, siteToken, "host", permission.PermissionReport{}))
+	if err != nil {
+		t.Fatalf("Enroll: %v", err)
+	}
+	if err := reg.RevokeEnrollmentToken(ctx, sha256hex(siteToken)); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("revoking a used token = %v, want sql.ErrNoRows", err)
+	}
+	if err := reg.RevokeEnrollmentToken(ctx, "deadbeef"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("revoking an unknown token = %v, want sql.ErrNoRows", err)
+	}
+
+	// An unused token revokes cleanly, then enrollment rejects it.
+	reToken, err := reg.CreateReinstallToken(ctx, resp.AgentID, time.Hour)
+	if err != nil {
+		t.Fatalf("CreateReinstallToken: %v", err)
+	}
+	if err := reg.RevokeEnrollmentToken(ctx, sha256hex(reToken)); err != nil {
+		t.Fatalf("revoke: %v", err)
+	}
+	pub2, priv2, _ := ed25519.GenerateKey(nil)
+	if _, err := reg.Enroll(ctx, enrollReq(priv2, pub2, reToken, "host2", permission.PermissionReport{})); !errors.Is(err, ErrEnrollToken) {
+		t.Fatalf("Enroll with revoked token = %v, want ErrEnrollToken", err)
+	}
+}
+
+// TestReinstallSkipsQuota: a reinstall reuses an existing row, so it must NOT be
+// blocked by a full agent quota the way a fresh enrollment would.
+func TestReinstallSkipsQuota(t *testing.T) {
+	db := storetest.Open(t)
+	ctx := context.Background()
+	mustExec(t, db, `INSERT INTO sites(id,name,created_at) VALUES('site_default','def',?)`, time.Now().UTC())
+	reg := New(db, 1, nil)
+
+	pub, priv, _ := ed25519.GenerateKey(nil)
+	siteToken, err := reg.CreateEnrollmentToken(ctx, "site_default", "first", time.Hour)
+	if err != nil {
+		t.Fatalf("CreateEnrollmentToken: %v", err)
+	}
+	resp, err := reg.Enroll(ctx, enrollReq(priv, pub, siteToken, "host", permission.PermissionReport{}))
+	if err != nil {
+		t.Fatalf("Enroll: %v", err)
+	}
+
+	// Quota is now full (maxAgents=1). A fresh enroll would 403; the reinstall
+	// must sail through because it adds no row.
+	pub2, priv2, _ := ed25519.GenerateKey(nil)
+	siteToken2, _ := reg.CreateEnrollmentToken(ctx, "site_default", "second", time.Hour)
+	if _, err := reg.Enroll(ctx, enrollReq(priv2, pub2, siteToken2, "host2", permission.PermissionReport{})); !errors.Is(err, ErrQuota) {
+		t.Fatalf("fresh enroll at quota = %v, want ErrQuota", err)
+	}
+
+	reToken, err := reg.CreateReinstallToken(ctx, resp.AgentID, time.Hour)
+	if err != nil {
+		t.Fatalf("CreateReinstallToken: %v", err)
+	}
+	pub3, priv3, _ := ed25519.GenerateKey(nil)
+	re, err := reg.Enroll(ctx, enrollReq(priv3, pub3, reToken, "host3", permission.PermissionReport{}))
+	if err != nil {
+		t.Fatalf("reinstall at quota = %v, want success", err)
+	}
+	if re.AgentID != resp.AgentID {
+		t.Fatalf("reinstall agent_id = %q, want %q", re.AgentID, resp.AgentID)
+	}
+}
+
+// TestReinstallTokenSupersedesEarlierOnes: minting a reinstall token revokes the
+// agent's other unused reinstall tokens, so a console that opened the dialog
+// several times cannot leave a pile of valid credentials for one identity — an
+// earlier exposed one could otherwise rebind the agent after a fresh token was
+// handed out.
+func TestReinstallTokenSupersedesEarlierOnes(t *testing.T) {
+	db := storetest.Open(t)
+	ctx := context.Background()
+	mustExec(t, db, `INSERT INTO sites(id,name,created_at) VALUES('site_default','def',?)`, time.Now().UTC())
+	reg := New(db, 0, nil)
+
+	pub, priv, _ := ed25519.GenerateKey(nil)
+	siteToken, err := reg.CreateEnrollmentToken(ctx, "site_default", "first", time.Hour)
+	if err != nil {
+		t.Fatalf("CreateEnrollmentToken: %v", err)
+	}
+	resp, err := reg.Enroll(ctx, enrollReq(priv, pub, siteToken, "host", permission.PermissionReport{}))
+	if err != nil {
+		t.Fatalf("Enroll: %v", err)
+	}
+
+	first, err := reg.CreateReinstallToken(ctx, resp.AgentID, time.Hour)
+	if err != nil {
+		t.Fatalf("first CreateReinstallToken: %v", err)
+	}
+	second, err := reg.CreateReinstallToken(ctx, resp.AgentID, time.Hour)
+	if err != nil {
+		t.Fatalf("second CreateReinstallToken: %v", err)
+	}
+
+	var revoked int
+	if err := db.QueryRowContext(ctx, `SELECT revoked FROM enrollment_tokens WHERE token_hash=?`, sha256hex(first)).Scan(&revoked); err != nil {
+		t.Fatalf("read first token: %v", err)
+	}
+	if revoked == 0 {
+		t.Errorf("first reinstall token still usable after a fresh mint")
+	}
+
+	pub2, priv2, _ := ed25519.GenerateKey(nil)
+	if _, err := reg.Enroll(ctx, enrollReq(priv2, pub2, first, "host2", permission.PermissionReport{})); !errors.Is(err, ErrEnrollToken) {
+		t.Fatalf("Enroll with superseded token = %v, want ErrEnrollToken", err)
+	}
+	pub3, priv3, _ := ed25519.GenerateKey(nil)
+	re, err := reg.Enroll(ctx, enrollReq(priv3, pub3, second, "host3", permission.PermissionReport{}))
+	if err != nil {
+		t.Fatalf("Enroll with latest token: %v", err)
+	}
+	if re.AgentID != resp.AgentID {
+		t.Fatalf("agent_id = %q, want %q", re.AgentID, resp.AgentID)
 	}
 }

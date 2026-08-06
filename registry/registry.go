@@ -66,6 +66,19 @@ type Service struct {
 	db        *store.DB
 	maxAgents int // 0 = unlimited
 	bus       *eventbus.Bus
+	// ResetSeqWatermark, when set, clears the ingest service's in-memory per-agent
+	// sequence watermark. Reenrollment (AGENT-006) reuses an agent id whose WAL was
+	// wiped and restarted at sequence 1; without this the next ack would report the
+	// previous installation's high watermark and the agent would fast-forward past
+	// un-uploaded batches. A function, not an ingest reference, so registry stays
+	// free of an ingest import. Wired at composition (server.Start); nil is a no-op.
+	ResetSeqWatermark func(ctx context.Context, agentID string)
+	// DisconnectSession, when set, forcibly ends a live agent session. Called at
+	// the START of a reenrollment, before any sequence state is cleared: the old
+	// session authenticated with a now-rotated credential and, left running, would
+	// ingest after the reset and re-create a high watermark. Wired at composition;
+	// nil is a no-op (no live session to fence).
+	DisconnectSession func(ctx context.Context, agentID string)
 }
 
 // New constructs the registry. maxAgents caps enrollment (0 = unlimited). bus may

@@ -57,13 +57,23 @@ CREATE TABLE sites(
   game_record_unmatched INTEGER NOT NULL DEFAULT 1
 );
 
+-- Enrollment tokens: one-time + TTL, only the hash stored. A token may be a
+-- plain site enrollment token (agent_id NULL) or a reinstall token bound to an
+-- existing agent (AGENT-006): redeeming the latter rejoins the SAME agents row
+-- instead of minting a new identity, so history is inherited. agent_id cascades
+-- on agent deletion — a reinstall token for a deleted agent is meaningless and
+-- must not strand an FK (SQLite defaults to NO ACTION). revoked lets an operator
+-- void an unused token without deleting the row.
 CREATE TABLE enrollment_tokens(
   token_hash TEXT PRIMARY KEY,
   site_id TEXT NOT NULL REFERENCES sites(id),
   note TEXT,
   expires_at TIMESTAMP NOT NULL,
-  used_at TIMESTAMP
+  used_at TIMESTAMP,
+  agent_id TEXT REFERENCES agents(id) ON DELETE CASCADE,
+  revoked INTEGER NOT NULL DEFAULT 0
 );
+CREATE INDEX idx_enrollment_tokens_agent ON enrollment_tokens(agent_id);
 
 CREATE TABLE app_settings(
   key   TEXT PRIMARY KEY,

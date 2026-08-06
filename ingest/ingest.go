@@ -476,6 +476,19 @@ func (s *Service) watermark(ctx context.Context, agentID string, seq uint64) (ui
 	return cur, nil
 }
 
+// ResetSeqWatermark drops the in-memory per-agent sequence watermark so the next
+// ack re-derives it from the database. Used by reenrollment (AGENT-006): the fresh
+// WAL starts again at sequence 1, and a stale in-memory high would make the ack
+// report a watermark the new installation never reached — the agent's
+// Outbox.FastForward would then jump its next sequence past batches that were
+// never uploaded. Idempotent; the next watermark() call re-seeds from
+// agent_packets (which reenrollment has emptied).
+func (s *Service) ResetSeqWatermark(ctx context.Context, agentID string) {
+	s.seqMu.Lock()
+	delete(s.highSeq, agentID)
+	s.seqMu.Unlock()
+}
+
 // PrunePackets deletes dedup rows older than keep. The agent WAL retains at
 // most 72h of unacked samples, so anything older can never legitimately replay;
 // without pruning agent_packets grows by one row per packet forever.

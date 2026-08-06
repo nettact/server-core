@@ -156,6 +156,9 @@ func Router(d Deps) http.Handler {
 			r.Get("/agents/{id}", d.handleGetAgent)
 			r.Put("/agents/{id}", d.handleUpdateAgent)
 			r.Delete("/agents/{id}", d.handleDeleteAgent)
+			// Offline-agent reinstall: mint a one-time token bound to this agent so
+			// a reinstalled machine rejoins under the SAME agent_id (AGENT-006).
+			r.Post("/agents/{id}/reinstall-token", d.handleReinstallToken)
 			r.Get("/agents/{id}/metrics", d.handleAgentMetrics)
 			r.Get("/agents/{id}/metrics/summary", d.handleAgentMetricsSummary)
 			r.Get("/agents/{id}/latest", d.handleAgentLatest)
@@ -193,6 +196,8 @@ func Router(d Deps) http.Handler {
 			r.Put("/sites/{id}/game-collection", d.handleUpdateGameCollection)
 			r.Get("/enrollment-tokens", d.handleListTokens)
 			r.Post("/enrollment-tokens", d.handleCreateToken)
+			// Void an unused enrollment token (minted by mistake / leaked).
+			r.Post("/enrollment-tokens/{token_hash}/revoke", d.handleRevokeToken)
 			r.Get("/sites/{id}/targets", d.handleListTargets)
 			r.Put("/sites/{id}/targets", d.handleSetTargets)
 			// History data cleanup: controlled series inventory, dry-run preview, and
@@ -440,6 +445,9 @@ func (d Deps) handleEnroll(w http.ResponseWriter, r *http.Request) {
 		return
 	case errors.Is(err, registry.ErrSignature):
 		writeError(w, http.StatusBadRequest, "invalid signature")
+		return
+	case errors.Is(err, registry.ErrReinstallAgent):
+		writeError(w, http.StatusNotFound, "reinstall target agent no longer exists")
 		return
 	case err != nil:
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -719,6 +727,27 @@ func (d Deps) handleDeleteAgent(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// handleReinstallToken mints a one-time token bound to an agent (AGENT-006).
+// Redeeming it makes a freshly installed machine rejoin under the SAME agent_id
+// and inherit the agent's history, instead of enrolling a second row. The
+// response shape mirrors handleCreateToken so the console renders both the same
+// way.
+func (d Deps) handleReinstallToken(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	ttl := 24 * time.Hour
+	token, err := d.Registry.CreateReinstallToken(r.Context(), id, ttl)
+	if errors.Is(err, sql.ErrNoRows) {
+		writeError(w, http.StatusNotFound, "agent not found")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	d.Audit.Log(r.Context(), "admin", "agent.reinstall_token", id, "")
+	writeJSON(w, http.StatusOK, map[string]any{"token": token, "expires_in_minutes": int(ttl.Minutes())})
+}
+
 // handleAgentMetrics serves a series window for charting. since_seconds is a
 // RELATIVE lookback (seconds before now) while the optional until is an ABSOLUTE
 // unix timestamp, so the effective window is
@@ -943,7 +972,7 @@ func (d Deps) handleCreateToken(w http.ResponseWriter, r *http.Request) {
 	}
 	ttl := time.Duration(body.TTLMinutes) * time.Minute
 	if ttl <= 0 {
-		ttl = 60 * time.Minute
+		ttl = 24 * time.Hour
 	}
 	token, err := d.Registry.CreateEnrollmentToken(r.Context(), body.SiteID, body.Note, ttl)
 	if err != nil {
@@ -952,6 +981,23 @@ func (d Deps) handleCreateToken(w http.ResponseWriter, r *http.Request) {
 	}
 	d.Audit.Log(r.Context(), "admin", "enroll_token.create", body.SiteID, body.Note)
 	writeJSON(w, http.StatusOK, map[string]any{"token": token, "expires_in_minutes": int(ttl.Minutes())})
+}
+
+// handleRevokeToken voids an unused enrollment token (minted by mistake / leaked
+// into the wrong hands). A used, already-revoked, or unknown token is a 404 — to
+// the operator they all mean "nothing revocable here".
+func (d Deps) handleRevokeToken(w http.ResponseWriter, r *http.Request) {
+	hash := chi.URLParam(r, "token_hash")
+	if err := d.Registry.RevokeEnrollmentToken(r.Context(), hash); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(w, http.StatusNotFound, "token not found or already used")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	d.Audit.Log(r.Context(), "admin", "enroll_token.revoke", hash, "")
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (d Deps) handleListTargets(w http.ResponseWriter, r *http.Request) {

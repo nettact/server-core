@@ -77,14 +77,14 @@ type Hub struct {
 	mu          sync.Mutex
 	conns       map[string]*session    // agentID -> its single live session
 	closed      bool                   // set by CloseAll; refuses further sessions
-	handshaking map[wire.Conn]struct{} // admitted conns not yet registered; CloseAll cuts them loose
+	handshaking map[wire.Conn]string // admitted conns not yet registered -> agentID; CloseAll and Disconnect cut them loose
 	serving     sync.WaitGroup         // one per admitted serve; CloseAll waits for all of them
 }
 
 // New constructs the hub and subscribes it to config changes so edited targets
 // reach connected agents without waiting for anything agent-initiated.
 func New(d Deps) *Hub {
-	h := &Hub{deps: d, conns: make(map[string]*session), handshaking: make(map[wire.Conn]struct{})}
+	h := &Hub{deps: d, conns: make(map[string]*session), handshaking: make(map[wire.Conn]string)}
 	if d.Bus != nil {
 		d.Bus.Subscribe(eventbus.TopicConfigChanged, func(m eventbus.Message) {
 			ev, ok := m.Payload.(eventbus.ConfigChanged)
@@ -160,7 +160,7 @@ func (h *Hub) serve(ctx context.Context, agentID, siteID string, c wire.Conn) {
 		return
 	}
 	h.serving.Add(1)
-	h.handshaking[c] = struct{}{}
+	h.handshaking[c] = agentID
 	h.mu.Unlock()
 	defer h.serving.Done()
 	defer func() {
@@ -460,7 +460,23 @@ func (h *Hub) PushTraceRequest(agentID string, req pcfg.TraceRequest) bool {
 func (h *Hub) Disconnect(agentID string, code wire.CloseCode, reason string) {
 	h.mu.Lock()
 	s := h.conns[agentID]
+	// A connection that authenticated under this agent but is still mid-handshake
+	// (admitted, not yet registered) is not in h.conns; fence it too, or it would
+	// register with its captured agent id after the caller rotated the credential
+	// and clear its sequence state (AGENT-006 reenrollment).
+	var hs []wire.Conn
+	for c, id := range h.handshaking {
+		if id == agentID {
+			hs = append(hs, c)
+		}
+	}
 	h.mu.Unlock()
+	// Fire-and-forget: a close handshake can block on an unresponsive peer and
+	// must not stall the caller (or a session teardown waiting on the writer).
+	// serve()'s parked Hello read fails and the goroutine unwinds on its own.
+	for _, c := range hs {
+		go func(c wire.Conn) { _ = c.Close(code, reason) }(c)
+	}
 	if s != nil {
 		s.shutdown(code, reason)
 		<-s.closed
