@@ -106,6 +106,12 @@ type Deps struct {
 	// server restart onto the newly saved listen address (asynchronously, after
 	// the settings PUT response is written).
 	ApplyListenAddr func(ctx context.Context, addr string) error
+
+	// LocalAgent is non-nil only in desktop mode: it manages the external servers
+	// the in-process agent connects to besides this one (AGENT-007 phase 3). A
+	// self-hosted server has no embedded agent to configure and leaves it nil,
+	// which makes the /local-agent routes answer 404 — see localagent.go.
+	LocalAgent LocalAgentAPI
 }
 
 // ListenStatus describes the server's actual listen binding for server-info.
@@ -277,6 +283,13 @@ func Router(d Deps) http.Handler {
 			// Global server settings (e.g. console_base_url for notification links).
 			r.Get("/settings", d.handleGetSettings)
 			r.Put("/settings", d.handleUpdateSettings)
+			// Desktop only: the external servers this machine's embedded agent
+			// connects to besides this one. Absent (404) on a self-hosted server;
+			// server-info's local_agent bit is how the console knows.
+			r.Get("/local-agent/servers", d.handleListLocalAgentServers)
+			r.Post("/local-agent/servers", d.handleAddLocalAgentServer)
+			r.Delete("/local-agent/servers/{name}", d.handleRemoveLocalAgentServer)
+			r.Put("/local-agent/servers/{name}/permissions", d.handleSetLocalAgentServerPermissions)
 			r.Get("/dashboard-layout", d.handleGetDashboardLayout)
 			r.Put("/dashboard-layout", d.handleUpdateDashboardLayout)
 			r.Get("/onboarding", d.handleGetOnboardingState)
@@ -401,6 +414,16 @@ func (d Deps) handleMe(w http.ResponseWriter, r *http.Request) {
 // absent only when update checking is switched off. The console gates its
 // software-update panel on it, and that panel holds the notice switch the
 // desktop tray shares — so a pending or failing check must not hide it.
+//
+// "local_agent" is the same optional-block idea reduced to a bare capability
+// bit: the /local-agent routes exist only where the seam is wired. It is
+// reported separately from listen.desktop on purpose. listen.desktop describes a
+// deployment ("this server is embedded in the desktop app") and lives inside a
+// block that is itself present only when a host supplies ListenStatus, so gating
+// a feature on it would make the console infer one optional thing from another
+// and be wrong the moment a desktop build serves the console without having
+// wired its embedded agent. A capability bit that means exactly "these routes
+// are here" cannot drift that way.
 func (d Deps) handleServerInfo(w http.ResponseWriter, r *http.Request) {
 	out := map[string]any{
 		"os":            runtime.GOOS,
@@ -416,6 +439,9 @@ func (d Deps) handleServerInfo(w http.ResponseWriter, r *http.Request) {
 			ls.PendingAddr = v
 		}
 		out["listen"] = ls
+	}
+	if d.LocalAgent != nil {
+		out["local_agent"] = true
 	}
 	writeJSON(w, http.StatusOK, out)
 }
