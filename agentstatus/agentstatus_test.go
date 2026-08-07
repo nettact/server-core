@@ -72,6 +72,34 @@ func find(rows []AgentStatusRow, id string) AgentStatusRow {
 	return AgentStatusRow{}
 }
 
+// The console decides per agent whether to offer NETTACT_AGENT_PERMISSIONS
+// instructions or say "fixed at full access", and this row is where it reads the
+// answer. Dropping the column would not fail any other assertion here — every
+// agent would simply look like an ordinary one — so it is asserted on its own.
+func TestPolicySourceIsPerAgent(t *testing.T) {
+	db := openDB(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	// A desktop install serves both at once: its embedded agent and any ordinary
+	// agent enrolled against it.
+	seedAgent(t, db, "agent_embedded", "online", &now)
+	seedAgent(t, db, "agent_plain", "online", &now)
+	mustExec(t, db, `UPDATE agents SET policy_source='desktop_full_access' WHERE id='agent_embedded'`)
+	mustExec(t, db, `UPDATE agents SET policy_source='environment' WHERE id='agent_plain'`)
+
+	got, err := New(db, nil, settings.New(db)).SiteAgentStatuses(ctx, "site_default")
+	if err != nil {
+		t.Fatalf("SiteAgentStatuses: %v", err)
+	}
+	if s := find(got.Agents, "agent_embedded").PolicySource; s != "desktop_full_access" {
+		t.Errorf("embedded agent policy_source = %q, want desktop_full_access", s)
+	}
+	if s := find(got.Agents, "agent_plain").PolicySource; s != "environment" {
+		t.Errorf("plain agent policy_source = %q, want environment", s)
+	}
+}
+
 func TestStatusPriority(t *testing.T) {
 	db := openDB(t)
 	ctx := context.Background()

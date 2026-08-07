@@ -155,6 +155,15 @@ type AgentStatusRow struct {
 	AgentVersion            string            `json:"agent_version"`
 	Status                  string            `json:"status"`   // offline|abnormal|never_connected|ok
 	Presence                string            `json:"presence"` // online|offline (raw registry status)
+	// Where this agent's permission grant came from (default|environment|
+	// desktop_full_access), mirroring registry.Agent. It rides on the status row
+	// because "is this agent desktop-embedded" is a PER-AGENT question that the
+	// console cannot answer from the server it is talking to: a desktop install
+	// serves its own embedded agent AND any ordinary agents enrolled against it,
+	// and permission remediation differs between them — the embedded one is
+	// fixed at full access, the others are configured with
+	// NETTACT_AGENT_PERMISSIONS exactly as they would be against any server.
+	PolicySource            string            `json:"policy_source"`
 	StatusSince             *time.Time        `json:"status_since"`
 	LastSeenAt              *time.Time        `json:"last_seen_at"`
 	FirstConnectedAt        *time.Time        `json:"first_connected_at"`
@@ -259,7 +268,7 @@ func overallStatus(r AgentStatusRow) string {
 func (s *Service) loadAgents(ctx context.Context, siteID string) ([]AgentStatusRow, error) {
 	rows, err := s.db.Read().QueryContext(ctx, `
 		SELECT id, COALESCE(display_name,''), COALESCE(hostname,''), COALESCE(platform,''), COALESCE(agent_version,''),
-		       status, last_seen_at, first_connected_at, COALESCE(last_disconnect_kind,''), connectivity_alerts_muted, created_at
+		       status, COALESCE(policy_source,''), last_seen_at, first_connected_at, COALESCE(last_disconnect_kind,''), connectivity_alerts_muted, created_at
 		FROM agents WHERE revoked=0 AND site_id=? ORDER BY created_at`, siteID)
 	if err != nil {
 		return nil, err
@@ -271,7 +280,7 @@ func (s *Service) loadAgents(ctx context.Context, siteID string) ([]AgentStatusR
 		var lastSeen, firstConn sql.NullTime
 		var muted int
 		if err := rows.Scan(&a.ID, &a.DisplayName, &a.Hostname, &a.Platform, &a.AgentVersion,
-			&a.Presence, &lastSeen, &firstConn, &a.LastDisconnectKind, &muted, &a.CreatedAt); err != nil {
+			&a.Presence, &a.PolicySource, &lastSeen, &firstConn, &a.LastDisconnectKind, &muted, &a.CreatedAt); err != nil {
 			return nil, err
 		}
 		if lastSeen.Valid {
