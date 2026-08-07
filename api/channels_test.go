@@ -155,3 +155,156 @@ func TestWebhookAuditDetail(t *testing.T) {
 		}
 	}
 }
+
+// postChannel invokes handleCreateChannel with a raw JSON body.
+func postChannel(d Deps, body string) *httptest.ResponseRecorder {
+	w := httptest.NewRecorder()
+	d.handleCreateChannel(w, httptest.NewRequest(http.MethodPost, "/api/v1/channels", strings.NewReader(body)))
+	return w
+}
+
+// TestCreateChannelTypeAllowList: the allow-list is the three built-ins plus the
+// notification package's provider registry — an unregistered type is rejected,
+// a registered push type is created.
+//
+// The telegram config here is deliberately valid under the FINAL provider
+// validation rules (a real-shaped bot token and chat id), not merely under the
+// phase-A stub that accepts everything, so this fixture keeps passing when the
+// real ValidateConfig lands.
+func TestCreateChannelTypeAllowList(t *testing.T) {
+	d := channelTestDeps(t)
+
+	if w := postChannel(d, `{"type":"pigeon","name":"P","config":{}}`); w.Code != http.StatusBadRequest {
+		t.Fatalf("unknown type status=%d body=%s", w.Code, w.Body.String())
+	}
+	if w := postChannel(d, `{"type":"","config":{}}`); w.Code != http.StatusBadRequest {
+		t.Fatalf("empty type status=%d body=%s", w.Code, w.Body.String())
+	}
+
+	w := postChannel(d, `{"type":"telegram","name":"TG","config":{"bot_token":"123456:AAAA","chat_id":"-100123","lang":"zh"}}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("telegram create status=%d body=%s", w.Code, w.Body.String())
+	}
+	var created struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &created); err != nil || created.ID == "" {
+		t.Fatalf("create response=%s err=%v", w.Body.String(), err)
+	}
+	ch, err := d.Notification.Get(context.Background(), created.ID)
+	if err != nil || ch.Type != "telegram" || ch.Config["bot_token"] != "123456:AAAA" {
+		t.Fatalf("stored channel=%+v err=%v", ch, err)
+	}
+}
+
+// TestUpdateChannelMergesMaskedSecrets: the console only ever sees a masked
+// credential, so saving an edit form that did not retype the token must keep the
+// stored token and still apply the other field's change.
+func TestUpdateChannelMergesMaskedSecrets(t *testing.T) {
+	d := channelTestDeps(t)
+	id, err := d.Notification.Create(context.Background(), "TG", "telegram", map[string]string{
+		"bot_token": "123456:AAAAreal", "chat_id": "-100123", "lang": "zh",
+	})
+	if err != nil {
+		t.Fatalf("seed channel: %v", err)
+	}
+
+	w := putChannel(d, id, `{"name":"TG","enabled":true,"config":{"bot_token":"`+notification.MaskedSecret+`","chat_id":"-100999","lang":"zh"}}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("masked update status=%d body=%s", w.Code, w.Body.String())
+	}
+	ch, err := d.Notification.Get(context.Background(), id)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if ch.Config["bot_token"] != "123456:AAAAreal" {
+		t.Fatalf("masked token overwrote the stored one: %q", ch.Config["bot_token"])
+	}
+	if ch.Config["chat_id"] != "-100999" {
+		t.Fatalf("non-secret change lost: %q", ch.Config["chat_id"])
+	}
+
+	// A genuine rotation still replaces the stored token.
+	w = putChannel(d, id, `{"name":"TG","enabled":true,"config":{"bot_token":"654321:BBBBnew","chat_id":"-100999","lang":"zh"}}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("rotation status=%d body=%s", w.Code, w.Body.String())
+	}
+	if ch, _ = d.Notification.Get(context.Background(), id); ch.Config["bot_token"] != "654321:BBBBnew" {
+		t.Fatalf("rotation lost: %q", ch.Config["bot_token"])
+	}
+}
+
+// TestTestChannelProvider covers the generalized test endpoint: push types are
+// testable, channel_id merges stored secrets behind the mask, and a bad
+// channel_id is a 404 / type mismatch a 400.
+//
+// The masked case must NOT be a 400: the merge happens before validation, so the
+// bullets never reach it. Delivery itself may fail (the phase-A provider stubs
+// do not build a request at all) — that is still a 200 with ok:false, because a
+// delivery failure is a result, not an API error.
+func TestTestChannelProvider(t *testing.T) {
+	d := channelTestDeps(t)
+
+	post := func(body string) *httptest.ResponseRecorder {
+		w := httptest.NewRecorder()
+		d.handleTestChannel(w, httptest.NewRequest(http.MethodPost, "/api/v1/channels/test", strings.NewReader(body)))
+		return w
+	}
+	decode := func(t *testing.T, w *httptest.ResponseRecorder) struct {
+		OK         bool   `json:"ok"`
+		StatusCode int    `json:"status_code"`
+		Body       string `json:"body"`
+		Error      string `json:"error"`
+	} {
+		t.Helper()
+		var resp struct {
+			OK         bool   `json:"ok"`
+			StatusCode int    `json:"status_code"`
+			Body       string `json:"body"`
+			Error      string `json:"error"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("decode %s: %v", w.Body.String(), err)
+		}
+		return resp
+	}
+
+	tgID, err := d.Notification.Create(context.Background(), "TG", "telegram", map[string]string{
+		"bot_token": "123456:AAAAreal", "chat_id": "-100123", "lang": "zh",
+	})
+	if err != nil {
+		t.Fatalf("seed telegram: %v", err)
+	}
+	whID, err := d.Notification.Create(context.Background(), "WH", "webhook", map[string]string{"url": "https://x"})
+	if err != nil {
+		t.Fatalf("seed webhook: %v", err)
+	}
+
+	// Masked secret + channel_id: accepted, delivered (unsuccessfully, since the
+	// provider is still a stub), reported as a result.
+	w := post(`{"type":"telegram","channel_id":"` + tgID + `","config":{"bot_token":"` + notification.MaskedSecret + `","chat_id":"-100123","lang":"zh"}}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("masked test status=%d body=%s", w.Code, w.Body.String())
+	}
+	if resp := decode(t, w); resp.OK {
+		t.Fatalf("stub provider reported a successful send: %+v", resp)
+	}
+
+	// Without channel_id the endpoint still accepts a fully-typed config.
+	if w := post(`{"type":"telegram","config":{"bot_token":"123456:AAAA","chat_id":"-100123"}}`); w.Code != http.StatusOK {
+		t.Fatalf("unsaved telegram test status=%d body=%s", w.Code, w.Body.String())
+	}
+
+	// channel_id naming a channel of a different type: refuse rather than merge
+	// one channel's secrets into another's form.
+	if w := post(`{"type":"telegram","channel_id":"` + whID + `","config":{}}`); w.Code != http.StatusBadRequest {
+		t.Fatalf("type mismatch status=%d body=%s", w.Code, w.Body.String())
+	}
+	if w := post(`{"type":"telegram","channel_id":"chan_missing","config":{}}`); w.Code != http.StatusNotFound {
+		t.Fatalf("missing channel status=%d body=%s", w.Code, w.Body.String())
+	}
+	// system/email remain untestable.
+	if w := post(`{"type":"system","config":{}}`); w.Code != http.StatusBadRequest {
+		t.Fatalf("system test status=%d", w.Code)
+	}
+}

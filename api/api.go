@@ -2396,12 +2396,27 @@ func (d Deps) handleCreateChannel(w http.ResponseWriter, r *http.Request) {
 		Type   string            `json:"type"`
 		Config map[string]string `json:"config"`
 	}
-	if err := json.NewDecoder(io.LimitReader(r.Body, maxChannelBodyBytes)).Decode(&body); err != nil || (body.Type != "webhook" && body.Type != "email" && body.Type != "system") {
-		writeError(w, http.StatusBadRequest, "type must be webhook, email or system")
+	if err := json.NewDecoder(io.LimitReader(r.Body, maxChannelBodyBytes)).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid body")
 		return
 	}
-	if body.Type == "webhook" {
+	// The allow-list is the three built-in types plus whatever the notification
+	// package's provider registry knows, so a new push platform becomes creatable
+	// by registering it there — there is no second list of type strings to keep in
+	// sync.
+	prov, isProvider := notification.ProviderFor(body.Type)
+	if !isProvider && body.Type != "webhook" && body.Type != "email" && body.Type != "system" {
+		writeError(w, http.StatusBadRequest, "unsupported channel type: "+body.Type)
+		return
+	}
+	switch {
+	case body.Type == "webhook":
 		if msg := validateWebhookConfig(body.Config); msg != "" {
+			writeError(w, http.StatusBadRequest, msg)
+			return
+		}
+	case isProvider:
+		if msg := prov.ValidateConfig(body.Config); msg != "" {
 			writeError(w, http.StatusBadRequest, msg)
 			return
 		}
@@ -2418,31 +2433,82 @@ func (d Deps) handleCreateChannel(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"id": id})
 }
 
-// handleTestChannel sends a sample incident to a webhook config WITHOUT saving a
-// channel, so an operator can validate a custom method / headers / body template
-// from the add or edit form. Only webhook channels are testable. The request
-// always returns 200 with the delivery outcome — a delivery failure is a result,
-// not an API error.
+// handleTestChannel sends a sample incident to a channel config WITHOUT saving
+// anything, so an operator can validate a webhook's method / headers / body
+// template or a push platform's credentials from the add or edit form. Webhook
+// and the six push provider types are testable; email and system are not (they
+// have no request/response to report back).
+//
+// channel_id is optional and only meaningful when editing: the posted config
+// carries masked credentials, because that is all the console was ever shown, so
+// the stored row is fetched and the masks are merged back. Without it an operator
+// would have to retype every token just to press "test".
+//
+// The request always returns 200 with the delivery outcome — a delivery failure
+// is a result, not an API error. That includes the push platforms' HTTP-200
+// soft failures, which surface as ok:false with the platform's own errmsg in
+// body.
 func (d Deps) handleTestChannel(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Type   string            `json:"type"`
-		Config map[string]string `json:"config"`
+		Type      string            `json:"type"`
+		ChannelID string            `json:"channel_id"` // optional: merge masked secrets from this stored channel
+		Config    map[string]string `json:"config"`
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, maxChannelBodyBytes)).Decode(&body); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid body")
 		return
 	}
-	if body.Type != "webhook" {
-		writeError(w, http.StatusBadRequest, "only webhook channels can be tested")
+	prov, isProvider := notification.ProviderFor(body.Type)
+	if body.Type != "webhook" && !isProvider {
+		writeError(w, http.StatusBadRequest, "channel type "+body.Type+" cannot be tested")
 		return
 	}
-	if msg := validateWebhookConfig(body.Config); msg != "" {
+	if body.ChannelID != "" {
+		ch, err := d.Notification.Get(r.Context(), body.ChannelID)
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			writeError(w, http.StatusNotFound, "channel not found")
+			return
+		case err != nil:
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		// A mismatch means the console is testing one channel's form against another
+		// channel's stored secrets — refuse rather than merge across types.
+		if ch.Type != body.Type {
+			writeError(w, http.StatusBadRequest, "channel type mismatch")
+			return
+		}
+		notification.MergeMaskedSecrets(body.Type, body.Config, ch.Config)
+	}
+	msg := ""
+	if isProvider {
+		msg = prov.ValidateConfig(body.Config)
+	} else {
+		msg = validateWebhookConfig(body.Config)
+	}
+	if msg != "" {
 		writeError(w, http.StatusBadRequest, msg)
 		return
 	}
-	p := notification.SampleWebhookPayload(d.Settings.ConsoleBaseURL(r.Context()))
-	status, snippet, err := d.Notification.TestWebhook(r.Context(), body.Config, p)
-	d.Audit.Log(r.Context(), "admin", "channel.test", body.Type, webhookAuditDetail(body.Config["url"]))
+	p := notification.SamplePayload(d.Settings.ConsoleBaseURL(r.Context()))
+	var (
+		status  int
+		snippet string
+		err     error
+		detail  string
+	)
+	if isProvider {
+		status, snippet, err = d.Notification.TestProvider(r.Context(), prov, body.Config, p)
+		// A provider's send URL is derived from its credentials (a DingTalk URL is
+		// its access_token), so unlike a webhook there is no non-secret part of it
+		// to record — the bare type string is the whole audit detail.
+		detail = body.Type
+	} else {
+		status, snippet, err = d.Notification.TestWebhook(r.Context(), body.Config, p)
+		detail = webhookAuditDetail(body.Config["url"])
+	}
+	d.Audit.Log(r.Context(), "admin", "channel.test", body.Type, detail)
 	resp := map[string]any{"ok": err == nil && status < 300, "status_code": status, "body": snippet}
 	if err != nil {
 		resp["error"] = err.Error()
@@ -2677,8 +2743,8 @@ func (d Deps) handleUpdateChannel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := chi.URLParam(r, "id")
-	// When config is supplied for a webhook channel, validate it. The update body
-	// carries no type, so look it up (also gives a clean 404 for a bad id).
+	// When config is supplied, validate it against the channel's type. The update
+	// body carries no type, so look it up (also gives a clean 404 for a bad id).
 	if body.Config != nil {
 		ch, err := d.Notification.Get(r.Context(), id)
 		switch {
@@ -2689,8 +2755,18 @@ func (d Deps) handleUpdateChannel(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
+		// Merge BEFORE validating: the console only ever saw masked credentials, so
+		// an untouched secret field comes back as the mask. Validating first would
+		// judge the placeholder, and storing it would overwrite the real token with
+		// bullets.
+		notification.MergeMaskedSecrets(ch.Type, body.Config, ch.Config)
 		if ch.Type == "webhook" {
 			if msg := validateWebhookConfig(body.Config); msg != "" {
+				writeError(w, http.StatusBadRequest, msg)
+				return
+			}
+		} else if prov, ok := notification.ProviderFor(ch.Type); ok {
+			if msg := prov.ValidateConfig(body.Config); msg != "" {
 				writeError(w, http.StatusBadRequest, msg)
 				return
 			}

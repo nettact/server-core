@@ -1,6 +1,7 @@
 // Package notification delivers incident events to configured channels
-// (webhook + SMTP + native OS desktop notification). Delivery is best-effort
-// and must never block or fail the incident pipeline.
+// (webhook + SMTP + native OS desktop notification + the push platforms behind
+// the Provider registry). Delivery is best-effort and must never block or fail
+// the incident pipeline.
 package notification
 
 import (
@@ -91,9 +92,14 @@ type RecoveredTarget struct {
 
 // Channel is a notification destination.
 type Channel struct {
-	ID      string            `json:"id"`
-	Name    string            `json:"name"` // human label to tell multiple channels apart
-	Type    string            `json:"type"` // "webhook" | "email" | "system"
+	ID   string `json:"id"`
+	Name string `json:"name"` // human label to tell multiple channels apart
+	// Type is one of the nine destinations: "webhook" (generic HTTP, templatable)
+	// | "email" (SMTP) | "system" (native OS notification on the host process) |
+	// "dingtalk" | "wecom" | "feishu" | "telegram" | "serverchan" | "wxpusher".
+	// The last six are push platforms served by the Provider registry; each has
+	// its own credential keys (see SecretKeys) rather than a URL.
+	Type    string            `json:"type"`
 	Config  map[string]string `json:"config"`
 	Enabled bool              `json:"enabled"`
 	// StormMerge decides whether this destination receives one summary when many
@@ -282,6 +288,15 @@ func (s *Service) Notify(ctx context.Context, channelIDs []string, p Payload) {
 			s.sendEmail(config, p)
 		case "system":
 			s.sendNative(ctx, config["lang"], p)
+		default:
+			// Push platforms (DingTalk / WeCom / Feishu / Telegram / ServerChan /
+			// WxPusher) all deliver through one code path, so adding a platform is a
+			// registry entry rather than another case here. An unregistered type is
+			// silently skipped: a row can only carry one if the type allow-list was
+			// bypassed, and a notification path is the wrong place to raise about it.
+			if prov, ok := ProviderFor(typ); ok {
+				s.sendProvider(ctx, typ, prov, config, p)
+			}
 		}
 	}
 }
@@ -389,11 +404,15 @@ func (s *Service) TestWebhook(ctx context.Context, cfg map[string]string, p Payl
 	return s.deliverWebhook(ctx, cfg, p)
 }
 
-// SampleWebhookPayload builds a representative payload for test sends: one
-// HTTP-503 fault on a single host, deep-linked into consoleBase when configured.
-// The event is "test" so the rendered title/text and the {{event}} variable mark
-// it clearly as a test, letting receivers distinguish it from a real incident.
-func SampleWebhookPayload(consoleBase string) Payload {
+// SamplePayload builds a representative payload for test sends: one HTTP-503
+// fault on a single host, deep-linked into consoleBase when configured. The
+// event is "test" so the rendered title/text and the {{event}} variable mark it
+// clearly as a test, letting receivers distinguish it from a real incident.
+//
+// It feeds EVERY testable channel type, not just webhooks: the same payload is
+// what a push provider renders through pushText, so a test send exercises the
+// real rendering path rather than a special-cased "hello" string.
+func SamplePayload(consoleBase string) Payload {
 	link := ""
 	if consoleBase != "" {
 		link = consoleBase + "/incidents?incident=inc_sample"
@@ -500,17 +519,25 @@ func (s *Service) sendNative(ctx context.Context, lang string, p Payload) {
 	}
 }
 
-// redact hides secrets when listing channels for the UI.
+// redact hides secrets when listing channels for the UI. Which keys count as
+// secret is decided per channel type by SecretKeys — the same authority the API
+// layer uses to merge masked values back on update — so a newly registered push
+// provider is masked here without this function knowing it exists.
+//
+// Only non-empty values are masked: showing bullets for an unset optional
+// credential (a DingTalk channel with no signing secret) would tell the operator
+// a secret is configured when none is.
 func redact(c Channel) Channel {
 	if c.Config == nil {
 		return c
 	}
 	out := make(map[string]string, len(c.Config))
 	for k, v := range c.Config {
-		if k == "password" && v != "" {
-			out[k] = "••••••"
-		} else {
-			out[k] = v
+		out[k] = v
+	}
+	for _, k := range SecretKeys(c.Type) {
+		if out[k] != "" {
+			out[k] = MaskedSecret
 		}
 	}
 	c.Config = out
