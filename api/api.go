@@ -2392,12 +2392,17 @@ func (d Deps) handleListChannels(w http.ResponseWriter, r *http.Request) {
 
 func (d Deps) handleCreateChannel(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Name   string            `json:"name"`
-		Type   string            `json:"type"`
-		Config map[string]string `json:"config"`
+		Name       string            `json:"name"`
+		Type       string            `json:"type"`
+		Config     map[string]string `json:"config"`
+		StormMerge *bool             `json:"storm_merge"`
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, maxChannelBodyBytes)).Decode(&body); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid body")
+		return
+	}
+	if body.StormMerge == nil {
+		writeError(w, http.StatusBadRequest, "storm_merge is required")
 		return
 	}
 	// The allow-list is the three built-in types plus whatever the notification
@@ -2421,12 +2426,32 @@ func (d Deps) handleCreateChannel(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	// Storm merging is not settable at creation: a new channel always starts
-	// merged (the column default), and the operator flips it from the list. One
-	// less decision in the add form for a setting almost nobody changes.
-	id, err := d.Notification.Create(r.Context(), body.Name, body.Type, body.Config)
+	id, err := d.Notification.Create(r.Context(), body.Name, body.Type, body.Config, *body.StormMerge)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	// A new channel starts checked in the site default and Agent-connectivity
+	// policies — an operator who adds a channel is asking to be notified through
+	// it, and one that arrives routed nowhere fails silently at the worst moment
+	// (see notifypolicy.AttachChannelToBuiltins for the full rationale, including
+	// why this is not the same decision as EnsureBuiltins seeding them empty).
+	//
+	// EnsureBuiltins runs first because the built-ins are materialized lazily by
+	// the notifications page, and a channel can be created before that page has
+	// ever been opened — the onboarding wizard does exactly that.
+	siteID := siteParam(r)
+	attachErr := d.NotifyPolicy.EnsureBuiltins(r.Context(), siteID)
+	if attachErr == nil {
+		attachErr = d.NotifyPolicy.AttachChannelToBuiltins(r.Context(), siteID, id)
+	}
+	if attachErr != nil {
+		// Undo the channel rather than report a half-done create: the console's
+		// retry would otherwise leave a duplicate behind, and a channel wired to
+		// nothing is the exact failure this block exists to prevent.
+		_ = d.Notification.Delete(r.Context(), id)
+		writeError(w, http.StatusInternalServerError,
+			"could not add the channel to the default notification policies: "+attachErr.Error())
 		return
 	}
 	d.Audit.Log(r.Context(), "admin", "channel.create", body.Type, body.Name)

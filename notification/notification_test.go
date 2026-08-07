@@ -17,7 +17,7 @@ func TestSystemChannelCRUD(t *testing.T) {
 	ctx := context.Background()
 	svc := New(db, false)
 
-	id, err := svc.Create(ctx, "Desktop", "system", map[string]string{})
+	id, err := svc.Create(ctx, "Desktop", "system", map[string]string{}, true)
 	if err != nil {
 		t.Fatalf("create system channel: %v", err)
 	}
@@ -35,7 +35,7 @@ func TestSystemChannelCRUD(t *testing.T) {
 	if got == nil {
 		t.Fatalf("created channel %s not returned by List", id)
 	}
-	if got.Type != "system" || got.Name != "Desktop" || !got.Enabled {
+	if got.Type != "system" || got.Name != "Desktop" || !got.Enabled || !got.StormMerge {
 		t.Fatalf("unexpected channel: %+v", *got)
 	}
 

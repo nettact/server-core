@@ -23,6 +23,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -134,6 +135,10 @@ const policyCols = `id, site_id, name, scope_kind, scope_id, enabled, min_severi
 // state explicitly as "faults are recorded, external notification not
 // configured" so it can never be mistaken for detection being off.
 //
+// That is a statement about SEEDING, not about staying empty: the first channel
+// an operator adds is checked into both of these, because adding a channel is
+// the ask this function must not presume (see AttachChannelToBuiltins).
+//
 // The Agent one additionally ships DISABLED, which in this resolver means "fall
 // back to the site default" — so its mere existence changes nothing until an
 // operator deliberately turns it on. Materializing it up front (rather than on
@@ -170,6 +175,81 @@ func (s *Service) ensureScope(ctx context.Context, siteID, kind, name string, en
 		"np_"+uuid.NewString(), siteID, name, kind, boolInt(enabled),
 		DefaultWarnDelaySec, DefaultCriticalDelaySec, boolInt(isDefault), time.Now().UTC())
 	return err
+}
+
+// AttachChannelToBuiltins adds channelID to the site's two built-in policies —
+// the site default and the Agent-connectivity one — and leaves every group
+// override alone. Callers pass a channel they have just created.
+//
+// Why creation wires this up when EnsureBuiltins deliberately does not: they are
+// different acts by different parties. Seeding a site is the system making a
+// site, and wiring outbound messaging there would be the system deciding to
+// message someone. Adding a channel is an operator saying "notify me here" —
+// there is nothing left to presume. A channel that lands wired to nothing means
+// the operator pastes a bot token, sends a test message that arrives, and then
+// hears nothing at all when something actually breaks; the misconfiguration is
+// invisible until the moment it costs the most.
+//
+// The Agent-connectivity policy is included even though it ships DISABLED. While
+// disabled it means "fall back to the site default", so listing a channel there
+// changes nothing today. It is what the switch does LATER that matters: an
+// operator turning it on to route Agent-offline notices separately would
+// otherwise be enabling a policy with no channels — silencing precisely the
+// notices they had just singled out.
+//
+// Group overrides are left untouched because they exist by deliberate narrowing;
+// widening one back is the sort of help nobody asked for.
+//
+// Idempotent, and one transaction: a new channel ends up in both built-ins or in
+// neither, never half-wired.
+func (s *Service) AttachChannelToBuiltins(ctx context.Context, siteID, channelID string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }() // no-op once Commit succeeded
+
+	rows, err := tx.QueryContext(ctx, `SELECT id, channel_ids FROM notification_policies
+		WHERE site_id=? AND (is_default=1 OR scope_kind=?)`, siteID, ScopeAgent)
+	if err != nil {
+		return err
+	}
+	type builtin struct{ id, chans string }
+	var found []builtin
+	for rows.Next() {
+		var b builtin
+		if err := rows.Scan(&b.id, &b.chans); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		found = append(found, b)
+	}
+	err = rows.Err()
+	// Drained and closed before the updates run: the write handle is a single
+	// connection (MaxOpenConns(1)), so an open cursor and an UPDATE cannot share it.
+	_ = rows.Close()
+	if err != nil {
+		return err
+	}
+
+	for _, b := range found {
+		ids := []string{}
+		if b.chans != "" {
+			_ = json.Unmarshal([]byte(b.chans), &ids)
+		}
+		if slices.Contains(ids, channelID) {
+			continue
+		}
+		enc, err := json.Marshal(append(ids, channelID))
+		if err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE notification_policies SET channel_ids=? WHERE id=?`, string(enc), b.id); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // List returns a site's policies, default first then by scope kind and name.

@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -102,6 +103,17 @@ func (h *harness) setDefaultChannels(ids ...string) Policy {
 }
 
 // agentPolicy returns the site's built-in Agent-connectivity policy.
+// sitePolicy reads the site default policy — the one every incident falls back
+// to when no narrower policy claims it.
+func (h *harness) sitePolicy() Policy {
+	h.t.Helper()
+	p, err := h.svc.byScope(h.ctx, "site_default", ScopeSite, "")
+	if err != nil {
+		h.t.Fatalf("read site default policy: %v", err)
+	}
+	return p
+}
+
 func (h *harness) agentPolicy() Policy {
 	h.t.Helper()
 	p, err := h.svc.byScope(h.ctx, "site_default", ScopeAgent, "")
@@ -875,5 +887,62 @@ func TestNothingIsClaimedWithoutDispatch(t *testing.T) {
 	}
 	if total := h.cap.count(); total != 1 {
 		t.Fatalf("total dispatches = %d (before=%d), want exactly 1", total, before)
+	}
+}
+
+// TestAttachChannelToBuiltinsChecksBothAndOnlyThem: a newly created channel is
+// checked into the site default AND the Agent-connectivity policy, and into
+// nothing else. The Agent one matters even though it ships disabled — an
+// operator who later switches it on must not find it pointing at no channels.
+func TestAttachChannelToBuiltinsChecksBothAndOnlyThem(t *testing.T) {
+	h := newHarness(t)
+	override, err := h.svc.Create(h.ctx, "site_default", Policy{
+		Name: "group override", ScopeKind: ScopeGroup, ScopeID: "mg",
+		Enabled: true, MinSeverity: "warn",
+	})
+	if err != nil {
+		t.Fatalf("create override: %v", err)
+	}
+
+	if err := h.svc.AttachChannelToBuiltins(h.ctx, "site_default", "ch_a"); err != nil {
+		t.Fatalf("attach: %v", err)
+	}
+
+	if got := h.sitePolicy().ChannelIDs; !slices.Equal(got, []string{"ch_a"}) {
+		t.Fatalf("site default channels = %v, want [ch_a]", got)
+	}
+	if got := h.agentPolicy().ChannelIDs; !slices.Equal(got, []string{"ch_a"}) {
+		t.Fatalf("agent policy channels = %v, want [ch_a]", got)
+	}
+	// A group override is a deliberate narrowing; widening it back would undo the
+	// operator's decision.
+	after, err := h.svc.Get(h.ctx, override.ID)
+	if err != nil {
+		t.Fatalf("get override: %v", err)
+	}
+	if len(after.ChannelIDs) != 0 {
+		t.Fatalf("group override channels = %v, want none touched", after.ChannelIDs)
+	}
+}
+
+// TestAttachChannelToBuiltinsAppendsWithoutDuplicating: attaching keeps whatever
+// the operator already chose, and attaching the same channel twice (a retried
+// create) does not list it twice — a duplicate would deliver the same incident
+// to the same channel twice.
+func TestAttachChannelToBuiltinsAppendsWithoutDuplicating(t *testing.T) {
+	h := newHarness(t)
+	h.setDefaultChannels("ch_a")
+
+	for range 2 {
+		if err := h.svc.AttachChannelToBuiltins(h.ctx, "site_default", "ch_b"); err != nil {
+			t.Fatalf("attach: %v", err)
+		}
+	}
+
+	if got := h.sitePolicy().ChannelIDs; !slices.Equal(got, []string{"ch_a", "ch_b"}) {
+		t.Fatalf("site default channels = %v, want [ch_a ch_b]", got)
+	}
+	if got := h.agentPolicy().ChannelIDs; !slices.Equal(got, []string{"ch_b"}) {
+		t.Fatalf("agent policy channels = %v, want [ch_b]", got)
 	}
 }

@@ -6,13 +6,17 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 
 	"github.com/nettact/server-core/audit"
+	"github.com/nettact/server-core/eventbus"
 	"github.com/nettact/server-core/notification"
+	"github.com/nettact/server-core/notifypolicy"
 	"github.com/nettact/server-core/settings"
 	"github.com/nettact/server-core/store/storetest"
 )
@@ -20,7 +24,21 @@ import (
 func channelTestDeps(t *testing.T) Deps {
 	t.Helper()
 	db := storetest.Open(t)
-	return Deps{Notification: notification.New(db, false), Settings: settings.New(db), Audit: audit.New(db)}
+	// The site row is not optional scenery: creating a channel checks it into that
+	// site's two built-in policies, so without it every create would fail.
+	if _, err := db.ExecContext(context.Background(),
+		`INSERT INTO sites(id,name,created_at) VALUES('site_default','Default Site',?)`,
+		time.Now().UTC()); err != nil {
+		t.Fatalf("seed site: %v", err)
+	}
+	notif := notification.New(db, false)
+	set := settings.New(db)
+	return Deps{
+		Notification: notif,
+		NotifyPolicy: notifypolicy.New(db, notif, set, eventbus.New()),
+		Settings:     set,
+		Audit:        audit.New(db),
+	}
 }
 
 // putChannel invokes handleUpdateChannel with an injected chi "id" URL param.
@@ -37,10 +55,10 @@ func putChannel(d Deps, id, body string) *httptest.ResponseRecorder {
 func TestCreateChannelValidatesWebhook(t *testing.T) {
 	d := channelTestDeps(t)
 	bad := map[string]string{
-		"missing url": `{"type":"webhook","config":{}}`,
-		"bad scheme":  `{"type":"webhook","config":{"url":"ftp://x"}}`,
-		"bad method":  `{"type":"webhook","config":{"url":"https://x","method":"get"}}`,
-		"bad headers": `{"type":"webhook","config":{"url":"https://x","headers":"not json"}}`,
+		"missing url": `{"type":"webhook","storm_merge":true,"config":{}}`,
+		"bad scheme":  `{"type":"webhook","storm_merge":true,"config":{"url":"ftp://x"}}`,
+		"bad method":  `{"type":"webhook","storm_merge":true,"config":{"url":"https://x","method":"get"}}`,
+		"bad headers": `{"type":"webhook","storm_merge":true,"config":{"url":"https://x","headers":"not json"}}`,
 	}
 	for name, payload := range bad {
 		t.Run(name, func(t *testing.T) {
@@ -54,9 +72,17 @@ func TestCreateChannelValidatesWebhook(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	d.handleCreateChannel(w, httptest.NewRequest(http.MethodPost, "/api/v1/channels",
-		strings.NewReader(`{"type":"webhook","name":"WH","config":{"url":"https://x/y","method":"POST","headers":"{\"Authorization\":\"Bearer z\"}"}}`)))
+		strings.NewReader(`{"type":"webhook","name":"WH","storm_merge":true,"config":{"url":"https://x/y","method":"POST","headers":"{\"Authorization\":\"Bearer z\"}"}}`)))
 	if w.Code != http.StatusOK {
 		t.Fatalf("valid create status=%d body=%s", w.Code, w.Body.String())
+	}
+}
+
+func TestCreateChannelRequiresStormMergeChoice(t *testing.T) {
+	d := channelTestDeps(t)
+	w := postChannel(d, `{"type":"system","name":"Desktop","config":{"lang":"zh"}}`)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("missing storm_merge status=%d body=%s", w.Code, w.Body.String())
 	}
 }
 
@@ -70,7 +96,7 @@ func TestUpdateChannelValidation(t *testing.T) {
 	}
 
 	// Create a webhook to edit.
-	id, err := d.Notification.Create(context.Background(), "WH", "webhook", map[string]string{"url": "https://x", "lang": "zh"})
+	id, err := d.Notification.Create(context.Background(), "WH", "webhook", map[string]string{"url": "https://x", "lang": "zh"}, true)
 	if err != nil {
 		t.Fatalf("seed channel: %v", err)
 	}
@@ -181,7 +207,7 @@ func TestCreateChannelTypeAllowList(t *testing.T) {
 		t.Fatalf("empty type status=%d body=%s", w.Code, w.Body.String())
 	}
 
-	w := postChannel(d, `{"type":"telegram","name":"TG","config":{"bot_token":"123456:AAAA","chat_id":"-100123","lang":"zh"}}`)
+	w := postChannel(d, `{"type":"telegram","name":"TG","storm_merge":false,"config":{"bot_token":"123456:AAAA","chat_id":"-100123","lang":"zh"}}`)
 	if w.Code != http.StatusOK {
 		t.Fatalf("telegram create status=%d body=%s", w.Code, w.Body.String())
 	}
@@ -192,7 +218,7 @@ func TestCreateChannelTypeAllowList(t *testing.T) {
 		t.Fatalf("create response=%s err=%v", w.Body.String(), err)
 	}
 	ch, err := d.Notification.Get(context.Background(), created.ID)
-	if err != nil || ch.Type != "telegram" || ch.Config["bot_token"] != "123456:AAAA" {
+	if err != nil || ch.Type != "telegram" || ch.Config["bot_token"] != "123456:AAAA" || ch.StormMerge {
 		t.Fatalf("stored channel=%+v err=%v", ch, err)
 	}
 }
@@ -204,7 +230,7 @@ func TestUpdateChannelMergesMaskedSecrets(t *testing.T) {
 	d := channelTestDeps(t)
 	id, err := d.Notification.Create(context.Background(), "TG", "telegram", map[string]string{
 		"bot_token": "123456:AAAAreal", "chat_id": "-100123", "lang": "zh",
-	})
+	}, true)
 	if err != nil {
 		t.Fatalf("seed channel: %v", err)
 	}
@@ -271,11 +297,11 @@ func TestTestChannelProvider(t *testing.T) {
 
 	tgID, err := d.Notification.Create(context.Background(), "TG", "telegram", map[string]string{
 		"bot_token": "123456:AAAAreal", "chat_id": "-100123", "lang": "zh",
-	})
+	}, true)
 	if err != nil {
 		t.Fatalf("seed telegram: %v", err)
 	}
-	whID, err := d.Notification.Create(context.Background(), "WH", "webhook", map[string]string{"url": "https://x"})
+	whID, err := d.Notification.Create(context.Background(), "WH", "webhook", map[string]string{"url": "https://x"}, true)
 	if err != nil {
 		t.Fatalf("seed webhook: %v", err)
 	}
@@ -306,5 +332,57 @@ func TestTestChannelProvider(t *testing.T) {
 	// system/email remain untestable.
 	if w := post(`{"type":"system","config":{}}`); w.Code != http.StatusBadRequest {
 		t.Fatalf("system test status=%d", w.Code)
+	}
+}
+
+// TestCreateChannelChecksItIntoBuiltinPolicies: a channel is created in order to
+// be notified through, so the create wires it into the site default AND the
+// Agent-connectivity policy. The built-ins are materialized lazily by the
+// notifications page, and this test deliberately never calls it — that is the
+// onboarding path, where the first channel exists long before anyone opens the
+// policy UI.
+func TestCreateChannelChecksItIntoBuiltinPolicies(t *testing.T) {
+	d := channelTestDeps(t)
+	ctx := context.Background()
+
+	w := postChannel(d, `{"name":"tg","type":"telegram","storm_merge":true,
+		"config":{"bot_token":"123456:ABCDEF","chat_id":"-100123","lang":"zh"}}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("create = %d, body %s", w.Code, w.Body.String())
+	}
+	var created struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode create: %v", err)
+	}
+
+	policies, err := d.NotifyPolicy.List(ctx, "site_default")
+	if err != nil {
+		t.Fatalf("list policies: %v", err)
+	}
+	if len(policies) != 2 {
+		t.Fatalf("expected the two built-in policies, got %d", len(policies))
+	}
+	for _, p := range policies {
+		if !slices.Contains(p.ChannelIDs, created.ID) {
+			t.Errorf("%s policy channels = %v, want the new channel %s", p.ScopeKind, p.ChannelIDs, created.ID)
+		}
+	}
+
+	// A second channel joins the first rather than replacing it.
+	w2 := postChannel(d, `{"name":"dd","type":"dingtalk","storm_merge":true,
+		"config":{"access_token":"abc","lang":"zh"}}`)
+	if w2.Code != http.StatusOK {
+		t.Fatalf("second create = %d, body %s", w2.Code, w2.Body.String())
+	}
+	policies, err = d.NotifyPolicy.List(ctx, "site_default")
+	if err != nil {
+		t.Fatalf("list policies: %v", err)
+	}
+	for _, p := range policies {
+		if len(p.ChannelIDs) != 2 {
+			t.Errorf("%s policy channels = %v, want both channels", p.ScopeKind, p.ChannelIDs)
+		}
 	}
 }

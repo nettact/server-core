@@ -208,14 +208,14 @@ func (s *Service) Get(ctx context.Context, id string) (Channel, error) {
 	return c, nil
 }
 
-// Create adds a channel. config is stored as JSON. Storm merging starts on (the
-// column default) and is changed afterwards through Update.
-func (s *Service) Create(ctx context.Context, name, typ string, config map[string]string) (string, error) {
+// Create adds a channel. Config is stored as JSON and the grouping choice is
+// explicit so creation has the same delivery semantics as later edits.
+func (s *Service) Create(ctx context.Context, name, typ string, config map[string]string, stormMerge bool) (string, error) {
 	id := "chan_" + uuid.NewString()
 	b, _ := json.Marshal(config)
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO notification_channels(id, name, type, config, enabled) VALUES(?,?,?,?,1)`,
-		id, name, typ, string(b))
+		`INSERT INTO notification_channels(id, name, type, config, enabled, storm_merge) VALUES(?,?,?,?,1,?)`,
+		id, name, typ, string(b), boolInt(stormMerge))
 	return id, err
 }
 
