@@ -497,7 +497,7 @@ func TestNormalCadenceIsNotTreatedAsAGap(t *testing.T) {
 	h := newHarness(t)
 	det := DefaultDetection()
 
-	// ICMP's window is StaleAfter(10s, 5.8s, 5s) = 31.6s, so a 25s stutter between
+	// ICMP's window is StaleAfter(10s, 10s, 30s) = 90s, so a 25s stutter between
 	// rounds is within tolerance and the streak stands.
 	h.evaluate(det, loss(400000, 100))
 	h.evaluate(det, loss(400025, 100))

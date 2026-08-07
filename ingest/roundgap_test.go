@@ -51,6 +51,11 @@ func gapFor(t *testing.T, db *store.DB, s *Service) time.Duration {
 	return m.MaxRoundGap
 }
 
+// icmpCycle is the whole-cycle deadline an agent reports for the seeded ICMP
+// target, taken from the shared formula rather than a literal so these tests
+// cannot drift from it. Spread pacing makes it the check interval.
+func icmpCycle(p pcfg.ProbeParams) time.Duration { return pcfg.CycleDeadline("icmp", p) }
+
 // TestRoundGapHonoursAgentReportedFloor: an agent floors every interval at its
 // local MinProbeInterval, so a 10s ICMP target on an agent with a 60s floor really
 // runs every 60s. The tolerance has to follow the reported cadence, or that agent
@@ -59,22 +64,24 @@ func TestRoundGapHonoursAgentReportedFloor(t *testing.T) {
 	db, svc := openGapDB(t)
 	ctx := context.Background()
 
-	// Desired config only: ICMP defaults give StaleAfter(10s, 5.8s, 5s) = 31.6s.
+	// Desired config only: ICMP defaults give StaleAfter(10s, 10s, 30s) = 90s.
 	fallback := gapFor(t, db, svc)
-	if want := pcfg.StaleAfter(10*time.Second, 5800*time.Millisecond, pcfg.DefaultUploadInterval); fallback != want {
+	if want := pcfg.StaleAfter(10*time.Second, icmpCycle(pcfg.ProbeParams{}), pcfg.DefaultUploadInterval); fallback != want {
 		t.Fatalf("desired-config fallback = %v, want %v", fallback, want)
 	}
 
-	// The agent echoes its real schedule for this generation: a 60s floored interval.
+	// The agent echoes its real schedule for this generation: a 60s floored
+	// interval. Its cycle deadline stays the unfloored 10s (see monitoreval's
+	// stampSchedule), which the base term absorbs either way.
 	if _, err := db.ExecContext(ctx, `
 		INSERT INTO monitor_status(agent_id, monitor_id, status, config_version, updated_at, source,
 		    target_config_serial, effective_interval_seconds, cycle_deadline_ms, upload_interval_seconds)
-		VALUES('agent_a','t_icmp','active',1,?,'reported',4,60,5800,5)`, time.Now().UTC()); err != nil {
+		VALUES('agent_a','t_icmp','active',1,?,'reported',4,60,10000,5)`, time.Now().UTC()); err != nil {
 		t.Fatal(err)
 	}
 
 	got := gapFor(t, db, svc)
-	if want := pcfg.StaleAfter(60*time.Second, 5800*time.Millisecond, 5*time.Second); got != want {
+	if want := pcfg.StaleAfter(60*time.Second, 10*time.Second, 5*time.Second); got != want {
 		t.Fatalf("reported schedule = %v, want %v", got, want)
 	}
 	// The whole point: the tolerance now exceeds the real 60s cadence, so consecutive
@@ -98,11 +105,11 @@ func TestRoundGapIgnoresStaleGenerationEcho(t *testing.T) {
 	if _, err := db.ExecContext(ctx, `
 		INSERT INTO monitor_status(agent_id, monitor_id, status, config_version, updated_at, source,
 		    target_config_serial, effective_interval_seconds, cycle_deadline_ms, upload_interval_seconds)
-		VALUES('agent_a','t_icmp','active',1,?,'reported',3,600,5800,5)`, time.Now().UTC()); err != nil {
+		VALUES('agent_a','t_icmp','active',1,?,'reported',3,600,10000,5)`, time.Now().UTC()); err != nil {
 		t.Fatal(err)
 	}
 
-	want := pcfg.StaleAfter(10*time.Second, 5800*time.Millisecond, pcfg.DefaultUploadInterval)
+	want := pcfg.StaleAfter(10*time.Second, icmpCycle(pcfg.ProbeParams{}), pcfg.DefaultUploadInterval)
 	if got := gapFor(t, db, svc); got != want {
 		t.Fatalf("stale-generation echo must not be used: got %v, want the desired-config %v", got, want)
 	}
@@ -117,11 +124,11 @@ func TestRoundGapIgnoresPredictedSchedule(t *testing.T) {
 	if _, err := db.ExecContext(ctx, `
 		INSERT INTO monitor_status(agent_id, monitor_id, status, config_version, updated_at, source,
 		    target_config_serial, effective_interval_seconds, cycle_deadline_ms)
-		VALUES('agent_a','t_icmp','active',1,?,'predicted',4,600,5800)`, time.Now().UTC()); err != nil {
+		VALUES('agent_a','t_icmp','active',1,?,'predicted',4,600,10000)`, time.Now().UTC()); err != nil {
 		t.Fatal(err)
 	}
 
-	want := pcfg.StaleAfter(10*time.Second, 5800*time.Millisecond, pcfg.DefaultUploadInterval)
+	want := pcfg.StaleAfter(10*time.Second, icmpCycle(pcfg.ProbeParams{}), pcfg.DefaultUploadInterval)
 	if got := gapFor(t, db, svc); got != want {
 		t.Fatalf("predicted schedule must not be used: got %v, want %v", got, want)
 	}
@@ -135,7 +142,8 @@ func TestRoundGapUsesConfiguredInterval(t *testing.T) {
 		`UPDATE probe_tasks SET params='{"interval_seconds":300}' WHERE id='t_icmp'`); err != nil {
 		t.Fatal(err)
 	}
-	want := pcfg.StaleAfter(300*time.Second, 5800*time.Millisecond, pcfg.DefaultUploadInterval)
+	params := pcfg.ProbeParams{IntervalSeconds: 300}
+	want := pcfg.StaleAfter(300*time.Second, icmpCycle(params), pcfg.DefaultUploadInterval)
 	if got := gapFor(t, db, svc); got != want {
 		t.Fatalf("configured interval = %v, want %v", got, want)
 	}
