@@ -9,6 +9,8 @@ package agentstatus
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
+	"strconv"
 	"time"
 
 	"github.com/nettact/protocol/telemetry"
@@ -66,6 +68,32 @@ type ConnAlertRef struct {
 	OfflineSince time.Time `json:"offline_since"`
 }
 
+// ProbeOverloadRef reports that this agent recently ran out of probe-concurrency
+// budget and skipped probes it was due to run.
+//
+// It exists to explain a silence. A probe the budget turned away leaves no
+// sample, so its monitor goes stale exactly as it would if the network had gone
+// away — same badge, same freshness window, entirely different cause and
+// entirely different fix. Without this the console can only report the symptom;
+// with it, it can name the knob (max_probe_concurrency) and how far short it
+// fell.
+//
+// It is per agent rather than per monitor because the budget is the machine's:
+// the probes that lost the race are not the ones that overran it, so attributing
+// the shortfall to whichever monitor happened to be skipped would point at the
+// wrong target. Only the most recent report is carried — the condition is a
+// standing one, not a history to page through.
+type ProbeOverloadRef struct {
+	// Skipped is how many probe operations the budget refused during Window.
+	Skipped int `json:"skipped"`
+	// Window is the aggregation window in seconds the count covers.
+	Window int `json:"window_s"`
+	// Limit is the configured max_probe_concurrency the probes competed for.
+	Limit int `json:"limit"`
+	// ReportedAt is when the agent reported it.
+	ReportedAt time.Time `json:"reported_at"`
+}
+
 // ScalarSample is a single-valued resource reading with its unit + sampling time.
 type ScalarSample struct {
 	Value float64   `json:"value"`
@@ -120,24 +148,25 @@ type Resources struct {
 }
 
 type AgentStatusRow struct {
-	ID                      string        `json:"id"`
-	DisplayName             string        `json:"display_name"`
-	Hostname                string        `json:"hostname"`
-	Platform                string        `json:"platform"`
-	AgentVersion            string        `json:"agent_version"`
-	Status                  string        `json:"status"`   // offline|abnormal|never_connected|ok
-	Presence                string        `json:"presence"` // online|offline (raw registry status)
-	StatusSince             *time.Time    `json:"status_since"`
-	LastSeenAt              *time.Time    `json:"last_seen_at"`
-	FirstConnectedAt        *time.Time    `json:"first_connected_at"`
-	LastDisconnectKind      string        `json:"last_disconnect_kind"`
-	ConnectivityAlertsMuted bool          `json:"connectivity_alerts_muted"`
-	Groups                  []GroupRef    `json:"groups"`
-	FiringFaults            int           `json:"firing_faults"`
-	ActiveIssues            int           `json:"active_issues"`
-	ConnectivityAlert       *ConnAlertRef `json:"connectivity_alert"`
-	Resources               Resources     `json:"resources"`
-	CreatedAt               time.Time     `json:"created_at"`
+	ID                      string            `json:"id"`
+	DisplayName             string            `json:"display_name"`
+	Hostname                string            `json:"hostname"`
+	Platform                string            `json:"platform"`
+	AgentVersion            string            `json:"agent_version"`
+	Status                  string            `json:"status"`   // offline|abnormal|never_connected|ok
+	Presence                string            `json:"presence"` // online|offline (raw registry status)
+	StatusSince             *time.Time        `json:"status_since"`
+	LastSeenAt              *time.Time        `json:"last_seen_at"`
+	FirstConnectedAt        *time.Time        `json:"first_connected_at"`
+	LastDisconnectKind      string            `json:"last_disconnect_kind"`
+	ConnectivityAlertsMuted bool              `json:"connectivity_alerts_muted"`
+	Groups                  []GroupRef        `json:"groups"`
+	FiringFaults            int               `json:"firing_faults"`
+	ActiveIssues            int               `json:"active_issues"`
+	ConnectivityAlert       *ConnAlertRef     `json:"connectivity_alert"`
+	ProbeOverload           *ProbeOverloadRef `json:"probe_overload"`
+	Resources               Resources         `json:"resources"`
+	CreatedAt               time.Time         `json:"created_at"`
 }
 
 // SiteAgentStatuses assembles the per-agent rollup for a site. Reads run on the
@@ -167,6 +196,10 @@ func (s *Service) SiteAgentStatuses(ctx context.Context, siteID string) (SiteAge
 	if err != nil {
 		return SiteAgentStatuses{}, err
 	}
+	overloads, err := s.loadProbeOverloads(ctx, siteID, now)
+	if err != nil {
+		return SiteAgentStatuses{}, err
+	}
 	statusSince, err := s.loadStatusSince(ctx, siteID)
 	if err != nil {
 		return SiteAgentStatuses{}, err
@@ -183,6 +216,9 @@ func (s *Service) SiteAgentStatuses(ctx context.Context, siteID string) (SiteAge
 		row.ActiveIssues = issues[a.ID]
 		if ca, ok := connAlerts[a.ID]; ok {
 			row.ConnectivityAlert = &ca
+		}
+		if po, ok := overloads[a.ID]; ok {
+			row.ProbeOverload = &po
 		}
 		if t, ok := statusSince[a.ID]; ok {
 			tt := t
@@ -311,8 +347,106 @@ func (s *Service) loadConnAlerts(ctx context.Context, siteID string) (map[string
 	return out, rows.Err()
 }
 
-func (s *Service) loadStatusSince(ctx context.Context, siteID string) (map[string]time.Time, error) {
-	// Select the direct changed_at column of each agent's latest transition rather
+// probeOverloadFreshFor is how long a reported overload keeps describing the
+// present.
+//
+// The agent aggregates its refusals into one event per 5-minute window, so a
+// single window is the shortest honest answer and would blink off between
+// reports on an agent that is still overloaded. Three windows is long enough to
+// ride out a missed or delayed upload — the WAL batches on its own cadence — and
+// short enough that the notice goes away on its own once the operator has raised
+// the limit, instead of accusing a healthy agent for the rest of the day.
+const probeOverloadFreshFor = 15 * time.Minute
+
+// loadProbeOverloads returns each agent's most recent probe-overload report,
+// dropping ones too old to describe the present.
+//
+// It is the first and only reader of the events table, which is why it reaches
+// into it directly rather than through a general event feed: what the console
+// needs here is one standing condition per agent, not a queryable history, and
+// a table scan bounded by (site, ts) — the index the table already carries — is
+// the whole cost.
+//
+// # Whose clock this trusts
+//
+// events.ts is stamped by the AGENT and stored unchanged, so a badly skewed
+// agent clock shifts this window by the skew: a slow one can date a live report
+// outside it and show nothing, a fast one holds a recovered agent's last report
+// inside it for that much longer before it ages out. That is deliberate rather
+// than overlooked. Every freshness judgement in the product already reads
+// agent-stamped time — targetstatus compares sample timestamps against
+// StaleAfter the same way — so correcting skew for this one notice would make it
+// disagree with the staleness it exists to explain, which is the one outcome
+// worse than either failure mode. Skew is a whole-product concern and belongs to
+// a whole-product fix (a server-derived occurrence time at ingest), not to a
+// special case here.
+//
+// A future-dated report is still clamped below, so the timestamp the console
+// shows is never one that has not happened yet.
+func (s *Service) loadProbeOverloads(ctx context.Context, siteID string, now time.Time) (map[string]ProbeOverloadRef, error) {
+	// The cutoff MUST be UTC. The driver renders a time.Time bind parameter with
+	// its zone offset and TIMESTAMP columns compare as text, so a local-zone
+	// cutoff ("…T15:04+08:00") is compared against a stored UTC instant
+	// ("…T07:04Z") as a string — east of Greenwich that silently excludes every
+	// row, west of it includes far too many. s.now() is time.Now, which is local.
+	utcNow := now.UTC()
+	rows, err := s.db.Read().QueryContext(ctx, `
+		SELECT agent_id, ts, COALESCE(attrs,'') FROM events
+		WHERE site_id=? AND type=? AND ts >= ?
+		ORDER BY ts ASC`,
+		siteID, string(telemetry.EventProbeOverload), utcNow.Add(-probeOverloadFreshFor))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]ProbeOverloadRef{}
+	for rows.Next() {
+		var agentID, attrs string
+		var ts time.Time
+		if err := rows.Scan(&agentID, &ts, &attrs); err != nil {
+			return nil, err
+		}
+		var a map[string]string
+		if attrs != "" && json.Unmarshal([]byte(attrs), &a) != nil {
+			continue // an unparseable payload says nothing; do not guess at it
+		}
+		skipped := atoiOr(a[telemetry.ProbeOverloadAbandonedLabel], 0)
+		if skipped <= 0 {
+			// A count of zero is not a notice. The producer only emits when it has
+			// refused something, so reaching here means an absent or malformed
+			// payload — and rendering "0 probes skipped against a limit of 0" as a
+			// standing warning would be worse than saying nothing.
+			continue
+		}
+		// Ascending order means a later row overwrites an earlier one, so each
+		// agent ends on its most recent report. A future-dated one is clamped so
+		// the console never shows a timestamp that has not happened yet.
+		reported := ts
+		if reported.After(utcNow) {
+			reported = utcNow
+		}
+		out[agentID] = ProbeOverloadRef{
+			Skipped:    skipped,
+			Window:     atoiOr(a[telemetry.ProbeOverloadWindowLabel], 0),
+			Limit:      atoiOr(a[telemetry.ProbeOverloadLimitLabel], 0),
+			ReportedAt: reported,
+		}
+	}
+	return out, rows.Err()
+}
+
+// atoiOr parses a decimal attribute, falling back to def. An attribute the agent
+// could not fill is absent rather than zero, and either way the console renders
+// what it got instead of refusing the whole notice.
+func atoiOr(s string, def int) int {
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		return def
+	}
+	return n
+}
+
+func (s *Service) loadStatusSince(ctx context.Context, siteID string) (map[string]time.Time, error) { // Select the direct changed_at column of each agent's latest transition rather
 	// than MAX(changed_at): the aggregate strips the column's TIMESTAMP affinity, so
 	// the modernc SQLite driver hands it back as a raw string that will not scan into
 	// time.Time. A bare column read keeps the affinity (as registry.StatusHistory

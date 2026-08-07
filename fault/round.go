@@ -1,6 +1,7 @@
 package fault
 
 import (
+	"encoding/json"
 	"math"
 	"sort"
 	"time"
@@ -169,6 +170,81 @@ type TargetMeta struct {
 	// maxRoundGap), so a caller that does not set it still gets a sane bound
 	// rather than an unbounded one.
 	MaxRoundGap time.Duration
+	// PingCount is how many echoes an icmp/gateway round is configured to send
+	// (packet_count, or the protocol default). It is what an incoming round's
+	// probe.icmp.sent is measured against to tell a complete round from one the
+	// agent's probe budget truncated — see RoundComplete. Zero for every other
+	// kind, and for an icmp target whose params could not be read, which disables
+	// the check rather than guessing a count.
+	PingCount int
+}
+
+// RoundComplete reports whether a round measured everything it was configured to
+// measure, and so may be trusted with a verdict.
+//
+// Only ICMP has an incomplete state. Its loss is a ratio over the echoes
+// actually SENT (see telemetry.ICMPSent), and the agent sends fewer than
+// configured when its probe-concurrency budget could not admit them inside the
+// round's timing budget. A round that managed one echo of five reports either 0%
+// or 100% — figures indistinguishable from a healthy or a dead target, on
+// exactly the metric the availability detector reads. Trusting them would let a
+// busy agent invent both recoveries and outages.
+//
+// So an incomplete round is classified RoundInvalid: it is stored and charted
+// like any other sample, but it neither confirms nor clears, and it stays out of
+// the availability denominator. What it cannot do is hide the problem — the
+// truncation means fewer rounds, the monitor goes stale on its own, and the
+// agent's own overload event says why.
+//
+// # A missing count fails CLOSED
+//
+// sent <= 0 means the round carried no probe.icmp.sent at all, and that is
+// treated as incomplete rather than waved through. Every agent that can connect
+// emits it — the schema version was bumped for this contract, so the handshake
+// refuses a peer that predates it — which leaves exactly one way to reach here
+// without a count: a producer regression. Failing open would let that regression
+// silently restore the behaviour this check exists to remove, and it would be an
+// old-payload fallback of the kind AGENTS.md rules out.
+//
+// want <= 0 is the opposite case and deliberately fails OPEN. It means the
+// SERVER could not read the target's own configured packet count (an unparseable
+// probe_tasks.params). The check is then inapplicable, not failed, and the party
+// at fault is the server's own bookkeeping — silencing a monitor whose agent is
+// reporting perfectly well would punish the wrong side of the exchange.
+func RoundComplete(probeKind string, sent, want int) bool {
+	if probeKind != "icmp" && probeKind != "gateway" {
+		return true
+	}
+	if want <= 0 {
+		return true
+	}
+	return sent >= want
+}
+
+// ConfiguredPingCount is the packet count an icmp/gateway round is measured
+// against, read from a probe_tasks.params blob. It is the `want` argument to
+// RoundComplete.
+//
+// It lives here, next to the predicate, because two independent paths need the
+// SAME answer: ingest derives it when building rounds for the detector, and
+// targetstatus derives it when deciding the probe_state chip. Computing it twice
+// is how those two came to disagree — one defaulting an unparseable blob to five
+// while the other returned zero — which put a green chip next to a fault state
+// that had deliberately abstained.
+//
+// Unreadable params yield 0, which disables the check (RoundComplete's fail-open
+// branch). That is the safe direction here: the SERVER could not read its own
+// bookkeeping, so the comparison is inapplicable rather than failed, and
+// silencing a monitor whose agent is reporting fine would punish the wrong side.
+func ConfiguredPingCount(probeKind, params string) int {
+	if probeKind != "icmp" && probeKind != "gateway" {
+		return 0
+	}
+	var p pcfg.ProbeParams
+	if params != "" && json.Unmarshal([]byte(params), &p) != nil {
+		return 0
+	}
+	return pcfg.PingCount(p)
 }
 
 // maxRoundGap is the tolerance for calling two rounds consecutive, defaulting to
@@ -473,6 +549,10 @@ func BuildRounds(ms []telemetry.Metric, meta map[string]TargetMeta) []Round {
 		hasReason    bool
 		reasonCode   int
 		reasonDetail string
+		// sent is this round's probe.icmp.sent, the echoes the agent actually
+		// managed. Compared against the target's configured count to reject a
+		// truncated round's verdict — see RoundComplete.
+		sent int
 		// Where the probe actually went. The two families sit on different samples:
 		// NAT names its STUN server on the primary metric (it has no reason metric at
 		// all), DNS names its resolver on the error_class metric alongside the detail.
@@ -504,7 +584,8 @@ func BuildRounds(ms []telemetry.Metric, meta map[string]TargetMeta) []Round {
 		isPrimary := kind == primary
 		isReason := hasReason && kind == reason
 		isQuality := baselineKinds[kind]
-		if !isPrimary && !isReason && !isQuality {
+		isSent := kind == string(telemetry.ICMPSent) && (tm.Kind == "icmp" || tm.Kind == "gateway")
+		if !isPrimary && !isReason && !isQuality && !isSent {
 			continue
 		}
 		k := roundKey{targetID: m.MonitorID, ts: m.TS.Unix()}
@@ -512,6 +593,10 @@ func BuildRounds(ms []telemetry.Metric, meta map[string]TargetMeta) []Round {
 		if a == nil {
 			a = &roundAcc{}
 			acc[k] = a
+		}
+		if isSent {
+			a.sent = int(m.Value)
+			continue
 		}
 		// A quality metric can also BE the primary one (ICMP loss is both), so this
 		// records first and the primary/reason branches below still run for it.
@@ -546,6 +631,9 @@ func BuildRounds(ms []telemetry.Metric, meta map[string]TargetMeta) []Round {
 			continue // no primary metric this cycle → not a verdict
 		}
 		tm := meta[k.targetID]
+		if !RoundComplete(tm.Kind, a.sent, tm.PingCount) {
+			continue // the agent's probe budget truncated it → not a verdict
+		}
 		class := Classify(tm.Kind, a.value, tm.Det)
 		if class == RoundInvalid {
 			continue

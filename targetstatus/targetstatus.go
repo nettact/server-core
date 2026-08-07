@@ -34,6 +34,7 @@ import (
 	"time"
 
 	pcfg "github.com/nettact/protocol/config"
+	"github.com/nettact/protocol/telemetry"
 	"github.com/nettact/protocol/wire"
 	"github.com/nettact/server-core/fault"
 	"github.com/nettact/server-core/metrics"
@@ -218,9 +219,14 @@ type targetRow struct {
 	configSerial                    int
 	configChangedAt                 sql.NullTime
 	params                          pcfg.ProbeParams
-	detection                       fault.DetectionSettings
-	groupIsDefault                  bool
-	groupName                       string
+	// pingCount is the configured ICMP packet count a round's reported sent count
+	// is measured against, derived through the same helper ingest uses so the
+	// probe_state chip and the detector can never disagree about which rounds
+	// count. Zero for every other kind.
+	pingCount      int
+	detection      fault.DetectionSettings
+	groupIsDefault bool
+	groupName      string
 }
 
 type applicablePair struct {
@@ -554,6 +560,13 @@ func (s *Service) deriveAgent(t *targetRow, p applicablePair, now time.Time,
 		switch {
 		case now.Sub(lo) > staleAfter:
 			as.ProbeState = probeStale
+		case !roundComplete(t, sv, samples[pairKey+"\x00"+string(telemetry.ICMPSent)]):
+			// The agent's probe budget truncated this round, so its loss figure —
+			// a ratio over the echoes it managed — cannot be read as health. The
+			// detector abstains on exactly the same rounds (fault.RoundComplete);
+			// showing a verdict here would put a green or red chip next to a fault
+			// state that deliberately did not move.
+			as.ProbeState = probeNoData
 		case fault.Classify(t.kind, sv.value, t.detection) == fault.RoundFail:
 			as.ProbeState = probeFailed
 		default:
@@ -740,6 +753,12 @@ func (s *Service) loadTargets(ctx context.Context, tx *sql.Tx, siteID string) ([
 		if params != "" {
 			_ = json.Unmarshal([]byte(params), &t.params)
 		}
+		// Derived from the RAW blob through the same helper ingest uses, not from
+		// the parsed struct above: that unmarshal ignores its error, so a
+		// malformed blob would silently yield the zero value and the default count
+		// of five, while ingest would see the parse fail and disable the check.
+		// The two paths would then judge the same round differently.
+		t.pingCount = fault.ConfiguredPingCount(t.kind, params)
 		out = append(out, t)
 	}
 	return out, rows.Err()
@@ -1012,6 +1031,32 @@ func beforeCutoff(ts time.Time, cutoff *time.Time) bool {
 // granularity mismatch to correct.
 func sampleBeforeCutoff(ts int64, cutoff *time.Time) bool {
 	return cutoff != nil && ts < cutoff.Unix()
+}
+
+// roundComplete reports whether the latest primary sample describes a round that
+// measured everything it was configured to, so its value may be read as health.
+//
+// It defers to fault.RoundComplete with the SAME arguments the detector derives,
+// which is the whole point: this chip sits next to the fault state, and the two
+// disagreeing is worse than either being wrong alone. An absent sent sample is
+// therefore passed through as a count of zero rather than waved through — the
+// detector rejects that round, so this must not paint it green. Only ICMP has an
+// incomplete state; see fault.RoundComplete for why a truncated round's loss
+// figure is unreadable.
+//
+// A sent sample from a DIFFERENT round than the primary one is also a zero: the
+// two are emitted together every round, so a mismatch means the latest round's
+// count cannot be established, and an unverifiable round is exactly what the
+// gate exists to withhold a verdict from.
+func roundComplete(t *targetRow, primary, sent *sampleVal) bool {
+	if primary == nil {
+		return true
+	}
+	got := 0
+	if sent != nil && sent.ts == primary.ts {
+		got = int(sent.value)
+	}
+	return fault.RoundComplete(t.kind, got, t.pingCount)
 }
 
 func severityName(rank int) string {

@@ -604,6 +604,8 @@ func describeZh(d FaultDetail) string {
 		s = fmt.Sprintf("%s 抖动 %sms%s", subj, num(d.Value), thrZh(d, "ms"))
 	case telemetry.ICMPSamples:
 		s = fmt.Sprintf("%s 有效采样数 %s%s", subj, num(d.Value), thrZh(d, ""))
+	case telemetry.ICMPSent:
+		s = fmt.Sprintf("%s 本轮发包数 %s%s", subj, num(d.Value), thrZh(d, ""))
 	case telemetry.DNSOK:
 		s = subj + " 解析失败"
 	case telemetry.DNSResolve:
@@ -740,6 +742,8 @@ func describeEn(d FaultDetail) string {
 		s = fmt.Sprintf("%s jitter is %sms%s", subj, num(d.Value), thrEn(d, "ms"))
 	case telemetry.ICMPSamples:
 		s = fmt.Sprintf("%s valid samples is %s%s", subj, num(d.Value), thrEn(d, ""))
+	case telemetry.ICMPSent:
+		s = fmt.Sprintf("%s sent %s echoes this round%s", subj, num(d.Value), thrEn(d, ""))
 	case telemetry.DNSOK:
 		s = subj + " failed to resolve"
 	case telemetry.DNSResolve:

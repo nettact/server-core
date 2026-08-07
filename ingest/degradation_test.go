@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/nettact/protocol"
+	pcfg "github.com/nettact/protocol/config"
 	"github.com/nettact/protocol/telemetry"
 	"github.com/nettact/server-core/baseline"
 	"github.com/nettact/server-core/eventbus"
@@ -74,6 +75,14 @@ func (h *degHarness) seedBaseline(daypart int, weekend bool, p50, p95 float64) {
 }
 
 // push sends one packet of n consecutive healthy ICMP rounds ending ~now.
+// push ingests n consecutive ICMP rounds at the given RTT.
+//
+// Every round carries probe.icmp.sent, exactly as a real agent's does: loss is a
+// ratio over the echoes actually sent, and the server refuses a verdict on a
+// round that cannot show it sent everything it was configured to (see
+// fault.RoundComplete). A fixture that omitted it would be judged an incomplete
+// round and produce no verdict at all — which is the invariant working, not a
+// detail to route around.
 func (h *degHarness) push(n int, rttMs float64) {
 	h.t.Helper()
 	base := time.Now().Unix() - int64(2*n)
@@ -83,6 +92,9 @@ func (h *degHarness) push(n int, rttMs float64) {
 		ms = append(ms,
 			telemetry.Metric{TS: ts, Kind: telemetry.ICMPLoss, Target: "192.168.1.1",
 				Value: 0, Unit: telemetry.UnitPct, MonitorID: "t_icmp", ConfigSerial: 1},
+			telemetry.Metric{TS: ts, Kind: telemetry.ICMPSent, Target: "192.168.1.1",
+				Value: float64(pcfg.PingCount(pcfg.ProbeParams{})), Unit: telemetry.UnitCount,
+				MonitorID: "t_icmp", ConfigSerial: 1},
 			telemetry.Metric{TS: ts, Kind: telemetry.ICMPRTTms, Target: "192.168.1.1",
 				Value: rttMs, Unit: telemetry.UnitMs, MonitorID: "t_icmp", ConfigSerial: 1},
 		)

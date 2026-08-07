@@ -370,6 +370,7 @@ func (s *Service) probeMeta(ctx context.Context, q rowQuerier, agentID, siteID s
 		m.Enabled = enabled == 1
 		m.Det.SmartEnabled = smartEnabled == 1
 		m.Port = portFromParams(params)
+		m.PingCount = fault.ConfiguredPingCount(m.Kind, params)
 		m.ProxyAddr = proxyAddr(m.ProxyType, proxyHost, proxyPort, wgEndpoint)
 		m.MaxRoundGap = roundGap(m.Kind, params, sched, m.ConfigSerial)
 		m.Det = m.Det.Normalize()
