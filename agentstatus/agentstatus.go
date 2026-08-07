@@ -576,10 +576,33 @@ func buildResources(points []metrics.Point, staleCutoff time.Time) Resources {
 		res.Net = n
 	}
 	if len(disks) > 0 {
+		// A mount that stopped reporting must not keep deciding this cell. The
+		// snapshot feeding this function returns the newest sample of every series
+		// ever seen, with no lower time bound, so a mount that goes away — an
+		// unplugged disk, an unmounted share, a filesystem the agent stopped
+		// collecting — lingers at its final value indefinitely. Because the headline
+		// is the WORST mount, a departed mount that happened to be full captures the
+		// percentage, the mountpoint AND the timestamp permanently: the cell reads
+		// "100%, stale" forever while every live filesystem is nearly empty. It also
+		// keeps adding its capacity to the sum, overstating the host's storage.
+		//
+		// Keeping every mount when they are ALL stale is the deliberate other half:
+		// that is an agent gone quiet rather than a disk gone away, and showing its
+		// last known disks behind the stale badge is exactly what the badge is for.
+		live := make(map[string]*diskAgg, len(disks))
+		for mount, d := range disks {
+			if !d.ts.Before(staleCutoff) {
+				live[mount] = d
+			}
+		}
+		if len(live) == 0 {
+			live = disks
+		}
+
 		var worstMount string
 		var worst *diskAgg
 		var sumUsed, sumTotal float64
-		for mount, d := range disks {
+		for mount, d := range live {
 			if d.used != nil {
 				sumUsed += *d.used
 			}
@@ -599,7 +622,7 @@ func buildResources(points []metrics.Point, staleCutoff time.Time) Resources {
 			// single signal.
 			res.Disk = &DiskSample{
 				Pct: *worst.pct, Used: sumUsed, Total: sumTotal,
-				Mount: worstMount, Mounts: len(disks),
+				Mount: worstMount, Mounts: len(live),
 				TS: worst.ts, Stale: worst.ts.Before(staleCutoff),
 			}
 		}

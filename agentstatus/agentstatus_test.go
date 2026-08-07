@@ -175,6 +175,103 @@ func TestResourcesStaleAndWorstMount(t *testing.T) {
 	}
 }
 
+// TestDepartedMountDoesNotDecideDiskCell covers a mount that stopped reporting
+// while the agent kept running. The latest-sample snapshot has no lower time
+// bound, so such a mount stays at its final value forever — and since the cell
+// shows the worst mount, a full one would own the percentage, the mountpoint and
+// the timestamp permanently. The case that produced it: an OpenWrt agent stopped
+// collecting its read-only /rom image, whose last sample was 100% by
+// construction, and the console showed "100%, stale" indefinitely for a router
+// with 0.9% of its writable space used.
+func TestDepartedMountDoesNotDecideDiskCell(t *testing.T) {
+	db := openDB(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	seedAgent(t, db, "agent_a", "online", &now)
+
+	set := settings.New(db)
+	_ = set.Set(ctx, settings.KeyAgentStatusStaleSeconds, "120")
+
+	fresh := now.Add(-10 * time.Second)
+	gone := now.Add(-6 * time.Hour) // last seen long ago; the agent is still live
+	fm := &fakeMetrics{byAgent: map[string][]metrics.Point{
+		"agent_a": {
+			{TS: gone, Kind: string(telemetry.HostDiskPct), Target: "/rom", Value: 100, Unit: "pct"},
+			{TS: gone, Kind: string(telemetry.HostDiskUsed), Target: "/rom", Value: 230686720},
+			{TS: gone, Kind: string(telemetry.HostDiskTotal), Target: "/rom", Value: 230686720},
+			{TS: fresh, Kind: string(telemetry.HostDiskPct), Target: "/overlay", Value: 0.9, Unit: "pct"},
+			{TS: fresh, Kind: string(telemetry.HostDiskUsed), Target: "/overlay", Value: 18350080},
+			{TS: fresh, Kind: string(telemetry.HostDiskTotal), Target: "/overlay", Value: 2040373248},
+			{TS: fresh, Kind: string(telemetry.HostDiskPct), Target: "/boot", Value: 6.5, Unit: "pct"},
+			{TS: fresh, Kind: string(telemetry.HostDiskUsed), Target: "/boot", Value: 8404992},
+			{TS: fresh, Kind: string(telemetry.HostDiskTotal), Target: "/boot", Value: 132075520},
+		},
+	}}
+	svc := New(db, fm, set)
+	svc.now = func() time.Time { return now }
+
+	got, err := svc.SiteAgentStatuses(ctx, "site_default")
+	if err != nil {
+		t.Fatalf("SiteAgentStatuses: %v", err)
+	}
+	d := find(got.Agents, "agent_a").Resources.Disk
+	if d == nil {
+		t.Fatal("disk should be present")
+	}
+	if d.Mount != "/boot" || d.Pct != 6.5 {
+		t.Errorf("worst LIVE mount should decide the headline, got mount=%q pct=%v", d.Mount, d.Pct)
+	}
+	if d.Stale {
+		t.Error("cell should not be stale: the mounts that still report are fresh")
+	}
+	if d.Mounts != 2 {
+		t.Errorf("mount count should exclude the departed mount, got %d", d.Mounts)
+	}
+	if d.Total != 2040373248+132075520 {
+		t.Errorf("departed mount should not add to capacity, got total=%v", d.Total)
+	}
+}
+
+// TestAllMountsStaleKeepsThemAll is the other half: every mount going quiet at
+// once means the AGENT went quiet, not that its disks went away. The last known
+// state behind the stale badge is what the badge is for, so nothing is dropped.
+func TestAllMountsStaleKeepsThemAll(t *testing.T) {
+	db := openDB(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	seedAgent(t, db, "agent_a", "offline", &now)
+
+	set := settings.New(db)
+	_ = set.Set(ctx, settings.KeyAgentStatusStaleSeconds, "120")
+
+	old := now.Add(-30 * time.Minute)
+	fm := &fakeMetrics{byAgent: map[string][]metrics.Point{
+		"agent_a": {
+			{TS: old, Kind: string(telemetry.HostDiskPct), Target: "C:", Value: 88, Unit: "pct"},
+			{TS: old, Kind: string(telemetry.HostDiskTotal), Target: "C:", Value: 5e11},
+			{TS: old, Kind: string(telemetry.HostDiskPct), Target: "D:", Value: 30, Unit: "pct"},
+			{TS: old, Kind: string(telemetry.HostDiskTotal), Target: "D:", Value: 5e11},
+		},
+	}}
+	svc := New(db, fm, set)
+	svc.now = func() time.Time { return now }
+
+	got, err := svc.SiteAgentStatuses(ctx, "site_default")
+	if err != nil {
+		t.Fatalf("SiteAgentStatuses: %v", err)
+	}
+	d := find(got.Agents, "agent_a").Resources.Disk
+	if d == nil {
+		t.Fatal("disk should still be present when the agent is quiet")
+	}
+	if !d.Stale {
+		t.Error("cell should be stale")
+	}
+	if d.Mounts != 2 || d.Mount != "C:" || d.Total != 1e12 {
+		t.Errorf("every mount should be kept, got %+v", d)
+	}
+}
+
 func TestNullResourcesWhenNoData(t *testing.T) {
 	db := openDB(t)
 	ctx := context.Background()
