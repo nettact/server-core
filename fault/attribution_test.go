@@ -696,6 +696,48 @@ func TestLoadTraceFactsSkipsResolvedSignals(t *testing.T) {
 	}
 }
 
+// A local_no_route report says the Agent's own host could not send the probes.
+// A route that vanished mid-sweep still leaves the hops measured before it did,
+// and a truncated private-only hop table is exactly what R4 reads as "the trace
+// died in the LAN" — so left in, an agent-side failure would argue for an ISP
+// verdict about a path that was never probed.
+func TestLoadTraceFactsSkipsLocalNoRouteReports(t *testing.T) {
+	h := newHarness(t)
+	h.seedIncident("inc_1")
+	h.seedFiringSignal("inc_1", "t_a", "SrvA", "8.8.8.8", "icmp", telemetry.ProbeReasonTimeout, noProxy())
+	h.seedTraceForRecompute("tr_1", "inc_1", "t_a_sig", "target", false)
+
+	ctx := context.Background()
+	// One transaction per call, and h.exec strictly between them: the store runs a
+	// single write connection, so seeding while a transaction is open would wait on
+	// a connection that transaction is holding.
+	load := func() []traceFact {
+		t.Helper()
+		tx, err := h.db.BeginTx(ctx, nil)
+		if err != nil {
+			t.Fatalf("begin: %v", err)
+		}
+		defer func() { _ = tx.Rollback() }()
+		traces, err := loadTraceFacts(ctx, tx, "inc_1")
+		if err != nil {
+			t.Fatalf("loadTraceFacts: %v", err)
+		}
+		return traces
+	}
+
+	h.exec(`UPDATE trace_reports SET status='failed', reason='local_no_route' WHERE id='tr_1'`)
+	if got := load(); len(got) != 0 {
+		t.Fatalf("a local_no_route report must be excluded from attribution, got %d", len(got))
+	}
+
+	// The guard must key on the reason, not the status: an ordinary failed report
+	// is still path evidence.
+	h.exec(`UPDATE trace_reports SET reason='probe_failed' WHERE id='tr_1'`)
+	if got := load(); len(got) != 1 {
+		t.Fatalf("a failed report with another reason must still load, got %d", len(got))
+	}
+}
+
 func TestAttributionTraceStaysWithItsTarget(t *testing.T) {
 	h := newHarness(t)
 	h.seedIncident("inc_1")

@@ -244,6 +244,14 @@ func referenceStaleAfter(kind, paramsJSON string, eff, cycle, upload sql.NullInt
 // diagnose a FIRING member (a just-resolved signal's trace is evidence of a fault
 // that is no longer part of this incident), keeps the latest report per
 // (subject, target), and classifies each one's hop table.
+//
+// local_no_route reports are excluded outright. That reason means the Agent's own
+// host could not send the probes at all, so the report describes the agent's
+// machine and not the path — but a route that vanished mid-sweep leaves the real
+// hops measured before it did, and a truncated private-only hop table is exactly
+// the shape R4 reads as "the trace died in the LAN". Left in, an agent-side NIC
+// or route failure would argue for an ISP verdict. The hops stay on the report
+// for the console to show; they simply are not path evidence.
 func loadTraceFacts(ctx context.Context, tx *sql.Tx, incidentID string) ([]traceFact, error) {
 	rows, err := tx.QueryContext(ctx, `
 		SELECT tr.id, tr.subject_kind, tr.status, tr.reached, fs.target_id
@@ -252,6 +260,7 @@ func loadTraceFacts(ctx context.Context, tx *sql.Tx, incidentID string) ([]trace
 		JOIN fault_signals fs ON fs.id = r.signal_id
 		WHERE r.incident_id=? AND r.active=1 AND fs.state='firing'
 		  AND tr.status IN('succeeded','partial','failed','timed_out')
+		  AND tr.reason <> 'local_no_route'
 		ORDER BY tr.received_at DESC`, incidentID)
 	if err != nil {
 		return nil, err
