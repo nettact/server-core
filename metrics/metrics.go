@@ -972,9 +972,9 @@ func (s *Store) currentSerialsLocked(ctx context.Context, monitorIDs map[string]
 	return out, rows.Err()
 }
 
-// TargetValue is the latest value of a series (for the rule engine). TS is the
-// sample's unix timestamp, used by an in-tx evaluation to merge the accepted
-// batch newest-wins over this cached value.
+// TargetValue is the latest value of a series, keyed by its target string. TS is
+// the sample's unix timestamp, so a caller merging it with an in-flight batch can
+// let the newer of the two win.
 type TargetValue struct {
 	Target string
 	Value  float64
@@ -982,8 +982,11 @@ type TargetValue struct {
 }
 
 // LatestPerSeries returns the newest value per matching SYSTEM series
-// (monitor_id=”) since sinceUnix — host/interface rules bind by target
-// string. Served from the latest cache; glob supports '*' and '?'.
+// (monitor_id=""), newer than sinceUnix. System series are keyed by target
+// string rather than by monitor, which is what this exists to look up: the
+// system-status detectors need the machine's core count to read a load average,
+// and it is reported as an ordinary series. Served from the latest cache; glob
+// supports '*' and '?'.
 func (s *Store) LatestPerSeries(ctx context.Context, agentID, kind, glob string, sinceUnix int64) ([]TargetValue, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

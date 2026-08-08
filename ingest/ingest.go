@@ -45,6 +45,12 @@ type Ack struct {
 // post-commit, off the write path.
 type Evaluator interface {
 	EvaluateAgentTx(ctx context.Context, tx *sql.Tx, agentID, siteID string, rounds []fault.Round) (*fault.Outcome, error)
+	// EvaluateHostTx advances the system-status detectors over the same batch, in
+	// the same transaction. Separate from EvaluateAgentTx because host readings are
+	// not probe rounds — they carry a threshold and a third "hold" verdict that a
+	// probe round has no use for.
+	EvaluateHostTx(ctx context.Context, tx *sql.Tx, agentID, siteID string,
+		rounds []fault.HostRound, mounts map[string]fault.HostMountView) (*fault.Outcome, error)
 	PublishOutcome(ctx context.Context, out *fault.Outcome)
 }
 
@@ -146,6 +152,16 @@ func (s *Service) Ingest(ctx context.Context, agentID, siteID string, pkt teleme
 		}
 	}
 
+	// The machine's core count, for the load-per-core judgement, resolved off the
+	// write path for the same reason the baselines above are. A batch carrying its
+	// own count overrides this; this covers the ordinary case where the count
+	// arrived in some earlier packet.
+	hostBatch := hasHostMetrics(pkt.Metrics)
+	var cores float64
+	if hostBatch {
+		cores = s.latestCores(ctx, agentID)
+	}
+
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return Ack{}, err
@@ -168,6 +184,7 @@ func (s *Service) Ingest(ctx context.Context, agentID, siteID string, pkt teleme
 
 	var acceptedTx []telemetry.Metric
 	var outcome *fault.Outcome
+	var hostOutcome *fault.Outcome
 	var traces *incidentops.TraceOutcome
 	if affected > 0 {
 		// Authoritative in-tx re-check: config edits serialize on the single write
@@ -234,6 +251,25 @@ func (s *Service) Ingest(ctx context.Context, agentID, siteID string, pkt teleme
 				return Ack{}, err
 			}
 		}
+		// The system-status detectors run in the same transaction, over the same
+		// batch, under the same contract: a machine that has been pegged for the
+		// configured duration opens a fault, plans its notification and commits with
+		// the samples that prove it. Its anchors are resolved here rather than pre-tx
+		// because a threshold edit serializes on this same write connection, so what
+		// is read here is what the evaluation is judged against.
+		if s.fault != nil && hostBatch {
+			metas, err := hostMeta(ctx, tx, agentID, siteID, cores, config.DefaultRegularSeconds)
+			if err != nil {
+				return Ack{}, err
+			}
+			if len(metas) > 0 {
+				hostRounds, mounts := fault.BuildHostRounds(acceptedTx, metas)
+				hostOutcome, err = s.fault.EvaluateHostTx(ctx, tx, agentID, siteID, hostRounds, mounts)
+				if err != nil {
+					return Ack{}, err
+				}
+			}
+		}
 		// Traceroute reports the agent ran on its own initiative. They land in this
 		// same transaction, after the fault evaluation, so a report and the rounds
 		// that explain it commit together and a report can attach to a fault the
@@ -263,6 +299,9 @@ func (s *Service) Ingest(ctx context.Context, agentID, siteID string, pkt teleme
 		if s.fault != nil && outcome != nil {
 			s.fault.PublishOutcome(ctx, outcome)
 		}
+		if s.fault != nil && hostOutcome != nil {
+			s.fault.PublishOutcome(ctx, hostOutcome)
+		}
 		if s.tracer != nil && traces != nil {
 			s.tracer.PublishTraceOutcome(ctx, traces)
 		}
@@ -270,6 +309,12 @@ func (s *Service) Ingest(ctx context.Context, agentID, siteID string, pkt teleme
 			ids := monitorIDs(acceptedTx)
 			if outcome != nil {
 				ids = append(ids, outcome.ChangedTargetIDs...)
+			}
+			// Host samples carry no monitor id, so a host anchor whose fault state just
+			// moved would never reach monitorIDs. Its own outcome is the only thing that
+			// refreshes the anchor's row in the console.
+			if hostOutcome != nil {
+				ids = append(ids, hostOutcome.ChangedTargetIDs...)
 			}
 			if len(ids) > 0 {
 				s.bus.Publish(eventbus.TopicTargetStatusChanged,

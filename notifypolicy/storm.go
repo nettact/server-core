@@ -51,6 +51,24 @@ type stormMemberChannel struct {
 // no storm at all, so the normal path stays untouched and correlation only ever
 // has to cancel and replace.
 func (s *Service) correlateStormTx(ctx context.Context, tx *sql.Tx, sc fault.IncidentScope, now time.Time) error {
+	// A SYSTEM-STATUS incident never takes part in a storm, at any of the three
+	// points below. A storm's whole claim is that one vantage point's view of the
+	// NETWORK broke at once, and it is announced as such — "suspected WAN-layer
+	// fault", "network recovered". CPU, memory and disk faults on one machine
+	// routinely fire together, because that is what a machine under load looks
+	// like, so left in they would form a storm, silently cancel their own
+	// notifications, and later be summarized as a network event they are not.
+	//
+	// The check has to be here rather than only in the candidate query: an
+	// incident joins an ALREADY-OPEN storm through the two branches above that
+	// query, which never consult it.
+	host, err := isHostIncident(ctx, tx, sc.IncidentID)
+	if err != nil {
+		return err
+	}
+	if host {
+		return nil
+	}
 	// An incident that ALREADY belongs to a storm stays with that storm, whatever
 	// agent this particular signal was observed from. A merge-enabled group's
 	// incident collects signals from every agent in scope, so an escalation can
@@ -105,6 +123,21 @@ func (s *Service) correlateStormTx(ctx context.Context, tx *sql.Tx, sc fault.Inc
 	return s.openStormTx(ctx, tx, sc, members, now)
 }
 
+// isHostIncident reports whether an incident's members are system-status faults.
+// It is a property of the incident rather than of this signal: the "hostm:"
+// open-key prefix keeps host faults in their own incidents, so one member
+// answering yes settles it.
+func isHostIncident(ctx context.Context, tx *sql.Tx, incidentID string) (bool, error) {
+	var n int
+	err := tx.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM fault_signals
+		WHERE incident_id=? AND detector_key LIKE 'host\_%' ESCAPE '\'`, incidentID).Scan(&n)
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
 // stormOf returns the storm an incident belongs to, or "" when it belongs to
 // none (including when the incident no longer exists).
 func stormOf(ctx context.Context, tx *sql.Tx, incidentID string) (string, error) {
@@ -134,12 +167,20 @@ func stormOf(ctx context.Context, tx *sql.Tx, incidentID string) (string, error)
 // notice its dedicated policy had just planned and folding it into a summary
 // routed by everyone else's channels, which is exactly the separation that
 // policy exists to provide.
+//
+// A SYSTEM-STATUS signal is excluded for the same kind of reason. A storm's whole
+// claim is that one vantage point's view of the NETWORK broke at once, and it is
+// announced as such ("suspected WAN-layer fault", "network recovered"). CPU,
+// memory and disk faults on one machine routinely fire together — that is what a
+// machine under load looks like — so without this they would form or join a storm
+// and be summarized as a network event they are not.
 func unstormedOpenIncidents(ctx context.Context, tx *sql.Tx, siteID, agentID string, since time.Time) ([]string, error) {
 	rows, err := tx.QueryContext(ctx, `
 		SELECT i.id FROM incidents i
 		WHERE i.site_id=? AND i.state='open' AND i.storm_id IS NULL AND i.opened_at>=?
 		  AND EXISTS(SELECT 1 FROM fault_signals s
-		             WHERE s.incident_id=i.id AND s.agent_id=? AND s.detector_key<>?)
+		             WHERE s.incident_id=i.id AND s.agent_id=?
+		               AND s.detector_key<>? AND s.detector_key NOT LIKE 'host\_%' ESCAPE '\')
 		ORDER BY i.opened_at`, siteID, since, agentID, fault.DetectorAgentConnectivity)
 	if err != nil {
 		return nil, err

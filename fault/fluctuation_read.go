@@ -132,8 +132,8 @@ func (s *Service) queryFluctuations(ctx context.Context, q string, args ...any) 
 		var roundsJSON string
 		if err := rows.Scan(&fl.ID, &fl.SiteID, &fl.AgentID, &fl.AgentName, &fl.TargetID,
 			&fl.TargetName, &fl.TargetAddr, &fl.Port, &fl.ProbeKind, &fl.GroupID, &fl.Layer,
-			&fl.FailRounds, &fl.FailThreshold, &fl.MetricKind, &fl.Comparator, &fl.Value,
-			&fl.Threshold, &fl.ReasonCode, &fl.ReasonDetail, &roundsJSON,
+			&fl.DetectorKey, &fl.FailRounds, &fl.FailThreshold, &fl.MetricKind, &fl.Comparator,
+			&fl.Value, &fl.Threshold, &fl.ReasonCode, &fl.ReasonDetail, &roundsJSON,
 			&fl.StartedAt, &fl.EndedAt, &fl.IncidentID); err != nil {
 			return nil, err
 		}

@@ -57,6 +57,34 @@ func TestDescribeDetail(t *testing.T) {
 			wantZh: []string{"主机 web01（host）", "CPU 使用率 95%", "阈值 > 90%"},
 			wantEn: []string{"host web01 (host)", "CPU usage is 95%", "threshold > 90%"},
 		},
+		{
+			// A system-status fault about the whole machine has no sub-target, so the
+			// subject must not render an empty parenthetical.
+			name:   "host load per core",
+			d:      FaultDetail{ProbeKind: "host", MetricKind: "host.load.per_core", Comparator: "gte", Threshold: 2, Value: 4, TargetName: "web01"},
+			wantZh: []string{"主机 web01", "每核负载 4", "阈值 ≥ 2"},
+			wantEn: []string{"host web01", "load per core is 4", "threshold ≥ 2"},
+		},
+		{
+			name:   "host download rate",
+			d:      FaultDetail{ProbeKind: "host", MetricKind: "host.net.rx_mbps", Comparator: "gte", Threshold: 100, Value: 200, TargetName: "web01"},
+			wantZh: []string{"下载速率 200 Mbps", "阈值 ≥ 100 Mbps"},
+			wantEn: []string{"download rate is 200 Mbps", "threshold ≥ 100 Mbps"},
+		},
+		{
+			name:   "host upload rate",
+			d:      FaultDetail{ProbeKind: "host", MetricKind: "host.net.tx_mbps", Comparator: "gte", Threshold: 20, Value: 45, TargetName: "web01"},
+			wantZh: []string{"上传速率 45 Mbps"},
+			wantEn: []string{"upload rate is 45 Mbps"},
+		},
+		{
+			// A disk names its mount, which is what makes one of four full disks a
+			// legible sentence rather than "a disk is full".
+			name:   "host disk mount",
+			d:      FaultDetail{ProbeKind: "host", MetricKind: "host.disk.pct", Comparator: "gte", Threshold: 90, Value: 97, Target: "C:", TargetName: "web01"},
+			wantZh: []string{"主机 web01（C:）", "磁盘使用率 97%"},
+			wantEn: []string{"host web01 (C:)", "disk usage is 97%"},
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

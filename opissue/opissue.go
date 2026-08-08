@@ -18,6 +18,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"strings"
 	"time"
 
@@ -25,9 +26,11 @@ import (
 
 	pcfg "github.com/nettact/protocol/config"
 	"github.com/nettact/protocol/permission"
+	"github.com/nettact/protocol/telemetry"
 	"github.com/nettact/protocol/wire"
 	"github.com/nettact/server-core/config"
 	"github.com/nettact/server-core/eventbus"
+	"github.com/nettact/server-core/fault"
 	"github.com/nettact/server-core/store"
 )
 
@@ -463,19 +466,57 @@ func (s *Service) ReevaluateHostMonitorsForSite(ctx context.Context, siteID stri
 	return nil
 }
 
-// hostRequired returns the closure of host permissions a host monitor requires.
+// hostRequired returns the closure of host permissions a host monitor requires:
+// the union over the metric families its system-status detection has switched on.
 //
-// The requirement used to be derived from the monitor's threshold rules — the
-// metrics they watched named the permissions needed to read them. Built-in
-// detection covers network availability only (a machine may legitimately have an
-// idle NIC or an unreadable sensor, so no host metric is auto-faulted), which
-// leaves a host monitor with no server-side metric requirement at all. Returning
-// an empty set keeps it unconditionally active; claiming a requirement nothing
-// actually has would raise permission issues for permissions no evaluation reads.
-// A genuinely missing host permission still surfaces through the Agent's own
-// per-metric permission reporting.
+// It has to be derived from the thresholds rather than fixed, because a host
+// anchor requires nothing in particular by itself. An anchor watching only disk
+// has no business raising a permission issue about an Agent that withholds its
+// temperature sensors, and an anchor watching CPU that cannot read CPU must not
+// sit green and silent while nothing evaluates. A missing settings row means the
+// zero-config defaults, so the requirement is computed the same way whether or
+// not anyone ever opened the form. All families off requires nothing, which
+// leaves the anchor unconditionally active.
 func hostRequired(ctx context.Context, tx *sql.Tx, monitorID string) (permission.Set, error) {
-	return permission.Set{}, nil
+	def := fault.DefaultHostSettings()
+	cpuOn, memOn, loadOn, netOn, diskOn := def.CPUEnabled, def.MemEnabled, def.LoadEnabled, def.NetEnabled, def.DiskEnabled
+	var cpu, mem, load, net, disk int
+	err := tx.QueryRowContext(ctx, `
+		SELECT cpu_enabled, mem_enabled, load_enabled, net_enabled, disk_enabled
+		FROM host_detection_settings WHERE target_id=?`, monitorID).
+		Scan(&cpu, &mem, &load, &net, &disk)
+	switch {
+	case errors.Is(err, sql.ErrNoRows): // never configured: the defaults apply
+	case err != nil:
+		return permission.Set{}, err
+	default:
+		cpuOn, memOn, loadOn = cpu != 0, mem != 0, load != 0
+		netOn, diskOn = net != 0, disk != 0
+	}
+
+	var ids []permission.ID
+	// One representative kind per family; RequiredForHostMetric maps by prefix, so
+	// naming the family's primary series names the whole family's permission.
+	// Load asks only for the load permission: the core count it divides by rides
+	// along under either the cpu or the load grant, by construction on the agent.
+	for _, f := range []struct {
+		on   bool
+		kind telemetry.MetricKind
+	}{
+		{cpuOn, telemetry.HostCPUPct},
+		{memOn, telemetry.HostMemPct},
+		{loadOn, telemetry.HostLoad1},
+		{netOn, telemetry.HostNetRxBps},
+		{diskOn, telemetry.HostDiskPct},
+	} {
+		if f.on {
+			ids = append(ids, permission.RequiredForHostMetric(string(f.kind))...)
+		}
+	}
+	if len(ids) == 0 {
+		return permission.Set{}, nil
+	}
+	return permission.Closure(permission.NewSet(ids...)), nil
 }
 
 // ---- scope reconciliation ----

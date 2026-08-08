@@ -27,6 +27,7 @@ package fault
 import (
 	"context"
 	"database/sql"
+	"strings"
 	"time"
 
 	"github.com/nettact/server-core/eventbus"
@@ -51,7 +52,61 @@ const (
 	// the operator has already stated a loss tolerance of their own.
 	DetectorLatencyDegradation = "latency_degradation"
 	DetectorLossDegradation    = "loss_degradation"
+
+	// The system-status family: the built-in detectors over a host anchor's own
+	// machine metrics. Unlike the probe detectors these DO carry a threshold, and
+	// unlike the deleted rule engine the threshold is the only thing an operator
+	// states — what to watch, how to confirm it and what to call it are fixed.
+	//
+	// A machine has one CPU figure and one memory figure but many disks and two
+	// directions of traffic, so the two multi-subject families fold their subject
+	// into the key after a '|' (see HostDetectorKey): 'host_disk|C:',
+	// 'host_net|rx'. That keeps every key-shaped contract in the schema — the
+	// detector_state primary key, the open-signal unique index, the target-scoped
+	// termination predicates — saying exactly what it said before, while letting
+	// two mounts be full at the same time.
+	DetectorHostCPU  = "host_cpu"
+	DetectorHostMem  = "host_mem"
+	DetectorHostLoad = "host_load"
+	DetectorHostNet  = "host_net"
+	DetectorHostDisk = "host_disk"
 )
+
+// hostDetectorSubjectSep separates a system-status family from its subject. It is
+// '|' because a subject is a mount point, and mount points contain ':' on Windows
+// and '/' everywhere else.
+const hostDetectorSubjectSep = "|"
+
+// HostDetectorKey composes a system-status detector key. An empty subject yields
+// the bare family, which is what the single-subject families (cpu, mem, load) use.
+func HostDetectorKey(family, subject string) string {
+	if subject == "" {
+		return family
+	}
+	return family + hostDetectorSubjectSep + subject
+}
+
+// SplitHostDetectorKey splits a stored detector key back into its family and
+// subject. A key with no subject returns it unchanged and an empty subject, so
+// callers can run every key through this unconditionally.
+func SplitHostDetectorKey(key string) (family, subject string) {
+	if f, s, ok := strings.Cut(key, hostDetectorSubjectSep); ok {
+		return f, s
+	}
+	return key, ""
+}
+
+// IsHostDetector reports whether a detector key belongs to the system-status
+// family. Used wherever a caller must not treat a machine-resource verdict as a
+// network one — most importantly in incident attribution, which reasons about
+// what the network path implies and has nothing to say about a full disk.
+func IsHostDetector(detectorKey string) bool {
+	switch family, _ := SplitHostDetectorKey(detectorKey); family {
+	case DetectorHostCPU, DetectorHostMem, DetectorHostLoad, DetectorHostNet, DetectorHostDisk:
+		return true
+	}
+	return false
+}
 
 // IsDegradation reports whether a detector key belongs to the baseline-relative
 // quality family. Used wherever a caller has to distinguish "measurably worse"
@@ -80,6 +135,11 @@ const (
 	// worth keeping open about a target that has stopped answering, and it is
 	// certainly not a recovery.
 	ReasonSuperseded = "superseded"
+	// ReasonSubjectGone ends a system-status signal whose subject stopped existing:
+	// the removable disk carrying a "nearly full" fault was ejected. It is
+	// deliberately not a recovery — the disk did not get emptier, it left — so it
+	// closes the fault without announcing that anything was fixed.
+	ReasonSubjectGone = "subject_gone"
 )
 
 // IsRecovery reports whether a resolve reason represents a genuine recovery (the

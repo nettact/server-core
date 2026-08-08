@@ -28,6 +28,9 @@ import (
 	"github.com/nettact/protocol/permission"
 	"github.com/nettact/protocol/telemetry"
 	"github.com/nettact/protocol/wire"
+
+	pcfg "github.com/nettact/protocol/config"
+
 	"github.com/nettact/server-core/agentconnectivity"
 	"github.com/nettact/server-core/agentstatus"
 	"github.com/nettact/server-core/agentws"
@@ -265,6 +268,11 @@ func Router(d Deps) http.Handler {
 			// Built-in detector sensitivity, per target.
 			r.Get("/targets/{id}/detection-settings", d.handleGetDetectionSettings)
 			r.Patch("/targets/{id}/detection-settings", d.handleUpdateDetectionSettings)
+			// System-status thresholds, per host anchor. Separate from the sensitivity
+			// above because they configure different things: sensitivity says how many
+			// rounds confirm a verdict, these say what the verdict is about.
+			r.Get("/targets/{id}/host-detection", d.handleGetHostDetection)
+			r.Patch("/targets/{id}/host-detection", d.handleUpdateHostDetection)
 			r.Get("/targets/{id}/baseline", d.handleGetTargetBaseline)
 			// Notification policies decide whether/when/where a recorded fault is
 			// announced. Exactly one applies per incident: group > site for a probe
@@ -1303,9 +1311,19 @@ func validateTarget(t *config.ProbeTarget) error {
 			return errors.New("interface name too long (max 128)")
 		}
 	}
+	// A host anchor watches the whole machine, so its target is fixed rather than
+	// chosen. It used to be a metric-series selector ("host", a mount point, "*"
+	// for every wireless adapter) because the deleted rule engine bound each rule
+	// to one series; the system-status detectors instead cover every family and
+	// every mount from one anchor, which leaves nothing for a per-anchor subject to
+	// mean. Forced rather than validated: the console no longer sends one.
+	if t.Kind == "host" {
+		t.Target = "host"
+		t.Params = pcfg.ProbeParams{}
+		t.ProxyID = ""
+	}
 	// Every kind needs a target: probes need something to hit, and a host anchor
-	// needs its metric-series target (e.g. "host", "core0", a mount) or the rule
-	// engine — which skips rules bound to an empty target — can never match it.
+	// carries the fixed "host" set just above.
 	if t.Target == "" {
 		return errors.New("target is required")
 	}
@@ -2223,6 +2241,57 @@ func (d Deps) handleUpdateDetectionSettings(w http.ResponseWriter, r *http.Reque
 	}
 	d.Audit.Log(r.Context(), "admin", "detection_settings.update", id, ds.Profile)
 	writeJSON(w, http.StatusOK, ds)
+}
+
+// handleGetHostDetection serves a host anchor's system-status thresholds. A
+// never-configured anchor answers with the zero-config defaults, so the console
+// renders the same form either way.
+func (d Deps) handleGetHostDetection(w http.ResponseWriter, r *http.Request) {
+	hd, err := d.Config.GetHostDetection(r.Context(), chi.URLParam(r, "id"))
+	if errors.Is(err, sql.ErrNoRows) {
+		writeError(w, http.StatusNotFound, "target not found")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, hd)
+}
+
+func (d Deps) handleUpdateHostDetection(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	var patch config.HostDetectionPatch
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&patch); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid host detection body")
+		return
+	}
+	hd, err := d.Config.UpdateHostDetection(r.Context(), id, patch)
+	if errors.Is(err, sql.ErrNoRows) {
+		writeError(w, http.StatusNotFound, "target not found")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	// Enabling a family can newly require a host permission the Agent has not
+	// granted, so the operational-issue view is recomputed here for the same reason
+	// the targets reconcile does it: an anchor that cannot read what it now watches
+	// must say so rather than sit green and silent.
+	//
+	// Site-scoped, not per-anchor: the requirement is a property of the anchor but
+	// the ISSUE is per (agent, anchor), and this anchor may be watching every
+	// machine in its group. ReevaluateHostMonitors keys on an AGENT id, so handing
+	// it this target id would find no agent and quietly succeed.
+	if d.OpIssue != nil {
+		if err := d.OpIssue.ReevaluateHostMonitorsForSite(r.Context(), hd.SiteID); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	}
+	d.Audit.Log(r.Context(), "admin", "host_detection.update", id, "")
+	writeJSON(w, http.StatusOK, hd)
 }
 
 // handleGetTargetBaseline serves one target's learned baseline as seen from one

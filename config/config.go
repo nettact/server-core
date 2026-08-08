@@ -28,9 +28,15 @@ import (
 )
 
 // Default scheduler intervals delivered to agents (seconds).
+//
+// DefaultRegularSeconds is exported because it is not only the agent's cadence:
+// it is the collection interval the system-status detectors convert a configured
+// duration into a round count against ("above 90% for 5 minutes" is ten readings
+// at 30s). Ingest passes it into the fault engine rather than the engine reading
+// it, because this package already imports fault.
 const (
 	defaultBaseSeconds    = 10
-	defaultRegularSeconds = 30
+	DefaultRegularSeconds = 30
 )
 
 // defaultGroupName is the display name of every site's undeletable default
@@ -982,7 +988,7 @@ func (s *Service) DesiredStateFor(ctx context.Context, agentID string) (pcfg.Des
 	}
 	ds := pcfg.DesiredState{
 		ConfigVersion: st.ConfigVersion,
-		Intervals:     pcfg.Intervals{BaseSeconds: defaultBaseSeconds, RegularSeconds: defaultRegularSeconds},
+		Intervals:     pcfg.Intervals{BaseSeconds: defaultBaseSeconds, RegularSeconds: DefaultRegularSeconds},
 	}
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT pt.id, kind, COALESCE(name,''), COALESCE(target,''), COALESCE(params,''), pt.config_serial,

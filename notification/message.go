@@ -5,6 +5,7 @@ import (
 	"math"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/nettact/protocol/telemetry"
@@ -636,6 +637,12 @@ func describeZh(d FaultDetail) string {
 		s = fmt.Sprintf("%s 内存使用率 %s%%%s", subj, num(d.Value), thrZh(d, "%"))
 	case telemetry.HostDiskPct:
 		s = fmt.Sprintf("%s 磁盘使用率 %s%%%s", subj, num(d.Value), thrZh(d, "%"))
+	case telemetry.HostLoadPerCore:
+		s = fmt.Sprintf("%s 每核负载 %s%s", subj, num(d.Value), thrZh(d, ""))
+	case telemetry.HostNetRxMbps:
+		s = fmt.Sprintf("%s 下载速率 %s Mbps%s", subj, num(d.Value), thrZh(d, " Mbps"))
+	case telemetry.HostNetTxMbps:
+		s = fmt.Sprintf("%s 上传速率 %s Mbps%s", subj, num(d.Value), thrZh(d, " Mbps"))
 	case telemetry.IfaceUp:
 		s = fmt.Sprintf("网卡 %s 已断开", d.Target)
 	case telemetry.WiFiUp:
@@ -704,10 +711,17 @@ func isErrorClassKind(metricKind string) bool {
 
 func subjectZh(d FaultDetail) string {
 	name := d.Target
+	// A system-status fault about the whole machine has no sub-target, so the
+	// parenthetical would render as an empty "（）". Its disk and network members
+	// still carry one (the mount, the direction) and keep it.
 	if d.TargetName != "" && d.TargetName != d.Target {
-		name = fmt.Sprintf("%s（%s）", d.TargetName, d.Target)
+		if d.Target == "" {
+			name = d.TargetName
+		} else {
+			name = fmt.Sprintf("%s（%s）", d.TargetName, d.Target)
+		}
 	}
-	return kindNoun(d.ProbeKind, "zh") + " " + name
+	return strings.TrimSpace(kindNoun(d.ProbeKind, "zh") + " " + name)
 }
 
 // thrZh renders the threshold clause "（阈值 ≥ 50%）", or "" when there is no
@@ -774,6 +788,12 @@ func describeEn(d FaultDetail) string {
 		s = fmt.Sprintf("%s memory usage is %s%%%s", subj, num(d.Value), thrEn(d, "%"))
 	case telemetry.HostDiskPct:
 		s = fmt.Sprintf("%s disk usage is %s%%%s", subj, num(d.Value), thrEn(d, "%"))
+	case telemetry.HostLoadPerCore:
+		s = fmt.Sprintf("%s load per core is %s%s", subj, num(d.Value), thrEn(d, ""))
+	case telemetry.HostNetRxMbps:
+		s = fmt.Sprintf("%s download rate is %s Mbps%s", subj, num(d.Value), thrEn(d, " Mbps"))
+	case telemetry.HostNetTxMbps:
+		s = fmt.Sprintf("%s upload rate is %s Mbps%s", subj, num(d.Value), thrEn(d, " Mbps"))
 	case telemetry.IfaceUp:
 		s = fmt.Sprintf("interface %s is down", d.Target)
 	case telemetry.WiFiUp:
@@ -796,10 +816,17 @@ func describeEn(d FaultDetail) string {
 
 func subjectEn(d FaultDetail) string {
 	name := d.Target
+	// A system-status fault about the whole machine has no sub-target, so the
+	// parenthetical would render as an empty "()". Its disk and network members
+	// still carry one (the mount, the direction) and keep it.
 	if d.TargetName != "" && d.TargetName != d.Target {
-		name = fmt.Sprintf("%s (%s)", d.TargetName, d.Target)
+		if d.Target == "" {
+			name = d.TargetName
+		} else {
+			name = fmt.Sprintf("%s (%s)", d.TargetName, d.Target)
+		}
 	}
-	return kindNoun(d.ProbeKind, "en") + " " + name
+	return strings.TrimSpace(kindNoun(d.ProbeKind, "en") + " " + name)
 }
 
 func thrEn(d FaultDetail, unit string) string {

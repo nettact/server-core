@@ -54,6 +54,14 @@ func SignalTitleLang(s Signal, lang string) string {
 		}
 		return fmt.Sprintf("「%s」丢包明显高于平时", name)
 	}
+	// The system-status wording names the resource and the machine, and stops
+	// there. "CPU usage is persistently high" is what was measured; "the machine is
+	// overloaded" would be a conclusion about whether that matters, which depends
+	// on what the machine is for and is exactly the judgement the operator makes by
+	// choosing the threshold.
+	if family, subject := SplitHostDetectorKey(s.DetectorKey); IsHostDetector(s.DetectorKey) {
+		return hostSignalTitle(family, subject, s.TargetName, s.AgentName, en)
+	}
 	if en {
 		return signalTitleEn(s, name)
 	}
@@ -120,6 +128,84 @@ func DegradationGroupTitle(groupName, lang string) string {
 		return fmt.Sprintf("Network quality in %q has degraded", groupName)
 	}
 	return fmt.Sprintf("「%s」网络质量下降", groupName)
+}
+
+// hostSignalTitle renders a system-status statement. The subject is what makes
+// several of these legible — one of four disks being full is a different sentence
+// from "a disk is full" — so it is in the title rather than only in the evidence.
+//
+// The machine is named by the anchor when it has a name and by the Agent
+// otherwise, because a host anchor is very often left unnamed: it is created to
+// watch every machine in a group, and there is nothing sensible for one name to
+// say about all of them. The Agent's name is then the honest answer to "whose
+// CPU", and it is the one the reader is looking for anyway.
+func hostSignalTitle(family, subject, targetName, agentName string, en bool) string {
+	who := targetName
+	if who == "" {
+		who = agentName
+	}
+	// The named/unnamed pair is written out for each family rather than assembled
+	// from fragments: Chinese and English put the possessor in different places,
+	// and a machine with no name at all must still produce a whole sentence.
+	named := func(zh, zhAnon, enS, enAnon string) string {
+		if en {
+			if who == "" {
+				return enAnon
+			}
+			return fmt.Sprintf(enS, who)
+		}
+		if who == "" {
+			return zhAnon
+		}
+		return fmt.Sprintf(zh, who)
+	}
+	switch family {
+	case DetectorHostCPU:
+		return named("「%s」CPU 使用率持续过高", "CPU 使用率持续过高",
+			"CPU usage on %q is persistently high", "CPU usage is persistently high")
+	case DetectorHostMem:
+		return named("「%s」内存使用率持续过高", "内存使用率持续过高",
+			"Memory usage on %q is persistently high", "Memory usage is persistently high")
+	case DetectorHostLoad:
+		return named("「%s」系统负载持续过高", "系统负载持续过高",
+			"System load on %q is persistently high", "System load is persistently high")
+	case DetectorHostNet:
+		if subject == "tx" {
+			return named("「%s」上传速率持续超过阈值", "上传速率持续超过阈值",
+				"Upload rate on %q is persistently above the threshold",
+				"The upload rate is persistently above the threshold")
+		}
+		return named("「%s」下载速率持续超过阈值", "下载速率持续超过阈值",
+			"Download rate on %q is persistently above the threshold",
+			"The download rate is persistently above the threshold")
+	case DetectorHostDisk:
+		if en {
+			if who == "" {
+				return fmt.Sprintf("Disk %s is almost full", subject)
+			}
+			return fmt.Sprintf("Disk %s on %q is almost full", subject, who)
+		}
+		if who == "" {
+			return fmt.Sprintf("磁盘 %s 空间不足", subject)
+		}
+		return fmt.Sprintf("「%s」磁盘 %s 空间不足", who, subject)
+	}
+	if en {
+		return "A system resource is above its threshold"
+	}
+	return "系统资源超出阈值"
+}
+
+// HostGroupTitle names a merged system-status incident, for the same reason
+// DegradationGroupTitle exists: the bare group name is already what a merged
+// availability incident is called, and two identically-titled incidents — one
+// meaning the group is unreachable, one meaning its machines are struggling —
+// tell the reader nothing about either.
+func HostGroupTitle(groupName, lang string) string {
+	if lang == "en" {
+		return fmt.Sprintf("System status in %q is abnormal", groupName)
+	}
+	return fmt.Sprintf("「%s」系统状态异常", groupName)
 }
 
 // TargetPortSuffix renders ":port" for a TCP-style target whose address does not

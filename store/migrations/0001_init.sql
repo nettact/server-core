@@ -360,6 +360,52 @@ CREATE TABLE probe_detection_settings(
   updated_at        TIMESTAMP NOT NULL
 );
 
+-- Per-anchor system-status detection: the thresholds behind the built-in host
+-- detectors (CPU / memory / load / network / disk). One row per kind='host'
+-- probe_tasks anchor; a MISSING row means the defaults below, so a freshly
+-- created anchor already watches the machine without anyone opening a form.
+--
+-- Purely server-side, like the anchor itself: nothing here is ever pushed to an
+-- agent (the agent reports host metrics under its own permissions and knows
+-- nothing about thresholds), so an edit neither bumps the site's config serial
+-- nor re-pushes DesiredState.
+--
+-- Durations are stored in SECONDS, not in rounds. The round count a streak needs
+-- is derived at evaluation time from the collection cadence, so "5 minutes"
+-- keeps meaning five minutes if the cadence ever changes; storing rounds would
+-- silently redefine every existing alert.
+--
+-- Network is the one family off by default and the one with nullable
+-- thresholds: "90% CPU" is a defensible universal, "300 Mbps" is not — it
+-- depends on a link speed the server cannot know. A NULL direction is not
+-- alerted at all, which is how one-directional (upload-only) alerting is
+-- expressed. Disk has no duration: a filling disk is not a spike, and waiting
+-- five minutes to say so buys nothing.
+--
+-- revision advances on every edit; detector streaks are pinned to it, so an
+-- edited threshold restarts confirmation instead of inheriting a streak counted
+-- against the old one.
+CREATE TABLE host_detection_settings(
+  target_id       TEXT PRIMARY KEY REFERENCES probe_tasks(id) ON DELETE CASCADE,
+  cpu_enabled     INTEGER NOT NULL DEFAULT 1,
+  cpu_pct         REAL    NOT NULL DEFAULT 90  CHECK(cpu_pct > 0 AND cpu_pct <= 100),
+  cpu_duration_s  INTEGER NOT NULL DEFAULT 300 CHECK(cpu_duration_s BETWEEN 30 AND 3600),
+  mem_enabled     INTEGER NOT NULL DEFAULT 1,
+  mem_pct         REAL    NOT NULL DEFAULT 90  CHECK(mem_pct > 0 AND mem_pct <= 100),
+  mem_duration_s  INTEGER NOT NULL DEFAULT 300 CHECK(mem_duration_s BETWEEN 30 AND 3600),
+  load_enabled    INTEGER NOT NULL DEFAULT 1,
+  load_per_core   REAL    NOT NULL DEFAULT 2.0 CHECK(load_per_core > 0 AND load_per_core <= 100),
+  load_duration_s INTEGER NOT NULL DEFAULT 300 CHECK(load_duration_s BETWEEN 30 AND 3600),
+  net_enabled     INTEGER NOT NULL DEFAULT 0,
+  net_rx_mbps     REAL             CHECK(net_rx_mbps IS NULL OR net_rx_mbps > 0),
+  net_tx_mbps     REAL             CHECK(net_tx_mbps IS NULL OR net_tx_mbps > 0),
+  net_duration_s  INTEGER NOT NULL DEFAULT 300 CHECK(net_duration_s BETWEEN 30 AND 3600),
+  disk_enabled    INTEGER NOT NULL DEFAULT 1,
+  disk_pct        REAL    NOT NULL DEFAULT 90  CHECK(disk_pct > 0 AND disk_pct <= 100),
+  revision        INTEGER NOT NULL DEFAULT 1,
+  updated_at      TIMESTAMP NOT NULL
+);
+
 -- ===== time series =====
 --
 -- Narrow, normalized storage sized for months-to-years in SQLite: a series
@@ -851,6 +897,16 @@ CREATE INDEX idx_game_run_gaps_run ON game_run_gaps(run_id, started_at);
 
 -- Per-(target, agent, detector) streak state driving the built-in availability
 -- detectors. Reset when the target's generation or sensitivity revision moves.
+--
+-- detector_key is 'availability' | 'agent_connectivity' | 'latency_degradation' |
+-- 'loss_degradation' for probe targets, and for a host anchor one of the
+-- system-status families 'host_cpu' | 'host_mem' | 'host_load' | 'host_net' |
+-- 'host_disk'. The two families that watch more than one thing per machine carry
+-- their subject folded into the key after a '|': 'host_disk|C:', 'host_net|rx'.
+-- Folding rather than adding a subject column keeps every key-shaped contract in
+-- this schema unchanged — this primary key, fault_signals' open-signal unique
+-- index, and the target-scoped termination predicates all still say exactly what
+-- they said before, and two mounts can be down at once without colliding.
 CREATE TABLE detector_state(
   target_id        TEXT NOT NULL REFERENCES probe_tasks(id) ON DELETE CASCADE,
   agent_id         TEXT NOT NULL,
@@ -871,6 +927,13 @@ CREATE TABLE detector_state(
   -- and what a confirming signal freezes as its own per-round evidence. Cleared
   -- on confirm, on recovery, and on any counter reset; bounded by fail_threshold.
   pending_fails    TEXT NOT NULL DEFAULT '[]',
+  -- How many disk snapshots in a row did NOT mention this detector's subject.
+  -- Only the system-status disk detectors use it, and only to tell an ejected
+  -- drive from a mount whose usage read failed this cycle: the agent omits the
+  -- mount either way, so absence has to be counted in OBSERVED collections. Wall
+  -- time cannot do it — an agent that was offline for an hour comes back with a
+  -- gap that looks identical to a removal on its very first report.
+  subject_misses   INTEGER NOT NULL DEFAULT 0,
   updated_at       TIMESTAMP NOT NULL,
   PRIMARY KEY(target_id, agent_id, detector_key)
 );
@@ -1016,6 +1079,7 @@ CREATE TABLE fluctuations(
   probe_kind     TEXT NOT NULL DEFAULT '',
   group_id       TEXT NOT NULL DEFAULT '',
   layer          TEXT NOT NULL DEFAULT '',
+  detector_key   TEXT NOT NULL DEFAULT 'availability',  -- see detector_state.detector_key
   fail_rounds    INTEGER NOT NULL,                    -- streak length, 1..fail_threshold-1
   fail_threshold INTEGER NOT NULL,                    -- the threshold it did NOT reach, frozen
   metric_kind    TEXT NOT NULL DEFAULT '',            -- summary evidence: the LAST failing round
@@ -1039,7 +1103,12 @@ CREATE TABLE fluctuations(
 -- sensitivity edit or a scope change deletes detector_state WITHOUT bumping the
 -- config serial, so the watermark can restart at 0 while the agent is still
 -- retrying an unacked batch of the same rounds.
-CREATE UNIQUE INDEX idx_fluctuations_streak ON fluctuations(target_id, agent_id, started_at);
+--
+-- The detector is part of the key because a host anchor's families all read the
+-- same collect timestamp: one Collect() stamps CPU and memory with one instant,
+-- so their streaks routinely START at the same second on the same anchor, and
+-- without the detector the second family's dip would be silently dropped.
+CREATE UNIQUE INDEX idx_fluctuations_streak ON fluctuations(target_id, agent_id, detector_key, started_at);
 CREATE INDEX idx_fluctuations_target   ON fluctuations(target_id, ended_at);
 CREATE INDEX idx_fluctuations_site     ON fluctuations(site_id, ended_at);
 CREATE INDEX idx_fluctuations_agent    ON fluctuations(agent_id, ended_at);

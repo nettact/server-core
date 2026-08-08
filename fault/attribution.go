@@ -335,6 +335,14 @@ func computeAttribution(ctx context.Context, tx *sql.Tx, members []memberFact, t
 		if m.detectorKey == DetectorAgentConnectivity {
 			return "", nil, nil // agent-offline incidents have their own wording
 		}
+		// The rules below reason about the network path — which hop failed, what a
+		// healthy reference proves — and a system-status member has no path. Left in,
+		// a CPU fault on a machine whose gateway happens to be flaky would satisfy
+		// the "everything through the router is failing" rule and get blamed on the
+		// router, which is a confident answer to a question nobody asked.
+		if IsHostDetector(m.detectorKey) {
+			return "", nil, nil
+		}
 		if m.agentID != agentID {
 			return "", nil, nil // claim boundary is one agent's vantage point
 		}

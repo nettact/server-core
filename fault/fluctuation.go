@@ -66,6 +66,10 @@ type Fluctuation struct {
 	ProbeKind  string `json:"probe_kind"`
 	GroupID    string `json:"group_id,omitempty"`
 	Layer      string `json:"layer"`
+	// DetectorKey names which detector recorded the streak, in the same vocabulary
+	// as a signal's (see detector_state.detector_key). Without it a system-status
+	// dip and an availability dip on the same host anchor are indistinguishable.
+	DetectorKey string `json:"detector_key"`
 	// FailRounds is how many consecutive rounds failed; FailThreshold is the
 	// sensitivity it did not reach. Rendered together as "2 of 3", which tells the
 	// operator both what happened and why no fault was raised.
@@ -100,8 +104,8 @@ type Fluctuation struct {
 
 // fluctuationCols is the stored projection, in Fluctuation field order.
 const fluctuationCols = `id, site_id, agent_id, agent_name, target_id, target_name, target_addr,
-	target_port, probe_kind, group_id, layer, fail_rounds, fail_threshold, metric_kind, comparator,
-	value, threshold, reason_code, reason_detail, rounds_json, started_at, ended_at,
+	target_port, probe_kind, group_id, layer, detector_key, fail_rounds, fail_threshold, metric_kind,
+	comparator, value, threshold, reason_code, reason_detail, rounds_json, started_at, ended_at,
 	COALESCE(incident_id,'')`
 
 // insertFluctuation records a recovered sub-threshold streak inside the ingest
@@ -109,8 +113,8 @@ const fluctuationCols = `id, site_id, agent_id, agent_name, target_id, target_na
 // and of the end time); st is the detector state as it stood BEFORE the success
 // branch cleared it, holding the streak's length, start and per-round evidence.
 //
-// Idempotent on (target, agent, started_at): a streak begins once, so a replay of
-// the same rounds updates nothing rather than filing the same dip twice.
+// Idempotent on (target, agent, detector, started_at): a streak begins once, so a
+// replay of the same rounds updates nothing rather than filing the same dip twice.
 func insertFluctuation(ctx context.Context, tx *sql.Tx, agentID, siteID, agentName string, r Round, st detectorState) error {
 	started := timeFromUnix(r.TS)
 	if st.firstFailTS.Valid {
@@ -124,24 +128,57 @@ func insertFluctuation(ctx context.Context, tx *sql.Tx, agentID, siteID, agentNa
 	// evidence because they are properties of the probe kind and the sensitivity, not
 	// of an individual round, and a sensitivity change would have reset the streak
 	// before it could be recorded here.
+	return insertFluctuationRow(ctx, tx, fluctuationRow{
+		SiteID: siteID, AgentID: agentID, AgentName: agentName,
+		TargetID: r.TargetID, TargetName: r.Meta.Name, TargetAddr: r.Meta.Addr, Port: r.Meta.Port,
+		ProbeKind: r.Kind, GroupID: r.GroupID, Layer: r.Layer, DetectorKey: DetectorAvailability,
+		FailRounds: st.failRounds, FailThreshold: r.Det.FailRounds,
+		Comparator: r.Comparator, Threshold: r.Threshold,
+		Rounds: st.pendingFails, StartedAt: started, EndedAt: timeFromUnix(r.TS),
+	})
+}
+
+// fluctuationRow is one recorded streak as it goes to storage. It exists because
+// two detector families record through the same table from different shapes: the
+// availability detector has a probe Round to describe itself with, and the
+// system-status detectors have no probe at all. Threading a probe-shaped Round
+// through the host path would mean fabricating a probe for a CPU reading.
+type fluctuationRow struct {
+	SiteID, AgentID, AgentName       string
+	TargetID, TargetName, TargetAddr string
+	Port                             int
+	ProbeKind, GroupID, Layer        string
+	DetectorKey                      string
+	FailRounds, FailThreshold        int
+	Comparator                       string
+	Threshold                        float64
+	// Rounds is every failing round of the streak, oldest first; the last one
+	// supplies the summary columns.
+	Rounds             []FailEvidence
+	StartedAt, EndedAt time.Time
+}
+
+// insertFluctuationRow is the single write path into fluctuations.
+func insertFluctuationRow(ctx context.Context, tx *sql.Tx, f fluctuationRow) error {
 	summary := FailEvidence{}
-	if n := len(st.pendingFails); n > 0 {
-		summary = st.pendingFails[n-1]
+	if n := len(f.Rounds); n > 0 {
+		summary = f.Rounds[n-1]
 	}
-	roundsJSON, err := encodeRounds(st.pendingFails)
+	roundsJSON, err := encodeRounds(f.Rounds)
 	if err != nil {
 		return err
 	}
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO fluctuations(id, site_id, agent_id, agent_name, target_id, target_name, target_addr,
-		    target_port, probe_kind, group_id, layer, fail_rounds, fail_threshold, metric_kind, comparator,
-		    value, threshold, reason_code, reason_detail, rounds_json, started_at, ended_at)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-		ON CONFLICT(target_id, agent_id, started_at) DO NOTHING`,
-		"flx_"+uuid.NewString(), siteID, agentID, agentName, r.TargetID, r.Meta.Name, r.Meta.Addr,
-		r.Meta.Port, r.Kind, r.GroupID, r.Layer, st.failRounds, r.Det.FailRounds,
-		summary.MetricKind, r.Comparator, summary.Value, r.Threshold,
-		summary.ReasonCode, summary.ReasonDetail, roundsJSON, started, timeFromUnix(r.TS))
+		    target_port, probe_kind, group_id, layer, detector_key, fail_rounds, fail_threshold,
+		    metric_kind, comparator, value, threshold, reason_code, reason_detail, rounds_json,
+		    started_at, ended_at)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+		ON CONFLICT(target_id, agent_id, detector_key, started_at) DO NOTHING`,
+		"flx_"+uuid.NewString(), f.SiteID, f.AgentID, f.AgentName, f.TargetID, f.TargetName, f.TargetAddr,
+		f.Port, f.ProbeKind, f.GroupID, f.Layer, f.DetectorKey, f.FailRounds, f.FailThreshold,
+		summary.MetricKind, f.Comparator, summary.Value, f.Threshold,
+		summary.ReasonCode, summary.ReasonDetail, roundsJSON, f.StartedAt, f.EndedAt)
 	return err
 }
 
