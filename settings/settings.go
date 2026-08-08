@@ -238,6 +238,33 @@ var diagPolicyKeys = map[string]bool{
 	KeyDiagPerHopTimeoutMs:     true,
 }
 
+// keyDiagPolicySerial is bookkeeping, not an operator setting (hence not in
+// IntKeys and never rendered by the console): a monotonic counter bumped with
+// every diag_* change, stamped onto the pushed DiagPolicy so the agent can
+// order policy updates that arrive out of build order. Persisted because the
+// ordering must survive a server restart — an in-memory counter would restart
+// at zero and make every pre-restart policy look newer than every later one.
+const keyDiagPolicySerial = "diag_policy_serial"
+
+// DiagPolicySerial returns the current policy generation, zero on an install
+// whose diagnostic settings were never touched (every zero-serial push carries
+// the identical defaults, so ordering among them is moot). Nil-safe like the
+// other readers.
+func (s *Service) DiagPolicySerial(ctx context.Context) uint64 {
+	if s == nil {
+		return 0
+	}
+	v, err := s.Get(ctx, keyDiagPolicySerial)
+	if err != nil || v == "" {
+		return 0
+	}
+	n, err := strconv.ParseUint(strings.TrimSpace(v), 10, 64)
+	if err != nil {
+		return 0
+	}
+	return n
+}
+
 // OnDiagPolicyChange registers fn to run after any diag_* key changes. The
 // assembly points it at a TopicConfigChanged publish so connected agents get a
 // fresh DesiredState immediately. Not safe to call concurrently with Set; wire
@@ -316,9 +343,18 @@ func (s *Service) Set(ctx context.Context, key, value string) error {
 		}
 	}
 	// Clearing counts as a change too: reverting to the default is as much a
-	// policy edit as setting a number.
-	if s.onDiagChange != nil && diagPolicyKeys[key] {
-		s.onDiagChange()
+	// policy edit as setting a number. The serial bump commits before the hook
+	// fires so the push the hook triggers reads the new generation.
+	if diagPolicyKeys[key] {
+		if _, err := s.db.ExecContext(ctx, `
+			INSERT INTO app_settings(key, value) VALUES(?, '1')
+			ON CONFLICT(key) DO UPDATE SET value=CAST(CAST(value AS INTEGER)+1 AS TEXT)`,
+			keyDiagPolicySerial); err != nil {
+			return err
+		}
+		if s.onDiagChange != nil {
+			s.onDiagChange()
+		}
 	}
 	return nil
 }

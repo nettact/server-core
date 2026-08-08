@@ -1054,6 +1054,7 @@ func (s *Service) diagPolicy(ctx context.Context) *pcfg.DiagPolicy {
 	}
 	return &pcfg.DiagPolicy{
 		Enabled:             s.set.Bool(ctx, settings.KeyDiagEnabled),
+		Serial:              s.set.DiagPolicySerial(ctx),
 		ConsecutiveFailures: n(settings.KeyDiagConsecutiveFailures),
 		CooldownSeconds:     n(settings.KeyDiagCooldownSec),
 		MaxHops:             n(settings.KeyDiagMaxHops),

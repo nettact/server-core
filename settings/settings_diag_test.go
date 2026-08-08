@@ -24,16 +24,25 @@ func TestSetFiresDiagPolicyHookForDiagKeysOnly(t *testing.T) {
 	if fired != 1 {
 		t.Fatalf("fired = %d after a diag set, want 1", fired)
 	}
+	if got := s.DiagPolicySerial(ctx); got != 1 {
+		t.Fatalf("serial = %d after one diag change, want 1", got)
+	}
 	if err := s.Set(ctx, KeyDiagConsecutiveFailures, ""); err != nil {
 		t.Fatalf("clear diag_consecutive_failures: %v", err)
 	}
 	if fired != 2 {
 		t.Fatalf("fired = %d after a diag clear, want 2", fired)
 	}
+	if got := s.DiagPolicySerial(ctx); got != 2 {
+		t.Fatalf("serial = %d after a diag clear, want 2 (clearing is a policy edit too)", got)
+	}
 	if err := s.Set(ctx, KeyGameRunRetentionDays, "30"); err != nil {
 		t.Fatalf("set non-diag key: %v", err)
 	}
 	if fired != 2 {
 		t.Fatalf("fired = %d after a non-diag set, want it unchanged at 2", fired)
+	}
+	if got := s.DiagPolicySerial(ctx); got != 2 {
+		t.Fatalf("serial = %d after a non-diag set, want it unchanged at 2", got)
 	}
 }
