@@ -29,6 +29,24 @@ import (
 // unrelated outage half an hour ago be presented as this incident's evidence.
 const claimWindow = 15 * time.Minute
 
+// attachSlack is the tolerance applied when a report's first-failure time is
+// compared against a signal's first observed failing round. The two timestamps
+// describe the same outage from two clocks: the Agent stamps its streak locally
+// and the server stamps the round it ingested, so skew plus round phasing can
+// legitimately put the Agent's mark a little before the server's. What the
+// comparison must reject is a report from a PREVIOUS outage of the same
+// destination — those are minutes-to-hours apart, not seconds — so a small
+// fixed slack separates the two cases cleanly.
+const attachSlack = 2 * time.Minute
+
+// unreferencedTraceRetention is how long a report that never found its fault is
+// kept. An Agent legitimately traces without a server-side verdict (its streak
+// threshold crossed, but the rounds recovered before the server's profile
+// confirmed), and after claimWindow nothing can ever reference such a report —
+// it is invisible to every read path, which is incident-scoped. A day preserves
+// it for hand debugging; past that it is dead weight.
+const unreferencedTraceRetention = 24 * time.Hour
+
 // TraceEligibleMetric reports whether a firing condition — identified by its
 // probe kind and breached metric — is a network-availability fault that an Agent
 // would have traced. It is the server's half of the same eligibility rule the
@@ -250,17 +268,21 @@ func attachTrace(ctx context.Context, tx *sql.Tx, agentID string, res telemetry.
 		return nil, nil
 	}
 	rows, err := tx.QueryContext(ctx, `
-		SELECT id, incident_id FROM fault_signals
+		SELECT id, incident_id, detector_key, observed_at FROM fault_signals
 		WHERE agent_id=? AND state='firing' AND incident_id IS NOT NULL AND incident_id<>''`,
 		agentID)
 	if err != nil {
 		return nil, err
 	}
-	type ref struct{ signalID, incidentID string }
+	type ref struct {
+		signalID, incidentID string
+		detectorKey          string
+		observedAt           time.Time
+	}
 	var refs []ref
 	for rows.Next() {
 		var r ref
-		if err := rows.Scan(&r.signalID, &r.incidentID); err != nil {
+		if err := rows.Scan(&r.signalID, &r.incidentID, &r.detectorKey, &r.observedAt); err != nil {
 			rows.Close()
 			return nil, err
 		}
@@ -275,8 +297,25 @@ func attachTrace(ctx context.Context, tx *sql.Tx, agentID string, res telemetry.
 	}
 
 	// Narrow to the signals whose own diagnosable destination is this report's.
+	// Two more guards mirror the claim-back path (OnSignalConfirmed), which
+	// filters the same things before it goes looking for reports:
+	//   - a degradation signal never attaches — its target is answering, just
+	//     slowly, and the Agent never traced FOR it; sharing a destination with
+	//     a hard-failure trace must not put that trace in its evidence;
+	//   - a report whose streak began well before this signal's first failing
+	//     round belongs to an earlier outage of the same destination. A
+	//     reconnect drains both outages' records in one packet, and by the time
+	//     traces are extracted only the later signal is still firing — the time
+	//     comparison is what keeps the stale report out of it.
 	matched := refs[:0]
 	for _, r := range refs {
+		if fault.IsDegradation(r.detectorKey) {
+			continue
+		}
+		if !res.FirstFailedAt.IsZero() && !r.observedAt.IsZero() &&
+			res.FirstFailedAt.Before(r.observedAt.Add(-attachSlack)) {
+			continue
+		}
 		ok, err := signalMatchesDest(ctx, tx, r.signalID, res.DestKey)
 		if err != nil {
 			return nil, err
@@ -377,17 +416,36 @@ func (s *Service) OnSignalConfirmed(ctx context.Context, ev fault.SignalEvent) e
 	return s.claimTraces(ctx, ev, destKey)
 }
 
-// claimTraces attaches every recent unreferenced report for this agent and
-// destination to the newly-confirmed signal, then recomputes the incident's
-// attribution. Idempotent: re-running it re-selects nothing, because the reports
-// it claimed now carry a reference.
+// claimTraces attaches every recent, temporally compatible report for this
+// agent and destination to the newly-confirmed signal, then recomputes the
+// incident's attribution.
+//
+// "Temporally compatible" replaces an earlier unreferenced-only rule, for both
+// of that rule's failure modes. A report already claimed by one signal must
+// still be claimable by a second signal of the SAME outage — the Agent dedupes
+// by path cohort and will never send a second report, so refusing to share
+// would leave the second incident permanently without evidence. And a report
+// whose streak began before this signal's first failing round (minus clock
+// slack) is a previous outage's evidence, which no window keyed on receipt
+// time can distinguish — a reconnect delivers both outages' backlogs in one
+// burst, stamping them with the same received_at. Idempotency comes from the
+// reference upsert, not from claiming being one-shot.
 func (s *Service) claimTraces(ctx context.Context, ev fault.SignalEvent, destKey string) error {
+	var observedAt time.Time
+	err := s.db.Read().QueryRowContext(ctx,
+		`SELECT observed_at FROM fault_signals WHERE id=?`, ev.SignalID).Scan(&observedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
 	cutoff := time.Now().UTC().Add(-claimWindow)
 	rows, err := s.db.Read().QueryContext(ctx, `
 		SELECT id FROM trace_reports
 		WHERE agent_id=? AND dest_key=? AND received_at >= ?
-		  AND NOT EXISTS(SELECT 1 FROM trace_report_refs r WHERE r.report_id=trace_reports.id)
-		ORDER BY received_at`, ev.AgentID, destKey, cutoff)
+		  AND (first_failed_at IS NULL OR first_failed_at >= ?)
+		ORDER BY received_at`, ev.AgentID, destKey, cutoff, observedAt.Add(-attachSlack).UTC())
 	if err != nil {
 		return err
 	}
@@ -419,19 +477,36 @@ func (s *Service) claimTraces(ctx context.Context, ev fault.SignalEvent, destKey
 		}
 	}()
 	now := time.Now().UTC()
+	claimed := 0
 	for _, reportID := range reportIDs {
-		if _, err := tx.ExecContext(ctx, `
+		// The WHERE on the conflict arm makes RowsAffected the "was this new"
+		// signal: a fresh reference or a reactivation counts, re-claiming an
+		// already-active one does not. The timeline entry rides that signal —
+		// without it, every re-confirmation of a signal would repeat the
+		// "diagnostic completed" line for evidence the incident already shows.
+		r, err := tx.ExecContext(ctx, `
 			INSERT INTO trace_report_refs(report_id, incident_id, signal_id, active, created_at)
 			VALUES(?,?,?,1,?)
-			ON CONFLICT(report_id, incident_id, signal_id) DO UPDATE SET active=1`,
-			reportID, ev.IncidentID, ev.SignalID, now); err != nil {
+			ON CONFLICT(report_id, incident_id, signal_id) DO UPDATE SET active=1 WHERE active=0`,
+			reportID, ev.IncidentID, ev.SignalID, now)
+		if err != nil {
 			return err
 		}
+		if n, err := r.RowsAffected(); err != nil || n == 0 {
+			if err != nil {
+				return err
+			}
+			continue
+		}
+		claimed++
 		if _, err := tx.ExecContext(ctx,
 			`INSERT INTO incident_timeline(id, incident_id, ts, kind, message, ref) VALUES(?,?,?,?,?,?)`,
 			"tl_"+uuid.NewString(), ev.IncidentID, now, "diag.completed", "", reportID); err != nil {
 			return err
 		}
+	}
+	if claimed == 0 {
+		return tx.Rollback()
 	}
 	// The trace's reached-point is the strongest attribution evidence there is, so
 	// claiming one has to re-answer "where did this break" rather than leaving the

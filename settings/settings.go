@@ -213,9 +213,36 @@ var IntKeys = map[string]IntBounds{
 
 type Service struct {
 	db *store.DB
+
+	// onDiagChange, when set, runs after a successful Set of any diag_* key.
+	// The diag keys are the one settings family that travels to agents inside
+	// DesiredState rather than being read lazily by a server-side worker, so a
+	// mutation must trigger a push — otherwise a connected agent keeps tracing
+	// under the old policy (including one the operator just switched off) until
+	// it happens to reconnect. The hook lives here, on the single mutation
+	// choke point, rather than in the HTTP handler: every future writer of
+	// these keys gets the push for free.
+	onDiagChange func()
 }
 
 func New(db *store.DB) *Service { return &Service{db: db} }
+
+// diagPolicyKeys are the keys DesiredStateFor folds into the pushed DiagPolicy.
+var diagPolicyKeys = map[string]bool{
+	KeyDiagEnabled:             true,
+	KeyDiagTotalTimeoutMs:      true,
+	KeyDiagMaxHops:             true,
+	KeyDiagAttemptsPerHop:      true,
+	KeyDiagConsecutiveFailures: true,
+	KeyDiagCooldownSec:         true,
+	KeyDiagPerHopTimeoutMs:     true,
+}
+
+// OnDiagPolicyChange registers fn to run after any diag_* key changes. The
+// assembly points it at a TopicConfigChanged publish so connected agents get a
+// fresh DesiredState immediately. Not safe to call concurrently with Set; wire
+// it during assembly, before the HTTP surface is up.
+func (s *Service) OnDiagPolicyChange(fn func()) { s.onDiagChange = fn }
 
 // Int returns the stored value for an integer key, falling back to the key's
 // registered default when unset, unparseable, or out of bounds. Unknown keys
@@ -278,13 +305,22 @@ func (s *Service) All(ctx context.Context) (map[string]string, error) {
 // "empty string" read back the same.
 func (s *Service) Set(ctx context.Context, key, value string) error {
 	if value == "" {
-		_, err := s.db.ExecContext(ctx, `DELETE FROM app_settings WHERE key=?`, key)
-		return err
+		if _, err := s.db.ExecContext(ctx, `DELETE FROM app_settings WHERE key=?`, key); err != nil {
+			return err
+		}
+	} else {
+		if _, err := s.db.ExecContext(ctx,
+			`INSERT INTO app_settings(key, value) VALUES(?, ?)
+			 ON CONFLICT(key) DO UPDATE SET value=excluded.value`, key, value); err != nil {
+			return err
+		}
 	}
-	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO app_settings(key, value) VALUES(?, ?)
-		 ON CONFLICT(key) DO UPDATE SET value=excluded.value`, key, value)
-	return err
+	// Clearing counts as a change too: reverting to the default is as much a
+	// policy edit as setting a number.
+	if s.onDiagChange != nil && diagPolicyKeys[key] {
+		s.onDiagChange()
+	}
+	return nil
 }
 
 // ConsoleBaseURL returns the configured console origin with any trailing slash

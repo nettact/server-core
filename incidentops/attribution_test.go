@@ -195,8 +195,9 @@ func TestConfirmationClaimsAnEarlierTraceAndPublishes(t *testing.T) {
 		t.Fatalf("timeline entries = %d, want 1", timeline)
 	}
 
-	// Re-running the handler must not claim the same report twice: it is already
-	// referenced, so the window query no longer selects it.
+	// Re-running the handler must not repeat the evidence: the reference upsert
+	// only reports a row affected when it creates or reactivates one, and the
+	// timeline entry rides that signal, so an already-active claim adds nothing.
 	if err := svc.OnSignalConfirmed(ctx, ev); err != nil {
 		t.Fatalf("second confirm: %v", err)
 	}

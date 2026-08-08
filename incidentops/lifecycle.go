@@ -190,5 +190,18 @@ func (s *Service) Retention(ctx context.Context) error {
 				WHERE r.report_id=tr.id AND NOT (i.state='resolved' AND i.evidence_expired=1)))`); err != nil {
 		return err
 	}
+
+	// A report that never found its fault — the Agent's streak crossed its
+	// threshold but the rounds recovered before this server's profile confirmed
+	// anything — can gain a reference only inside claimWindow. Past that it is
+	// unreachable from every read path (all incident-scoped), so age it out
+	// whole; the hops go with it via ON DELETE CASCADE.
+	if _, err := s.db.ExecContext(ctx, `
+		DELETE FROM trace_reports
+		WHERE received_at < ?
+		  AND NOT EXISTS(SELECT 1 FROM trace_report_refs r WHERE r.report_id=trace_reports.id)`,
+		time.Now().UTC().Add(-unreferencedTraceRetention)); err != nil {
+		return err
+	}
 	return nil
 }

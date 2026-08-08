@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/nettact/protocol/telemetry"
+	"github.com/nettact/server-core/eventbus"
 	"github.com/nettact/server-core/fault"
 	"github.com/nettact/server-core/settings"
 	"github.com/nettact/server-core/store"
@@ -276,5 +277,73 @@ func TestResolutionDeactivatesReferencesWithoutDeletingTheReport(t *testing.T) {
 	}
 	if active != 0 || reports != 1 {
 		t.Fatalf("active refs = %d, reports = %d; want 0/1", active, reports)
+	}
+}
+
+// One outage, several verdicts: the Agent dedupes by path cohort and sends ONE
+// report, so every signal of that outage must be allowed to reference it — the
+// old unreferenced-only claim rule would leave the second incident permanently
+// without evidence. The same time comparison that allows the share is what
+// keeps a LATER outage from lifting it: a report whose streak began long before
+// the signal's first failing round is a previous outage's evidence, no matter
+// how recently it was received.
+func TestSameOutageSignalsShareOneReportButALaterOutageDoesNot(t *testing.T) {
+	db, ctx := openIncidentOpsTest(t)
+	now := time.Now().UTC()
+
+	seedIncidentSignal(t, db, "inc_a", "sig_a", "agent_a", "firing")
+	seedIncidentSignal(t, db, "inc_b", "sig_b", "agent_a", "firing")
+	seedIncidentSignal(t, db, "inc_late", "sig_late", "agent_a", "firing")
+	for _, sig := range []string{"sig_a", "sig_b", "sig_late"} {
+		seedEvidence(t, db, sig, "icmp", "8.8.8.8", 0, "probe.icmp.loss_pct")
+	}
+	// sig_a and sig_b observed the same outage; sig_late is a fresh one that
+	// confirmed ten minutes after the report's streak began.
+	for sig, at := range map[string]time.Time{
+		"sig_a":    now.Add(-10 * time.Minute),
+		"sig_b":    now.Add(-9 * time.Minute),
+		"sig_late": now,
+	} {
+		if _, err := db.ExecContext(ctx, `UPDATE fault_signals SET observed_at=? WHERE id=?`, at, sig); err != nil {
+			t.Fatalf("set observed_at: %v", err)
+		}
+	}
+	seedStoredTrace(t, db, "trace_shared", "", "", "agent_a", "ip:8.8.8.8", "8.8.8.8")
+	if _, err := db.ExecContext(ctx,
+		`UPDATE trace_reports SET first_failed_at=? WHERE id='trace_shared'`, now.Add(-10*time.Minute)); err != nil {
+		t.Fatalf("set first_failed_at: %v", err)
+	}
+
+	svc := New(db, nil, settings.New(db), eventbus.New())
+	for _, ev := range []fault.SignalEvent{
+		{SignalID: "sig_a", IncidentID: "inc_a", AgentID: "agent_a", SiteID: "site_default"},
+		{SignalID: "sig_b", IncidentID: "inc_b", AgentID: "agent_a", SiteID: "site_default"},
+		{SignalID: "sig_late", IncidentID: "inc_late", AgentID: "agent_a", SiteID: "site_default"},
+	} {
+		if err := svc.OnSignalConfirmed(ctx, ev); err != nil {
+			t.Fatalf("confirm %s: %v", ev.SignalID, err)
+		}
+	}
+
+	counts := map[string]int{}
+	rows, err := db.QueryContext(ctx,
+		`SELECT incident_id, COUNT(*) FROM trace_report_refs WHERE report_id='trace_shared' AND active=1 GROUP BY incident_id`)
+	if err != nil {
+		t.Fatalf("count refs: %v", err)
+	}
+	for rows.Next() {
+		var inc string
+		var n int
+		if err := rows.Scan(&inc, &n); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		counts[inc] = n
+	}
+	rows.Close()
+	if counts["inc_a"] != 1 || counts["inc_b"] != 1 {
+		t.Fatalf("same-outage refs = %v, want one each for inc_a and inc_b", counts)
+	}
+	if counts["inc_late"] != 0 {
+		t.Fatalf("the later outage claimed the earlier report: refs = %v", counts)
 	}
 }
