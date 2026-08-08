@@ -93,6 +93,14 @@ func terminalTraceStatus(status string) bool {
 // console told. Empty for the common case of a report that matched no open
 // fault, which is not a failure — the report waits to be claimed.
 type TraceOutcome struct {
+	// Touched names every incident that gained a reference or timeline entry.
+	// It exists separately from Attributed because an attachment that does NOT
+	// move the attribution — an unsupported report, or one that only confirms
+	// the current answer — still changed what an open incident view shows, and
+	// a console holding that view open has no other signal to refresh on.
+	Touched []eventbus.IncidentEvent
+	// Attributed is the subset whose attribution answer actually changed; these
+	// additionally refresh the fault-centre target status.
 	Attributed []eventbus.IncidentEvent
 }
 
@@ -156,15 +164,16 @@ func (s *Service) IngestTracesTx(ctx context.Context, tx *sql.Tx, agentID, siteI
 		if err != nil {
 			return nil, err
 		}
-		if !didChange {
-			continue
-		}
 		if siteFromRow != "" {
 			site = siteFromRow
 		}
+		out.Touched = append(out.Touched, eventbus.IncidentEvent{IncidentID: incidentID, SiteID: site})
+		if !didChange {
+			continue
+		}
 		out.Attributed = append(out.Attributed, eventbus.IncidentEvent{IncidentID: incidentID, SiteID: site})
 	}
-	if len(out.Attributed) == 0 {
+	if len(out.Touched) == 0 {
 		return nil, nil
 	}
 	return out, nil
@@ -177,8 +186,18 @@ func (s *Service) PublishTraceOutcome(ctx context.Context, out *TraceOutcome) {
 	if out == nil {
 		return
 	}
+	attributed := map[string]bool{}
 	for _, ev := range out.Attributed {
+		attributed[ev.IncidentID] = true
 		s.publishAttributionRefresh(ctx, ev.SiteID, ev.IncidentID)
+	}
+	// The rest changed evidence without changing the answer: one incident event
+	// keeps an open drawer honest, no target-status churn needed.
+	for _, ev := range out.Touched {
+		if attributed[ev.IncidentID] || s.bus == nil {
+			continue
+		}
+		s.bus.Publish(eventbus.TopicIncidentUpdated, eventbus.IncidentEvent{IncidentID: ev.IncidentID, SiteID: ev.SiteID})
 	}
 }
 
@@ -524,6 +543,10 @@ func (s *Service) claimTraces(ctx context.Context, ev fault.SignalEvent, destKey
 			siteID = ev.SiteID
 		}
 		s.publishAttributionRefresh(ctx, siteID, ev.IncidentID)
+	} else if s.bus != nil {
+		// The claim added evidence without moving the attribution; an open
+		// incident view still has to hear about it.
+		s.bus.Publish(eventbus.TopicIncidentUpdated, eventbus.IncidentEvent{IncidentID: ev.IncidentID, SiteID: ev.SiteID})
 	}
 	return nil
 }
