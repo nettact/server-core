@@ -118,6 +118,40 @@ func ValidatePassword(pw string) error {
 // winner. bcrypt runs inside the transaction (~100ms holding the single write
 // connection); that is acceptable for the single-admin console.
 func (s *Service) UpdatePassword(ctx context.Context, userID, oldPassword, newPassword, keepSessionID string) error {
+	return s.setPassword(ctx, userID, newPassword, keepSessionID, func(hash string) error {
+		if bcrypt.CompareHashAndPassword([]byte(hash), []byte(oldPassword)) != nil {
+			return ErrAuth
+		}
+		return nil
+	})
+}
+
+// SetPassword rotates a user's password WITHOUT proving knowledge of the current
+// one, keeping everything else about UpdatePassword (single transaction,
+// compare-and-swap, other sessions revoked).
+//
+// This exists for the desktop all-in-one, and only makes sense there. A desktop
+// install generates a random admin password at first start and never shows it:
+// the app mints the console session in-process from a loopback-only one-time
+// token, so nobody — including the owner — can produce the current password to
+// type into a "change password" form. Requiring one would make the account
+// permanently unchangeable, which in turn makes logging in from a phone or a
+// second computer impossible.
+//
+// It grants no authority that the caller does not already hold. Reaching this
+// path requires a live admin session, and on a desktop install the only way to
+// obtain one is to be at the machine (the login URL is minted by the tray and
+// redeemable from loopback only) or to already know the password. The server API
+// must therefore keep this behind that desktop check — a self-hosted server, where
+// a session can be obtained from anywhere with the password, must keep requiring
+// the old one so a stolen session cannot lock the owner out.
+func (s *Service) SetPassword(ctx context.Context, userID, newPassword, keepSessionID string) error {
+	return s.setPassword(ctx, userID, newPassword, keepSessionID, nil)
+}
+
+// setPassword is the shared transaction. verify, when non-nil, is the
+// old-password check, run against the hash read inside the transaction.
+func (s *Service) setPassword(ctx context.Context, userID, newPassword, keepSessionID string, verify func(hash string) error) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -133,8 +167,10 @@ func (s *Service) UpdatePassword(ctx context.Context, userID, oldPassword, newPa
 	if err != nil {
 		return err
 	}
-	if bcrypt.CompareHashAndPassword([]byte(hash), []byte(oldPassword)) != nil {
-		return ErrAuth
+	if verify != nil {
+		if err := verify(hash); err != nil {
+			return err
+		}
 	}
 	if err := ValidatePassword(newPassword); err != nil {
 		return err

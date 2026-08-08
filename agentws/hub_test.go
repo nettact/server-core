@@ -368,7 +368,8 @@ func TestSnapshotRequestPush(t *testing.T) {
 	e := newTestEnv(t)
 	e.seedAgent(t, "agent_a", "tok_a")
 
-	if e.hub.PushSnapshotRequest("agent_a", e.hostLive.Request("agent_a", []string{"host.process.basic.read", "host.connection.summary.read"})) {
+	first, _ := e.hostLive.Request("agent_a", []string{"host.process.basic.read", "host.connection.summary.read"})
+	if e.hub.PushSnapshotRequest("agent_a", first) {
 		t.Fatal("push to a disconnected agent must return false")
 	}
 
@@ -384,8 +385,13 @@ func TestSnapshotRequestPush(t *testing.T) {
 		t.Fatalf("second push = %+v, want re-pushed SnapshotRequest", f)
 	}
 
-	// A fresh request while connected pushes directly.
-	req := e.hostLive.Request("agent_a", []string{"host.process.basic.read"})
+	// A fresh request while connected pushes directly. It asks for a scope the
+	// still-pending request above does not cover — a subset of it would (rightly)
+	// be coalesced into that one instead of producing a second push.
+	req, push := e.hostLive.Request("agent_a", []string{"host.process.owner.read"})
+	if !push {
+		t.Fatal("a request for an uncovered scope must be pushed")
+	}
 	if !e.hub.PushSnapshotRequest("agent_a", req) {
 		t.Fatal("push to a connected agent returned false")
 	}
@@ -393,8 +399,8 @@ func TestSnapshotRequestPush(t *testing.T) {
 	if f.SnapshotRequest == nil || f.SnapshotRequest.RequestID != req.RequestID {
 		t.Fatalf("pushed frame = %+v, want SnapshotRequest %s", f, req.RequestID)
 	}
-	if len(f.SnapshotRequest.Scopes) != 1 || f.SnapshotRequest.Scopes[0] != "host.process.basic.read" {
-		t.Errorf("request scopes = %+v, want [host.process.basic.read]", f.SnapshotRequest.Scopes)
+	if len(f.SnapshotRequest.Scopes) != 1 || f.SnapshotRequest.Scopes[0] != "host.process.owner.read" {
+		t.Errorf("request scopes = %+v, want [host.process.owner.read]", f.SnapshotRequest.Scopes)
 	}
 
 	// Answer it; the snapshot is stored (and the pending entry cleared) without

@@ -5,6 +5,7 @@ package store
 import (
 	"database/sql"
 	"fmt"
+	"os"
 
 	_ "modernc.org/sqlite"
 )
@@ -30,15 +31,52 @@ type DB struct {
 // each distinct hot page into the main file once more. Checkpointing 8× less
 // often coalesces 8× more of those rewrites into one back-copy, cutting total
 // block writes roughly in half for the cost of a WAL that can reach ~32 MiB.
-const dsnPragmas = "?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)" +
-	"&_pragma=foreign_keys(ON)&_pragma=synchronous(NORMAL)&_pragma=auto_vacuum(INCREMENTAL)" +
+//
+// busy_timeout comes first so every pragma after it is already covered by the
+// busy handler rather than failing outright on a contended file.
+//
+// auto_vacuum is deliberately NOT in this list, even though the store depends on
+// it (metrics purge reclaims space with `PRAGMA incremental_vacuum`). Setting
+// auto_vacuum compiles to a *write* transaction, so as a shared DSN pragma it
+// makes every connection either pool opens — read-only ones included — take the
+// WAL write lock while it initializes. That is invisible at startup and lethal
+// later: both pools create connections on demand, so one appears at an arbitrary
+// moment under load, and a transaction that is already open and tries to write
+// just then gets SQLITE_BUSY *immediately* — SQLite skips the busy handler once
+// the connection holds a transaction, since retrying there could deadlock, so
+// busy_timeout does not cover it. It is instead set by Open on a first-run
+// database only (see autoVacuumPragma), which is the only time it does anything.
+const dsnPragmas = "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)" +
+	"&_pragma=foreign_keys(ON)&_pragma=synchronous(NORMAL)" +
 	"&_pragma=cache_size(-65536)&_pragma=mmap_size(268435456)&_pragma=temp_store(MEMORY)" +
 	"&_pragma=wal_autocheckpoint(8192)"
+
+// autoVacuumPragma switches a database to incremental auto-vacuum. It has to
+// ride on the connection that creates the file and it has to be in the DSN, not
+// a statement: SQLite only accepts the setting while page 1 is still unread, so
+// the very first query on the handle is already too late, and the mode cannot be
+// changed afterwards without a full VACUUM. Open therefore appends it to the
+// write handle's DSN exactly when the file does not exist yet — where the write
+// lock it takes is uncontended because nothing else has the database open.
+const autoVacuumPragma = "&_pragma=auto_vacuum(INCREMENTAL)"
 
 // Open opens (creating if needed) the SQLite database at path, applies pending
 // migrations, and returns a ready DB with separate write and read handles.
 func Open(path string) (*DB, error) {
-	w, err := sql.Open("sqlite", path+dsnPragmas)
+	// _txlock=immediate makes every transaction on the write handle start as
+	// BEGIN IMMEDIATE. The default deferred BEGIN only takes the write lock on
+	// the first mutation, and an upgrade that finds the lock held fails with
+	// SQLITE_BUSY on the spot — SQLite does not invoke the busy handler once the
+	// connection is inside a transaction, so busy_timeout does not cover it and a
+	// perfectly ordinary write dies instead of waiting its turn. Taking the lock
+	// up front puts the wait back under the busy handler. It costs no
+	// concurrency: the write pool is one connection, so these were serialized
+	// already.
+	writeDSN := path + dsnPragmas + "&_txlock=immediate"
+	if isFreshDatabase(path) {
+		writeDSN += autoVacuumPragma
+	}
+	w, err := sql.Open("sqlite", writeDSN)
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
@@ -78,6 +116,18 @@ func (d *DB) Read() *sql.DB {
 		return d.read
 	}
 	return d.DB
+}
+
+// isFreshDatabase reports whether path has no database in it yet, so Open knows
+// whether the handle it is about to build is the one that will create the file.
+// A zero-length file counts as fresh: that is how SQLite itself treats one, and
+// it is what a half-finished first run leaves behind. Guessing wrong is cheap in
+// both directions — a false positive sets a mode the file already has, a false
+// negative leaves auto-vacuum off on a database that will simply grow instead of
+// reclaiming pages — so a stat error is not worth failing Open over.
+func isFreshDatabase(path string) bool {
+	fi, err := os.Stat(path)
+	return err != nil || fi.Size() == 0
 }
 
 // Close closes both handles.

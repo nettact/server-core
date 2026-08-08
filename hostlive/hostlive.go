@@ -24,6 +24,18 @@ const (
 	pendingTTL = 60 * time.Second
 	// snapshotTTL is how long a delivered snapshot is served before it is stale.
 	snapshotTTL = 60 * time.Second
+	// coalesceWindow is how recently a snapshot must have been delivered for a NEW
+	// request to be answered from it instead of asking the agent again.
+	//
+	// It exists because the agent refuses back-to-back collections:
+	// agent/internal/conn rate-limits them to one per SnapshotMinInterval (3s) and
+	// answers a request inside that window with every scope marked failed
+	// ("rate_limited"), which the console can only render as "collection failed".
+	// Two people — or one person with the page open twice — would each make the
+	// other's page look broken. This window must stay comfortably ABOVE the
+	// agent's interval, or the coalescing lets exactly the request through that
+	// the agent is about to refuse.
+	coalesceWindow = 5 * time.Second
 )
 
 type pending struct {
@@ -52,20 +64,84 @@ func New() *Store {
 	}
 }
 
-// Request registers (or replaces) a pending live-snapshot request for an agent
-// and returns the built request so the caller can push it to the agent's
-// WebSocket session. scopes are the process/connection permission IDs the console
-// asked for; the agent evaluates each against its own effective policy and answers
-// per scope (collected / denied / unsupported / failed).
-func (s *Store) Request(agentID string, scopes []string) pcfg.SnapshotRequest {
+// Request answers a console's ask for a live snapshot. It returns the request the
+// console should poll for, and whether the caller must push it to the agent.
+//
+// A push is skipped when an answer for these scopes is already on its way or has
+// just arrived:
+//
+//   - an unanswered request that covers the asked-for scopes — the second caller
+//     joins it and polls the same request id, so both see the one snapshot;
+//   - a snapshot delivered within coalesceWindow that covers them — returned as
+//     its own request id, which the caller's next poll matches immediately.
+//
+// Either way nothing reaches the agent, which is the point: the agent refuses a
+// second collection inside its rate-limit window and answers with every scope
+// failed, so a second console open used to turn into "collection failed" on the
+// page that asked second (and, a moment later, on any page that polled).
+//
+// A snapshot containing a failed scope is never reused — failure is the one
+// answer worth asking again for, and it is also how a rate_limited response from
+// before this coalescing (or from another server sharing the agent) drains out
+// instead of being replayed for the next 5 seconds. Denied and unsupported are
+// stable answers: asking again returns them unchanged.
+func (s *Store) Request(agentID string, scopes []string) (pcfg.SnapshotRequest, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	now := s.nowFn()
+
+	if p, ok := s.pending[agentID]; ok {
+		switch {
+		case now.Sub(p.requestedAt) > pendingTTL:
+			delete(s.pending, agentID)
+		case covers(p.req.Scopes, scopes):
+			return p.req, false
+		}
+	}
+	if st, ok := s.latest[agentID]; ok && now.Sub(st.at) <= coalesceWindow && reusable(st.snap, scopes) {
+		return pcfg.SnapshotRequest{RequestID: st.snap.RequestID, Scopes: scopes}, false
+	}
+
 	req := pcfg.SnapshotRequest{
 		RequestID: "snap_" + uuid.NewString(),
 		Scopes:    scopes,
 	}
-	s.pending[agentID] = &pending{req: req, requestedAt: s.nowFn()}
-	return req
+	s.pending[agentID] = &pending{req: req, requestedAt: now}
+	return req, true
+}
+
+// covers reports whether have ⊇ want.
+func covers(have, want []string) bool {
+	set := make(map[string]struct{}, len(have))
+	for _, s := range have {
+		set[s] = struct{}{}
+	}
+	for _, s := range want {
+		if _, ok := set[s]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// reusable reports whether a delivered snapshot can answer a fresh ask for the
+// given scopes: it must carry a result for every one of them, and none of those
+// results may be a failure (see Request).
+func reusable(snap telemetry.HostSnapshot, want []string) bool {
+	if snap.RequestID == "" {
+		return false
+	}
+	answered := make(map[string]string, len(snap.Scopes))
+	for _, sr := range snap.Scopes {
+		answered[sr.Scope] = sr.Status
+	}
+	for _, sc := range want {
+		st, ok := answered[sc]
+		if !ok || st == telemetry.ScopeFailed {
+			return false
+		}
+	}
+	return true
 }
 
 // Pending returns the agent's live pending request, or nil. Its only remaining

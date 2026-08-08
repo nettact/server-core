@@ -377,6 +377,15 @@ func (d Deps) handleLogout(w http.ResponseWriter, r *http.Request) {
 // from requireSession's 401 "login required" so the console can tell "your
 // session lapsed, log in again" apart from "that current-password field is
 // wrong" and route the user accordingly.
+//
+// On a DESKTOP install the current password is not required and `old_password`
+// is ignored. There, the admin password is random and never shown: the app mints
+// the session in-process from a loopback-only token, so there is no current
+// password anyone could type, and without this the account could never be given
+// one — which is the only way to log in from a phone or a second computer. The
+// check costs nothing in authority (see identity.SetPassword) but it must stay
+// desktop-only: on a self-hosted server a session can be obtained from anywhere
+// with the password, so a stolen one must not be able to lock the owner out.
 func (d Deps) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		OldPassword string `json:"old_password"`
@@ -392,7 +401,13 @@ func (d Deps) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, "login required")
 		return
 	}
-	switch err := d.Identity.UpdatePassword(r.Context(), u.ID, body.OldPassword, body.NewPassword, sid); {
+	change := func() error {
+		if d.isDesktop(r.Context()) {
+			return d.Identity.SetPassword(r.Context(), u.ID, body.NewPassword, sid)
+		}
+		return d.Identity.UpdatePassword(r.Context(), u.ID, body.OldPassword, body.NewPassword, sid)
+	}
+	switch err := change(); {
 	case errors.Is(err, identity.ErrAuth):
 		writeError(w, http.StatusForbidden, "invalid old password")
 		return
@@ -405,6 +420,19 @@ func (d Deps) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 	}
 	d.Audit.Log(r.Context(), u.Username, "auth.password_changed", "", "")
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+// isDesktop reports whether this server is the embedded one inside the desktop
+// all-in-one. Derived from ListenStatus rather than carried as its own Deps field
+// so there is exactly one source for the fact (the host builds it from the same
+// desktop config), and so a bare server-core test — which supplies no
+// ListenStatus — gets the self-hosted answer, which is the strict one.
+func (d Deps) isDesktop(ctx context.Context) bool {
+	if d.ListenStatus == nil {
+		return false
+	}
+	ls := d.ListenStatus(ctx)
+	return ls != nil && ls.Desktop
 }
 
 func (d Deps) handleMe(w http.ResponseWriter, r *http.Request) {
@@ -579,11 +607,17 @@ func (d Deps) handleRequestSnapshot(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	req := d.HostLive.Request(id, body.Scopes)
-	// Push directly; a race where the agent dropped between the check above and
-	// here is fine — the request is re-pushed if it reconnects while pending,
-	// and expires via TTL otherwise.
-	d.AgentWS.PushSnapshotRequest(id, req)
+	// The store decides whether the agent has to be asked at all: a request already
+	// in flight, or a snapshot it delivered a moment ago, answers this caller too.
+	// Pushing regardless would hit the agent's own rate limit and come back with
+	// every scope failed — which is what a second console open used to look like.
+	req, push := d.HostLive.Request(id, body.Scopes)
+	if push {
+		// Push directly; a race where the agent dropped between the check above and
+		// here is fine — the request is re-pushed if it reconnects while pending,
+		// and expires via TTL otherwise.
+		d.AgentWS.PushSnapshotRequest(id, req)
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"request_id": req.RequestID, "precheck": precheck})
 }
 
