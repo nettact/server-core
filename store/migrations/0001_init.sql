@@ -1115,8 +1115,17 @@ CREATE TABLE incident_snapshot_entries(
 );
 CREATE UNIQUE INDEX idx_snap_entry_req ON incident_snapshot_entries(request_id);
 
+-- One traceroute an Agent decided to run and reported afterwards.
+--
+-- The server does not command these and holds no plan while one is in flight:
+-- the Agent notices a target failing round after round, derives the subject and
+-- destination from the target it was pushed, runs the sweep, and files the whole
+-- self-describing report through its outbox. So every row here is TERMINAL on
+-- arrival — there is no queued, running, claim or deadline state to keep, and no
+-- single-flight index, because the Agent already deduplicated by destination
+-- before it spent a packet.
 CREATE TABLE trace_reports(
-  id           TEXT PRIMARY KEY,
+  id           TEXT PRIMARY KEY,                    -- Agent-minted; with agent_id it is the ingest idempotency key
   site_id      TEXT NOT NULL,
   agent_id     TEXT NOT NULL,
   agent_name   TEXT NOT NULL DEFAULT '',
@@ -1125,22 +1134,25 @@ CREATE TABLE trace_reports(
   dest_ip      TEXT NOT NULL DEFAULT '',
   mode         TEXT NOT NULL CHECK(mode IN('icmp','tcp')),
   port         INTEGER NOT NULL DEFAULT 0,
-  status       TEXT NOT NULL DEFAULT 'queued',      -- queued|running|succeeded|partial|timed_out|unsupported|failed|canceled
+  status       TEXT NOT NULL,                       -- succeeded|partial|timed_out|unsupported|failed|canceled
   reason       TEXT NOT NULL DEFAULT '',
-  max_hops     INTEGER NOT NULL,
+  max_hops     INTEGER NOT NULL,                    -- the bounds the sweep really ran under, reported with it
   attempts     INTEGER NOT NULL,
-  timeout_ms   INTEGER NOT NULL,
-  resolve_hops INTEGER NOT NULL DEFAULT 0,
   reached      INTEGER NOT NULL DEFAULT 0,
   reached_ttl  INTEGER NOT NULL DEFAULT 0,
-  cohort_open  INTEGER NOT NULL DEFAULT 1,
-  requested_at TIMESTAMP NOT NULL,
+  -- WHY the Agent ran it. Nothing server-side asked for this trace, so without
+  -- the trigger the report would be an unexplained execution: the rule that
+  -- fired, how many consecutive failing rounds it took, and when the streak
+  -- began (which is also what makes a claim by a later fault defensible).
+  trigger_reason  TEXT NOT NULL DEFAULT '',         -- consecutive_failures
+  trigger_streak  INTEGER NOT NULL DEFAULT 0,
+  first_failed_at TIMESTAMP,
   started_at   TIMESTAMP,
   completed_at TIMESTAMP,
-  deadline_at  TIMESTAMP NOT NULL,
-  -- A TCP plan whose agent lacks the TCP-traceroute permission runs as ICMP
-  -- instead; these record the mode it was originally requested as and why it
-  -- was downgraded, so a fallback reads as a fallback rather than a failure.
+  received_at  TIMESTAMP NOT NULL,                  -- server clock at ingest; the claim window is measured on it
+  -- A TCP plan whose Agent lacks the TCP-traceroute permission runs as ICMP
+  -- instead; these record the mode it was originally planned as and why it was
+  -- downgraded, so a fallback reads as a fallback rather than a failure.
   fallback_from   TEXT NOT NULL DEFAULT '',   -- '' | tcp
   fallback_reason TEXT NOT NULL DEFAULT '',   -- raw_socket_unavailable | permission_denied
   -- WHAT this diagnostic traced, which is not always the monitored target: a DNS
@@ -1150,35 +1162,26 @@ CREATE TABLE trace_reports(
   subject_kind    TEXT NOT NULL DEFAULT 'target'
                   CHECK(subject_kind IN('target','resolver','proxy','wg_endpoint','stun_server')),
   -- '' | tunnel_unreachable | tunnel_target_unreachable | tunnel_not_attempted.
-  -- Empty on a WireGuard subject means the fault carried no classified cause, so
-  -- no verdict is asserted (a NAT monitor never produces one).
+  -- Empty on a WireGuard subject means the failing round carried no classified
+  -- cause, so no verdict is asserted (a NAT monitor never produces one).
   subject_reason  TEXT NOT NULL DEFAULT '',
-  -- WHICH PATH the probes travel, orthogonal to subject_kind (which says who is
-  -- being measured): direct host stack, the host-stack path toward a WireGuard
-  -- peer's physical endpoint, or hop-by-hop INSIDE the tunnel. An in-tunnel
-  -- report and a physical-endpoint report about the same tunnel must never
-  -- render alike — their hops describe different networks.
+  -- WHICH PATH the probes travelled, orthogonal to subject_kind (which says who
+  -- is being measured): direct host stack, the host-stack path toward a
+  -- WireGuard peer's physical endpoint, or hop-by-hop INSIDE the tunnel. An
+  -- in-tunnel report and a physical-endpoint report about the same tunnel must
+  -- never render alike — their hops describe different networks.
   path_scope           TEXT NOT NULL DEFAULT 'direct'
                        CHECK(path_scope IN('direct','wireguard_physical','wireguard_inner')),
-  -- The exact proxy generation an in-tunnel trace is pinned to, frozen from the
-  -- fault evidence. The agent must match both ID and serial or fail closed —
-  -- never a rotated key, never the host stack — and ingest rejects a result
-  -- whose attestation disagrees. '' / 0 on every host-stack report.
+  -- The exact proxy generation an in-tunnel trace ran through, as the Agent
+  -- attested it. '' / 0 on every host-stack report.
   egress_id            TEXT NOT NULL DEFAULT '',
   egress_config_serial INTEGER NOT NULL DEFAULT 0
 );
--- The subject columns are part of the key: the same host is a different
--- diagnosis as a resolver than as a monitored target, and a WireGuard peer
--- traced because the tunnel is down is a different conclusion from one traced
--- because the tunnel worked. Merging either pair would answer one fault with
--- another fault's evidence, since a report freezes one subject and one reason.
--- The path columns are part of the key for the same reason one level down: two
--- WireGuard tunnels can both contain 10.0.0.10, and the same in-tunnel address
--- traced through different tunnels — or different generations of one tunnel —
--- is a different execution with a different answer.
-CREATE UNIQUE INDEX idx_trace_singleflight
-  ON trace_reports(agent_id, dest_key, mode, port, subject_kind, subject_reason, path_scope, egress_id, egress_config_serial) WHERE cohort_open=1;
-CREATE INDEX idx_trace_status ON trace_reports(status);
+-- A report arrives before, during or after the fault it explains, so the fault
+-- side looks it up by (agent, destination) within a recent window — both when
+-- ingest attaches it to an already-open incident and when a later confirmation
+-- claims one that landed first.
+CREATE INDEX idx_trace_claim ON trace_reports(agent_id, dest_key, received_at);
 
 CREATE TABLE trace_hops(
   report_id TEXT NOT NULL REFERENCES trace_reports(id) ON DELETE CASCADE,

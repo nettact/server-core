@@ -88,8 +88,9 @@ func (s *Service) Snapshot(ctx context.Context, incidentID string) (SnapshotView
 // ---- trace reads ----
 
 // TraceSummary is one traceroute report as referenced from an incident: the
-// shared execution record's identity, status and reached verdict, plus how the
-// incident references it (via which fault signals, and whether still active).
+// Agent-run execution record's identity, status and reached verdict, why the
+// Agent ran it, plus how the incident references it (via which fault signals, and
+// whether still active).
 type TraceSummary struct {
 	ReportID   string `json:"report_id"`
 	AgentID    string `json:"agent_id"`
@@ -102,6 +103,13 @@ type TraceSummary struct {
 	Reason     string `json:"reason,omitempty"`
 	Reached    bool   `json:"reached"`
 	ReachedTTL int    `json:"reached_ttl,omitempty"`
+	// TriggerReason/TriggerStreak/FirstFailedAt say WHY the Agent traced. Nothing
+	// server-side asked for the report, so without them it reads as an execution
+	// that appeared from nowhere; with them the console can say "the Agent traced
+	// this after 3 consecutive failures starting at 14:02".
+	TriggerReason string     `json:"trigger_reason,omitempty"`
+	TriggerStreak int        `json:"trigger_streak,omitempty"`
+	FirstFailedAt *time.Time `json:"first_failed_at,omitempty"`
 	// FallbackFrom/FallbackReason surface a derivation-time permission fallback:
 	// the report ran in Mode after being downgraded from FallbackFrom ('' when
 	// it ran in its natural mode), because of FallbackReason.
@@ -124,10 +132,13 @@ type TraceSummary struct {
 	EgressID           string     `json:"egress_id,omitempty"`
 	EgressConfigSerial int        `json:"egress_config_serial,omitempty"`
 	ActiveRefs         int        `json:"active_refs"`
-	RequestedAt        time.Time  `json:"requested_at"`
 	StartedAt          *time.Time `json:"started_at"`
 	CompletedAt        *time.Time `json:"completed_at"`
-	DeadlineAt         time.Time  `json:"deadline_at"`
+	// ReceivedAt is this server's clock when the report arrived, which can be far
+	// later than CompletedAt: a trace collected during an outage waits in the
+	// Agent's outbox until the link comes back, which is the whole point of
+	// sending it that way.
+	ReceivedAt time.Time `json:"received_at"`
 }
 
 // TracesForIncident returns the traceroute reports referenced by an incident,
@@ -136,14 +147,15 @@ func (s *Service) TracesForIncident(ctx context.Context, incidentID string) ([]T
 	rows, err := s.db.Read().QueryContext(ctx, `
 		SELECT tr.id, tr.agent_id, COALESCE(tr.agent_name,''), tr.mode, tr.dest_host, COALESCE(tr.dest_ip,''),
 		       tr.port, tr.status, COALESCE(tr.reason,''), tr.reached, tr.reached_ttl,
+		       COALESCE(tr.trigger_reason,''), tr.trigger_streak, tr.first_failed_at,
 		       COALESCE(tr.fallback_from,''), COALESCE(tr.fallback_reason,''),
 		       COALESCE(tr.subject_kind,''), COALESCE(tr.subject_reason,''),
 		       tr.path_scope, tr.egress_id, tr.egress_config_serial,
 		       (SELECT COUNT(*) FROM trace_report_refs r2 WHERE r2.report_id=tr.id AND r2.incident_id=? AND r2.active=1),
-		       tr.requested_at, tr.started_at, tr.completed_at, tr.deadline_at
+		       tr.started_at, tr.completed_at, tr.received_at
 		FROM trace_reports tr
 		WHERE tr.id IN (SELECT DISTINCT report_id FROM trace_report_refs WHERE incident_id=?)
-		ORDER BY tr.requested_at DESC`, incidentID, incidentID)
+		ORDER BY tr.received_at DESC`, incidentID, incidentID)
 	if err != nil {
 		return nil, err
 	}
@@ -162,17 +174,20 @@ func (s *Service) TracesForIncident(ctx context.Context, incidentID string) ([]T
 func scanTraceSummary(rows *sql.Rows) (TraceSummary, error) {
 	var t TraceSummary
 	var reached int
-	var started, completed sql.NullTime
+	var started, completed, firstFailed sql.NullTime
 	if err := rows.Scan(&t.ReportID, &t.AgentID, &t.AgentName, &t.Mode, &t.DestHost, &t.DestIP,
-		&t.Port, &t.Status, &t.Reason, &reached, &t.ReachedTTL, &t.FallbackFrom, &t.FallbackReason,
+		&t.Port, &t.Status, &t.Reason, &reached, &t.ReachedTTL,
+		&t.TriggerReason, &t.TriggerStreak, &firstFailed,
+		&t.FallbackFrom, &t.FallbackReason,
 		&t.SubjectKind, &t.SubjectReason,
 		&t.PathScope, &t.EgressID, &t.EgressConfigSerial,
-		&t.ActiveRefs, &t.RequestedAt, &started, &completed, &t.DeadlineAt); err != nil {
+		&t.ActiveRefs, &started, &completed, &t.ReceivedAt); err != nil {
 		return TraceSummary{}, err
 	}
 	t.Reached = reached == 1
 	t.StartedAt = timePtr(started)
 	t.CompletedAt = timePtr(completed)
+	t.FirstFailedAt = timePtr(firstFailed)
 	return t, nil
 }
 
@@ -204,19 +219,23 @@ func (s *Service) TraceReport(ctx context.Context, reportID string) (TraceReport
 	var v TraceReportView
 	var siteID string
 	var reached int
-	var started, completed sql.NullTime
+	var started, completed, firstFailed sql.NullTime
 	err := s.db.Read().QueryRowContext(ctx, `
 		SELECT id, site_id, agent_id, COALESCE(agent_name,''), mode, dest_host, COALESCE(dest_ip,''), port,
-		       status, COALESCE(reason,''), reached, reached_ttl, COALESCE(fallback_from,''), COALESCE(fallback_reason,''),
+		       status, COALESCE(reason,''), reached, reached_ttl,
+		       COALESCE(trigger_reason,''), trigger_streak, first_failed_at,
+		       COALESCE(fallback_from,''), COALESCE(fallback_reason,''),
 		       COALESCE(subject_kind,''), COALESCE(subject_reason,''),
 		       path_scope, egress_id, egress_config_serial,
-		       requested_at, started_at, completed_at, deadline_at
+		       started_at, completed_at, received_at
 		FROM trace_reports WHERE id=?`, reportID).
 		Scan(&v.ReportID, &siteID, &v.AgentID, &v.AgentName, &v.Mode, &v.DestHost, &v.DestIP, &v.Port,
-			&v.Status, &v.Reason, &reached, &v.ReachedTTL, &v.FallbackFrom, &v.FallbackReason,
+			&v.Status, &v.Reason, &reached, &v.ReachedTTL,
+			&v.TriggerReason, &v.TriggerStreak, &firstFailed,
+			&v.FallbackFrom, &v.FallbackReason,
 			&v.SubjectKind, &v.SubjectReason,
 			&v.PathScope, &v.EgressID, &v.EgressConfigSerial,
-			&v.RequestedAt, &started, &completed, &v.DeadlineAt)
+			&started, &completed, &v.ReceivedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return TraceReportView{}, "", false, nil
 	}
@@ -226,6 +245,7 @@ func (s *Service) TraceReport(ctx context.Context, reportID string) (TraceReport
 	v.Reached = reached == 1
 	v.StartedAt = timePtr(started)
 	v.CompletedAt = timePtr(completed)
+	v.FirstFailedAt = timePtr(firstFailed)
 
 	rows, err := s.db.Read().QueryContext(ctx,
 		`SELECT ttl, attempt, COALESCE(addr,''), COALESCE(hostname,''), rtt_us, timed_out

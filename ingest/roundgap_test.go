@@ -35,7 +35,7 @@ func openGapDB(t *testing.T) (*store.DB, *Service) {
 			t.Fatalf("seed %q: %v", q.sql, err)
 		}
 	}
-	return db, New(db, nil, nil, nil, nil)
+	return db, New(db, nil, nil, nil, nil, nil)
 }
 
 func gapFor(t *testing.T, db *store.DB, s *Service) time.Duration {

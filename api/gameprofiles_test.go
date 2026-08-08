@@ -22,7 +22,7 @@ import (
 func openGameProfileAPI(t *testing.T) (*store.DB, Deps) {
 	t.Helper()
 	db, d := openGameAPI(t)
-	d.Config = config.New(db, registry.New(db, 0, nil), eventbus.New(), nil)
+	d.Config = config.New(db, registry.New(db, 0, nil), eventbus.New(), nil, nil)
 	return db, d
 }
 

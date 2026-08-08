@@ -33,7 +33,7 @@ func TestSetSiteTargetsIsIdempotentAndSiteSafe(t *testing.T) {
 	db, ctx := openConfigTestDB(t)
 	reg := registry.New(db, 0, nil)
 	bus := eventbus.New()
-	svc := New(db, reg, bus, nil)
+	svc := New(db, reg, bus, nil, nil)
 	var configEvents int
 	var statusEvents []eventbus.TargetStatusChanged
 	bus.Subscribe(eventbus.TopicConfigChanged, func(eventbus.Message) { configEvents++ })
@@ -109,7 +109,7 @@ func TestSetSiteTargetsIsIdempotentAndSiteSafe(t *testing.T) {
 
 func TestConcurrentTargetReplacementNeverMergesSets(t *testing.T) {
 	db, ctx := openConfigTestDB(t)
-	svc := New(db, registry.New(db, 0, nil), nil, nil)
+	svc := New(db, registry.New(db, 0, nil), nil, nil, nil)
 	const groupID = "group-default"
 	if _, err := db.ExecContext(ctx, `INSERT INTO monitor_groups(id,site_id,name,is_default,all_agents) VALUES(?,'site_default','Default',1,1)`, groupID); err != nil {
 		t.Fatal(err)
@@ -150,7 +150,7 @@ func TestConcurrentTargetReplacementNeverMergesSets(t *testing.T) {
 func TestDesiredStateUsesMonitorGroupScope(t *testing.T) {
 	db, ctx := openConfigTestDB(t)
 	reg := registry.New(db, 0, nil)
-	svc := New(db, reg, nil, nil)
+	svc := New(db, reg, nil, nil, nil)
 
 	agid, err := reg.CreateGroup(ctx, "site_default", "agents-a")
 	if err != nil {
@@ -207,7 +207,7 @@ func TestDesiredStateUsesMonitorGroupScope(t *testing.T) {
 func TestValidateGroupScopeRejectsBeforeMutation(t *testing.T) {
 	db, ctx := openConfigTestDB(t)
 	reg := registry.New(db, 0, nil)
-	svc := New(db, reg, nil, nil)
+	svc := New(db, reg, nil, nil, nil)
 	other, err := reg.CreateGroup(ctx, "site_other", "other-site")
 	if err != nil {
 		t.Fatalf("create other-site group: %v", err)
@@ -226,7 +226,7 @@ func TestValidateGroupScopeRejectsBeforeMutation(t *testing.T) {
 
 func TestHostAnchorIsStoredButNotPushed(t *testing.T) {
 	db, ctx := openConfigTestDB(t)
-	svc := New(db, registry.New(db, 0, nil), nil, nil)
+	svc := New(db, registry.New(db, 0, nil), nil, nil, nil)
 	groupID, err := svc.CreateGroup(ctx, "site_default", "all", false, true, nil)
 	if err != nil {
 		t.Fatalf("create monitor group: %v", err)

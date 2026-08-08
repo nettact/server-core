@@ -26,7 +26,7 @@ func openWiFiIngest(t *testing.T) (*store.DB, *Service, *inventory.Service, *met
 		t.Fatalf("seed agent: %v", err)
 	}
 	m := metrics.New(db)
-	return db, New(db, nil, m, nil, nil), inventory.New(db, nil), m
+	return db, New(db, nil, m, nil, nil, nil), inventory.New(db, nil), m
 }
 
 func wifiPacket(seq uint64, sampled time.Time, state telemetry.WiFiLinkState, ssid string, interfaces bool) telemetry.Packet {

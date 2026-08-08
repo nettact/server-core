@@ -44,7 +44,7 @@ func newDegHarness(t *testing.T) *degHarness {
 
 	m := metrics.New(db)
 	faultSvc := fault.New(db, eventbus.New(), nil)
-	h.svc = New(db, nil, m, faultSvc, baseline.New(db))
+	h.svc = New(db, nil, m, faultSvc, baseline.New(db), nil)
 	return h
 }
 

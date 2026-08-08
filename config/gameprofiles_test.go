@@ -18,7 +18,7 @@ func gameSvc(t *testing.T) (*store.DB, context.Context, *Service, *int, *int) {
 	t.Helper()
 	db, ctx := openConfigTestDB(t)
 	bus := eventbus.New()
-	svc := New(db, registry.New(db, 0, nil), bus, nil)
+	svc := New(db, registry.New(db, 0, nil), bus, nil, nil)
 	var configEvents, statusEvents int
 	bus.Subscribe(eventbus.TopicConfigChanged, func(eventbus.Message) { configEvents++ })
 	bus.Subscribe(eventbus.TopicTargetStatusChanged, func(eventbus.Message) { statusEvents++ })

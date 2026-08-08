@@ -38,6 +38,12 @@ const KeyOnboardingState = "onboarding_state"
 // knobs, plus evidence retention. Each is a UI-editable, server-validated int
 // setting stored in app_settings; the bounds and defaults live in one table
 // (IntKeys) so the API validator and the typed accessors never drift.
+//
+// The diag_* keys are the SERVER's statement of policy, not its schedule: the
+// Agent decides when to traceroute and executes it, and these travel down inside
+// DesiredState as config.DiagPolicy. That is why there is no concurrency knob
+// here any more — how many traces may run at once is a property of the machine
+// running them, and it is configured on the Agent alongside its probe budget.
 const (
 	KeyIncidentSnapshotDeadlineMs = "incident_snapshot_deadline_ms"
 	KeyIncidentSnapshotMaxBytes   = "incident_snapshot_max_bytes"
@@ -45,10 +51,18 @@ const (
 	KeyDiagTotalTimeoutMs         = "diag_total_timeout_ms"
 	KeyDiagMaxHops                = "diag_max_hops"
 	KeyDiagAttemptsPerHop         = "diag_attempts_per_hop"
-	KeyDiagAgentConcurrency       = "diag_agent_concurrency"
-	KeyDiagGlobalConcurrency      = "diag_global_concurrency"
-	KeyDiagResolveHops            = "diag_resolve_hops"
-	KeyEvidenceRetentionDays      = "evidence_retention_days"
+	// KeyDiagConsecutiveFailures is how many consecutive failing rounds an Agent
+	// must see before it traces. It defaults to the same 3 as the balanced
+	// availability profile so a trace fires as the fault becomes real, rather than
+	// on the first blip (noise) or long after confirmation (evidence collected past
+	// the interesting moment).
+	KeyDiagConsecutiveFailures = "diag_consecutive_failures"
+	// KeyDiagCooldownSec is the minimum spacing between two traces of one
+	// destination on one Agent. A target that stays down produces a failing round
+	// every interval, and the path to it does not change nearly that often.
+	KeyDiagCooldownSec       = "diag_cooldown_sec"
+	KeyDiagPerHopTimeoutMs   = "diag_per_hop_timeout_ms"
+	KeyEvidenceRetentionDays = "evidence_retention_days"
 	// KeyFluctuationRetentionDays ages out recorded sub-threshold streaks. It bounds
 	// only the UNLINKED ones: a fluctuation claimed as an incident's precursor is
 	// that incident's evidence and lives as long as it does.
@@ -151,7 +165,7 @@ type IntBounds struct {
 // settings: their defaults and validated bounds. The generic settings API reads
 // it to (a) allow-list the keys, (b) reject out-of-range values, and the typed
 // accessors below read it to fall back to the default on unset/invalid values.
-// Booleans (diag_enabled, diag_resolve_hops) are modeled as 0/1 ints.
+// Booleans (diag_enabled) are modeled as 0/1 ints.
 var IntKeys = map[string]IntBounds{
 	KeyIncidentSnapshotDeadlineMs: {Default: 10000, Min: 1000, Max: 60000},
 	KeyIncidentSnapshotMaxBytes:   {Default: 262144, Min: 65536, Max: 1048576},
@@ -159,11 +173,13 @@ var IntKeys = map[string]IntBounds{
 	KeyDiagTotalTimeoutMs:         {Default: 300000, Min: 5000, Max: 600000},
 	KeyDiagMaxHops:                {Default: 30, Min: 1, Max: 64},
 	KeyDiagAttemptsPerHop:         {Default: 3, Min: 1, Max: 5},
-	KeyDiagAgentConcurrency:       {Default: 4, Min: 1, Max: 16},
-	KeyDiagGlobalConcurrency:      {Default: 16, Min: 1, Max: 64},
-	KeyDiagResolveHops:            {Default: 0, Min: 0, Max: 1},
-	KeyEvidenceRetentionDays:      {Default: 30, Min: 1, Max: 365},
-	KeyFluctuationRetentionDays:   {Default: 30, Min: 1, Max: 365},
+	KeyDiagConsecutiveFailures:    {Default: 3, Min: 1, Max: 20},
+	KeyDiagCooldownSec:            {Default: 900, Min: 60, Max: 86400},
+	// 0 means "derive it from the total budget and the hop ceiling", which is the
+	// sane relationship; the range starts at the Agent's own per-attempt floor.
+	KeyDiagPerHopTimeoutMs:      {Default: 0, Min: 0, Max: 10000},
+	KeyEvidenceRetentionDays:    {Default: 30, Min: 1, Max: 365},
+	KeyFluctuationRetentionDays: {Default: 30, Min: 1, Max: 365},
 	// Agent connectivity detection. Grace min (15s) stays above the sweeper's 10s
 	// presence grace so a confirmed fault is always strictly slower than the UI
 	// flipping the agent offline; stale default (120s) is ~4x the 30s host-metric

@@ -52,7 +52,7 @@ func newTestEnv(t *testing.T) *testEnv {
 	}
 	reg := registry.New(db, 0, nil)
 	bus := eventbus.New()
-	cfg := config.New(db, reg, bus, nil)
+	cfg := config.New(db, reg, bus, nil, nil)
 	groupID, err := cfg.EnsureDefaultGroup(ctx, site.DefaultSiteID)
 	if err != nil {
 		t.Fatalf("ensure default monitor group: %v", err)
@@ -60,7 +60,7 @@ func newTestEnv(t *testing.T) *testEnv {
 	hostLive := hostlive.New()
 	hub := New(Deps{
 		Registry: reg,
-		Ingest:   ingest.New(db, bus, metrics.New(db), nil, nil),
+		Ingest:   ingest.New(db, bus, metrics.New(db), nil, nil, nil),
 		Config:   cfg,
 		HostLive: hostLive,
 		OpIssue:  opissue.New(db, bus),

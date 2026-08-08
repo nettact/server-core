@@ -16,7 +16,7 @@ func newProxySvc(t *testing.T) (*Service, *store.DB, *eventbus.Bus, context.Cont
 	t.Helper()
 	db, ctx := openConfigTestDB(t)
 	bus := eventbus.New()
-	return New(db, registry.New(db, 0, nil), bus, nil), db, bus, ctx
+	return New(db, registry.New(db, 0, nil), bus, nil, nil), db, bus, ctx
 }
 
 func sampleRelay(name string) Proxy {

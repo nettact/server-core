@@ -252,7 +252,7 @@ func loadTraceFacts(ctx context.Context, tx *sql.Tx, incidentID string) ([]trace
 		JOIN fault_signals fs ON fs.id = r.signal_id
 		WHERE r.incident_id=? AND r.active=1 AND fs.state='firing'
 		  AND tr.status IN('succeeded','partial','failed','timed_out')
-		ORDER BY tr.requested_at DESC`, incidentID)
+		ORDER BY tr.received_at DESC`, incidentID)
 	if err != nil {
 		return nil, err
 	}

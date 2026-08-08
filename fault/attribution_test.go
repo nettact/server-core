@@ -528,9 +528,9 @@ func (h *harness) seedTraceForRecompute(reportID, incidentID, signalID, subjectK
 	h.t.Helper()
 	now := time.Now().UTC()
 	h.exec(`INSERT INTO trace_reports(id, site_id, agent_id, dest_key, dest_host, mode, status, max_hops, attempts,
-		timeout_ms, subject_kind, reached, cohort_open, requested_at, deadline_at)
-		VALUES(?, 'site_default', 'agent_a', 'ip:8.8.8.8', '8.8.8.8', 'icmp', 'partial', 30, 3, 30000, ?, ?, 0, ?, ?)`,
-		reportID, subjectKind, boolToInt(reached), now, now.Add(time.Minute))
+		subject_kind, reached, trigger_reason, trigger_streak, completed_at, received_at)
+		VALUES(?, 'site_default', 'agent_a', 'ip:8.8.8.8', '8.8.8.8', 'icmp', 'partial', 30, 3, ?, ?, 'consecutive_failures', 3, ?, ?)`,
+		reportID, subjectKind, boolToInt(reached), now, now)
 	h.exec(`INSERT INTO trace_report_refs(report_id, incident_id, signal_id, active, created_at)
 		VALUES(?, ?, ?, 1, ?)`, reportID, incidentID, signalID, now)
 	h.exec(`INSERT INTO trace_hops(report_id, ttl, attempt, addr, rtt_us, timed_out)

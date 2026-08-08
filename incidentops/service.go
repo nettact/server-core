@@ -37,7 +37,6 @@ import (
 // imports agentws).
 type Pusher interface {
 	PushIncidentSnapshotRequest(agentID string, req pcfg.IncidentSnapshotRequest) bool
-	PushTraceRequest(agentID string, req pcfg.TraceRequest) bool
 }
 
 // Service orchestrates incident snapshots and traceroute reports.
@@ -76,6 +75,10 @@ func (s *Service) snapshotMaxBytes(ctx context.Context) int {
 	return s.intSetting(ctx, settings.KeyIncidentSnapshotMaxBytes)
 }
 
+// diagEnabled gates the claim path. The bounds themselves are pushed to the
+// Agent inside DesiredState (see config.DiagPolicy) — the server states the
+// policy but keeps none of the execution — so the only thing it reads here is
+// whether path diagnostics exist at all.
 func (s *Service) diagEnabled(ctx context.Context) bool {
 	if s.settings == nil {
 		return settings.IntKeys[settings.KeyDiagEnabled].Default != 0
@@ -83,28 +86,6 @@ func (s *Service) diagEnabled(ctx context.Context) bool {
 	return s.settings.Bool(ctx, settings.KeyDiagEnabled)
 }
 
-func (s *Service) diagTotalTimeout(ctx context.Context) time.Duration {
-	return time.Duration(s.intSetting(ctx, settings.KeyDiagTotalTimeoutMs)) * time.Millisecond
-}
-
-func (s *Service) diagMaxHops(ctx context.Context) int {
-	return s.intSetting(ctx, settings.KeyDiagMaxHops)
-}
-func (s *Service) diagAttempts(ctx context.Context) int {
-	return s.intSetting(ctx, settings.KeyDiagAttemptsPerHop)
-}
-func (s *Service) diagAgentConcurrency(ctx context.Context) int {
-	return s.intSetting(ctx, settings.KeyDiagAgentConcurrency)
-}
-func (s *Service) diagGlobalConcurrency(ctx context.Context) int {
-	return s.intSetting(ctx, settings.KeyDiagGlobalConcurrency)
-}
-func (s *Service) diagResolveHops(ctx context.Context) bool {
-	if s.settings == nil {
-		return settings.IntKeys[settings.KeyDiagResolveHops].Default != 0
-	}
-	return s.settings.Bool(ctx, settings.KeyDiagResolveHops)
-}
 func (s *Service) retentionDays(ctx context.Context) int {
 	return s.intSetting(ctx, settings.KeyEvidenceRetentionDays)
 }
@@ -137,18 +118,22 @@ func (s *Service) agentPermissions(ctx context.Context, agentID string) (support
 		permission.FromStrings(decodeStrings(effRaw))
 }
 
-// canonicalDest returns the single-flight destination key and the display host
-// for a raw target host/IP. An IP literal keys as "ip:<canonical-ip>"; anything
-// else keys as "host:<lowercased-host>" (the hostname stands in until the agent
-// resolves an address, matching the spec's per-Agent canonical-destination rule).
-func canonicalDest(host string) (destKey, destHost, destIP string) {
+// canonicalDest returns the destination key and display host for a raw target
+// host/IP. An IP literal keys as "ip:<canonical-ip>"; anything else keys as
+// "host:<lowercased-host>".
+//
+// It must spell keys exactly as the Agent's own canonicalization does: the key is
+// how a stored report and a confirmed fault find each other, and two independent
+// normalizations are two chances to disagree about whether "Example.com" and
+// "example.com" are one destination.
+func canonicalDest(host string) (destKey, destHost string) {
 	host = strings.TrimSpace(host)
 	if ip := net.ParseIP(host); ip != nil {
 		c := ip.String()
-		return "ip:" + c, c, c
+		return "ip:" + c, c
 	}
 	lower := strings.ToLower(host)
-	return "host:" + lower, lower, ""
+	return "host:" + lower, lower
 }
 
 // terminal snapshot / entry statuses.

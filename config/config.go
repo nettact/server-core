@@ -23,6 +23,7 @@ import (
 	pcfg "github.com/nettact/protocol/config"
 	"github.com/nettact/server-core/eventbus"
 	"github.com/nettact/server-core/registry"
+	"github.com/nettact/server-core/settings"
 	"github.com/nettact/server-core/store"
 )
 
@@ -99,10 +100,15 @@ type Service struct {
 	reg  *registry.Service
 	bus  *eventbus.Bus
 	term FaultTerminator // force-resolves signals of removed/changed targets (nil-safe)
+	// set supplies the path-diagnostic policy pushed inside DesiredState. The
+	// server states the policy even though the Agent owns the trigger, so it has to
+	// reach the same push the targets do. Nil-safe: the accessors fall back to the
+	// registered defaults, which is what every test wants.
+	set *settings.Service
 }
 
-func New(db *store.DB, reg *registry.Service, bus *eventbus.Bus, term FaultTerminator) *Service {
-	return &Service{db: db, reg: reg, bus: bus, term: term}
+func New(db *store.DB, reg *registry.Service, bus *eventbus.Bus, term FaultTerminator, set *settings.Service) *Service {
+	return &Service{db: db, reg: reg, bus: bus, term: term, set: set}
 }
 
 // MonitorGroup is a site-scoped monitor group: a static owner of targets plus the
@@ -1026,7 +1032,35 @@ func (s *Service) DesiredStateFor(ctx context.Context, agentID string) (pcfg.Des
 		return pcfg.DesiredState{}, err
 	}
 	ds.Game = game
+	// The diagnostic policy is ALWAYS present, for the same reason the game block
+	// is: an absent block means "this server has nothing to say" and leaves the
+	// Agent's built-in defaults standing, so an operator who turned diagnostics OFF
+	// would have that decision read as silence and ignored.
+	ds.Diag = s.diagPolicy(ctx)
 	return ds, nil
+}
+
+// diagPolicy reads the site's path-diagnostic policy for the DesiredState push.
+//
+// It is deliberately not versioned into ConfigVersion or a serial of its own:
+// unlike probe targets and game profiles, applying it costs nothing — no probe
+// restarts, no sensor restarts, no state to reconcile — so re-pushing it with
+// every DesiredState is cheaper than the bookkeeping that would let it be
+// skipped.
+func (s *Service) diagPolicy(ctx context.Context) *pcfg.DiagPolicy {
+	n := func(key string) int {
+		v, _ := s.set.Int(ctx, key)
+		return v
+	}
+	return &pcfg.DiagPolicy{
+		Enabled:             s.set.Bool(ctx, settings.KeyDiagEnabled),
+		ConsecutiveFailures: n(settings.KeyDiagConsecutiveFailures),
+		CooldownSeconds:     n(settings.KeyDiagCooldownSec),
+		MaxHops:             n(settings.KeyDiagMaxHops),
+		Attempts:            n(settings.KeyDiagAttemptsPerHop),
+		PerHopTimeoutMs:     n(settings.KeyDiagPerHopTimeoutMs),
+		BudgetMs:            n(settings.KeyDiagTotalTimeoutMs),
+	}
 }
 
 // announce publishes TopicConfigChanged so the WebSocket hub pushes fresh

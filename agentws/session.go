@@ -211,15 +211,6 @@ func (h *Hub) readLoop(ctx context.Context, s *session) error {
 					log.Printf("agentws: incident snapshot from %s: %v", s.agentID, err)
 				}
 			}
-		case frame.TraceResult != nil:
-			// One-shot traceroute result. Never acked; matched by (report id +
-			// authenticated agent id + nonterminal state) so a duplicate/late/wrong-
-			// agent result cannot mutate or attach elsewhere.
-			if h.deps.IncidentOps != nil {
-				if err := h.deps.IncidentOps.IngestTrace(ctx, s.agentID, *frame.TraceResult); err != nil {
-					log.Printf("agentws: trace result from %s: %v", s.agentID, err)
-				}
-			}
 		default:
 			// A second Hello, or a server->agent frame kind (Ack / DesiredState /
 			// SnapshotRequest) coming FROM the agent: both are protocol violations.

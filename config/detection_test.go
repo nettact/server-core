@@ -12,7 +12,7 @@ import (
 func seedDetectionTarget(t *testing.T) (*Service, string) {
 	t.Helper()
 	db, ctx := openConfigTestDB(t)
-	svc := New(db, registry.New(db, 0, nil), nil, nil)
+	svc := New(db, registry.New(db, 0, nil), nil, nil, nil)
 	if _, err := db.ExecContext(ctx,
 		`INSERT INTO monitor_groups(id,site_id,name,is_default,merge_enabled,all_agents)
 		 VALUES('mg','site_default','Default',1,0,1)`); err != nil {

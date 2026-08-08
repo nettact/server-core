@@ -53,19 +53,21 @@ type Deps struct {
 	HostLive *hostlive.Store  // in-memory live snapshots (never persisted)
 	OpIssue  *opissue.Service // operational-issue engine (monitor status + host re-eval)
 	Bus      *eventbus.Bus    // source of TopicConfigChanged pushes
-	// IncidentOps routes inbound incident-snapshot / trace-result frames and drives
-	// the on-connect re-push of still-outstanding, in-deadline snapshot/trace work.
-	// Optional (nil in a build without the orchestration wired).
+	// IncidentOps routes inbound incident-snapshot frames and drives the on-connect
+	// re-push of still-outstanding, in-deadline snapshot work. Optional (nil in a
+	// build without the orchestration wired).
 	IncidentOps IncidentOps
 }
 
-// IncidentOps is the incident snapshot/trace orchestration surface the hub needs:
-// ingest of agent results and the reconnect re-push. Satisfied by
+// IncidentOps is the incident-snapshot orchestration surface the hub needs:
+// ingest of the agent's scene result and the reconnect re-push. Satisfied by
 // *incidentops.Service; kept as an interface so agentws does not hard-depend on
 // its construction.
+//
+// Traceroute is absent by design: an Agent triggers its own traces and delivers
+// them inside telemetry packets, so nothing about them crosses this hub.
 type IncidentOps interface {
 	IngestSnapshot(ctx context.Context, agentID string, snap telemetry.IncidentSnapshot) error
-	IngestTrace(ctx context.Context, agentID string, res telemetry.TraceResult) error
 	OnAgentConnected(ctx context.Context, agentID string)
 }
 
@@ -75,10 +77,10 @@ type Hub struct {
 	deps Deps
 
 	mu          sync.Mutex
-	conns       map[string]*session    // agentID -> its single live session
-	closed      bool                   // set by CloseAll; refuses further sessions
+	conns       map[string]*session  // agentID -> its single live session
+	closed      bool                 // set by CloseAll; refuses further sessions
 	handshaking map[wire.Conn]string // admitted conns not yet registered -> agentID; CloseAll and Disconnect cut them loose
-	serving     sync.WaitGroup         // one per admitted serve; CloseAll waits for all of them
+	serving     sync.WaitGroup       // one per admitted serve; CloseAll waits for all of them
 }
 
 // New constructs the hub and subscribes it to config changes so edited targets
@@ -436,19 +438,6 @@ func (h *Hub) PushIncidentSnapshotRequest(agentID string, req pcfg.IncidentSnaps
 		return false
 	}
 	return s.enqueue(wire.Frame{IncidentSnapshotRequest: &req})
-}
-
-// PushTraceRequest pushes a traceroute request to the agent's live session,
-// reporting false when the agent is offline (the report then stays queued for a
-// reconnect re-dispatch). Satisfies incidentops.Pusher.
-func (h *Hub) PushTraceRequest(agentID string, req pcfg.TraceRequest) bool {
-	h.mu.Lock()
-	s := h.conns[agentID]
-	h.mu.Unlock()
-	if s == nil {
-		return false
-	}
-	return s.enqueue(wire.Frame{TraceRequest: &req})
 }
 
 // Disconnect synchronously evicts an agent's live session (no-op when it has

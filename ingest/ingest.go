@@ -26,6 +26,7 @@ import (
 	"github.com/nettact/server-core/eventbus"
 	"github.com/nettact/server-core/fault"
 	"github.com/nettact/server-core/gamedata"
+	"github.com/nettact/server-core/incidentops"
 	"github.com/nettact/server-core/metrics"
 	"github.com/nettact/server-core/store"
 )
@@ -57,12 +58,29 @@ type Baseliner interface {
 	Bands(ctx context.Context, agentID string, reqs map[baseline.BandKey]int) (map[baseline.BandKey]baseline.Band, error)
 }
 
+// Tracer persists the agent-triggered traceroute reports a packet carries, in
+// ingest's own write transaction. Satisfied by *incidentops.Service; kept as a
+// small interface so ingest unit tests can pass nil (reports are then dropped,
+// which no test asserts against).
+//
+// It shares the transaction for the same reason the fault evaluator does: a
+// report is evidence about the rounds arriving beside it, and committing the two
+// separately would let the console see an incident whose attribution was
+// computed without a trace that was in the same packet. A failure withholds the
+// ack, the agent replays, and the (agent, report id) idempotency makes the replay
+// a no-op.
+type Tracer interface {
+	IngestTracesTx(ctx context.Context, tx *sql.Tx, agentID, siteID string, results []telemetry.TraceResult) (*incidentops.TraceOutcome, error)
+	PublishTraceOutcome(ctx context.Context, out *incidentops.TraceOutcome)
+}
+
 type Service struct {
 	db       *store.DB
 	bus      *eventbus.Bus
 	metrics  *metrics.Store
 	fault    Evaluator // nil-safe: telemetry then commits without inline evaluation
 	baseline Baseliner // nil-safe: degradation detection is then never fed
+	tracer   Tracer    // nil-safe: traceroute reports are then not persisted
 
 	// Per-agent highest-sequence watermark, cached so the hot ingest path does
 	// not re-run MAX(sequence) on every packet. Loaded from the DB on first
@@ -71,8 +89,8 @@ type Service struct {
 	highSeq map[string]uint64
 }
 
-func New(db *store.DB, bus *eventbus.Bus, m *metrics.Store, ev Evaluator, bl Baseliner) *Service {
-	return &Service{db: db, bus: bus, metrics: m, fault: ev, baseline: bl, highSeq: make(map[string]uint64)}
+func New(db *store.DB, bus *eventbus.Bus, m *metrics.Store, ev Evaluator, bl Baseliner, tr Tracer) *Service {
+	return &Service{db: db, bus: bus, metrics: m, fault: ev, baseline: bl, tracer: tr, highSeq: make(map[string]uint64)}
 }
 
 // Ingest stores one telemetry packet idempotently and returns the ack watermark.
@@ -150,6 +168,7 @@ func (s *Service) Ingest(ctx context.Context, agentID, siteID string, pkt teleme
 
 	var acceptedTx []telemetry.Metric
 	var outcome *fault.Outcome
+	var traces *incidentops.TraceOutcome
 	if affected > 0 {
 		// Authoritative in-tx re-check: config edits serialize on the single write
 		// connection, so a serial read here has no TOCTOU with the pre-tx filter.
@@ -215,6 +234,15 @@ func (s *Service) Ingest(ctx context.Context, agentID, siteID string, pkt teleme
 				return Ack{}, err
 			}
 		}
+		// Traceroute reports the agent ran on its own initiative. They land in this
+		// same transaction, after the fault evaluation, so a report and the rounds
+		// that explain it commit together and a report can attach to a fault the
+		// very batch it arrived in has just confirmed.
+		if s.tracer != nil && len(pkt.TraceResults) > 0 {
+			if traces, err = s.tracer.IngestTracesTx(ctx, tx, agentID, siteID, pkt.TraceResults); err != nil {
+				return Ack{}, err
+			}
+		}
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -234,6 +262,9 @@ func (s *Service) Ingest(ctx context.Context, agentID, siteID string, pkt teleme
 		}
 		if s.fault != nil && outcome != nil {
 			s.fault.PublishOutcome(ctx, outcome)
+		}
+		if s.tracer != nil && traces != nil {
+			s.tracer.PublishTraceOutcome(ctx, traces)
 		}
 		if s.bus != nil {
 			ids := monitorIDs(acceptedTx)

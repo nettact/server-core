@@ -49,7 +49,7 @@ func seedScopeFixture(t *testing.T, db *store.DB) {
 func TestProbeMetaExcludesOutOfScopeAndForeignTargets(t *testing.T) {
 	db := storetest.Open(t)
 	seedScopeFixture(t, db)
-	svc := New(db, nil, nil, nil, nil)
+	svc := New(db, nil, nil, nil, nil, nil)
 	ctx := context.Background()
 
 	meta, err := svc.probeMeta(ctx, db.Read(), "agent_in", "site_a", []string{"t_scoped", "t_foreign"})
@@ -78,7 +78,7 @@ func TestProbeMetaExcludesOutOfScopeAndForeignTargets(t *testing.T) {
 func TestOutOfScopeTelemetryIsDropped(t *testing.T) {
 	db := storetest.Open(t)
 	seedScopeFixture(t, db)
-	svc := New(db, nil, nil, nil, nil)
+	svc := New(db, nil, nil, nil, nil, nil)
 	ctx := context.Background()
 
 	meta, err := svc.probeMeta(ctx, db.Read(), "agent_out", "site_a", []string{"t_scoped"})
