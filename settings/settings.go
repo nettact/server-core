@@ -175,9 +175,10 @@ var IntKeys = map[string]IntBounds{
 	KeyDiagAttemptsPerHop:         {Default: 3, Min: 1, Max: 5},
 	KeyDiagConsecutiveFailures:    {Default: 3, Min: 1, Max: 20},
 	KeyDiagCooldownSec:            {Default: 900, Min: 60, Max: 86400},
-	// 0 means "derive it from the total budget and the hop ceiling", which is the
-	// sane relationship; the range starts at the Agent's own per-attempt floor.
-	KeyDiagPerHopTimeoutMs:      {Default: 0, Min: 0, Max: 10000},
+	// 0 means "derive it from the total budget and the probe count", which is the
+	// sane relationship; the range otherwise mirrors the Agent's own per-attempt
+	// clamp window, so a configured value is never silently reduced on arrival.
+	KeyDiagPerHopTimeoutMs:      {Default: 0, Min: 0, Max: 1500},
 	KeyEvidenceRetentionDays:    {Default: 30, Min: 1, Max: 365},
 	KeyFluctuationRetentionDays: {Default: 30, Min: 1, Max: 365},
 	// Agent connectivity detection. Grace min (15s) stays above the sweeper's 10s
