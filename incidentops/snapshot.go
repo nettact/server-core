@@ -228,25 +228,35 @@ func (s *Service) baseMembers(ctx context.Context, tx *sql.Tx, incidentID string
 // fails on a chart read.
 //
 // The window is anchored on the fault's OWN evidence rather than on the wall
-// clock. A snapshot is written in the same transaction that confirms the fault,
-// so for live telemetry the two are the same thing — but a fault confirmed from
-// a backlog an agent replayed on reconnect is evidence from twenty minutes ago,
-// and a window measured back from now would find nothing at all and freeze an
-// empty chart into the one immutable record of what the failure looked like.
+// clock, and BOUNDED at both ends. A snapshot is written in the same transaction
+// that confirms the fault, so for live telemetry the two are the same thing —
+// but a fault confirmed from a backlog an agent replayed on reconnect is
+// evidence from twenty minutes ago, and a window measured back from now would
+// find nothing at all and freeze an empty chart into the one immutable record of
+// what the failure looked like.
+//
+// The upper bound is not cosmetic. metrics.Query picks its resolution tier from
+// the window's WIDTH, so a window left open to now spans the whole replay and an
+// hours-long backlog would be served from rollups — coarse buckets describing
+// time the snapshot did not ask about. Bounding it keeps a historical range at
+// the same resolution a live one gets, and keeps Limit selecting from the
+// samples around the failure rather than the oldest points of a long span.
 func (s *Service) recentSamples(ctx context.Context, agentID string, e baseEvidence, observedAt time.Time) []baseSample {
 	if s.metrics == nil || e.MetricKind == "" || e.TargetID == "" {
 		return nil
 	}
 	// Reach back from the first failing round, not from the confirmation: the
 	// samples worth freezing are the ones leading INTO the failure.
-	since := time.Now().Add(-recentSampleWindow)
-	if !observedAt.IsZero() {
-		if s := observedAt.Add(-recentSampleWindow); s.Before(since) {
-			since = s
-		}
+	anchor := time.Now()
+	if !observedAt.IsZero() && observedAt.Before(anchor) {
+		anchor = observedAt
 	}
 	q := metrics.Query{AgentID: agentID, Kind: e.MetricKind, MonitorID: e.TargetID,
-		Limit: recentSampleLimit, SinceUnix: since.Unix()}
+		Limit:     recentSampleLimit,
+		SinceUnix: anchor.Add(-recentSampleWindow).Unix(),
+		// Past the anchor by one window, so the chart also shows the failure
+		// itself rather than stopping at its first round.
+		UntilUnix: anchor.Add(recentSampleWindow).Unix()}
 	pts, err := s.metrics.Query(ctx, q)
 	if err != nil || len(pts) == 0 {
 		return nil

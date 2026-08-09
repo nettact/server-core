@@ -146,7 +146,9 @@ func TestLiveFaultKeepsItsConfiguredDelay(t *testing.T) {
 }
 
 // A policy whose delay already exceeds the settle window keeps it: the floor
-// raises, never lowers.
+// raises, never lowers. Deciding WHETHER a confirmation is a replay belongs to
+// the fault engine (it is the only side that knows the target's cadence), so a
+// zero lag here means "live" and needs no threshold of its own.
 func TestSettleFloorNeverShortensAConfiguredDelay(t *testing.T) {
 	if got := dueDelay(10*time.Minute, 30*time.Minute); got != 10*time.Minute {
 		t.Fatalf("dueDelay = %s, want the policy's own 10m", got)
@@ -157,8 +159,7 @@ func TestSettleFloorNeverShortensAConfiguredDelay(t *testing.T) {
 	if got := dueDelay(0, 0); got != 0 {
 		t.Fatalf("dueDelay = %s, want 0 for live evidence", got)
 	}
-	// Just under the threshold is ordinary agent-to-server lag, not a replay.
-	if got := dueDelay(0, fault.ReplayThreshold-time.Second); got != 0 {
-		t.Fatalf("dueDelay = %s, want 0 — sub-threshold lag is not a replay", got)
+	if got := dueDelay(30*time.Second, 0); got != 30*time.Second {
+		t.Fatalf("dueDelay = %s, want the policy's own 30s on live evidence", got)
 	}
 }

@@ -179,3 +179,40 @@ func TestAgentConnectivityFirstObservedIsTheLastSeenTime(t *testing.T) {
 		t.Fatalf("opened_at %s should trail the last-seen time by the grace period", openedAt)
 	}
 }
+
+// A slow upload cadence is not a replay. An install is free to configure an
+// upload interval longer than the replay threshold, and every one of its live
+// faults would then inherit the settle delay if lateness were judged against a
+// fixed constant instead of the target's own reporting rhythm.
+func TestReplayLagIgnoresLatenessWithinTheTargetsOwnCadence(t *testing.T) {
+	now := time.Now()
+
+	// A five-minute upload cadence: rounds routinely land minutes after they were
+	// taken, with no backlog involved.
+	slow := 6 * time.Minute
+	if got := replayLagOf(now.Add(-4*time.Minute), now, slow); got != 0 {
+		t.Fatalf("lag = %s for a round inside a slow agent's own gap, want 0", got)
+	}
+	// Past that rhythm it is a backlog again.
+	if got := replayLagOf(now.Add(-20*time.Minute), now, slow); got != 20*time.Minute {
+		t.Fatalf("lag = %s, want the full 20m once past the cadence", got)
+	}
+
+	// A brisk target keeps the constant floor, so ordinary batching and drain
+	// latency never reads as a replay either.
+	brisk := 30 * time.Second
+	if got := replayLagOf(now.Add(-90*time.Second), now, brisk); got != 0 {
+		t.Fatalf("lag = %s inside the %s floor, want 0", got, ReplayThreshold)
+	}
+	if got := replayLagOf(now.Add(-20*time.Minute), now, brisk); got != 20*time.Minute {
+		t.Fatalf("lag = %s, want 20m", got)
+	}
+
+	// No evidence time, and a clock running ahead, both mean "not a replay".
+	if got := replayLagOf(time.Time{}, now, brisk); got != 0 {
+		t.Fatalf("lag = %s with no evidence time, want 0", got)
+	}
+	if got := replayLagOf(now.Add(time.Hour), now, brisk); got != 0 {
+		t.Fatalf("lag = %s for future-dated evidence, want 0", got)
+	}
+}

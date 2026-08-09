@@ -321,7 +321,7 @@ func (s *Service) confirmSignal(ctx context.Context, tx *sql.Tx, agentID, siteID
 	// standalone curiosities and become this incident's precursor evidence, which is
 	// often the most useful thing in it: "it had been flapping for half an hour" is
 	// a different diagnosis from "it failed out of nowhere".
-	if err := s.openSignal(ctx, tx, sig, r.Meta.Port, openKey, title, observed, now, out); err != nil {
+	if err := s.openSignal(ctx, tx, sig, r.Meta.Port, openKey, title, observed, now, r.Meta.maxRoundGap(), out); err != nil {
 		return "", err
 	}
 	return signalID, nil
@@ -338,7 +338,7 @@ func (s *Service) confirmSignal(ctx context.Context, tx *sql.Tx, agentID, siteID
 // a non-zero precursorsFrom asks for sub-threshold fluctuations since that moment
 // to be claimed as this incident's precursors.
 func (s *Service) openSignal(ctx context.Context, tx *sql.Tx, sig Signal, port int,
-	openKey, title string, precursorsFrom, now time.Time, out *txOut) error {
+	openKey, title string, precursorsFrom, now time.Time, roundGap time.Duration, out *txOut) error {
 	incidentID, opened, oldSeverity, err := findOrCreateIncident(ctx, tx,
 		openKey, sig.SiteID, sig.GroupID, sig.GroupName, title, sig.Severity, sig.Layer, sig.ObservedAt, now)
 	if err != nil {
@@ -372,10 +372,12 @@ func (s *Service) openSignal(ctx context.Context, tx *sql.Tx, sig Signal, port i
 	scope := IncidentScope{
 		IncidentID: incidentID, SiteID: sig.SiteID, GroupID: sig.GroupID,
 		AgentID: sig.AgentID, Severity: newSeverity,
-		// How far behind the wall clock this confirmation's evidence is. Live
-		// telemetry lands near zero; a backlog an agent buffered through an outage
-		// and uploaded on reconnect lands at the length of the outage.
-		ReplayLag: replayLag(sig.ConfirmedAt, now),
+		// How far behind the wall clock this confirmation's evidence is, beyond what
+		// this target's own reporting cadence makes normal. Live telemetry — including
+		// from an agent on a deliberately slow upload interval — lands at zero; a
+		// backlog buffered through an outage and uploaded on reconnect lands at the
+		// length of the outage.
+		ReplayLag: replayLagOf(sig.ConfirmedAt, now, roundGap),
 	}
 	if opened {
 		// One immutable base snapshot per incident, written synchronously in this

@@ -254,8 +254,10 @@ type IncidentScope struct {
 	AgentConnectivity bool
 
 	// ReplayLag is how far the confirming evidence lags the transaction's wall
-	// clock. It is ~0 for telemetry arriving live and large for a backlog an agent
-	// buffered through an outage and uploaded on reconnect.
+	// clock, in excess of what this target's own cadence makes normal. It is
+	// zero for telemetry arriving live — including from an agent configured with
+	// a slow upload interval — and large for a backlog an agent buffered through
+	// an outage and uploaded on reconnect.
 	//
 	// The policy layer needs it because a replayed fault arrives already finished:
 	// the rounds that confirm it and the rounds that resolve it are seconds apart
@@ -267,31 +269,52 @@ type IncidentScope struct {
 	ReplayLag time.Duration
 }
 
-// ReplayThreshold is how far behind the wall clock a confirmation's evidence has
-// to be before it counts as replayed rather than live.
+// ReplayThreshold is the FLOOR on how far behind the wall clock a
+// confirmation's evidence has to be before it counts as replayed rather than
+// live.
 //
-// Two minutes is comfortably above the ordinary agent-to-server lag — probe
-// instant, batching, drain interval, ingest — and far below the outage lengths
-// this distinction exists for. It is not tunable: it separates two kinds of
-// event, not two tastes in alerting.
+// It is only a floor because "late" is a per-target quantity. The lag of live
+// telemetry is the probe instant plus batching plus the drain interval plus
+// ingest, and an install is free to configure an upload cadence longer than any
+// fixed constant here — at which point every honest round would look replayed
+// and every notification would inherit the settle delay. Callers therefore take
+// the maximum of this and the target's own consecutive-round tolerance
+// (TargetMeta.maxRoundGap, which already folds in the agent's REPORTED upload
+// interval); see replayLagOf.
+//
+// Two minutes is comfortably above the default cadence and far below the outage
+// lengths this distinction exists for. It is not tunable: it separates two kinds
+// of event, not two tastes in alerting.
 const ReplayThreshold = 2 * time.Minute
 
-// replayLag is how far behind now a confirmation's evidence is, never negative.
+// replayLagOf reports how far behind now a confirmation's evidence is, in excess
+// of what this target's own reporting cadence makes normal — zero when it is
+// within it.
 //
-// An agent whose clock runs ahead would otherwise produce a negative lag that
-// compares as "very live", which is the one direction that matters: it would let
-// a genuinely replayed fault be treated as live merely because the timestamps
-// are wrong in the other direction. Clamping keeps a bad clock from buying a
-// notification, and the agent's own correction (agent/internal/clockmon) is what
-// stops it happening in the first place.
-func replayLag(evidence, now time.Time) time.Duration {
+// tolerance is the target's consecutive-round gap, which already folds in the
+// probe interval, the cycle deadline and the agent's REPORTED upload interval.
+// Using it is what stops a legitimately slow uploader from having every one of
+// its live faults classified as a replay: a round that arrived inside the window
+// where two rounds still count as consecutive did not come out of a backlog.
+//
+// A negative lag is clamped to zero. An agent whose clock runs ahead would
+// otherwise produce one that compares as "very live", which is the one direction
+// that matters: it would let a genuinely replayed fault be treated as live
+// because the timestamps are wrong the other way. The agent's own correction
+// (agent/internal/clockmon) is what stops it happening in the first place.
+func replayLagOf(evidence, now time.Time, tolerance time.Duration) time.Duration {
 	if evidence.IsZero() {
 		return 0
 	}
-	if d := now.Sub(evidence); d > 0 {
-		return d
+	floor := ReplayThreshold
+	if tolerance > floor {
+		floor = tolerance
 	}
-	return 0
+	d := now.Sub(evidence)
+	if d <= floor {
+		return 0
+	}
+	return d
 }
 
 // Planner is the notification-policy surface the engine calls inside its write

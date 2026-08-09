@@ -710,7 +710,7 @@ func (s *Service) confirmHostSignal(ctx context.Context, tx *sql.Tx, agentID, si
 	}
 	// No precursor window: fluctuations are claimed by the availability detector's
 	// confirmations, and a CPU dip is not evidence about a disk.
-	if err := s.openSignal(ctx, tx, sig, 0, openKey, title, time.Time{}, now, out); err != nil {
+	if err := s.openSignal(ctx, tx, sig, 0, openKey, title, time.Time{}, now, r.maxRoundGap(), out); err != nil {
 		return "", err
 	}
 	return signalID, nil

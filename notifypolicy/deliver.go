@@ -133,8 +133,11 @@ func (s *Service) PlanOpenTx(ctx context.Context, tx *sql.Tx, sc fault.IncidentS
 const replaySettle = time.Minute
 
 // dueDelay is how long an open notification waits before it may be sent.
+// replayLag is already zero for anything the fault engine judged live, cadence
+// included (see fault.replayLagOf), so this only has to decide what a replay
+// costs.
 func dueDelay(policyDelay, replayLag time.Duration) time.Duration {
-	if replayLag < fault.ReplayThreshold {
+	if replayLag <= 0 {
 		return policyDelay
 	}
 	if policyDelay < replaySettle {

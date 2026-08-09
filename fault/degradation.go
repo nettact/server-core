@@ -271,7 +271,7 @@ func (s *Service) confirmDegradation(ctx context.Context, tx *sql.Tx, agentID, s
 			title = DegradationGroupTitle(groupName, "zh")
 		}
 	}
-	if err := s.openSignal(ctx, tx, sig, r.Meta.Port, openKey, title, time.Time{}, now, out); err != nil {
+	if err := s.openSignal(ctx, tx, sig, r.Meta.Port, openKey, title, time.Time{}, now, r.Meta.maxRoundGap(), out); err != nil {
 		return "", err
 	}
 	return signalID, nil
