@@ -13,7 +13,9 @@ import (
 
 	"github.com/nettact/protocol/gamesense"
 	"github.com/nettact/protocol/permission"
+	"github.com/nettact/protocol/wire"
 	"github.com/nettact/server-core/eventbus"
+	"github.com/nettact/server-core/opissue"
 	"github.com/nettact/server-core/registry"
 	"github.com/nettact/server-core/store"
 )
@@ -434,5 +436,73 @@ func TestAgentPermissionsNoRemediationForUnknownIDs(t *testing.T) {
 	// A known ungranted permission still gets one.
 	if known := findPerm(t, resp, permission.HostCPURead); known.PermissionsEnv == "" {
 		t.Fatalf("a known ungranted permission must still carry a policy line: %+v", known)
+	}
+}
+
+// TestAgentPermissionsEnvLinesUnionToTheMultiScopeLine pins the contract the
+// console's live-process page depends on.
+//
+// That page no longer asks an agent for scopes it cannot serve — the answer only
+// restates the agent's own `effective` set, and on the default policy (which
+// grants no process or connection scope) every visit spent a request to be told
+// so eight times over. It now names the missing scopes locally and builds the
+// one `NETTACT_AGENT_PERMISSIONS=…` line that grants them all by UNIONING this
+// endpoint's per-permission lines, ordered by this endpoint's own canonical
+// order.
+//
+// That is only legitimate because a union of dependency-closed sets is itself
+// closed, so the console still never works out a closure of its own. This test
+// is where that stays true: it asserts the union is byte-identical to the line
+// opissue.Remediate produces for the whole set at once — which is exactly what
+// the page used to display.
+func TestAgentPermissionsEnvLinesUnionToTheMultiScopeLine(t *testing.T) {
+	db := openStatusDB(t)
+	// The reported case: an agent on the default policy, whose platform supports
+	// the process/connection family but whose policy grants none of it.
+	granted := permission.Closure(permission.DefaultStandalone()).Strings()
+	seedPermAgent(t, db, "agent-union", permission.All().Strings(), granted, granted)
+
+	snapshotFamily := []string{
+		"host.process.basic.read", "host.process.owner.read",
+		"host.process.resource.read", "host.process.io.read",
+		"host.connection.summary.read", "host.connection.local.read",
+		"host.connection.remote.read", "host.connection.owner.read",
+	}
+	resp := getAgentPermissions(t, db, "agent-union")
+
+	// Union the per-permission lines exactly as the console does.
+	want := permission.FromStrings(snapshotFamily)
+	prefix := ""
+	union := map[string]struct{}{}
+	for _, p := range resp.Permissions {
+		if !want.Has(permission.ID(p.ID)) || p.PermissionsEnv == "" {
+			continue
+		}
+		eq := strings.Index(p.PermissionsEnv, "=")
+		if eq < 0 {
+			t.Fatalf("policy line for %q has no '=': %q", p.ID, p.PermissionsEnv)
+		}
+		prefix = p.PermissionsEnv[:eq+1]
+		for id := range strings.SplitSeq(p.PermissionsEnv[eq+1:], ",") {
+			if id = strings.TrimSpace(id); id != "" {
+				union[id] = struct{}{}
+			}
+		}
+	}
+	if prefix == "" {
+		t.Fatal("no snapshot-family permission carried a policy line; the console would have nothing to show")
+	}
+	var ordered []string
+	for _, p := range resp.Permissions {
+		if _, ok := union[p.ID]; ok {
+			ordered = append(ordered, p.ID)
+		}
+	}
+	got := prefix + strings.Join(ordered, ",")
+
+	// What the page used to show, straight from the one-shot remediation path.
+	rem := opissue.Remediate(wire.MonitorStatusPermissionBlocked, snapshotFamily, granted, "")
+	if got != rem.PermissionsEnv {
+		t.Fatalf("unioned policy line differs from the one-shot line\n union: %s\n  want: %s", got, rem.PermissionsEnv)
 	}
 }
