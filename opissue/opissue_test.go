@@ -2,6 +2,7 @@ package opissue
 
 import (
 	"context"
+	"github.com/nettact/protocol/wire"
 	"testing"
 
 	"github.com/nettact/server-core/store/storetest"
@@ -123,5 +124,56 @@ func TestAgentStatusesExposeExecutionProvenanceAndSchedule(t *testing.T) {
 		got.CycleDeadlineMs == nil || *got.CycleDeadlineMs != 10000 ||
 		got.UploadIntervalSeconds == nil || *got.UploadIntervalSeconds != 5 {
 		t.Fatalf("schedule = %+v", got)
+	}
+}
+
+// The upload cadence describes the whole outbox, so it is recorded on the agent
+// row and not only on the per-monitor ones.
+//
+// The case that forces it: an agent whose only subject is a host anchor sends a
+// MonitorStatus frame with NO entries, so there are no per-monitor rows to carry
+// it — and the host detectors would then judge how late a live reading may be
+// against the protocol default, classifying every one of a slow uploader's live
+// faults as a replay.
+func TestFrameLevelUploadCadenceIsRecordedWithoutAnyMonitorRows(t *testing.T) {
+	db := storetest.Open(t)
+	ctx := context.Background()
+	exec := func(q string, args ...any) {
+		t.Helper()
+		if _, err := db.ExecContext(ctx, q, args...); err != nil {
+			t.Fatalf("exec: %v", err)
+		}
+	}
+	exec(`INSERT INTO sites(id,name) VALUES('site_default','Default')`)
+	exec(`INSERT INTO agents(id,site_id,public_key,token_hash,status) VALUES('agent','site_default',x'00','h','online')`)
+
+	// A frame with no statuses at all — the host-anchor-only agent.
+	if err := New(db, nil).ApplyMonitorStatus(ctx, "agent", "site_default", wire.MonitorStatus{
+		ConfigVersion: 1, UploadIntervalSeconds: 300,
+	}); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+
+	var got int
+	if err := db.Read().QueryRowContext(ctx,
+		`SELECT upload_interval_seconds FROM agents WHERE id='agent'`).Scan(&got); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if got != 300 {
+		t.Fatalf("agents.upload_interval_seconds = %d, want the frame's 300", got)
+	}
+
+	// A later frame that omits it must not reset what is known.
+	if err := New(db, nil).ApplyMonitorStatus(ctx, "agent", "site_default", wire.MonitorStatus{
+		ConfigVersion: 2,
+	}); err != nil {
+		t.Fatalf("apply second: %v", err)
+	}
+	if err := db.Read().QueryRowContext(ctx,
+		`SELECT upload_interval_seconds FROM agents WHERE id='agent'`).Scan(&got); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if got != 300 {
+		t.Fatalf("upload_interval_seconds = %d after a frame that omitted it, want 300 kept", got)
 	}
 }

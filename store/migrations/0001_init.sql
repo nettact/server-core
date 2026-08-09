@@ -110,6 +110,14 @@ CREATE TABLE agents(
   -- Newest MonitorStatus config_version accepted from this agent; -1 = none yet.
   -- Feeds the monotonic guard that drops stale monitor-status frames.
   last_status_config_version INTEGER NOT NULL DEFAULT -1,
+  -- The agent's own batch-upload cadence, as attested frame-level in the same
+  -- MonitorStatus. It lives here rather than only on the per-monitor rows
+  -- because it describes the whole outbox, and because an agent with a host
+  -- anchor and no enabled probe monitors sends a frame with no entries at all —
+  -- so the per-monitor rows would carry no cadence, and the host detectors would
+  -- judge their readings' lateness against the protocol default. 0 = not yet
+  -- reported.
+  upload_interval_seconds INTEGER NOT NULL DEFAULT 0,
   status TEXT NOT NULL DEFAULT 'online',
   reported_config_version INTEGER NOT NULL DEFAULT 0,
   last_seen_at TIMESTAMP,

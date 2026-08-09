@@ -280,8 +280,16 @@ func (s *Service) ApplyMonitorStatus(ctx context.Context, agentID, siteID string
 	}
 	changed = changed || resolvedAny
 
+	// The upload cadence rides the same frame and is recorded here as well as on
+	// the per-monitor rows: it describes the whole outbox, and an agent whose only
+	// subject is a host anchor sends a frame with no entries, so the per-monitor
+	// rows would carry no cadence at all. A frame that omits it (0) leaves the
+	// last known value standing rather than resetting to the default.
 	if _, err := tx.ExecContext(ctx,
-		`UPDATE agents SET last_status_config_version=? WHERE id=?`, ms.ConfigVersion, agentID); err != nil {
+		`UPDATE agents SET last_status_config_version=?,
+		        upload_interval_seconds=CASE WHEN ?>0 THEN ? ELSE upload_interval_seconds END
+		 WHERE id=?`,
+		ms.ConfigVersion, ms.UploadIntervalSeconds, ms.UploadIntervalSeconds, agentID); err != nil {
 		return err
 	}
 	if err := tx.Commit(); err != nil {

@@ -120,17 +120,19 @@ func (s *Service) latestCores(ctx context.Context, agentID string) float64 {
 // reportedUploadSeconds is the agent's own batch-upload cadence, as it last
 // attested it in a MonitorStatus frame.
 //
-// Host anchors belong to no monitor, so unlike a probe target they have no
-// monitor_status row of their own to read it from; the agent reports ONE cadence
-// for its whole outbox, so the maximum across its rows is that one value. It
-// decides how late a live host reading can legitimately be — without it an
+// Read from the agents row rather than from monitor_status. The agent reports
+// ONE cadence for its whole outbox, and the case this exists for is precisely
+// the one where the per-monitor rows cannot carry it: an agent whose only
+// subject is a host anchor sends a frame with no entries, so there are no
+// per-monitor rows to read. Host anchors belong to no monitor either way.
+//
+// It decides how late a live host reading can legitimately be — without it an
 // install on a deliberately slow upload interval would have every live host
 // fault judged a replay and delayed accordingly. Zero (an agent that has not
 // reported yet) leaves the protocol default standing.
 func reportedUploadSeconds(ctx context.Context, q rowQuerier, agentID string) int {
 	rows, err := q.QueryContext(ctx,
-		`SELECT MAX(upload_interval_seconds) FROM monitor_status
-		 WHERE agent_id=? AND upload_interval_seconds > 0`, agentID)
+		`SELECT upload_interval_seconds FROM agents WHERE id=?`, agentID)
 	if err != nil {
 		return 0
 	}
@@ -141,7 +143,7 @@ func reportedUploadSeconds(ctx context.Context, q rowQuerier, agentID string) in
 			return 0
 		}
 	}
-	if !v.Valid {
+	if !v.Valid || v.Int64 < 0 {
 		return 0
 	}
 	return int(v.Int64)
