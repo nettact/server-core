@@ -2,6 +2,7 @@ package ingest
 
 import (
 	"context"
+	"database/sql"
 
 	"github.com/nettact/protocol/telemetry"
 	"github.com/nettact/server-core/config"
@@ -33,7 +34,7 @@ func hasHostMetrics(ms []telemetry.Metric) bool {
 // has exactly one answer in the codebase. An anchor with no
 // host_detection_settings row COALESCEs to the defaults, which is what makes a
 // freshly created anchor watch the machine without anyone opening a form.
-func hostMeta(ctx context.Context, q rowQuerier, agentID, siteID string, cores float64, intervalSeconds int) ([]fault.HostTargetMeta, error) {
+func hostMeta(ctx context.Context, q rowQuerier, agentID, siteID string, cores float64, intervalSeconds, uploadSeconds int) ([]fault.HostTargetMeta, error) {
 	def := fault.DefaultHostSettings()
 	defCPU, defMem, defLoad, defNet, defDisk := 0, 0, 0, 0, 0
 	if def.CPUEnabled {
@@ -94,6 +95,7 @@ func hostMeta(ctx context.Context, q rowQuerier, agentID, siteID string, cores f
 		m.Set.DiskEnabled = diskOn != 0
 		m.Cores = cores
 		m.IntervalSeconds = intervalSeconds
+		m.UploadSeconds = uploadSeconds
 		out = append(out, m)
 	}
 	return out, rows.Err()
@@ -113,4 +115,34 @@ func (s *Service) latestCores(ctx context.Context, agentID string) float64 {
 		return 0
 	}
 	return vals[0].Value
+}
+
+// reportedUploadSeconds is the agent's own batch-upload cadence, as it last
+// attested it in a MonitorStatus frame.
+//
+// Host anchors belong to no monitor, so unlike a probe target they have no
+// monitor_status row of their own to read it from; the agent reports ONE cadence
+// for its whole outbox, so the maximum across its rows is that one value. It
+// decides how late a live host reading can legitimately be — without it an
+// install on a deliberately slow upload interval would have every live host
+// fault judged a replay and delayed accordingly. Zero (an agent that has not
+// reported yet) leaves the protocol default standing.
+func reportedUploadSeconds(ctx context.Context, q rowQuerier, agentID string) int {
+	rows, err := q.QueryContext(ctx,
+		`SELECT MAX(upload_interval_seconds) FROM monitor_status
+		 WHERE agent_id=? AND upload_interval_seconds > 0`, agentID)
+	if err != nil {
+		return 0
+	}
+	defer rows.Close()
+	var v sql.NullInt64
+	if rows.Next() {
+		if err := rows.Scan(&v); err != nil {
+			return 0
+		}
+	}
+	if !v.Valid {
+		return 0
+	}
+	return int(v.Int64)
 }

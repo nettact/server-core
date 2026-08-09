@@ -155,6 +155,13 @@ type HostTargetMeta struct {
 	// configured duration into a round count. Passed in rather than read here
 	// because config imports this package, not the other way round.
 	IntervalSeconds int
+	// UploadSeconds is the agent's REPORTED batch-upload cadence, which decides
+	// how late a live host reading can legitimately be. Zero means it has not
+	// reported one and the protocol default stands. The probe path gets this from
+	// the target's own monitor_status row; host anchors belong to no monitor, so
+	// it is carried here instead — without it, an install on a deliberately slow
+	// upload interval would have every live host fault judged a replay.
+	UploadSeconds int
 	// Cores is the machine's logical core count, from this batch or the latest
 	// cached reading. Zero means unknown, and the load family is then skipped
 	// entirely — a per-core judgement without a core count would be a guess, and
@@ -191,6 +198,9 @@ type HostRound struct {
 	ConfigSerial  int
 	Revision      int
 	IntervalSec   int
+	// UploadSec is the agent's reported batch-upload cadence; see
+	// HostTargetMeta.UploadSeconds. Zero selects the protocol default.
+	UploadSec int
 }
 
 // hostRoundZone is what one reading says about the streak.
@@ -224,7 +234,12 @@ func (r HostRound) maxRoundGap() time.Duration {
 	if interval <= 0 {
 		interval = 30 * time.Second
 	}
-	return pcfg.StaleAfter(interval, 0, 0)
+	// The agent's reported upload cadence, not the protocol default: an install
+	// that batches every five minutes delivers live readings that late, and
+	// judging them against the default would call every one of them a replay.
+	// StaleAfter falls back to the default for a zero, which is what an agent
+	// that has reported nothing yet should get.
+	return pcfg.StaleAfter(interval, 0, time.Duration(r.UploadSec)*time.Second)
 }
 
 // hostFailRounds converts a configured duration into the number of consecutive
@@ -387,7 +402,7 @@ func BuildHostRounds(ms []telemetry.Metric, metas []HostTargetMeta) ([]HostRound
 				Threshold: threshold, RecoverBelow: recoverBelow, ReasonDetail: detail,
 				FailRounds: failRounds, RecoverRounds: recoverRounds,
 				GroupID: meta.GroupID, ConfigSerial: meta.ConfigSerial, Revision: set.Revision,
-				IntervalSec: meta.IntervalSeconds,
+				IntervalSec: meta.IntervalSeconds, UploadSec: meta.UploadSeconds,
 			})
 		}
 		for _, ts := range stamps {

@@ -258,7 +258,8 @@ func (s *Service) Ingest(ctx context.Context, agentID, siteID string, pkt teleme
 		// because a threshold edit serializes on this same write connection, so what
 		// is read here is what the evaluation is judged against.
 		if s.fault != nil && hostBatch {
-			metas, err := hostMeta(ctx, tx, agentID, siteID, cores, config.DefaultRegularSeconds)
+			metas, err := hostMeta(ctx, tx, agentID, siteID, cores, config.DefaultRegularSeconds,
+				reportedUploadSeconds(ctx, tx, agentID))
 			if err != nil {
 				return Ack{}, err
 			}

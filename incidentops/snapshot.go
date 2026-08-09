@@ -107,6 +107,12 @@ const recentSampleLimit = 12
 // for why it is measured from the fault's evidence rather than from now.
 const recentSampleWindow = 5 * time.Minute
 
+// recentSampleFetchCap bounds how many points are read before the window is
+// narrowed to recentSampleLimit around the failure. It exists only so a
+// pathologically dense series cannot make this row large; the bounded window is
+// what actually keeps the read small.
+const recentSampleFetchCap = 600
+
 // WriteIncidentBase writes the one immutable incident snapshot's server base row
 // synchronously, inside the caller's incident-open transaction. It reads the
 // just-inserted incident/alert/evidence rows through tx (so it sees uncommitted
@@ -251,24 +257,70 @@ func (s *Service) recentSamples(ctx context.Context, agentID string, e baseEvide
 	if !observedAt.IsZero() && observedAt.Before(anchor) {
 		anchor = observedAt
 	}
+	// Fetch the whole bounded window, then take the points AROUND the anchor.
+	//
+	// The limit cannot do that job itself: metrics.Query applies it as ORDER BY ts
+	// LIMIT n from the start of the range, so asking for twelve points over a
+	// ten-minute window of a ten-second series returns the first two minutes of it
+	// and the failure — which sits at the anchor — is not in the snapshot at all.
+	// The window is small and bounded, so reading it whole costs little; the cap
+	// is only there so a pathologically dense series cannot blow the row up.
 	q := metrics.Query{AgentID: agentID, Kind: e.MetricKind, MonitorID: e.TargetID,
-		Limit:     recentSampleLimit,
+		Limit:     recentSampleFetchCap,
 		SinceUnix: anchor.Add(-recentSampleWindow).Unix(),
-		// Past the anchor by one window, so the chart also shows the failure
-		// itself rather than stopping at its first round.
+		// Past the anchor by one window, so the chart shows the failure itself
+		// rather than stopping at its first round.
 		UntilUnix: anchor.Add(recentSampleWindow).Unix()}
 	pts, err := s.metrics.Query(ctx, q)
 	if err != nil || len(pts) == 0 {
 		return nil
 	}
-	if len(pts) > recentSampleLimit {
-		pts = pts[len(pts)-recentSampleLimit:]
-	}
+	pts = aroundAnchor(pts, anchor, recentSampleLimit)
 	out := make([]baseSample, 0, len(pts))
 	for _, p := range pts {
 		out = append(out, baseSample{TS: p.TS, Value: p.Value})
 	}
 	return out
+}
+
+// aroundAnchor keeps at most n points centred on the failure rather than on
+// either end of the window.
+//
+// Weighted towards what came BEFORE: the question a frozen chart answers is
+// "what did this look like on the way in", and the rounds after the first
+// failing one are the failure repeating itself. Taking the last point at or
+// before the anchor as the pivot means the anchor is always included when it
+// exists, which is the one sample nothing else in the snapshot carries.
+func aroundAnchor(pts []metrics.Point, anchor time.Time, n int) []metrics.Point {
+	if len(pts) <= n {
+		return pts
+	}
+	// Points come back in ascending timestamp order.
+	pivot := len(pts) - 1
+	for i, p := range pts {
+		if p.TS.After(anchor) {
+			pivot = i - 1
+			break
+		}
+	}
+	if pivot < 0 {
+		pivot = 0
+	}
+	after := n / 3 // a third of the budget for the failure itself
+	end := pivot + 1 + after
+	if end > len(pts) {
+		end = len(pts)
+	}
+	start := end - n
+	if start < 0 {
+		// The anchor sits at or before the start of the series, so there is
+		// nothing earlier to weight towards; spend the whole budget forwards.
+		start = 0
+		if end = n; end > len(pts) {
+			end = len(pts)
+		}
+	}
+	return pts[start:end]
 }
 
 // baseAgents freezes the identity/version of each involved agent (read pool).

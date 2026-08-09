@@ -900,3 +900,27 @@ func TestHostDiskNeedsTwoMissesToBeGone(t *testing.T) {
 		t.Errorf("resolve reason = %q, want %q", reason, ReasonSubjectGone)
 	}
 }
+
+// A host reading is late by the agent's own batch cadence, not by the protocol
+// default. Host anchors belong to no monitor, so unlike a probe target they have
+// no monitor_status row to read that from — it is carried on the meta instead,
+// and without it an install on a deliberately slow upload interval would have
+// every live host fault judged a replay and delayed accordingly.
+func TestHostRoundGapFollowsTheReportedUploadCadence(t *testing.T) {
+	base := HostRound{IntervalSec: 30}
+	def := base.maxRoundGap()
+
+	slow := base
+	slow.UploadSec = 300
+	if got := slow.maxRoundGap(); got <= def {
+		t.Fatalf("gap with a 5-minute upload cadence = %s, want more than the "+
+			"default-cadence %s", got, def)
+	}
+	if got := slow.maxRoundGap(); got < 5*time.Minute {
+		t.Fatalf("gap = %s, want at least the 5-minute cadence itself", got)
+	}
+	// An agent that has reported nothing keeps the protocol default.
+	if got := base.maxRoundGap(); got != def {
+		t.Fatalf("gap = %s, want the default %s", got, def)
+	}
+}
