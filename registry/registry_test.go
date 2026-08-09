@@ -852,3 +852,78 @@ func TestReinstallTokenSupersedesEarlierOnes(t *testing.T) {
 		t.Fatalf("agent_id = %q, want %q", re.AgentID, resp.AgentID)
 	}
 }
+
+// TestEnrollAppliesTokenNoteAsDisplayName: the note an operator types when
+// minting a token describes the machine they are about to install on, so a fresh
+// enrollment must come up already carrying that name instead of a bare hostname
+// the operator has to rename by hand.
+func TestEnrollAppliesTokenNoteAsDisplayName(t *testing.T) {
+	db := storetest.Open(t)
+	ctx := context.Background()
+	mustExec(t, db, `INSERT INTO sites(id,name,created_at,config_serial) VALUES('site_default','def',?,1)`, time.Now().UTC())
+	reg := New(db, 0, nil)
+
+	token, err := reg.CreateEnrollmentToken(ctx, "site_default", "  客厅路由器  ", time.Hour)
+	if err != nil {
+		t.Fatalf("CreateEnrollmentToken: %v", err)
+	}
+	pub, priv, _ := ed25519.GenerateKey(nil)
+	resp, err := reg.Enroll(ctx, enrollReq(priv, pub, token, "host-a", permission.PermissionReport{}))
+	if err != nil {
+		t.Fatalf("Enroll: %v", err)
+	}
+	a, err := reg.Get(ctx, resp.AgentID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	// Trimmed: the note is free text an operator typed into a form, and a name
+	// with stray padding sorts and reads wrong everywhere it is shown.
+	if a.DisplayName != "客厅路由器" {
+		t.Fatalf("display name = %q, want %q", a.DisplayName, "客厅路由器")
+	}
+
+	// An empty note leaves the name UNSET rather than empty-but-present, so the
+	// console's display_name || hostname fallback still names the device.
+	blank, err := reg.CreateEnrollmentToken(ctx, "site_default", "   ", time.Hour)
+	if err != nil {
+		t.Fatalf("CreateEnrollmentToken(blank): %v", err)
+	}
+	pubB, privB, _ := ed25519.GenerateKey(nil)
+	respB, err := reg.Enroll(ctx, enrollReq(privB, pubB, blank, "host-b", permission.PermissionReport{}))
+	if err != nil {
+		t.Fatalf("Enroll(blank note): %v", err)
+	}
+	var name sql.NullString
+	if err := db.QueryRowContext(ctx, `SELECT display_name FROM agents WHERE id=?`, respB.AgentID).Scan(&name); err != nil {
+		t.Fatalf("read display_name: %v", err)
+	}
+	if name.Valid {
+		t.Fatalf("display_name = %q, want NULL for a blank token note", name.String)
+	}
+
+	// A reinstall keeps the name the operator gave the agent: its token note is
+	// the server's own "reinstall:<id>" bookkeeping, which must never surface as a
+	// device name.
+	if err := reg.UpdateAgent(ctx, resp.AgentID, "改名后"); err != nil {
+		t.Fatalf("UpdateAgent: %v", err)
+	}
+	reToken, err := reg.CreateReinstallToken(ctx, resp.AgentID, time.Hour)
+	if err != nil {
+		t.Fatalf("CreateReinstallToken: %v", err)
+	}
+	pubC, privC, _ := ed25519.GenerateKey(nil)
+	reResp, err := reg.Enroll(ctx, enrollReq(privC, pubC, reToken, "host-a", permission.PermissionReport{}))
+	if err != nil {
+		t.Fatalf("Enroll(reinstall): %v", err)
+	}
+	if reResp.AgentID != resp.AgentID {
+		t.Fatalf("reinstall agent_id = %q, want %q", reResp.AgentID, resp.AgentID)
+	}
+	again, err := reg.Get(ctx, reResp.AgentID)
+	if err != nil {
+		t.Fatalf("Get after reinstall: %v", err)
+	}
+	if again.DisplayName != "改名后" {
+		t.Fatalf("display name after reinstall = %q, want %q", again.DisplayName, "改名后")
+	}
+}

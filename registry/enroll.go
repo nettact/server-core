@@ -9,6 +9,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -47,6 +48,13 @@ type EnrollmentToken struct {
 
 // CreateEnrollmentToken issues a one-time token bound to a site; only the hash
 // is stored. The plaintext is returned once.
+//
+// The note is not merely a label on the token list: whoever mints a token
+// already knows which machine it is for ("living-room router"), and Enroll
+// carries that note onto the agent it creates as its initial display_name.
+// Without that, the operator names the device twice — once when minting, once
+// again in the agent list after it appears under a bare hostname — and the note
+// they typed decays into a row about a credential nobody looks at again.
 func (s *Service) CreateEnrollmentToken(ctx context.Context, siteID, note string, ttl time.Duration) (string, error) {
 	token := randToken()
 	if _, err := s.db.ExecContext(ctx,
@@ -153,7 +161,9 @@ func (s *Service) RevokeEnrollmentToken(ctx context.Context, tokenHash string) e
 // --- enroll ---
 
 // Enroll verifies the possession proof and one-time token, enforces the agent
-// quota, creates the agent, and returns a bearer token (shown once).
+// quota, creates the agent, and returns a bearer token (shown once). A fresh
+// enrollment inherits the token's note as its display name (see
+// CreateEnrollmentToken); a reinstall token keeps the existing agent's name.
 func (s *Service) Enroll(ctx context.Context, req enroll.EnrollRequest) (enroll.EnrollResponse, error) {
 	if err := protocol.ValidateSchema(req.SchemaVersion); err != nil {
 		return enroll.EnrollResponse{}, err
@@ -192,9 +202,10 @@ func (s *Service) Enroll(ctx context.Context, req enroll.EnrollRequest) (enroll.
 	var usedAt sql.NullTime
 	var tokenAgentID sql.NullString
 	var revoked int
+	var tokenNote string
 	err = tx.QueryRowContext(ctx,
-		`SELECT site_id, expires_at, used_at, agent_id, revoked FROM enrollment_tokens WHERE token_hash=?`,
-		sha256hex(req.EnrollmentToken)).Scan(&siteID, &expiresAt, &usedAt, &tokenAgentID, &revoked)
+		`SELECT site_id, expires_at, used_at, agent_id, revoked, COALESCE(note,'') FROM enrollment_tokens WHERE token_hash=?`,
+		sha256hex(req.EnrollmentToken)).Scan(&siteID, &expiresAt, &usedAt, &tokenAgentID, &revoked, &tokenNote)
 	if errors.Is(err, sql.ErrNoRows) {
 		return enroll.EnrollResponse{}, ErrEnrollToken
 	}
@@ -236,17 +247,34 @@ func (s *Service) Enroll(ctx context.Context, req enroll.EnrollRequest) (enroll.
 		agentID = "agent_" + uuid.NewString()
 		agentToken = randToken()
 
+		// The token's note is this device's name from the moment it appears. It is
+		// what the operator typed when minting the token to describe the machine
+		// they were about to install on, so applying it here is the difference
+		// between an agent list of hostnames the operator has to decode and one
+		// that reads the way they described their own network. It stays editable
+		// afterwards (UpdateAgent) — this only decides the FIRST name, and an empty
+		// note leaves display_name NULL so the UI falls back to the hostname.
+		//
+		// Only a fresh enrollment does this. A reinstall token takes the branch
+		// above, which must not touch the name: its note is the server-generated
+		// "reinstall:<agent_id>" (see CreateReinstallToken), and the agent it
+		// rejoins already carries whatever the operator named it.
+		var displayName sql.NullString
+		if note := strings.TrimSpace(tokenNote); note != "" {
+			displayName = sql.NullString{String: note, Valid: true}
+		}
+
 		// The enrollment report's unsupported reasons are stored like the sets beside
 		// them: a first-time agent whose sensor is broken is precisely when an operator
 		// is looking at the page, so the "why" must be there from the first report and
 		// not only after the first reconnect refreshes it.
 		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO agents(id, site_id, public_key, token_hash, hostname, platform, agent_version,
+			INSERT INTO agents(id, site_id, public_key, token_hash, display_name, hostname, platform, agent_version,
 			                   perm_supported, perm_granted, perm_effective, perm_unsupported_reasons,
 			                   policy_source, policy_hash,
 			                   status, reported_config_version, last_seen_at, created_at)
-			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?, 'online', 0, ?, ?)`,
-			agentID, siteID, []byte(req.PublicKey), sha256hex(agentToken),
+			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'online', 0, ?, ?)`,
+			agentID, siteID, []byte(req.PublicKey), sha256hex(agentToken), displayName,
 			req.Hostname, req.Platform, req.AgentVersion,
 			marshalStrings(req.Permissions.Supported), marshalStrings(req.Permissions.Granted),
 			marshalStrings(req.Permissions.Effective),

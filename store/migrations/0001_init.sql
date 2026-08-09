@@ -116,7 +116,10 @@ CREATE TABLE agents(
   revoked INTEGER NOT NULL DEFAULT 0,
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   -- Operator-editable label. hostname/platform/version are agent-reported and
-  -- stay read-only; display_name lets operators name agents independently.
+  -- stay read-only; display_name lets operators name agents independently. It is
+  -- seeded at enrollment from the enrollment token's note (the operator already
+  -- described the machine when minting the token), and NULL when that note was
+  -- empty — the console then falls back to the reported hostname.
   display_name TEXT,
   -- Connectivity provenance: when this agent first ever connected (so a
   -- never-connected agent is distinguishable from a currently-offline one), and
