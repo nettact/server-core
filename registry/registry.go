@@ -8,6 +8,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -66,6 +67,15 @@ type Service struct {
 	db        *store.DB
 	maxAgents int // 0 = unlimited
 	bus       *eventbus.Bus
+	// lastTouch remembers, per agent, when a last_seen_at write was last
+	// COMMITTED, so the steady-state paths (ping every 15s, one packet every
+	// upload interval) can skip the UPDATE while the stored value is fresh
+	// enough. It advances only after the write is durable — a rolled-back
+	// transaction must leave the throttle due, or the skipped write becomes a
+	// permanently stale watermark (the 83d427e class of bug). Guarded by
+	// touchMu, never by the DB.
+	touchMu   sync.Mutex
+	lastTouch map[string]time.Time
 	// ResetSeqWatermark, when set, clears the ingest service's in-memory per-agent
 	// sequence watermark. Reenrollment (AGENT-006) reuses an agent id whose WAL was
 	// wiped and restarted at sequence 1; without this the next ack would report the
@@ -86,7 +96,7 @@ type Service struct {
 // quota is a product requirement (default 50); note architecture §7/§15 advise
 // against hard-limiting Lite — it is intentionally configurable.
 func New(db *store.DB, maxAgents int, bus *eventbus.Bus) *Service {
-	return &Service{db: db, maxAgents: maxAgents, bus: bus}
+	return &Service{db: db, maxAgents: maxAgents, bus: bus, lastTouch: map[string]time.Time{}}
 }
 
 // publishLiveness emits a TopicAgentLivenessChanged so a bridge can fan an
@@ -110,6 +120,15 @@ func (s *Service) publishSiteStatus(siteID string) {
 	}
 }
 
+// touchInterval is how fresh a durable last_seen_at may be before the
+// throttled touch paths skip rewriting it. 60s is safe against every consumer:
+// the offline sweeper excludes connected sessions entirely (SweepStale), the
+// console's staleness display defaults to 120s (agent_status_stale_seconds),
+// and agentconnectivity measures its grace from a monotonic absentSince, not
+// from last_seen_at. The unthrottled paths (Hello, session teardown) keep the
+// transition edges exact.
+const touchInterval = 60 * time.Second
+
 // TouchLastSeen bumps an agent's last-seen timestamp and marks it online,
 // recording an offline→online transition in the status history (and publishing a
 // liveness event) when the agent was previously offline.
@@ -121,11 +140,77 @@ func (s *Service) TouchLastSeen(ctx context.Context, id string) error {
 		`UPDATE agents SET last_seen_at=?, status='online' WHERE id=?`, now, id); err != nil {
 		return err
 	}
+	s.noteTouched(id, now)
 	if prev != "online" {
 		s.recordStatus(ctx, id, "online", "", now)
 		s.publishLiveness(siteID, id, "online")
 	}
 	return nil
+}
+
+// TouchLastSeenThrottled is TouchLastSeen for the 15s keepalive path: while the
+// stored last_seen_at is fresher than touchInterval it is a no-op with zero
+// queries. Within a live session the DB status cannot flip to offline behind
+// the throttle (the sweeper excludes connected sessions), so skipping the
+// SELECT cannot miss a transition.
+func (s *Service) TouchLastSeenThrottled(ctx context.Context, id string) error {
+	if !s.touchDue(id) {
+		return nil
+	}
+	return s.TouchLastSeen(ctx, id)
+}
+
+// TouchLastSeenTx is the ingest-transaction variant: when a touch is due it
+// runs the status read, the agents UPDATE and (on an offline→online
+// transition) the history INSERT inside the caller's tx, and returns a post
+// closure the caller MUST invoke after a successful commit — it advances the
+// throttle clock and publishes the liveness event. When no touch is due it
+// returns (nil, nil). On rollback the caller simply discards post, leaving the
+// throttle due, so the skipped write is retried by the next packet.
+func (s *Service) TouchLastSeenTx(ctx context.Context, tx *sql.Tx, id string) (post func(), err error) {
+	if !s.touchDue(id) {
+		return nil, nil
+	}
+	now := time.Now().UTC()
+	var prev, siteID string
+	_ = tx.QueryRowContext(ctx, `SELECT status, site_id FROM agents WHERE id=?`, id).Scan(&prev, &siteID)
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE agents SET last_seen_at=?, status='online' WHERE id=?`, now, id); err != nil {
+		return nil, err
+	}
+	transition := prev != "online"
+	if transition {
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO agent_status_history(id, agent_id, status, reason, changed_at) VALUES(?,?,?,?,?)`,
+			"ash_"+uuid.NewString(), id, "online", "", now); err != nil {
+			return nil, err
+		}
+	}
+	return func() {
+		s.noteTouched(id, now)
+		if transition {
+			s.publishLiveness(siteID, id, "online")
+		}
+	}, nil
+}
+
+func (s *Service) touchDue(id string) bool {
+	s.touchMu.Lock()
+	defer s.touchMu.Unlock()
+	return time.Since(s.lastTouch[id]) >= touchInterval
+}
+
+func (s *Service) noteTouched(id string, at time.Time) {
+	s.touchMu.Lock()
+	s.lastTouch[id] = at
+	s.touchMu.Unlock()
+}
+
+// forgetTouch drops an agent's throttle entry (delete / reenroll hygiene).
+func (s *Service) forgetTouch(id string) {
+	s.touchMu.Lock()
+	delete(s.lastTouch, id)
+	s.touchMu.Unlock()
 }
 
 // MarkFirstConnected stamps first_connected_at the first time an agent completes
@@ -427,9 +512,10 @@ func (s *Service) UpdateAgent(ctx context.Context, id, displayName string) error
 // are enforced (store.Open sets foreign_keys=ON), so FK-constrained child rows
 // (interfaces, agent_status_history, agent_group_members, monitor_status,
 // operational_issues, game_host_seconds) must go before the agent row; the non-FK
-// per-agent tables (agent_packets, events, detector_state) are cleared too so no
-// orphaned rows survive. detector_state keys on agent_id with no FK cascade, so
-// its live counters must be deleted explicitly here.
+// per-agent tables (events, detector_state) are cleared too so no orphaned rows
+// survive. detector_state keys on agent_id with no FK cascade, so its live
+// counters must be deleted explicitly here. The packet-dedup watermark needs no
+// step of its own: it is a column on the agents row and dies with it.
 //
 // fault_signals and fluctuations are NOT deleted: they are recorded history
 // carrying the agent's frozen name, and a fault (or an availability dip) that
@@ -465,7 +551,6 @@ func (s *Service) DeleteAgent(ctx context.Context, id string) error {
 		`DELETE FROM agent_group_members WHERE agent_id=?`,
 		`DELETE FROM monitor_status WHERE agent_id=?`,
 		`DELETE FROM operational_issues WHERE agent_id=?`,
-		`DELETE FROM agent_packets WHERE agent_id=?`,
 		`DELETE FROM events WHERE agent_id=?`,
 		`DELETE FROM detector_state WHERE agent_id=?`,
 		`DELETE FROM game_buckets WHERE run_id IN (SELECT id FROM game_runs WHERE agent_id=?)`,
@@ -496,6 +581,7 @@ func (s *Service) DeleteAgent(ctx context.Context, id string) error {
 	if err := tx.Commit(); err != nil {
 		return err
 	}
+	s.forgetTouch(id)
 	s.publishSiteStatus(siteID)
 	return nil
 }

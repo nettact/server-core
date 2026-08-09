@@ -43,7 +43,6 @@ func TestUpdateAndDeleteAgent(t *testing.T) {
 	mustExec(t, db, `INSERT INTO agent_status_history(id,agent_id,status,changed_at) VALUES('ash1','agent_x','online',?)`, now)
 	mustExec(t, db, `INSERT INTO agent_groups(id,site_id,name) VALUES('grp1','site_default','g')`)
 	mustExec(t, db, `INSERT INTO agent_group_members(group_id,agent_id) VALUES('grp1','agent_x')`)
-	mustExec(t, db, `INSERT INTO agent_packets(agent_id,sequence,received_at) VALUES('agent_x',1,?)`, now)
 	mustExec(t, db, `INSERT INTO events(id,agent_id,site_id,ts,type) VALUES('e1','agent_x','site_default',?,'t')`, now)
 	mustExec(t, db, `INSERT INTO monitor_groups(id,site_id,name,all_agents) VALUES('mg1','site_default','all',1)`)
 	mustExec(t, db, `INSERT INTO probe_tasks(id,site_id,group_id,kind,target,params,enabled) VALUES('mon1','site_default','mg1','http','https://example.test','{}',1)`)
@@ -92,7 +91,7 @@ func TestUpdateAndDeleteAgent(t *testing.T) {
 	}
 	for _, tbl := range []string{
 		"interfaces", "agent_wifi", "agent_status_history", "agent_group_members",
-		"agent_packets", "events", "detector_state", "game_runs", "game_host_seconds",
+		"events", "detector_state", "game_runs", "game_host_seconds",
 	} {
 		var n int
 		if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM `+tbl+` WHERE agent_id='agent_x'`).Scan(&n); err != nil {
@@ -510,13 +509,13 @@ func TestReinstallTokenRejoinsSameAgent(t *testing.T) {
 	if err := db.QueryRowContext(ctx, `SELECT site_id, created_at FROM agents WHERE id=?`, agentID).Scan(&siteBefore, &createdAt); err != nil {
 		t.Fatalf("snapshot agent: %v", err)
 	}
-	// The old installation left telemetry behind: an agent_packets row is the
-	// (agent_id, sequence) dedup watermark that must NOT carry across a reinstall
-	// (the fresh WAL starts again at sequence 1), and an agent_wifi row carries a
-	// SECOND sequence guard that would reject the fresh snapshots until the new
-	// WAL out-paces the old one. Also flip the agent offline, the state the
+	// The old installation left state behind: agents.high_sequence is the ingest
+	// dedup watermark that must NOT carry across a reinstall (the fresh WAL
+	// starts again at sequence 1), and an agent_wifi row carries a SECOND
+	// sequence guard that would reject the fresh snapshots until the new WAL
+	// out-paces the old one. Also flip the agent offline, the state the
 	// reinstall target is in.
-	mustExec(t, db, `INSERT INTO agent_packets(agent_id, sequence, received_at, sent_at) VALUES(?,1,?,NULL)`, agentID, time.Now().UTC())
+	mustExec(t, db, `UPDATE agents SET high_sequence=4321 WHERE id=?`, agentID)
 	mustExec(t, db, `INSERT INTO agent_wifi(agent_id, state, sampled_at, last_sequence) VALUES(?,'ok',?,999)`, agentID, time.Now().UTC())
 	mustExec(t, db, `UPDATE agents SET status='offline' WHERE id=?`, agentID)
 	// The old installation also attested a batch-upload cadence. A MonitorStatus
@@ -597,13 +596,13 @@ func TestReinstallTokenRejoinsSameAgent(t *testing.T) {
 	if !used.Valid {
 		t.Errorf("reinstall token not consumed")
 	}
-	// The dedup watermark is gone: the fresh WAL's sequence 1 will be accepted.
-	var packets int
-	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM agent_packets WHERE agent_id=?`, agentID).Scan(&packets); err != nil {
-		t.Fatalf("count packets: %v", err)
+	// The dedup watermark is reset: the fresh WAL's sequence 1 will be accepted.
+	var high int
+	if err := db.QueryRowContext(ctx, `SELECT high_sequence FROM agents WHERE id=?`, agentID).Scan(&high); err != nil {
+		t.Fatalf("read high_sequence: %v", err)
 	}
-	if packets != 0 {
-		t.Errorf("agent_packets has %d rows after reinstall, want 0", packets)
+	if high != 0 {
+		t.Errorf("high_sequence = %d after reinstall, want 0", high)
 	}
 	// The interface-snapshot sequence guard is gone with it, so the first fresh
 	// snapshot is no longer rejected as older than the previous installation's.

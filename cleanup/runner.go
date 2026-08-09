@@ -11,11 +11,6 @@ import (
 	"github.com/nettact/server-core/metrics"
 )
 
-// maxTS is an upper bound past any real unix-seconds timestamp, used to clear a
-// live/system series' entire history via PurgeRange (which keeps the dictionary
-// row) instead of PurgeSeriesIDs (which removes it).
-const maxTS int64 = 1 << 62
-
 // Recover requeues any job left 'running' by a process stop. Its still-pending
 // items are re-executed idempotently on the next Tick. Called at startup; Tick
 // also self-heals the same way, so a failed startup Recover does not wedge the
@@ -205,7 +200,11 @@ func (s *Service) runItem(ctx context.Context, run jobRun, jobID string, it pend
 	case !full:
 		actual, err = s.metrics.PurgeRange(ctx, ids, run.from, run.to)
 	case keepRow:
-		actual, err = s.metrics.PurgeRange(ctx, ids, 0, maxTS) // clear all data, keep the row
+		// Clear all data, keep the row. Not a PurgeRange to "infinity": the data
+		// plane's tombstones would mask the live series' FUTURE appends too (and
+		// the seconds→ms conversion of a sentinel bound overflows). The cutoff
+		// column hides history without touching storage at all.
+		actual, err = s.metrics.ClearSeriesHistory(ctx, ids)
 	default:
 		actual, err = s.metrics.PurgeSeriesIDs(ctx, ids)
 	}

@@ -140,7 +140,7 @@ func (h *Hub) HandleUpgrade(w http.ResponseWriter, r *http.Request) {
 	conn.SetReadLimit(maxFrameBytes)
 
 	sc := &wsConn{c: conn, contentType: wire.SubprotocolContentType(conn.Subprotocol())}
-	h.serve(r.Context(), agentID, siteID, sc)
+	h.serve(r.Context(), agentID, siteID, sc, bearer(r))
 }
 
 // serve runs one authenticated session over an established frame link: it
@@ -148,7 +148,9 @@ func (h *Hub) HandleUpgrade(w http.ResponseWriter, r *http.Request) {
 // the session (kicking any prior one for the same agent), pushes current
 // DesiredState, and loops until the link dies. It blocks for the session's life.
 // Transport-agnostic: HandleUpgrade wraps a WebSocket, DialLocal wraps a pipe.
-func (h *Hub) serve(ctx context.Context, agentID, siteID string, c wire.Conn) {
+// token is the bearer this connection authenticated with; it is re-validated at
+// registration (see below).
+func (h *Hub) serve(ctx context.Context, agentID, siteID string, c wire.Conn, token string) {
 	// Admission: a hub CloseAll has swept accepts no further connections, and one
 	// it HAS admitted must be awaited — the Hello side effects below write through
 	// the registry, so CloseAll must not return (its caller closes the DB) while a
@@ -203,7 +205,6 @@ func (h *Hub) serve(ctx context.Context, agentID, siteID string, c wire.Conn) {
 	// online immediately — a connected link IS liveness, no packet needed.
 	_ = h.deps.Registry.UpdatePermissions(ctx, agentID, hello.Permissions)
 	_ = h.deps.Registry.UpdateReportedInfo(ctx, agentID, hello.Hostname, hello.Platform, hello.AgentVersion)
-	_ = h.deps.Registry.SetReportedConfigVersion(ctx, agentID, hello.ReportedConfigVersion)
 	_ = h.deps.Registry.TouchLastSeen(ctx, agentID)
 	// Stamp the first-ever connection (no-op after the first): until this is set
 	// the agent is "never connected", which the status list and alert engine
@@ -251,6 +252,21 @@ func (h *Hub) serve(ctx context.Context, agentID, siteID string, c wire.Conn) {
 	// waiting on h.serving. Registration also ends the handshake phase: from
 	// here the conn is owned by the registered session and CloseAll closes it
 	// through s.shutdown, not the handshake sweep.
+	// Re-validate the bearer before taking the agent's slot. A reenrollment
+	// (AGENT-006) rotates the credential and fences live sessions, but its fence
+	// can only close what it can see: a connection that authenticated just before
+	// the rotation and is still mid-handshake gets a fire-and-forget Close whose
+	// delivery races this registration. If it registered anyway, it would ingest
+	// the PREVIOUS installation's sequences after the watermark reset and brick
+	// the new install's uploads. The rotation commits before the fence returns,
+	// so a dead token is always visible here; a rotation that lands after this
+	// check finds the session registered, where the fence waits for teardown.
+	if revID, _, err := h.deps.Registry.AuthenticateAgent(ctx, token); err != nil || revID != agentID {
+		_ = h.deps.Registry.RecordDisconnect(ctx, agentID, "revoked")
+		_ = c.Close(wire.CloseRevoked, "credential rotated")
+		return
+	}
+
 	h.mu.Lock()
 	delete(h.handshaking, c)
 	if h.closed {
@@ -388,7 +404,7 @@ func (h *Hub) DialLocal(ctx context.Context, token string) (wire.Conn, error) {
 	// context.Background(): the session's lifetime is governed by the link itself
 	// plus CloseAll on shutdown, exactly like a hijacked WebSocket that outlives
 	// the request context in practice.
-	go h.serve(context.Background(), agentID, siteID, serverEnd)
+	go h.serve(context.Background(), agentID, siteID, serverEnd, token)
 	return agentEnd, nil
 }
 

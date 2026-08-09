@@ -88,15 +88,74 @@ type Service struct {
 	baseline Baseliner // nil-safe: degradation detection is then never fed
 	tracer   Tracer    // nil-safe: traceroute reports are then not persisted
 
-	// Per-agent highest-sequence watermark, cached so the hot ingest path does
-	// not re-run MAX(sequence) on every packet. Loaded from the DB on first
-	// sight of an agent, then maintained in memory.
-	seqMu   sync.Mutex
-	highSeq map[string]uint64
+	// TouchAgentTx, when set, folds the agent's liveness bump into the ingest
+	// transaction (registry.TouchLastSeenTx): called once per packet — replays
+	// included, a replayed packet still proves the agent alive — it returns a
+	// post closure to run after commit (throttle advance + liveness publish) or
+	// (nil, nil) when the durable last_seen is fresh enough. A function field
+	// rather than a registry reference so ingest stays free of a registry
+	// import; wired at composition (server.Start), mirroring
+	// registry.ResetSeqWatermark. nil is a no-op.
+	TouchAgentTx func(ctx context.Context, tx *sql.Tx, agentID string) (post func(), err error)
+
+	// Per-agent highest-committed-sequence watermark, mirroring
+	// agents.high_sequence: cached so the hot ingest path does not re-read the
+	// row on every packet, seeded from the DB on first sight of an agent. The
+	// epoch counts ResetSeqWatermark calls; a post-commit advance carrying a
+	// stale epoch is discarded, so a session that straddled a reenrollment can
+	// never resurrect the previous installation's watermark.
+	seqMu sync.Mutex
+	seq   map[string]*seqState
+}
+
+// seqState is one agent's in-memory sequence watermark. high advances only
+// after the transaction that recorded the sequence has committed — the
+// rollback-discarded write of the old dedup-table design, kept as a hard rule
+// (the 83d427e class: state that outruns its transaction fabricates skips).
+type seqState struct {
+	high  uint64
+	epoch uint64
 }
 
 func New(db *store.DB, bus *eventbus.Bus, m *metrics.Store, ev Evaluator, bl Baseliner, tr Tracer) *Service {
-	return &Service{db: db, bus: bus, metrics: m, fault: ev, baseline: bl, tracer: tr, highSeq: make(map[string]uint64)}
+	return &Service{db: db, bus: bus, metrics: m, fault: ev, baseline: bl, tracer: tr, seq: make(map[string]*seqState)}
+}
+
+// Timestamp policy bounds (see Ingest's enforcement comment).
+const (
+	// tsFutureSlack tolerates ack-anchored clock jitter; a sample further ahead
+	// is a broken clock and would poison the data plane's global OOO floor.
+	tsFutureSlack = 2 * time.Minute
+	// tsPastHorizon is the deepest legitimate replay: the agent WAL retains at
+	// most 72h, plus an hour of slack. (The data plane's OOO window is 75h.)
+	tsPastHorizon = 73 * time.Hour
+)
+
+// filterTimestamps drops samples outside the ingest timestamp policy,
+// returning the kept slice (aliasing the input's backing array when nothing
+// was dropped) and the per-class drop counts.
+func filterTimestamps(ms []telemetry.Metric, now time.Time) (kept []telemetry.Metric, future, ancient int) {
+	hi := now.Add(tsFutureSlack)
+	lo := now.Add(-tsPastHorizon)
+	for i := range ms {
+		switch {
+		case ms[i].TS.After(hi):
+			future++
+		case ms[i].TS.Before(lo):
+			ancient++
+		}
+	}
+	if future+ancient == 0 {
+		return ms, 0, 0
+	}
+	kept = make([]telemetry.Metric, 0, len(ms)-future-ancient)
+	for i := range ms {
+		if ms[i].TS.After(hi) || ms[i].TS.Before(lo) {
+			continue
+		}
+		kept = append(kept, ms[i])
+	}
+	return kept, future, ancient
 }
 
 // Ingest stores one telemetry packet idempotently and returns the ack watermark.
@@ -105,6 +164,24 @@ func (s *Service) Ingest(ctx context.Context, agentID, siteID string, pkt teleme
 		return Ack{}, err
 	}
 	now := time.Now().UTC()
+
+	// Timestamp policy, enforced before ANYTHING sees the metrics. The data
+	// plane's out-of-order floor is relative to its GLOBAL head time: one agent
+	// with a badly-future clock would push the head forward and turn every
+	// other agent's honest samples into un-appendable ancient history. Samples
+	// beyond a small future slack are therefore dropped here — the agent
+	// anchors its clock to the server on every ack, so exceeding the slack is a
+	// broken machine, not jitter — and so are samples older than the deepest
+	// legitimate replay (the agent WAL holds 72h). Dropping BEFORE rounds are
+	// built keeps the fault engine, the latest cache and the data plane
+	// describing the same reality; a dropped sample exists nowhere.
+	if len(pkt.Metrics) > 0 {
+		kept, future, ancient := filterTimestamps(pkt.Metrics, now)
+		if future+ancient > 0 {
+			log.Printf("ingest: dropped %d future-stamped and %d ancient samples from agent %s (clock trouble?)", future, ancient, agentID)
+			pkt.Metrics = kept
+		}
+	}
 
 	// Provenance gate (pre-tx, read pool): a probe sample is accepted only if its
 	// monitor still belongs to this site AND is still in this agent's scope AND its
@@ -162,6 +239,15 @@ func (s *Service) Ingest(ctx context.Context, agentID, siteID string, pkt teleme
 		cores = s.latestCores(ctx, agentID)
 	}
 
+	// Replay gate. Read BEFORE the transaction: currentHigh may seed from the
+	// DB, and the single write connection is already checked out once BeginTx
+	// runs — a pool query here would deadlock against our own transaction.
+	high, epoch, err := s.currentHigh(ctx, agentID)
+	if err != nil {
+		return Ack{}, err
+	}
+	isNew := pkt.Sequence > high
+
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return Ack{}, err
@@ -173,25 +259,40 @@ func (s *Service) Ingest(ctx context.Context, agentID, siteID string, pkt teleme
 		}
 	}()
 
-	// Dedup: INSERT OR IGNORE on (agent_id, sequence). affected==0 => replay.
-	res, err := tx.ExecContext(ctx,
-		`INSERT OR IGNORE INTO agent_packets(agent_id, sequence, received_at, sent_at) VALUES(?,?,?,?)`,
-		agentID, pkt.Sequence, now, pkt.SentAt)
-	if err != nil {
-		return Ack{}, err
+	// Liveness rides the packet transaction (a replay proves liveness too). The
+	// post closure — throttle advance and the offline→online publish — runs only
+	// after commit; a rollback discards it and the next packet retries.
+	var touchPost func()
+	if s.TouchAgentTx != nil {
+		if touchPost, err = s.TouchAgentTx(ctx, tx, agentID); err != nil {
+			return Ack{}, err
+		}
 	}
-	affected, _ := res.RowsAffected()
+
+	if isNew {
+		// Persist the dedup watermark with the batch it admits. The monotone
+		// guard makes a stale writer harmless: a session that lost a reenrollment
+		// race writes nothing once the column was reset and re-raised past it,
+		// and affected==0 on a deleted agent matches the old FK-less dedup row's
+		// indifference.
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE agents SET high_sequence=? WHERE id=? AND high_sequence<?`,
+			pkt.Sequence, agentID, pkt.Sequence); err != nil {
+			return Ack{}, err
+		}
+	}
 
 	var acceptedTx []telemetry.Metric
+	var storedTx []telemetry.Metric
 	var outcome *fault.Outcome
 	var hostOutcome *fault.Outcome
 	var traces *incidentops.TraceOutcome
-	if affected > 0 {
+	if isNew {
 		// Authoritative in-tx re-check: config edits serialize on the single write
 		// connection, so a serial read here has no TOCTOU with the pre-tx filter.
 		acceptedTx = accepted
 		var rounds []fault.Round
-		storedTx := stored
+		storedTx = stored
 		if len(accepted) > 0 {
 			meta, err := s.probeMeta(ctx, tx, agentID, siteID, monitorIDs(accepted))
 			if err != nil {
@@ -202,7 +303,13 @@ func (s *Service) Ingest(ctx context.Context, agentID, siteID string, pkt teleme
 			attachBaselines(rounds, bands)
 			storedTx = append(acceptedTx, fault.AvailabilitySamples(rounds)...)
 		}
-		if err := s.metrics.InsertSamples(ctx, tx, agentID, seriesIDs, storedTx); err != nil {
+		// Raw samples reach the data plane AFTER this transaction commits (see
+		// the post-commit block); what rides HERE is the durable intent their
+		// backfill needs — the 1m rollup watermark rewind, computed from the
+		// same authoritative storedTx the append will use, so an
+		// obsolete-generation sample the re-check dropped can neither rewind a
+		// watermark nor reach storage.
+		if err := s.metrics.RewindForBatch(ctx, tx, agentID, seriesIDs, storedTx); err != nil {
 			return Ack{}, err
 		}
 		for _, e := range pkt.Events {
@@ -238,13 +345,16 @@ func (s *Service) Ingest(ctx context.Context, agentID, siteID string, pkt teleme
 			pkt.GameRuns, pkt.GameBuckets, pkt.GameGaps, pkt.GameHostSeconds); err != nil {
 			return Ack{}, err
 		}
-		// Fault evaluation runs INSIDE this sample transaction so samples, detector
-		// state, fault signals, incidents and notification plans commit atomically:
-		// the next status read can never observe an updated signal alongside stale
-		// detector counters or vice versa. An evaluation error rolls the whole batch
-		// back and the agent's ack is withheld (it retries the sequence). Evaluation
-		// consumes the batch's own rounds directly, so it never depends on the
-		// latest-value cache, which is only refreshed post-commit.
+		// Fault evaluation runs INSIDE this transaction so detector state, fault
+		// signals, incidents, notification plans and the sequence watermark
+		// commit atomically: the next status read can never observe an updated
+		// signal alongside stale detector counters or vice versa. An evaluation
+		// error rolls the whole batch back and the agent's ack is withheld (it
+		// retries the sequence). Evaluation consumes the batch's own rounds
+		// directly — it has never read stored samples — which is precisely what
+		// lets the RAW samples commit elsewhere: their durability is deferred to
+		// the data plane append after this commit, and a crash in that gap loses
+		// chart points only (an accepted contract), never a detection.
 		if s.fault != nil && len(rounds) > 0 {
 			outcome, err = s.fault.EvaluateAgentTx(ctx, tx, agentID, siteID, rounds)
 			if err != nil {
@@ -282,12 +392,48 @@ func (s *Service) Ingest(ctx context.Context, agentID, siteID string, pkt teleme
 		}
 	}
 
+	// Mark the batch's series in-flight BEFORE the commit makes the rewind
+	// durable, so no rollup pass can slip into the gap, consume the rewind and
+	// advance past samples that have not reached the data plane yet.
+	var pendingDone func()
+	if isNew && len(storedTx) > 0 {
+		pendingDone = s.metrics.BeginPendingAppend(seriesIDs)
+		defer func() {
+			if pendingDone != nil {
+				pendingDone()
+			}
+		}()
+	}
+
 	if err := tx.Commit(); err != nil {
 		return Ack{}, err
 	}
 	committed = true
+	if touchPost != nil {
+		touchPost()
+	}
 
-	if affected > 0 {
+	if isNew {
+		// Raw samples land in the data plane now, after the commit that admitted
+		// the packet: what the in-tx re-check dropped can never be stored, and a
+		// crash before this append loses ≤ one packet of chart points while the
+		// committed watermark makes the replay a no-op (accepted contract). An
+		// append failure deliberately still ACKS: the SQLite state is committed,
+		// a replay would be deduplicated anyway, and alerting must not be
+		// hostage to data-plane trouble — the gap is charts, loudly logged.
+		if len(storedTx) > 0 {
+			res, err := s.metrics.AppendRawSamples(ctx, agentID, seriesIDs, storedTx)
+			switch {
+			case err != nil:
+				log.Printf("ingest: DATA-PLANE APPEND FAILED for agent %s seq %d (%d samples lost to charts): %v",
+					agentID, pkt.Sequence, len(storedTx), err)
+			case res.Dropped > 0:
+				log.Printf("ingest: data plane dropped %d/%d samples from agent %s (post-filter — investigate)",
+					res.Dropped, len(storedTx), agentID)
+			}
+			pendingDone()
+			pendingDone = nil
+		}
 		// Post-commit, in order: refresh the in-memory latest cache (only after
 		// commit — a rolled-back batch must not surface as "current"), publish the
 		// fault outcome's lifecycle events, then one precise target-status event over
@@ -324,11 +470,10 @@ func (s *Service) Ingest(ctx context.Context, agentID, siteID string, pkt teleme
 		}
 	}
 
-	high, err := s.watermark(ctx, agentID, pkt.Sequence)
-	if err != nil {
-		return Ack{}, err
-	}
-	return Ack{HighestSequence: high, ServerTime: now}, nil
+	return Ack{
+		HighestSequence: s.noteCommittedSeq(agentID, pkt.Sequence, epoch, isNew),
+		ServerTime:      now,
+	}, nil
 }
 
 // rowQuerier is the read subset shared by the read pool (*store.DB / *sql.DB) and
@@ -567,46 +712,73 @@ func placeholders(n int) string {
 	return strings.TrimSuffix(strings.Repeat("?,", n), ",")
 }
 
-// watermark returns the agent's highest confirmed sequence, maintained in
-// memory (seeded from the DB once per agent per process).
-func (s *Service) watermark(ctx context.Context, agentID string, seq uint64) (uint64, error) {
+// currentHigh returns the agent's committed sequence watermark and the epoch it
+// was read under, seeding from agents.high_sequence on first sight. A packet
+// with Sequence <= high is a replay: the agent's WAL is FIFO per server with a
+// single in-flight packet resent under its original sequence until acked, and
+// the ack is already cumulative — so a below-watermark sequence that was never
+// processed cannot legitimately exist, and dropping it is exact. A missing
+// agents row (agent deleted mid-flight) surfaces as an error and fails the
+// packet, which is correct: nothing should ingest under a deleted identity.
+func (s *Service) currentHigh(ctx context.Context, agentID string) (high, epoch uint64, err error) {
 	s.seqMu.Lock()
 	defer s.seqMu.Unlock()
-	cur, ok := s.highSeq[agentID]
+	st, ok := s.seq[agentID]
 	if !ok {
-		var high sql.NullInt64
+		var dbHigh uint64
 		if err := s.db.QueryRowContext(ctx,
-			`SELECT MAX(sequence) FROM agent_packets WHERE agent_id=?`, agentID).Scan(&high); err != nil {
-			return 0, err
+			`SELECT high_sequence FROM agents WHERE id=?`, agentID).Scan(&dbHigh); err != nil {
+			return 0, 0, err
 		}
-		cur = uint64(high.Int64)
+		st = &seqState{high: dbHigh}
+		s.seq[agentID] = st
 	}
-	if seq > cur {
-		cur = seq
-	}
-	s.highSeq[agentID] = cur
-	return cur, nil
+	return st.high, st.epoch, nil
 }
 
-// ResetSeqWatermark drops the in-memory per-agent sequence watermark so the next
-// ack re-derives it from the database. Used by reenrollment (AGENT-006): the fresh
-// WAL starts again at sequence 1, and a stale in-memory high would make the ack
-// report a watermark the new installation never reached — the agent's
-// Outbox.FastForward would then jump its next sequence past batches that were
-// never uploaded. Idempotent; the next watermark() call re-seeds from
-// agent_packets (which reenrollment has emptied).
+// noteCommittedSeq folds a sequence whose transaction has COMMITTED into the
+// in-memory watermark and returns the ack value. epoch must be the value
+// currentHigh returned for this packet: if ResetSeqWatermark ran in between
+// (reenrollment), the advance is discarded — folding it would resurrect the
+// previous installation's watermark and misread the fresh WAL's low sequences
+// as replays. For a replay (committed=false) nothing advances; the ack simply
+// restates the current high.
+func (s *Service) noteCommittedSeq(agentID string, seq, epoch uint64, committed bool) uint64 {
+	s.seqMu.Lock()
+	defer s.seqMu.Unlock()
+	st, ok := s.seq[agentID]
+	if !ok || st.epoch != epoch {
+		if ok {
+			return st.high
+		}
+		return 0
+	}
+	if committed && seq > st.high {
+		st.high = seq
+	}
+	if st.high > seq {
+		return st.high
+	}
+	return seq
+}
+
+// ResetSeqWatermark resets the in-memory per-agent sequence watermark and bumps
+// its epoch. Used by reenrollment (AGENT-006): the fresh WAL starts again at
+// sequence 1 and the reenroll transaction zeroed agents.high_sequence — a stale
+// in-memory high would make the ack report a watermark the new installation
+// never reached, and the agent's Outbox.FastForward would then jump its next
+// sequence past batches that were never uploaded. The epoch bump additionally
+// discards any in-flight packet's post-commit advance from a session that
+// authenticated before the reenrollment (see noteCommittedSeq).
 func (s *Service) ResetSeqWatermark(ctx context.Context, agentID string) {
 	s.seqMu.Lock()
-	delete(s.highSeq, agentID)
+	if st, ok := s.seq[agentID]; ok {
+		st.high = 0
+		st.epoch++
+	} else {
+		s.seq[agentID] = &seqState{epoch: 1}
+	}
 	s.seqMu.Unlock()
-}
-
-// PrunePackets deletes dedup rows older than keep. The agent WAL retains at
-// most 72h of unacked samples, so anything older can never legitimately replay;
-// without pruning agent_packets grows by one row per packet forever.
-func (s *Service) PrunePackets(ctx context.Context, keep time.Duration) error {
-	_, err := s.db.ExecContext(ctx, `DELETE FROM agent_packets WHERE received_at < ?`, time.Now().UTC().Add(-keep))
-	return err
 }
 
 func encodeMap(m map[string]string) string {

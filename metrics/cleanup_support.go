@@ -2,12 +2,14 @@ package metrics
 
 import (
 	"context"
-	"database/sql"
+	"errors"
 	"time"
+
+	"github.com/nettact/server-core/tsstore"
 )
 
-// rollupTiers pairs each rollup table with its bucket width (seconds). Buckets
-// are aligned to their width (see alignDown in rollup.go), so a bucket row at ts
+// rollupTiers pairs each tier tag with its bucket width (seconds). Buckets are
+// aligned to their width (see alignDown in rollup.go), so a bucket at ts
 // covers [ts, ts+width).
 var rollupTiers = []struct {
 	table string
@@ -18,63 +20,97 @@ var rollupTiers = []struct {
 	{"rollup_1d", 86400},
 }
 
-// PurgeRange deletes samples in [from, to) for the given series and the rollup
-// buckets overlapping that window, then repairs the tiers so a subsequent query
-// stays consistent. Semantics:
+// PurgeRange deletes samples in [from, to) for the given series and the
+// bucket-tier windows overlapping it, then repairs the tiers so a subsequent
+// query stays consistent. Semantics:
 //
-//   - Raw samples are deleted precisely on [from, to).
-//   - Rollup buckets are whole-bucket units, so every bucket that OVERLAPS the
-//     window (bucket start in [alignDown(from,w), to)) is deleted. This can
-//     over-delete at the two edges (a boundary bucket straddling from/to loses
-//     its surviving out-of-range portion).
+//   - Raw samples are tombstoned precisely on [from, to). A post-purge replay
+//     that re-appends into the window is masked by the tombstone — consistent
+//     with purge intent.
+//   - Interior buckets (fully inside the window) are tombstoned: their source
+//     is gone, so nothing will ever legitimately write them again.
+//   - A straddling EDGE bucket is recomputed inline from its surviving source
+//     and k-repaired on the spot — better than the old whole-bucket
+//     over-delete, which left the edge missing until the next rollup pass.
+//     When the edge is too old to append (beyond the OOO horizon,
+//     tsstore.ErrBucketTooOld) it is tombstoned instead, which IS the old
+//     over-delete semantics for ancient ranges.
 //   - The rollup_state watermark for each tier is rewound to alignDown(from,w)
-//     (never forward), so the next Rollup() pass recomputes [alignDown(from,w),
-//     now) from the SURVIVING source data: interior buckets have no source and
-//     stay deleted, while the straddling edge buckets are rebuilt from the raw /
-//     lower-tier rows still outside the window — repairing the edge over-delete
-//     as long as that source is within its own retention window.
-//   - The in-memory latest cache is refreshed when the newest sample was in the
-//     deleted window.
+//     (never forward) as a belt: the next Rollup() pass re-verifies the window
+//     and its unchanged-guard absorbs the already-done inline repairs.
+//   - The in-memory latest cache is refreshed when the newest sample was in
+//     the deleted window (tombstones apply at read time, so the refresh
+//     already sees the post-purge truth).
 //
-// The series dictionary row is deliberately KEPT even when the range empties every
-// tier: a live series may have already obtained this id via EnsureSeries and be
-// about to insert samples outside s.mu, so removing the row here would strand those
-// samples under a deleted id. An emptied row is harmless (reachable, reused by the
-// next ingest); a deleted-target series is reclaimed by the full orphan-cleanup
-// path (PurgeSeriesIDs) instead.
+// The series dictionary row is deliberately KEPT even when the range empties
+// every tier: a live series may have already obtained this id via EnsureSeries
+// and be about to append samples outside s.mu, so removing the row here would
+// strand those samples under a deleted id. An emptied row is harmless; a
+// deleted-target series is reclaimed by the full orphan-cleanup path
+// (PurgeSeriesIDs) instead.
 //
-// from/to are unix seconds and to must be > from. For a full (unbounded) delete
-// callers use PurgeSeriesIDs instead.
+// from/to are unix seconds and to must be > from AND bounded (a real range).
+// Clearing a live series' ENTIRE history is ClearSeriesHistory — a tombstone
+// to "infinity" would mask the series' future appends forever, so an
+// unbounded PurgeRange does not exist by design.
 func (s *Store) PurgeRange(ctx context.Context, ids []int64, from, to int64) (PurgeCounts, error) {
 	if len(ids) == 0 || to <= from {
 		return PurgeCounts{}, nil
 	}
+	s.rollupMu.Lock()
+	defer s.rollupMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	var counts PurgeCounts
 	windows := make(map[int64]purgeWindow, len(ids))
 	for _, id := range ids {
-		// Raw: precise range delete.
-		res, err := s.db.ExecContext(ctx, `DELETE FROM samples WHERE series_id=? AND ts>=? AND ts<?`, id, from, to)
+		// Raw: count, then precise tombstone.
+		n, err := s.ts.RawCount(ctx, id, from, to)
 		if err != nil {
 			return counts, err
 		}
-		n, _ := res.RowsAffected()
 		counts.Samples += n
+		if err := s.ts.DeleteRawRange(ctx, id, from, to); err != nil {
+			return counts, err
+		}
 
-		// Rollups: whole-bucket delete of every overlapping bucket + watermark rewind.
 		for _, t := range rollupTiers {
+			tier := tierOf(t.table)
 			lo := alignDown(from, t.width)
-			res, err := s.db.ExecContext(ctx,
-				`DELETE FROM `+t.table+` WHERE series_id=? AND ts>=? AND ts<?`, id, lo, to)
+			affected, err := s.ts.ReadBuckets(ctx, tier, id, lo, to)
 			if err != nil {
 				return counts, err
 			}
-			rn, _ := res.RowsAffected()
-			counts.Rollups += rn
-			// Rewind the watermark so Rollup() revisits (and rebuilds edge buckets of)
-			// this window; only when it currently sits past lo, never push it forward.
+			counts.Rollups += int64(len(affected))
+
+			// Interior: [first bucket fully >= from, last bucket fully < to).
+			intLo := lo
+			if from%t.width != 0 {
+				intLo = lo + t.width
+			}
+			intHi := alignDown(to, t.width)
+			if intHi > intLo {
+				if err := s.ts.DeleteBucketRange(ctx, tier, id, intLo, intHi); err != nil {
+					return counts, err
+				}
+			}
+			// Straddling edges (at most two; one when the range sits inside a
+			// single bucket): recompute from surviving source, k-repair or
+			// tombstone. An aligned bound has no straddler on its side.
+			edges := map[int64]bool{}
+			if from%t.width != 0 {
+				edges[lo] = true
+			}
+			if to%t.width != 0 {
+				edges[alignDown(to, t.width)] = true
+			}
+			for edge := range edges {
+				if err := s.repairEdgeBucketLocked(ctx, tier, t.width, id, edge); err != nil {
+					return counts, err
+				}
+			}
+			// Watermark rewind (belt; never forward).
 			resStr := t.table[len("rollup_"):]
 			if _, err := s.db.ExecContext(ctx,
 				`UPDATE rollup_state SET last_ts=? WHERE resolution=? AND series_id=? AND last_ts>?`,
@@ -92,18 +128,14 @@ func (s *Store) PurgeRange(ctx context.Context, ids []int64, from, to int64) (Pu
 			}
 		}
 	}
-	_, _ = s.db.ExecContext(ctx, `PRAGMA incremental_vacuum(2000)`)
 
 	// Record the deleted windows so an in-flight ingest that committed BEFORE this
 	// purge but folds its latest-cache update AFTER it (UpdateLatest runs post-
-	// commit, outside this lock) re-verifies against the DB instead of resurrecting
-	// a just-deleted sample. The expiry is stamped HERE — after all deletes and the
-	// vacuum, just before the lock is released — so a fold that spent the whole
-	// purge blocked on s.mu still sees a live guard no matter how long the purge
-	// took. Sweeping expired entries here also bounds the map: without it, a series
-	// that never ingests again would keep its entry for the process lifetime (only
-	// UpdateLatest for the same id deletes on expiry). Entries from the most recent
-	// purge batch remain until the next purge or fold — bounded and small.
+	// commit, outside this lock) re-verifies instead of resurrecting a just-deleted
+	// sample. The expiry is stamped HERE — after all deletes, just before the lock
+	// is released — so a fold that spent the whole purge blocked on s.mu still sees
+	// a live guard no matter how long the purge took. Sweeping expired entries here
+	// also bounds the map.
 	now := time.Now().Unix()
 	for id, w := range s.purged {
 		if now > w.until {
@@ -126,6 +158,73 @@ func (s *Store) PurgeRange(ctx context.Context, ids []int64, from, to int64) (Pu
 	return counts, nil
 }
 
+// repairEdgeBucketLocked rebuilds one straddling bucket from its surviving
+// source (raw for m1, the child tier otherwise — the child's own edge was
+// repaired earlier in the same tier loop). Empty source or an
+// out-of-OOO-horizon window falls back to tombstoning the bucket.
+func (s *Store) repairEdgeBucketLocked(ctx context.Context, tier tsstore.Tier, width, id, start int64) error {
+	rs := rollupSeries{id: id}
+	recomputed, err := s.recomputeBuckets(ctx, tier, tier == tsstore.TierM1, rs, start, start+width)
+	if err != nil {
+		return err
+	}
+	if len(recomputed) == 0 {
+		return s.ts.DeleteBucketRange(ctx, tier, id, start, start+width)
+	}
+	// Skip the write when the surviving content matches what is already stored
+	// (the edge did not actually intersect the purge).
+	existing, err := s.ts.ReadBuckets(ctx, tier, id, start, start+width)
+	if err != nil {
+		return err
+	}
+	if len(existing) == 1 && existing[0].Cnt == recomputed[0].Cnt && existing[0].Sum == recomputed[0].Sum {
+		return nil
+	}
+	err = s.ts.AppendBuckets(ctx, tier, id, recomputed)
+	if errors.Is(err, tsstore.ErrBucketTooOld) {
+		return s.ts.DeleteBucketRange(ctx, tier, id, start, start+width)
+	}
+	return err
+}
+
+// ClearSeriesHistory hides a live series' entire recorded history without a
+// single tombstone: series.purge_cutoff is set to now and every read path
+// clamps below it, while the old blocks age out through ordinary retention.
+// This replaces "PurgeRange(0, maxTS)" — a tombstone over the future would
+// mask the very samples the still-live series keeps appending, and
+// compaction-time application would make the breakage permanent.
+func (s *Store) ClearSeriesHistory(ctx context.Context, ids []int64) (PurgeCounts, error) {
+	if len(ids) == 0 {
+		return PurgeCounts{}, nil
+	}
+	s.rollupMu.Lock()
+	defer s.rollupMu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := time.Now().Unix()
+	var counts PurgeCounts
+	for _, id := range ids {
+		n, err := s.ts.RawCount(ctx, id, 0, 0)
+		if err != nil {
+			return counts, err
+		}
+		counts.Samples += n
+		if _, err := s.db.ExecContext(ctx,
+			`UPDATE series SET purge_cutoff=? WHERE id=? AND purge_cutoff<?`, now, id, now); err != nil {
+			return counts, err
+		}
+		// The cutoff hides everything at or before it; the latest cache must
+		// follow immediately (refresh reads via the cutoff-clamped path).
+		if err := s.refreshLatestLocked(ctx, id); err != nil {
+			delete(s.latest, id)
+		}
+		// Rollup watermarks stay where they are: recompute clamps to the cutoff
+		// (see rollupTier), so history below it is simply never revisited.
+	}
+	return counts, nil
+}
+
 // InventoryEntry is one stored series row (a single generation) with its data
 // extent and an approximate sample count. The cleanup service collapses
 // generations of the same logical (agent, monitor, kind, target) key and joins
@@ -140,102 +239,112 @@ type InventoryEntry struct {
 	Unit       string `json:"unit"`
 	Earliest   int64  `json:"earliest_ts"` // 0 = no data
 	Latest     int64  `json:"latest_ts"`
-	EstSamples int64  `json:"est_samples"` // approximate; from rollup counters
+	EstSamples int64  `json:"est_samples"` // approximate; from bucket counters
 }
 
 // CleanupInventory returns every series row for a site with its data extent and
-// an approximate sample count, ordered for stable grouping. Reads run on the read
-// pool. Counts are estimates from the rollup counters (never a COUNT(*) over the
-// large samples table): SUM(cnt) of the 1d rollup, else the 1m rollup, else a
-// bounded raw count for a series younger than one rollup bucket.
+// an approximate sample count, ordered for stable grouping. Counts are
+// estimates from the bucket counters (never a full decompressing count over
+// raw): Σcnt of the 1d tier, else the 1m tier, else a raw count for a series
+// younger than one bucket.
 func (s *Store) CleanupInventory(ctx context.Context, siteID string) ([]InventoryEntry, error) {
 	rows, err := s.db.Read().QueryContext(ctx, `
-		SELECT id, agent_id, COALESCE(monitor_id,''), kind, COALESCE(target,''), COALESCE(layer,''), COALESCE(unit,'')
+		SELECT id, agent_id, COALESCE(monitor_id,''), kind, COALESCE(target,''), COALESCE(layer,''), COALESCE(unit,''), purge_cutoff
 		FROM series WHERE site_id=? ORDER BY agent_id, monitor_id, kind, target, config_serial`, siteID)
 	if err != nil {
 		return nil, err
 	}
 	var out []InventoryEntry
+	var cutoffs []int64
 	for rows.Next() {
 		var e InventoryEntry
-		if err := rows.Scan(&e.SeriesID, &e.AgentID, &e.MonitorID, &e.Kind, &e.Target, &e.Layer, &e.Unit); err != nil {
+		var cutoff int64
+		if err := rows.Scan(&e.SeriesID, &e.AgentID, &e.MonitorID, &e.Kind, &e.Target, &e.Layer, &e.Unit, &cutoff); err != nil {
 			rows.Close()
 			return nil, err
 		}
 		out = append(out, e)
+		cutoffs = append(cutoffs, cutoff)
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
 	for i := range out {
-		if err := s.fillEntryStats(ctx, &out[i]); err != nil {
+		if err := s.fillEntryStats(ctx, &out[i], cutoffs[i]); err != nil {
 			return nil, err
 		}
 	}
 	return out, nil
 }
 
-// fillEntryStats populates one entry's earliest/latest/est from index-bounded
-// per-series seeks (MIN/MAX use the (series_id, ts) PK; the rollup SUMs scan only
-// that series' bucket rows).
-func (s *Store) fillEntryStats(ctx context.Context, e *InventoryEntry) error {
-	var sMin, sMax, dMin, dMax sql.NullInt64
-	var d1, m1 int64
-	err := s.db.Read().QueryRowContext(ctx, `
-		SELECT
-			(SELECT MIN(ts) FROM samples   WHERE series_id=?),
-			(SELECT MAX(ts) FROM samples   WHERE series_id=?),
-			(SELECT MIN(ts) FROM rollup_1d WHERE series_id=?),
-			(SELECT MAX(ts) FROM rollup_1d WHERE series_id=?),
-			(SELECT COALESCE(SUM(cnt),0) FROM rollup_1d WHERE series_id=?),
-			(SELECT COALESCE(SUM(cnt),0) FROM rollup_1m WHERE series_id=?)`,
-		e.SeriesID, e.SeriesID, e.SeriesID, e.SeriesID, e.SeriesID, e.SeriesID).
-		Scan(&sMin, &sMax, &dMin, &dMax, &d1, &m1)
+// fillEntryStats populates one entry's earliest/latest/est from the data
+// plane's per-series extents, clamped to the purge cutoff.
+func (s *Store) fillEntryStats(ctx context.Context, e *InventoryEntry, cutoff int64) error {
+	rawMin, rawMax, rawOK, err := s.ts.RawExtent(ctx, e.SeriesID)
 	if err != nil {
 		return err
 	}
-	e.Earliest = minNonZero(nullVal(sMin), nullVal(dMin))
-	latest := nullVal(sMax)
-	if dMax.Valid && dMax.Int64+86400 > latest {
-		latest = dMax.Int64 + 86400
+	d1Min, d1Max, d1OK, err := s.ts.BucketExtent(ctx, tsstore.TierD1, e.SeriesID)
+	if err != nil {
+		return err
 	}
-	e.Latest = latest
-	switch {
-	case d1 > 0:
-		e.EstSamples = d1
-	case m1 > 0:
-		e.EstSamples = m1
-	case sMin.Valid:
-		// Young series with only raw samples: a bounded count of its own rows.
-		_ = s.db.Read().QueryRowContext(ctx, `SELECT COUNT(*) FROM samples WHERE series_id=?`, e.SeriesID).Scan(&e.EstSamples)
+	var earliest, latest int64
+	if rawOK {
+		earliest, latest = rawMin, rawMax
+	}
+	if d1OK {
+		if earliest == 0 || d1Min < earliest {
+			earliest = d1Min
+		}
+		if d1Max+86400 > latest {
+			latest = d1Max + 86400
+		}
+	}
+	if cutoff > 0 && earliest != 0 && earliest < cutoff {
+		earliest = cutoff
+	}
+	if cutoff > 0 && latest != 0 && latest <= cutoff {
+		earliest, latest = 0, 0 // everything recorded is hidden
+	}
+	e.Earliest, e.Latest = earliest, latest
+
+	sumCnt := func(tier tsstore.Tier) (int64, error) {
+		buckets, err := s.ts.ReadBuckets(ctx, tier, e.SeriesID, cutoff, 0)
+		if err != nil {
+			return 0, err
+		}
+		var total int64
+		for _, b := range buckets {
+			total += b.Cnt
+		}
+		return total, nil
+	}
+	if n, err := sumCnt(tsstore.TierD1); err != nil {
+		return err
+	} else if n > 0 {
+		e.EstSamples = n
+		return nil
+	}
+	if n, err := sumCnt(tsstore.TierM1); err != nil {
+		return err
+	} else if n > 0 {
+		e.EstSamples = n
+		return nil
+	}
+	if rawOK {
+		n, err := s.ts.RawCount(ctx, e.SeriesID, cutoff, 0)
+		if err != nil {
+			return err
+		}
+		e.EstSamples = n
 	}
 	return nil
 }
 
-func nullVal(n sql.NullInt64) int64 {
-	if n.Valid {
-		return n.Int64
-	}
-	return 0
-}
-
-func minNonZero(a, b int64) int64 {
-	switch {
-	case a == 0:
-		return b
-	case b == 0:
-		return a
-	case a < b:
-		return a
-	default:
-		return b
-	}
-}
-
-// RangeCounts is the per-tier exact row count of a proposed delete, for the
-// preview. It uses the same bucket-aligned bounds PurgeRange deletes with, so the
-// preview total matches the actual deletion (modulo ingest still in flight).
+// RangeCounts is the per-tier exact count of a proposed delete, for the
+// preview. It uses the same bucket-aligned bounds PurgeRange deletes with, so
+// the preview total matches the actual deletion (modulo ingest in flight).
 type RangeCounts struct {
 	Samples  int64 `json:"samples"`
 	Rollup1m int64 `json:"rollup_1m"`
@@ -243,45 +352,36 @@ type RangeCounts struct {
 	Rollup1d int64 `json:"rollup_1d"`
 }
 
-// Rollups returns the total rollup rows across tiers.
+// Rollups returns the total affected buckets across tiers.
 func (c RangeCounts) Rollups() int64 { return c.Rollup1m + c.Rollup1h + c.Rollup1d }
 
-// CountRange counts the rows a delete of [from, to) over ids would remove. When
-// from==0 && to==0 it counts every row for those series (the full-delete preview).
+// CountRange counts what a delete of [from, to) over ids would remove. When
+// from==0 && to==0 it counts every sample/bucket (the full-delete preview).
 func (s *Store) CountRange(ctx context.Context, ids []int64, from, to int64) (RangeCounts, error) {
 	var c RangeCounts
 	full := from == 0 && to == 0
 	for _, id := range ids {
-		var n int64
-		if full {
-			if err := s.db.Read().QueryRowContext(ctx, `SELECT COUNT(*) FROM samples WHERE series_id=?`, id).Scan(&n); err != nil {
-				return c, err
-			}
-		} else {
-			if err := s.db.Read().QueryRowContext(ctx, `SELECT COUNT(*) FROM samples WHERE series_id=? AND ts>=? AND ts<?`, id, from, to).Scan(&n); err != nil {
-				return c, err
-			}
+		n, err := s.ts.RawCount(ctx, id, from, to)
+		if err != nil {
+			return c, err
 		}
 		c.Samples += n
 		for _, t := range rollupTiers {
-			var rn int64
+			lo, hi := alignDown(from, t.width), to
 			if full {
-				if err := s.db.Read().QueryRowContext(ctx, `SELECT COUNT(*) FROM `+t.table+` WHERE series_id=?`, id).Scan(&rn); err != nil {
-					return c, err
-				}
-			} else {
-				lo := alignDown(from, t.width)
-				if err := s.db.Read().QueryRowContext(ctx, `SELECT COUNT(*) FROM `+t.table+` WHERE series_id=? AND ts>=? AND ts<?`, id, lo, to).Scan(&rn); err != nil {
-					return c, err
-				}
+				lo, hi = 0, 0
+			}
+			buckets, err := s.ts.ReadBuckets(ctx, tierOf(t.table), id, lo, hi)
+			if err != nil {
+				return c, err
 			}
 			switch t.table {
 			case "rollup_1m":
-				c.Rollup1m += rn
+				c.Rollup1m += int64(len(buckets))
 			case "rollup_1h":
-				c.Rollup1h += rn
+				c.Rollup1h += int64(len(buckets))
 			case "rollup_1d":
-				c.Rollup1d += rn
+				c.Rollup1d += int64(len(buckets))
 			}
 		}
 	}

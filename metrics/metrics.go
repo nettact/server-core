@@ -1,8 +1,11 @@
-// Package metrics is the time-series store: a series dictionary + narrow raw
-// samples + downsampled rollups, sized for months-to-years of history in SQLite
-// (see the series/samples/rollup tables in the schema). Ingest writes samples;
-// the API and rule engine read via resolution-aware queries so any time range
-// returns a bounded number of points.
+// Package metrics is the time-series layer: the SQLite series dictionary, the
+// in-memory latest-value cache, the query planner, and the rollup/purge
+// bookkeeping — while the sample data itself lives in the tsstore data plane
+// (embedded Prometheus TSDB instances; see package tsstore for why SQLite
+// stopped holding it: per-series B-tree tail pages made every 30s packet
+// commit rewrite ~2.6KB per stored float). What stays relational stays here:
+// series identity, rollup_state watermarks, and everything reads need to
+// resolve WHICH series to fetch before touching the data plane.
 //
 // Series are keyed by (agent, monitor, kind, target, config_serial): monitor_id is
 // the user-created monitor (probe_tasks.id) stamped by the agent, and config_serial
@@ -12,7 +15,7 @@
 //
 // Hot reads (the /latest snapshot and rule evaluation, which runs on every
 // ingest) are served from an in-memory latest-value cache updated at ingest —
-// no SQL on those paths after the per-agent warm-up.
+// no storage reads on those paths after the per-agent warm-up.
 package metrics
 
 import (
@@ -28,6 +31,7 @@ import (
 
 	"github.com/nettact/protocol/telemetry"
 	"github.com/nettact/server-core/store"
+	"github.com/nettact/server-core/tsstore"
 )
 
 // seriesIdent is the in-memory identity of one series row. config_serial is part
@@ -42,6 +46,7 @@ type seriesIdent struct {
 	layer        string
 	unit         string
 	configSerial int
+	purgeCutoff  int64 // series.purge_cutoff; reads clamp below it
 }
 
 type latestVal struct {
@@ -51,6 +56,7 @@ type latestVal struct {
 
 type Store struct {
 	db *store.DB
+	ts tsstore.SeriesStore
 
 	mu      sync.Mutex
 	cache   map[string]int64                  // seriesKey -> series id
@@ -58,23 +64,45 @@ type Store struct {
 	latest  map[int64]latestVal               // series id -> newest sample
 	warmed  map[string]bool                   // agent -> identities+latest loaded from DB
 	purged  map[int64]purgeWindow             // series id -> last purged range; see UpdateLatest
-	// retention is the window set the PRUNER deletes by, kept here so reads can
-	// tell which tier still holds a given moment. It is the same value the host
-	// passes to Retention; SetRetention exists so a host that configures
-	// non-default windows keeps the two in agreement.
+	// retention is the window set the data plane drops blocks by, kept here so
+	// reads can tell which tier still holds a given moment. It is the same value
+	// the host derived tsstore.Config from; SetRetention exists so a host that
+	// configures non-default windows keeps the two in agreement.
 	retention RetentionConfig
+
+	// rollupMu serializes every bucket-affecting operation: the rollup pass,
+	// PurgeRange, PurgeSeriesIDs and full-history clears. The k-encoded repair
+	// protocol (read window max ms → SQLite watermark rewind → append → CAS)
+	// is a multi-step exchange across two stores; interleaving two of them on
+	// one (tier, sid) can allocate the same k twice or cascade a rewind that a
+	// concurrent pass immediately re-advances past.
+	rollupMu sync.Mutex
+
+	// pendingAppend marks series whose ingest transaction has COMMITTED (the
+	// rollup_state rewind is durable) but whose raw samples have not yet
+	// reached the data plane — AppendRaw runs after the SQLite commit. The
+	// rollup pass skips marked series: recomputing in that gap would consume
+	// the rewind, advance the watermark past the still-in-flight samples, and
+	// silently exclude them from every tier forever. Entries are cleared once
+	// AppendRaw returns; a crash clears them trivially (process state) while
+	// the durable rewind makes the next pass recompute — the unchanged-guard
+	// then absorbs it. Guarded by pendingMu (not mu: ingest holds it across a
+	// data-plane write and must not block cache reads).
+	pendingMu     sync.Mutex
+	pendingAppend map[int64]int
 }
 
 // purgeWindow is a deleted [from, to) sample range. An UpdateLatest fold whose
 // ts lands inside it may belong to a batch that committed BEFORE the purge ran
-// (the rows are gone), so such folds re-verify against the DB instead of
-// resurrecting deleted samples in the latest cache. until bounds the guard in
-// wall-clock time; it is stamped when PurgeRange RELEASES s.mu (not when the
-// window is recorded), so a fold that spent an arbitrarily long purge blocked
-// on the mutex still finds a live guard. Only folds already in flight at purge
-// time can race, and those land within milliseconds of the unlock, so entries
-// expire quickly instead of forcing DB reads forever (a full-history purge has
-// to==maxTS). Expired entries are swept by the next fold or purge.
+// (the rows are gone), so such folds re-verify against the data plane instead
+// of resurrecting deleted samples in the latest cache. until bounds the guard
+// in wall-clock time; it is stamped when PurgeRange RELEASES s.mu (not when
+// the window is recorded), so a fold that spent an arbitrarily long purge
+// blocked on the mutex still finds a live guard. Only folds already in flight
+// at purge time can race, and those land within milliseconds of the unlock, so
+// entries expire quickly instead of forcing storage reads forever (a
+// full-history purge has to==maxTS). Expired entries are swept by the next
+// fold or purge.
 type purgeWindow struct{ from, to, until int64 }
 
 // purgeGuardSeconds is how long a purge window keeps guarding folds. Generous
@@ -82,15 +110,17 @@ type purgeWindow struct{ from, to, until int64 }
 // hot ingest path returns to pure cache hits almost immediately.
 const purgeGuardSeconds = 30
 
-func New(db *store.DB) *Store {
+func New(db *store.DB, ts tsstore.SeriesStore) *Store {
 	return &Store{
-		db:        db,
-		cache:     make(map[string]int64),
-		byAgent:   make(map[string]map[int64]*seriesIdent),
-		latest:    make(map[int64]latestVal),
-		warmed:    make(map[string]bool),
-		purged:    make(map[int64]purgeWindow),
-		retention: DefaultRetention(),
+		db:            db,
+		ts:            ts,
+		cache:         make(map[string]int64),
+		byAgent:       make(map[string]map[int64]*seriesIdent),
+		latest:        make(map[int64]latestVal),
+		warmed:        make(map[string]bool),
+		purged:        make(map[int64]purgeWindow),
+		pendingAppend: make(map[int64]int),
+		retention:     DefaultRetention(),
 	}
 }
 
@@ -136,7 +166,7 @@ func (s *Store) warmAgentLocked(ctx context.Context, agentID string) error {
 		return nil
 	}
 	rows, err := s.db.Read().QueryContext(ctx, `
-		SELECT id, COALESCE(monitor_id,''), kind, COALESCE(target,''), COALESCE(layer,''), COALESCE(unit,''), config_serial
+		SELECT id, COALESCE(monitor_id,''), kind, COALESCE(target,''), COALESCE(layer,''), COALESCE(unit,''), config_serial, purge_cutoff
 		FROM series WHERE agent_id=?`, agentID)
 	if err != nil {
 		return err
@@ -144,7 +174,7 @@ func (s *Store) warmAgentLocked(ctx context.Context, agentID string) error {
 	var idents []*seriesIdent
 	for rows.Next() {
 		var si seriesIdent
-		if err := rows.Scan(&si.id, &si.monitorID, &si.kind, &si.target, &si.layer, &si.unit, &si.configSerial); err != nil {
+		if err := rows.Scan(&si.id, &si.monitorID, &si.kind, &si.target, &si.layer, &si.unit, &si.configSerial, &si.purgeCutoff); err != nil {
 			rows.Close()
 			return err
 		}
@@ -156,20 +186,37 @@ func (s *Store) warmAgentLocked(ctx context.Context, agentID string) error {
 	}
 	for _, si := range idents {
 		s.registerLocked(agentID, si)
+	}
+	// One bulk read resolves every series' newest sample; in-memory values that
+	// are already newer (ingested since startup) are kept. The lower bound is
+	// the raw tier's LOGICAL window — anything older would not be served as
+	// "current" anyway — raised to the series' own purge cutoff where one is set.
+	bound := time.Now().Unix() - s.retention.RawSeconds
+	var missing []int64
+	for _, si := range idents {
 		if _, ok := s.latest[si.id]; ok {
-			continue // fresher value already ingested this process
-		}
-		var ts int64
-		var v float64
-		err := s.db.Read().QueryRowContext(ctx,
-			`SELECT ts, value FROM samples WHERE series_id=? ORDER BY ts DESC LIMIT 1`, si.id).Scan(&ts, &v)
-		if err == sql.ErrNoRows {
 			continue
 		}
+		if si.purgeCutoff > bound {
+			one, err := s.ts.RawLatest(ctx, []int64{si.id}, si.purgeCutoff)
+			if err != nil {
+				return err
+			}
+			if smp, ok := one[si.id]; ok {
+				s.latest[si.id] = latestVal{ts: smp.TS, value: smp.Value}
+			}
+			continue
+		}
+		missing = append(missing, si.id)
+	}
+	if len(missing) > 0 {
+		latest, err := s.ts.RawLatest(ctx, missing, bound)
 		if err != nil {
 			return err
 		}
-		s.latest[si.id] = latestVal{ts: ts, value: v}
+		for id, smp := range latest {
+			s.latest[id] = latestVal{ts: smp.TS, value: smp.Value}
+		}
 	}
 	s.warmed[agentID] = true
 	return nil
@@ -216,16 +263,15 @@ func (s *Store) EnsureSeries(ctx context.Context, agentID, siteID string, ms []t
 	return out, nil
 }
 
-// InsertSamples writes raw samples inside the caller's transaction using one
-// prepared statement for the whole batch. ids comes from EnsureSeries.
-// Idempotent: a replayed packet's samples are ignored. The latest cache is NOT
-// touched here — the tx may still roll back; call UpdateLatest after commit.
-func (s *Store) InsertSamples(ctx context.Context, tx *sql.Tx, agentID string, ids map[string]int64, ms []telemetry.Metric) error {
-	stmt, err := tx.PrepareContext(ctx, `INSERT OR IGNORE INTO samples(series_id, ts, value) VALUES(?,?,?)`)
-	if err != nil {
-		return err
-	}
-	defer stmt.Close()
+// RewindForBatch runs inside the ingest transaction where InsertSamples used
+// to: samples now reach the data plane AFTER this transaction commits (see
+// ingest's ordering), so the 1m watermark rewind — the durable intent that
+// makes a backfilled range get re-aggregated — is computed from the WHOLE
+// batch rather than from "rows that actually landed". The loosening is
+// deliberate and cheap: a replayed old packet may issue a rewind whose
+// recompute finds nothing changed, and the rollup upsert's unchanged-guard
+// then writes nothing. ids comes from EnsureSeries.
+func (s *Store) RewindForBatch(ctx context.Context, tx *sql.Tx, agentID string, ids map[string]int64, ms []telemetry.Metric) error {
 	oldest := make(map[int64]int64, len(ids))
 	for i := range ms {
 		m := &ms[i]
@@ -234,22 +280,57 @@ func (s *Store) InsertSamples(ctx context.Context, tx *sql.Tx, agentID string, i
 			continue
 		}
 		ts := m.TS.Unix()
-		wrote, err := stmt.ExecContext(ctx, id, ts, m.Value)
-		if err != nil {
-			return err
-		}
-		// Only a sample that actually landed can change history. INSERT OR IGNORE
-		// reports zero rows for one that was already stored — a replayed packet
-		// under a fresh sequence, or a retry — and rewinding for those would drag
-		// the watermark back over months of unchanged history for nothing.
-		if n, _ := wrote.RowsAffected(); n == 0 {
-			continue
-		}
 		if cur, ok := oldest[id]; !ok || ts < cur {
 			oldest[id] = ts
 		}
 	}
 	return rewindRollups(ctx, tx, oldest)
+}
+
+// AppendRawSamples writes a committed batch's samples to the data plane —
+// ingest calls it AFTER its SQLite transaction commits (see the ordering
+// rationale there). The conversion mirrors RewindForBatch's key lookup so the
+// two can never disagree about which series a metric lands in.
+func (s *Store) AppendRawSamples(ctx context.Context, agentID string, ids map[string]int64, ms []telemetry.Metric) (tsstore.AppendResult, error) {
+	raws := make([]tsstore.RawSample, 0, len(ms))
+	for i := range ms {
+		m := &ms[i]
+		id, ok := ids[seriesKey(agentID, m.MonitorID, string(m.Kind), m.Target, m.ConfigSerial)]
+		if !ok {
+			continue
+		}
+		raws = append(raws, tsstore.RawSample{SID: id, TS: m.TS.Unix(), Value: m.Value})
+	}
+	return s.ts.AppendRaw(ctx, raws)
+}
+
+// BeginPendingAppend marks the batch's series as having a committed rewind
+// whose raw samples are still in flight to the data plane; the rollup pass
+// skips them until the returned done() runs (after AppendRaw). See the
+// pendingAppend field comment for why the gap matters.
+func (s *Store) BeginPendingAppend(ids map[string]int64) (done func()) {
+	s.pendingMu.Lock()
+	for _, id := range ids {
+		s.pendingAppend[id]++
+	}
+	s.pendingMu.Unlock()
+	return func() {
+		s.pendingMu.Lock()
+		for _, id := range ids {
+			if s.pendingAppend[id] <= 1 {
+				delete(s.pendingAppend, id)
+			} else {
+				s.pendingAppend[id]--
+			}
+		}
+		s.pendingMu.Unlock()
+	}
+}
+
+func (s *Store) isPendingAppend(id int64) bool {
+	s.pendingMu.Lock()
+	defer s.pendingMu.Unlock()
+	return s.pendingAppend[id] > 0
 }
 
 // rewindRollups pulls a series' 1m rollup watermark back behind any sample that
@@ -329,24 +410,53 @@ func (s *Store) UpdateLatest(agentID string, ids map[string]int64, ms []telemetr
 	}
 }
 
-// refreshLatestLocked re-reads a series' newest surviving sample from the DB
-// into the latest cache (or evicts the entry when none remain). Caller holds
-// s.mu and decides how to handle a read failure.
+// LatestSample is one cached newest observation, as served to targetstatus.
+type LatestSample struct {
+	TS    int64
+	Value float64
+}
+
+// LatestForSeries returns the cached newest sample per series id, warming each
+// named agent's cache first. A series with no cached value (nothing ingested,
+// or everything hidden behind its purge cutoff) is absent from the map — the
+// caller's honest no_data.
+func (s *Store) LatestForSeries(ctx context.Context, agentIDs []string, ids []int64) (map[int64]LatestSample, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, a := range agentIDs {
+		if err := s.warmAgentLocked(ctx, a); err != nil {
+			return nil, err
+		}
+	}
+	out := make(map[int64]LatestSample, len(ids))
+	for _, id := range ids {
+		if lv, ok := s.latest[id]; ok {
+			out[id] = LatestSample{TS: lv.ts, Value: lv.value}
+		}
+	}
+	return out, nil
+}
+
+// refreshLatestLocked re-reads a series' newest surviving sample from the data
+// plane into the latest cache (tombstones are applied at read time there, and
+// the purge cutoff clamps a full-history clear), or evicts the entry when none
+// remain. Caller holds s.mu and decides how to handle a read failure.
 func (s *Store) refreshLatestLocked(ctx context.Context, id int64) error {
-	var ts int64
-	var v float64
-	err := s.db.Read().QueryRowContext(ctx,
-		`SELECT ts, value FROM samples WHERE series_id=? ORDER BY ts DESC LIMIT 1`, id).Scan(&ts, &v)
-	switch err {
-	case nil:
-		s.latest[id] = latestVal{ts: ts, value: v}
-		return nil
-	case sql.ErrNoRows:
-		delete(s.latest, id)
-		return nil
-	default:
+	var cutoff int64
+	if err := s.db.Read().QueryRowContext(ctx,
+		`SELECT purge_cutoff FROM series WHERE id=?`, id).Scan(&cutoff); err != nil && err != sql.ErrNoRows {
 		return err
 	}
+	latest, err := s.ts.RawLatest(ctx, []int64{id}, cutoff)
+	if err != nil {
+		return err
+	}
+	if smp, ok := latest[id]; ok {
+		s.latest[id] = latestVal{ts: smp.TS, value: smp.Value}
+	} else {
+		delete(s.latest, id)
+	}
+	return nil
 }
 
 // Point is a returned time-series point.
@@ -439,12 +549,26 @@ func pickTierFor(rangeSec, windowStart, now int64, ret RetentionConfig) (table s
 }
 
 type seriesMeta struct {
-	id        int64
-	monitorID string
-	kind      string
-	target    string
-	layer     string
-	unit      string
+	id          int64
+	monitorID   string
+	kind        string
+	target      string
+	layer       string
+	unit        string
+	purgeCutoff int64
+}
+
+// tierOf maps the ladder's table names (kept for pickTier/retention symmetry)
+// onto data-plane tiers.
+func tierOf(table string) tsstore.Tier {
+	switch table {
+	case "rollup_1m":
+		return tsstore.TierM1
+	case "rollup_1h":
+		return tsstore.TierH1
+	default:
+		return tsstore.TierD1
+	}
 }
 
 // Query returns points for the matching series at a resolution appropriate to
@@ -487,7 +611,7 @@ func (s *Store) Query(ctx context.Context, q Query) ([]Point, error) {
 		limit = 1000
 	}
 
-	sqlSeries := `SELECT id, COALESCE(monitor_id,''), kind, COALESCE(target,''), COALESCE(layer,''), COALESCE(unit,'') FROM series WHERE agent_id=? AND kind=?`
+	sqlSeries := `SELECT id, COALESCE(monitor_id,''), kind, COALESCE(target,''), COALESCE(layer,''), COALESCE(unit,''), purge_cutoff FROM series WHERE agent_id=? AND kind=?`
 	args := []any{q.AgentID, q.Kind}
 	if q.Target != "" {
 		sqlSeries += ` AND target=?`
@@ -504,7 +628,7 @@ func (s *Store) Query(ctx context.Context, q Query) ([]Point, error) {
 	var series []seriesMeta
 	for rows.Next() {
 		var m seriesMeta
-		if err := rows.Scan(&m.id, &m.monitorID, &m.kind, &m.target, &m.layer, &m.unit); err != nil {
+		if err := rows.Scan(&m.id, &m.monitorID, &m.kind, &m.target, &m.layer, &m.unit, &m.purgeCutoff); err != nil {
 			rows.Close()
 			return nil, err
 		}
@@ -516,43 +640,52 @@ func (s *Store) Query(ctx context.Context, q Query) ([]Point, error) {
 	}
 
 	table, raw := pickTierFor(tierEnd-since, since, now, s.retentionCfg())
-	valueExpr := `ts, total/cnt`
-	if raw {
-		table, valueExpr = "samples", `ts, value`
-	}
-	sqlPts := `SELECT ` + valueExpr + ` FROM ` + table + ` WHERE series_id=? AND ts>=?`
-	ptArgs := []any{int64(0), since}
+	// The interface ranges are half-open; this API's until is inclusive, so the
+	// data-plane bound is until+1 (0 stays "unbounded", preserving the
+	// future-samples-kept semantics above).
+	untilX := int64(0)
 	if until > 0 {
-		sqlPts += ` AND ts<=?`
-		ptArgs = append(ptArgs, until)
+		untilX = until + 1
 	}
-	// The limit still takes the EARLIEST points of the range, now counted within
-	// the bounded window rather than against everything after since.
-	sqlPts += ` ORDER BY ts LIMIT ?`
-	ptArgs = append(ptArgs, limit)
-
 	var out []Point
 	for _, sm := range series {
-		ptArgs[0] = sm.id
-		prows, err := s.db.Read().QueryContext(ctx, sqlPts, ptArgs...)
+		// A full-history clear (series.purge_cutoff) hides everything before the
+		// cutoff without a single tombstone; the clamp is the entire mechanism.
+		effSince := since
+		if sm.purgeCutoff > effSince {
+			effSince = sm.purgeCutoff
+		}
+		if untilX > 0 && effSince >= untilX {
+			continue
+		}
+		if raw {
+			samples, err := s.ts.RawRange(ctx, sm.id, effSince, untilX, limit)
+			if err != nil {
+				return nil, err
+			}
+			for _, smp := range samples {
+				out = append(out, Point{
+					TS: time.Unix(smp.TS, 0).UTC(), Kind: sm.kind, Target: sm.target,
+					Layer: sm.layer, Value: smp.Value, Unit: sm.unit, MonitorID: sm.monitorID,
+				})
+			}
+			continue
+		}
+		buckets, err := s.ts.ReadBuckets(ctx, tierOf(table), sm.id, effSince, untilX)
 		if err != nil {
 			return nil, err
 		}
-		for prows.Next() {
-			var tsUnix int64
-			var value float64
-			if err := prows.Scan(&tsUnix, &value); err != nil {
-				prows.Close()
-				return nil, err
+		if len(buckets) > limit {
+			buckets = buckets[:limit] // earliest points, matching the raw branch
+		}
+		for _, b := range buckets {
+			if b.Cnt == 0 {
+				continue
 			}
 			out = append(out, Point{
-				TS: time.Unix(tsUnix, 0).UTC(), Kind: sm.kind, Target: sm.target,
-				Layer: sm.layer, Value: value, Unit: sm.unit, MonitorID: sm.monitorID,
+				TS: time.Unix(b.TS, 0).UTC(), Kind: sm.kind, Target: sm.target,
+				Layer: sm.layer, Value: b.Sum / float64(b.Cnt), Unit: sm.unit, MonitorID: sm.monitorID,
 			})
-		}
-		prows.Close()
-		if err := prows.Err(); err != nil {
-			return nil, err
 		}
 	}
 	// Merge generations: same (kind, target, monitor) logical series may now span
@@ -657,7 +790,7 @@ func (s *Store) Summarize(ctx context.Context, q SummaryQuery) (map[string]KindS
 
 	out := make(map[string]KindSummary, len(q.Kinds))
 	for _, kind := range q.Kinds {
-		sqlSeries := `SELECT id, COALESCE(monitor_id,''), COALESCE(target,'') FROM series WHERE agent_id=? AND kind=?`
+		sqlSeries := `SELECT id, COALESCE(monitor_id,''), COALESCE(target,''), purge_cutoff FROM series WHERE agent_id=? AND kind=?`
 		args := []any{q.AgentID, kind}
 		if q.Target != "" {
 			sqlSeries += ` AND target=?`
@@ -674,11 +807,12 @@ func (s *Store) Summarize(ctx context.Context, q SummaryQuery) (map[string]KindS
 		type seriesRef struct {
 			id                int64
 			monitorID, target string
+			purgeCutoff       int64
 		}
 		var series []seriesRef
 		for rows.Next() {
 			var sr seriesRef
-			if err := rows.Scan(&sr.id, &sr.monitorID, &sr.target); err != nil {
+			if err := rows.Scan(&sr.id, &sr.monitorID, &sr.target, &sr.purgeCutoff); err != nil {
 				rows.Close()
 				return nil, err
 			}
@@ -707,30 +841,22 @@ func (s *Store) Summarize(ctx context.Context, q SummaryQuery) (map[string]KindS
 			worst = make(map[int64]float64)
 		}
 		for _, sr := range series {
-			prows, err := s.db.Read().QueryContext(ctx,
-				`SELECT ts, value FROM samples WHERE series_id=? AND ts>=? ORDER BY ts LIMIT ?`,
-				sr.id, since, perSeriesLimit)
+			effSince := since
+			if sr.purgeCutoff > effSince {
+				effSince = sr.purgeCutoff
+			}
+			samples, err := s.ts.RawRange(ctx, sr.id, effSince, 0, int(perSeriesLimit))
 			if err != nil {
 				return nil, err
 			}
-			for prows.Next() {
-				var ts int64
-				var value float64
-				if err := prows.Scan(&ts, &value); err != nil {
-					prows.Close()
-					return nil, err
-				}
+			for _, smp := range samples {
 				if worst != nil {
-					if prev, ok := worst[ts]; !ok || value > prev {
-						worst[ts] = value
+					if prev, ok := worst[smp.TS]; !ok || smp.Value > prev {
+						worst[smp.TS] = smp.Value
 					}
 					continue
 				}
-				merged = append(merged, sample{ts: ts, value: value, target: sr.target, monitorID: sr.monitorID})
-			}
-			prows.Close()
-			if err := prows.Err(); err != nil {
-				return nil, err
+				merged = append(merged, sample{ts: smp.TS, value: smp.Value, target: sr.target, monitorID: sr.monitorID})
 			}
 		}
 		if worst != nil {
@@ -795,28 +921,26 @@ func (s *Store) Summarize(ctx context.Context, q SummaryQuery) (map[string]KindS
 	return out, nil
 }
 
-// Stats reports row counts per tier (storage visibility).
+// Stats reports the dictionary size and the data plane's per-tier footprint
+// (storage visibility for the console's settings page). Row counts died with
+// the SQLite tables — counting TSDB samples means decompressing every chunk —
+// so the panel shows disk bytes and head series instead, which is what an
+// operator sizing a disk actually wants.
 type Stats struct {
-	Series   int64 `json:"series"`
-	Samples  int64 `json:"samples"`
-	Rollup1m int64 `json:"rollup_1m"`
-	Rollup1h int64 `json:"rollup_1h"`
-	Rollup1d int64 `json:"rollup_1d"`
+	Series int64         `json:"series"`
+	TSDB   tsstore.Stats `json:"tsdb"`
 }
 
 func (s *Store) Stats(ctx context.Context) (Stats, error) {
 	var st Stats
-	for _, c := range []struct {
-		table string
-		dst   *int64
-	}{
-		{"series", &st.Series}, {"samples", &st.Samples},
-		{"rollup_1m", &st.Rollup1m}, {"rollup_1h", &st.Rollup1h}, {"rollup_1d", &st.Rollup1d},
-	} {
-		if err := s.db.Read().QueryRowContext(ctx, `SELECT COUNT(*) FROM `+c.table).Scan(c.dst); err != nil {
-			return st, err
-		}
+	if err := s.db.Read().QueryRowContext(ctx, `SELECT COUNT(*) FROM series`).Scan(&st.Series); err != nil {
+		return st, err
 	}
+	ts, err := s.ts.Stats(ctx)
+	if err != nil {
+		return st, err
+	}
+	st.TSDB = ts
 	return st, nil
 }
 

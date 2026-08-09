@@ -14,6 +14,7 @@ import (
 	"github.com/nettact/server-core/metrics"
 	"github.com/nettact/server-core/store"
 	"github.com/nettact/server-core/store/storetest"
+	"github.com/nettact/server-core/tsstore/tsstoretest"
 )
 
 // The one seam the unit tests above cannot reach: a real telemetry packet going
@@ -42,9 +43,10 @@ func newDegHarness(t *testing.T) *degHarness {
 	h.exec(`INSERT INTO probe_tasks(id,site_id,group_id,kind,name,target,params,enabled,config_serial)
 	        VALUES('t_icmp','site_default','mg','icmp','Router','192.168.1.1','{}',1,1)`)
 
-	m := metrics.New(db)
+	ts := tsstoretest.Open(t)
+	m := metrics.New(db, ts)
 	faultSvc := fault.New(db, eventbus.New(), nil)
-	h.svc = New(db, nil, m, faultSvc, baseline.New(db), nil)
+	h.svc = New(db, nil, m, faultSvc, baseline.New(db, ts), nil)
 	return h
 }
 

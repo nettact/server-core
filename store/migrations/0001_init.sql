@@ -119,7 +119,14 @@ CREATE TABLE agents(
   -- reported.
   upload_interval_seconds INTEGER NOT NULL DEFAULT 0,
   status TEXT NOT NULL DEFAULT 'online',
-  reported_config_version INTEGER NOT NULL DEFAULT 0,
+  -- Highest packet sequence ever COMMITTED from this agent's current
+  -- installation — the ingest dedup watermark (replaces the old agent_packets
+  -- row-per-packet table). The agent's WAL is FIFO per server with a single
+  -- in-flight packet resent under its original sequence until acked, and the
+  -- ack is cumulative, so "seen before" is exactly sequence <= this. Reset to 0
+  -- by reenrollment (AGENT-006): the reinstalled machine's fresh WAL restarts
+  -- at sequence 1.
+  high_sequence INTEGER NOT NULL DEFAULT 0,
   last_seen_at TIMESTAMP,
   revoked INTEGER NOT NULL DEFAULT 0,
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -179,15 +186,6 @@ CREATE TABLE agent_group_members(
   PRIMARY KEY(group_id, agent_id)
 );
 CREATE INDEX idx_agm_agent ON agent_group_members(agent_id);
-
-CREATE TABLE agent_packets(
-  agent_id TEXT NOT NULL,
-  sequence INTEGER NOT NULL,
-  received_at TIMESTAMP NOT NULL,
-  sent_at TIMESTAMP,
-  PRIMARY KEY(agent_id, sequence)
-);
-CREATE INDEX idx_agent_packets_received ON agent_packets(received_at);
 
 CREATE TABLE devices(
   id TEXT PRIMARY KEY,
@@ -419,16 +417,27 @@ CREATE TABLE host_detection_settings(
 
 -- ===== time series =====
 --
--- Narrow, normalized storage sized for months-to-years in SQLite: a series
--- dictionary holds the wide TEXT columns once, samples carry only (series, ts,
--- value), and rollups downsample for long ranges.
+-- The series DICTIONARY: the wide TEXT identity of every time series, stored
+-- once. The sample data itself lives OUTSIDE SQLite, in the tsstore data plane
+-- (embedded Prometheus TSDB instances keyed by series.id) — the old
+-- (series_id, ts) tables rewrote every active series' B-tree tail page on
+-- every packet commit, ~100-400x write amplification. See package tsstore.
 
 CREATE TABLE series(
+  -- AUTOINCREMENT is load-bearing, not style: ids are NEVER reused, and the
+  -- data plane's whole-series delete (tombstones over the id's full history)
+  -- is only safe because a deleted id can never write again.
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   agent_id TEXT NOT NULL, site_id TEXT NOT NULL,
   monitor_id TEXT NOT NULL DEFAULT '', kind TEXT NOT NULL,
   target TEXT NOT NULL DEFAULT '', layer TEXT NOT NULL DEFAULT '',
   unit TEXT NOT NULL DEFAULT '', config_serial INTEGER NOT NULL DEFAULT 0,
+  -- A full-history clear of a LIVE series (cleanup's "delete data, keep the
+  -- monitor"): reads clamp below this unix-seconds cutoff, the old blocks age
+  -- out through ordinary retention. A data-plane tombstone cannot express this
+  -- — an interval reaching into the future would also mask the samples the
+  -- still-live series keeps appending.
+  purge_cutoff INTEGER NOT NULL DEFAULT 0,
   -- Generation-aware identity: a material edit starts a FRESH series, so
   -- old-generation samples can never surface as current.
   UNIQUE(agent_id, monitor_id, kind, target, config_serial)
@@ -437,43 +446,10 @@ CREATE INDEX idx_series_agent_kind ON series(agent_id, kind, target);
 CREATE INDEX idx_series_monitor   ON series(monitor_id);
 CREATE INDEX idx_series_site_kind ON series(site_id, kind);
 
-CREATE TABLE samples(
-  series_id INTEGER NOT NULL,
-  ts        INTEGER NOT NULL, -- unix seconds
-  value     REAL NOT NULL,
-  PRIMARY KEY(series_id, ts)
-) WITHOUT ROWID;
-
-CREATE TABLE rollup_1m(
-  series_id INTEGER NOT NULL,
-  ts        INTEGER NOT NULL, -- bucket start (unix seconds, aligned to 60)
-  cnt       INTEGER NOT NULL,
-  total     REAL NOT NULL,
-  vmin      REAL NOT NULL,
-  vmax      REAL NOT NULL,
-  PRIMARY KEY(series_id, ts)
-) WITHOUT ROWID;
-
-CREATE TABLE rollup_1h(
-  series_id INTEGER NOT NULL,
-  ts        INTEGER NOT NULL,
-  cnt       INTEGER NOT NULL,
-  total     REAL NOT NULL,
-  vmin      REAL NOT NULL,
-  vmax      REAL NOT NULL,
-  PRIMARY KEY(series_id, ts)
-) WITHOUT ROWID;
-
-CREATE TABLE rollup_1d(
-  series_id INTEGER NOT NULL,
-  ts        INTEGER NOT NULL,
-  cnt       INTEGER NOT NULL,
-  total     REAL NOT NULL,
-  vmin      REAL NOT NULL,
-  vmax      REAL NOT NULL,
-  PRIMARY KEY(series_id, ts)
-) WITHOUT ROWID;
-
+-- Per-(tier, series) downsampling watermarks. The BUCKETS these fence live in
+-- the data plane; the watermarks stay relational because the rollup job's
+-- correctness hangs on their transactional edges (ingest's backfill rewind,
+-- the parent-tier cascade, the CAS advance — see metrics/rollup.go).
 CREATE TABLE rollup_state(
   resolution TEXT NOT NULL,    -- '1m' | '1h' | '1d'
   series_id  INTEGER NOT NULL,

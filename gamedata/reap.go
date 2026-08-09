@@ -71,12 +71,13 @@ import (
 // already older than the grace when its agent drops — after a server restart, or
 // an upload backlog, i.e. exactly when a live agent looks stale — would be closed
 // on the very first tick with no grace at all. agents.last_seen_at is the right
-// clock for it because agentws pings every 15s and each successful ping bumps it,
-// so a connected agent's stamp is never more than a ping old whatever its upload
-// cadence is, and it is the same column the offline sweeper thresholds on: waiting
-// two minutes past it is waiting ~two minutes past the disconnect, which absorbs a
-// reconnect blip, an agent restart and a server restart without ending a run that
-// is still being played.
+// clock for it because it is bumped by the same liveness paths the offline
+// sweeper thresholds on. One caveat sizes the constant below: the steady-state
+// bumps are THROTTLED (registry touchInterval, 60s) — a session torn down
+// cleanly stamps a final unthrottled last_seen, but an agent killed hard dies
+// with a stamp up to a minute stale, so the grace must budget an extra
+// touchInterval on top of the reconnect blip it is really waiting out. Three
+// minutes = the old two-minute reconnect allowance + that worst-case staleness.
 //
 // # Cost
 //
@@ -88,7 +89,7 @@ const (
 	runAbandonedFloor        = 10 * time.Minute
 	runAbandonedUploadFactor = 4
 	runAbandonedMax          = 6 * time.Hour
-	runAbandonedAfterOffline = 2 * time.Minute
+	runAbandonedAfterOffline = 3 * time.Minute
 )
 
 // CloseAbandonedRuns ends runs that can no longer receive data and reports how

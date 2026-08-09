@@ -52,14 +52,20 @@ func (s *Store) ResolveSeriesIDs(ctx context.Context, siteID, agentID, monitorID
 		siteID, agentID, monitorID, kind, target)
 }
 
-// PurgeSeriesIDs fully removes the given series: every sample and rollup row, the
-// rollup watermarks, and the series dictionary rows, evicting each from the
-// in-memory caches. Returns the rows deleted per class. The shared full-delete
-// core behind PurgeAgent and the cleanup runner's unbounded (whole-series) path.
+// PurgeSeriesIDs fully removes the given series: the data plane's samples and
+// buckets (tombstoned across all tiers — safe forever because series ids are
+// never reused), the rollup watermarks, and the series dictionary rows,
+// evicting each from the in-memory caches. Returns the rows deleted per class
+// (Samples counted from the data plane before the tombstone; bucket counts are
+// not tallied — the cleanup UI sizes jobs with CountRange beforehand). The
+// shared full-delete core behind PurgeAgent and the cleanup runner's unbounded
+// (whole-series) path.
 func (s *Store) PurgeSeriesIDs(ctx context.Context, ids []int64) (PurgeCounts, error) {
 	if len(ids) == 0 {
 		return PurgeCounts{}, nil
 	}
+	s.rollupMu.Lock()
+	defer s.rollupMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -88,17 +94,13 @@ func (s *Store) PurgeSeriesIDs(ctx context.Context, ids []int64) (PurgeCounts, e
 
 	var counts PurgeCounts
 	for _, k := range list {
-		for _, t := range []string{"samples", "rollup_1m", "rollup_1h", "rollup_1d"} {
-			res, err := s.db.ExecContext(ctx, `DELETE FROM `+t+` WHERE series_id=?`, k.id)
-			if err != nil {
-				return counts, err
-			}
-			n, _ := res.RowsAffected()
-			if t == "samples" {
-				counts.Samples += n
-			} else {
-				counts.Rollups += n
-			}
+		n, err := s.ts.RawCount(ctx, k.id, 0, 0)
+		if err != nil {
+			return counts, err
+		}
+		counts.Samples += n
+		if err := s.ts.DeleteSeries(ctx, []int64{k.id}); err != nil {
+			return counts, err
 		}
 		if _, err := s.db.ExecContext(ctx, `DELETE FROM rollup_state WHERE series_id=?`, k.id); err != nil {
 			return counts, err
@@ -108,9 +110,6 @@ func (s *Store) PurgeSeriesIDs(ctx context.Context, ids []int64) (PurgeCounts, e
 		}
 		counts.Series++
 		s.evictLocked(k.agent, k.monitor, k.kind, k.target, k.configSerial, k.id)
-	}
-	if len(list) > 0 {
-		_, _ = s.db.ExecContext(ctx, `PRAGMA incremental_vacuum(2000)`)
 	}
 	return counts, nil
 }

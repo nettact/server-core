@@ -2,12 +2,16 @@ package metrics
 
 import (
 	"context"
-	"database/sql"
-	"strconv"
+	"math"
 	"time"
+
+	"github.com/nettact/server-core/tsstore"
 )
 
 // RetentionConfig is how long each tier is kept (seconds); 0 = keep forever.
+// The data plane enforces it by dropping whole blocks (each tsstore instance
+// gets its window at Open); this struct's job on the read side is tier
+// selection — covers() must agree with what the instances actually still hold.
 type RetentionConfig struct {
 	RawSeconds int64
 	M1Seconds  int64
@@ -17,10 +21,11 @@ type RetentionConfig struct {
 
 // DefaultRetention: raw 2d / 1m 30d / 1h 2y / 1d forever.
 //
-// Raw only serves reads of ranges ≤2h (pickTier), so it needs hours, not weeks;
-// at 1-second probe intervals a fleet peaks at thousands of samples/sec and
-// every extra raw day is GBs. The 1m tier carries the 2h–2d window plus the
-// status pages' availability math and is kept a month.
+// Raw only serves reads of ranges ≤2h (pickTier), so it needs hours, not weeks.
+// The 1m tier carries the 2h–2d window plus the status pages' availability math
+// and is kept a month. NOTE the raw figure here is the LOGICAL window readers
+// trust; the raw instance's PHYSICAL retention is wider (tsstore.Config) so a
+// 72h backfill cannot be block-dropped before the rollup pass aggregates it.
 func DefaultRetention() RetentionConfig {
 	return RetentionConfig{
 		RawSeconds: 2 * 86400,
@@ -30,10 +35,28 @@ func DefaultRetention() RetentionConfig {
 	}
 }
 
+// TSStoreConfig derives the data plane's physical windows from the logical
+// retention, in one place so the two can never drift apart: raw gets the
+// logical window plus three days of backfill/rollup slack, the tiers map
+// directly (their buckets are written once settled, no slack needed).
+func (c RetentionConfig) TSStoreConfig() tsstore.Config {
+	sec := func(s int64) time.Duration { return time.Duration(s) * time.Second }
+	cfg := tsstore.Config{
+		M1Retention: sec(c.M1Seconds),
+		H1Retention: sec(c.H1Seconds),
+		D1Retention: sec(c.D1Seconds),
+	}
+	if c.RawSeconds > 0 {
+		cfg.RawRetention = sec(c.RawSeconds + 3*86400)
+	}
+	return cfg
+}
+
 // keepFor returns a tier's retention window in seconds; 0 = keep forever. It is
-// the single mapping from table name to configured window, shared by the pruner
-// and by the reader's tier selection so the two can never disagree about which
-// tier still holds a given moment.
+// the single mapping from tier name to configured window, shared by the reader's
+// tier selection so it can never disagree with the data plane about which tier
+// still holds a given moment. (The table names survive the SQLite tables they
+// used to name; they are tier tags now — see tierOf.)
 func (c RetentionConfig) keepFor(table string) int64 {
 	switch table {
 	case "samples":
@@ -48,13 +71,13 @@ func (c RetentionConfig) keepFor(table string) int64 {
 }
 
 // covers reports whether a tier still holds data from ts, given the retention
-// the pruner deletes by (ts < now − keep). A disabled window (0) keeps forever.
+// the data plane drops by. A disabled window (0) keeps forever.
 //
 // The margin is what keeps the answer stable: the cutoff advances continuously
-// while the pruner runs periodically, so rows within a margin of the edge are
+// while block drops happen periodically, so data within a margin of the edge is
 // about to disappear — possibly between two refreshes of the same chart. Reading
-// one tier coarser slightly early costs resolution; trusting a tier the pruner
-// is about to empty costs the whole chart.
+// one tier coarser slightly early costs resolution; trusting a tier that is
+// about to drop the block costs the whole chart.
 func (c RetentionConfig) covers(table string, ts, now int64) bool {
 	keep := c.keepFor(table)
 	if keep <= 0 {
@@ -64,9 +87,7 @@ func (c RetentionConfig) covers(table string, ts, now int64) bool {
 }
 
 // retentionSafetyMargin is how far inside a tier's retention window a range must
-// start before that tier is trusted to still hold it. Sized to one prune cycle
-// (the host runs retention hourly), so a range near the edge does not alternate
-// between tiers as the cutoff creeps past it.
+// start before that tier is trusted to still hold it.
 const retentionSafetyMargin = 3600
 
 // Reprocess a trailing window each run so late samples (agent upload interval +
@@ -75,76 +96,99 @@ const retentionSafetyMargin = 3600
 // an unaligned start would REPLACE a complete bucket with a partial aggregate.
 const rollupOverlap = 120 // seconds
 
-// idleWatermarkAdvance is how far a series with no new source rows may fall
+// idleWatermarkAdvance is how far a series with no new source data may fall
 // behind before its rollup_state watermark is still written. Advancing the
 // watermark on every empty run would rewrite one row per series per tier per
-// run — for an idle series that is pure page churn (SQLite rewrites the whole
-// 4 KiB page into the WAL for a one-column update), and at fleet scale the
-// rollup_state rewrites rival the samples themselves. Deferring the advance
-// costs only a wider (still empty, still index-seeked) aggregation range on
-// subsequent runs, so the bound trades one row-write per hour against at most
-// an hour of empty range per probe.
+// run — pure page churn for an idle series; deferring costs only a wider
+// (still empty) recompute range on subsequent runs.
 const idleWatermarkAdvance = 3600 // seconds
 
 func alignDown(ts, bucket int64) int64 { return (ts / bucket) * bucket }
 
-// Rollup performs incremental downsampling raw→1m→1h→1d. Each tier iterates
-// the series dictionary and range-seeks one series' tail at a time (the
-// samples/rollup PKs lead with series_id, so there is no ts index to scan);
-// per-series watermarks live in rollup_state(resolution, series_id). Safe to
-// call often; each run's work is bounded by the data that arrived since the
-// last one.
+// rollupSeries is one dictionary row the rollup pass works from.
+type rollupSeries struct {
+	id     int64
+	cutoff int64 // series.purge_cutoff: recompute never reaches below it
+}
+
+// Rollup performs incremental downsampling raw→1m→1h→1d. Buckets live in the
+// data plane as append-only (cnt, sum) pairs; watermarks stay in SQLite's
+// rollup_state. Because the two stores cannot share a transaction, every
+// repair follows a fixed order whose every crash point is benign:
+//
+//  1. diff — recompute [watermark−overlap, upTo) from the source and compare
+//     against the existing buckets (Cnt and the exact Float64bits of Sum; the
+//     ascending scan makes the float sum deterministic, so the comparison is
+//     exact and a no-change pass writes NOTHING);
+//  2. if anything changed, FIRST commit the parent tier's watermark rewind in
+//     SQLite (guarded, never forward) — the durable intent that the tier above
+//     must re-aggregate;
+//  3. THEN append the changed buckets (k-repair: newest ms wins at read);
+//  4. THEN CAS-advance this tier's own watermark.
+//
+// Die after 2: the parent recomputes, finds nothing changed, the guard writes
+// nothing. Die after 3: this tier's watermark is behind, the next pass
+// recomputes, the diff comes back empty. Reversing 2 and 3 would instead lose
+// repairs: a parent pass running between them could aggregate the OLD child
+// buckets and advance past them, and with the repair already written the next
+// child pass sees no change and never rewinds the parent again.
+//
+// The whole pass holds rollupMu — see the field comment — and skips series
+// whose ingest transaction committed a rewind whose raw samples are still in
+// flight (pendingAppend).
 func (s *Store) Rollup(ctx context.Context) error {
+	s.rollupMu.Lock()
+	defer s.rollupMu.Unlock()
+	return s.rollupLocked(ctx)
+}
+
+func (s *Store) rollupLocked(ctx context.Context) error {
 	now := time.Now().Unix()
-	ids, err := s.allSeriesIDs(ctx)
+	series, err := s.allRollupSeries(ctx)
 	if err != nil {
 		return err
 	}
-	if len(ids) == 0 {
+	if len(series) == 0 {
 		return nil
 	}
-	// Each tier names the tier above it: repairing an old bucket has to drag that
-	// tier's watermark back down with it, or the repair stops here (see
-	// cascadeParent).
-	if err := s.rollupTier(ctx, ids, "1m", "rollup_1m", "samples", true, 60, now, "1h", 3600); err != nil {
+	if err := s.rollupTier(ctx, series, "1m", tsstore.TierM1, true, now, "1h", 3600); err != nil {
 		return err
 	}
-	if err := s.rollupTier(ctx, ids, "1h", "rollup_1h", "rollup_1m", false, 3600, now, "1d", 86400); err != nil {
+	if err := s.rollupTier(ctx, series, "1h", tsstore.TierH1, false, now, "1d", 86400); err != nil {
 		return err
 	}
-	return s.rollupTier(ctx, ids, "1d", "rollup_1d", "rollup_1h", false, 86400, now, "", 0)
+	return s.rollupTier(ctx, series, "1d", tsstore.TierD1, false, now, "", 0)
 }
 
-func (s *Store) allSeriesIDs(ctx context.Context) ([]int64, error) {
-	rows, err := s.db.Read().QueryContext(ctx, `SELECT id FROM series ORDER BY id`)
+func (s *Store) allRollupSeries(ctx context.Context) ([]rollupSeries, error) {
+	rows, err := s.db.Read().QueryContext(ctx, `SELECT id, purge_cutoff FROM series ORDER BY id`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var ids []int64
+	var out []rollupSeries
 	for rows.Next() {
-		var id int64
-		if err := rows.Scan(&id); err != nil {
+		var rs rollupSeries
+		if err := rows.Scan(&rs.id, &rs.cutoff); err != nil {
 			return nil, err
 		}
-		ids = append(ids, id)
+		out = append(out, rs)
 	}
-	return ids, rows.Err()
+	return out, rows.Err()
 }
 
-// rollupTier downsamples src → dst for every series in chunks of series per
-// transaction. One giant transaction would hold the single write connection for
-// the whole catch-up after downtime — minutes of aggregation during which every
-// write-handle query (and thus much of the HTTP API) stalls; chunking releases
-// the writer between batches, exactly like Retention.
-func (s *Store) rollupTier(ctx context.Context, ids []int64, res, dst, src string, srcRaw bool, bucket, now int64, parentRes string, parentBucket int64) error {
+// rollupTier downsamples one tier for every series. srcRaw selects the source:
+// raw samples for 1m, the child tier's buckets otherwise (1h reads 1m, 1d
+// reads 1h — coarser tiers never touch raw).
+func (s *Store) rollupTier(ctx context.Context, series []rollupSeries, res string, tier tsstore.Tier, srcRaw bool, now int64, parentRes string, parentBucket int64) error {
+	bucket := tier.BucketSeconds()
 	upTo := alignDown(now, bucket)
 	if upTo <= 0 {
 		return nil
 	}
 
-	// Load this resolution's per-series watermarks in one read.
-	states := make(map[int64]int64, len(ids))
+	// This resolution's per-series watermarks, in one read.
+	states := make(map[int64]int64, len(series))
 	srows, err := s.db.Read().QueryContext(ctx, `SELECT series_id, last_ts FROM rollup_state WHERE resolution=?`, res)
 	if err != nil {
 		return err
@@ -162,225 +206,118 @@ func (s *Store) rollupTier(ctx context.Context, ids []int64, res, dst, src strin
 		return err
 	}
 
-	bkt := strconv.FormatInt(bucket, 10)
-	expr := `(ts/` + bkt + `)*` + bkt
-	var aggSQL string
-	if srcRaw {
-		aggSQL = `SELECT ` + expr + `, COUNT(*), SUM(value), MIN(value), MAX(value)
-			FROM samples WHERE series_id=? AND ts>=? AND ts<? GROUP BY ` + expr
-	} else {
-		aggSQL = `SELECT ` + expr + `, SUM(cnt), SUM(total), MIN(vmin), MAX(vmax)
-			FROM ` + src + ` WHERE series_id=? AND ts>=? AND ts<? GROUP BY ` + expr
-	}
-
-	const batch = 64 // series per transaction
-	for start := 0; start < len(ids); start += batch {
-		end := start + batch
-		if end > len(ids) {
-			end = len(ids)
+	for _, rs := range series {
+		if srcRaw && s.isPendingAppend(rs.id) {
+			continue // its rewind is durable but the samples are mid-flight; next pass
 		}
-		if err := s.rollupBatch(ctx, ids[start:end], states, res, dst, aggSQL, bucket, upTo, parentRes, parentBucket); err != nil {
-			return err
+		from := alignDown(states[rs.id]-rollupOverlap, bucket)
+		if c := alignDown(rs.cutoff, bucket); c > from {
+			from = c
 		}
-	}
-	return nil
-}
-
-// rollupBatch downsamples one batch of series inside a single transaction with
-// prepared statements reused across the batch.
-func (s *Store) rollupBatch(ctx context.Context, ids []int64, states map[int64]int64, res, dst, aggSQL string, bucket, upTo int64, parentRes string, parentBucket int64) error {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			_ = tx.Rollback()
-		}
-	}()
-
-	agg, err := tx.PrepareContext(ctx, aggSQL)
-	if err != nil {
-		return err
-	}
-	defer agg.Close()
-	// DO UPDATE … WHERE changed, not INSERT OR REPLACE: a REPLACE rewrites the
-	// row (and dirties its page) even when the recomputed aggregate is identical,
-	// which is exactly what a backfill rewind produces for every bucket the late
-	// samples did NOT land in — re-aggregating the same source rows in the same
-	// scan order is bit-for-bit deterministic, so the guard is exact, and hours
-	// of rewound history then cost writes only where history actually changed.
-	upsert, err := tx.PrepareContext(ctx, `
-		INSERT INTO `+dst+`(series_id, ts, cnt, total, vmin, vmax) VALUES(?,?,?,?,?,?)
-		ON CONFLICT(series_id, ts) DO UPDATE SET
-			cnt=excluded.cnt, total=excluded.total, vmin=excluded.vmin, vmax=excluded.vmax
-		WHERE cnt<>excluded.cnt OR total<>excluded.total
-		   OR vmin<>excluded.vmin OR vmax<>excluded.vmax`)
-	if err != nil {
-		return err
-	}
-	defer upsert.Close()
-	// Compare-and-set against the watermark this pass actually read. Ingest can
-	// rewind a series mid-pass (a backlog commit lands between the snapshot above
-	// and this write), and an unconditional write would erase that rewind — the
-	// repair would then never happen, because every later pass reads only the
-	// advanced value. Losing the CAS means someone moved the watermark backwards
-	// on purpose; leaving it alone is exactly right, and the next pass picks it up.
-	setState, err := tx.PrepareContext(ctx, `
-		INSERT INTO rollup_state(resolution, series_id, last_ts) VALUES(?,?,?)
-		ON CONFLICT(resolution, series_id) DO UPDATE SET last_ts=excluded.last_ts
-		WHERE last_ts=?`)
-	if err != nil {
-		return err
-	}
-	defer setState.Close()
-
-	// Dragging the tier above back down to a repaired bucket. Ingest rewinds only
-	// the 1m tier, because it is the only one that reads raw samples; each coarser
-	// tier is pulled back here, by the tier below it, in the SAME transaction that
-	// writes the repair. That ordering is what makes the cascade safe under a
-	// concurrent pass: a tier can never be advanced past data that has not been
-	// aggregated into it, because the row that would let it skip ahead is written
-	// only alongside the repair itself.
-	var cascade *sql.Stmt
-	if parentRes != "" {
-		cascade, err = tx.PrepareContext(ctx, `
-			UPDATE rollup_state SET last_ts=? WHERE resolution=? AND series_id=? AND last_ts>?`)
-		if err != nil {
-			return err
-		}
-		defer cascade.Close()
-	}
-
-	type bucketAgg struct {
-		ts   int64
-		cnt  int64
-		tot  float64
-		vmin float64
-		vmax float64
-	}
-	for _, id := range ids {
-		from := alignDown(states[id]-rollupOverlap, bucket)
 		if from < 0 {
 			from = 0
 		}
 		if upTo <= from {
 			continue
 		}
-		rows, err := agg.QueryContext(ctx, id, from, upTo)
+
+		recomputed, err := s.recomputeBuckets(ctx, tier, srcRaw, rs, from, upTo)
 		if err != nil {
 			return err
 		}
-		var buckets []bucketAgg
-		for rows.Next() {
-			var b bucketAgg
-			if err := rows.Scan(&b.ts, &b.cnt, &b.tot, &b.vmin, &b.vmax); err != nil {
-				rows.Close()
-				return err
-			}
-			buckets = append(buckets, b)
-		}
-		rows.Close()
-		if err := rows.Err(); err != nil {
-			return err
-		}
-		// oldestChanged is the earliest bucket this pass actually altered. The
-		// WHERE-changed guard on the upsert makes that precise: re-aggregating a
-		// window whose history did not move reports zero rows affected and leaves
-		// the tier above untouched, so a rewind cascades exactly as far as the
-		// data really changed and no further.
-		var oldestChanged int64 = -1
-		for _, b := range buckets {
-			wrote, err := upsert.ExecContext(ctx, id, b.ts, b.cnt, b.tot, b.vmin, b.vmax)
+		var changed []tsstore.Bucket
+		if len(recomputed) > 0 {
+			existing, err := s.ts.ReadBuckets(ctx, tier, rs.id, from, upTo)
 			if err != nil {
 				return err
 			}
-			if n, _ := wrote.RowsAffected(); n > 0 && (oldestChanged < 0 || b.ts < oldestChanged) {
-				oldestChanged = b.ts
+			have := make(map[int64]tsstore.Bucket, len(existing))
+			for _, b := range existing {
+				have[b.TS] = b
+			}
+			for _, b := range recomputed {
+				if e, ok := have[b.TS]; !ok || e.Cnt != b.Cnt || math.Float64bits(e.Sum) != math.Float64bits(b.Sum) {
+					changed = append(changed, b)
+				}
+				// An existing bucket with no recomputed counterpart is left
+				// alone: rollup never deletes buckets, only purge does.
 			}
 		}
-		if cascade != nil && oldestChanged >= 0 {
-			if _, err := cascade.ExecContext(ctx,
-				alignDown(oldestChanged, parentBucket), parentRes, id, alignDown(oldestChanged, parentBucket)); err != nil {
-				return err
+		if len(changed) > 0 {
+			oldest := changed[0].TS
+			for _, b := range changed[1:] {
+				if b.TS < oldest {
+					oldest = b.TS
+				}
 			}
-		}
-		// Advance the watermark when there was data, and for an idle series only
-		// once it has fallen idleWatermarkAdvance behind — often enough that a
-		// dead series never rescans deep history, rarely enough that idle series
-		// stop rewriting their rollup_state row on every run.
-		if len(buckets) > 0 || upTo-states[id] >= idleWatermarkAdvance {
-			if _, err := setState.ExecContext(ctx, res, id, upTo, states[id]); err != nil {
-				return err
-			}
-		}
-	}
-	if err := tx.Commit(); err != nil {
-		return err
-	}
-	committed = true
-	return nil
-}
-
-// Retention prunes each tier past its window and reclaims space. Deletes are
-// per-series ranged (the PK leads with series_id — a global ts DELETE would
-// full-scan) and chunked into one transaction per series batch so the WAL
-// never balloons and the writer is released between batches.
-func (s *Store) Retention(ctx context.Context, cfg RetentionConfig) error {
-	now := time.Now().Unix()
-	ids, err := s.allSeriesIDs(ctx)
-	if err != nil {
-		return err
-	}
-	tiers := []struct {
-		table string
-		keep  int64
-	}{
-		{"samples", cfg.RawSeconds},
-		{"rollup_1m", cfg.M1Seconds},
-		{"rollup_1h", cfg.H1Seconds},
-		{"rollup_1d", cfg.D1Seconds},
-	}
-	const batch = 64 // series per transaction
-	for _, t := range tiers {
-		if t.keep <= 0 {
-			continue // keep forever
-		}
-		cutoff := now - t.keep
-		for start := 0; start < len(ids); start += batch {
-			end := start + batch
-			if end > len(ids) {
-				end = len(ids)
-			}
-			tx, err := s.db.BeginTx(ctx, nil)
-			if err != nil {
-				return err
-			}
-			del, err := tx.PrepareContext(ctx, `DELETE FROM `+t.table+` WHERE series_id=? AND ts<?`)
-			if err != nil {
-				_ = tx.Rollback()
-				return err
-			}
-			for _, id := range ids[start:end] {
-				if _, err := del.ExecContext(ctx, id, cutoff); err != nil {
-					del.Close()
-					_ = tx.Rollback()
+			if parentRes != "" {
+				// Step 2 (see Rollup's comment): durable rewind intent FIRST.
+				if _, err := s.db.ExecContext(ctx,
+					`UPDATE rollup_state SET last_ts=? WHERE resolution=? AND series_id=? AND last_ts>?`,
+					alignDown(oldest, parentBucket), parentRes, rs.id, alignDown(oldest, parentBucket)); err != nil {
 					return err
 				}
 			}
-			del.Close()
-			if err := tx.Commit(); err != nil {
+			// Step 3: the repair itself.
+			if err := s.ts.AppendBuckets(ctx, tier, rs.id, changed); err != nil {
+				return err
+			}
+		}
+		// Step 4: CAS against the watermark this pass read — ingest may have
+		// rewound the series mid-pass, and an unconditional write would erase
+		// that rewind (the repair would then never happen). Losing the CAS
+		// means someone moved the watermark backwards on purpose; leaving it
+		// alone is exactly right, and the next pass picks it up.
+		if len(recomputed) > 0 || upTo-states[rs.id] >= idleWatermarkAdvance {
+			if _, err := s.db.ExecContext(ctx, `
+				INSERT INTO rollup_state(resolution, series_id, last_ts) VALUES(?,?,?)
+				ON CONFLICT(resolution, series_id) DO UPDATE SET last_ts=excluded.last_ts
+				WHERE last_ts=?`, res, rs.id, upTo, states[rs.id]); err != nil {
 				return err
 			}
 		}
 	}
-	// No incremental_vacuum here, deliberately. At steady state this hourly prune
-	// deletes roughly what ingest inserted, so moving freed pages to the end of
-	// the file just rewrites up to 2000 pages (8 MiB) an hour that the next hour's
-	// samples would have reused in place — the file's high-water mark is the
-	// steady state, and shrinking below it buys nothing but disk writes. The
-	// user-initiated deletion paths (history cleanup, monitor purge) still
-	// vacuum: those are one-off deletes where the space genuinely comes back.
 	return nil
+}
+
+// recomputeBuckets aggregates one series' source data in [from, upTo) into
+// destination-width buckets. Sources are read ascending, so the float sums are
+// bit-for-bit deterministic across passes — the foundation of the diff's
+// exact unchanged-guard.
+func (s *Store) recomputeBuckets(ctx context.Context, tier tsstore.Tier, srcRaw bool, rs rollupSeries, from, upTo int64) ([]tsstore.Bucket, error) {
+	bucket := tier.BucketSeconds()
+	var out []tsstore.Bucket
+	add := func(ts int64, cnt int64, sum float64) {
+		start := alignDown(ts, bucket)
+		if n := len(out); n > 0 && out[n-1].TS == start {
+			out[n-1].Cnt += cnt
+			out[n-1].Sum += sum
+			return
+		}
+		out = append(out, tsstore.Bucket{TS: start, Cnt: cnt, Sum: sum})
+	}
+	if srcRaw {
+		samples, err := s.ts.RawRange(ctx, rs.id, from, upTo, 0)
+		if err != nil {
+			return nil, err
+		}
+		for _, smp := range samples {
+			add(smp.TS, 1, smp.Value)
+		}
+		return out, nil
+	}
+	var child tsstore.Tier
+	if tier == tsstore.TierH1 {
+		child = tsstore.TierM1
+	} else {
+		child = tsstore.TierH1
+	}
+	buckets, err := s.ts.ReadBuckets(ctx, child, rs.id, from, upTo)
+	if err != nil {
+		return nil, err
+	}
+	for _, b := range buckets {
+		add(b.TS, b.Cnt, b.Sum)
+	}
+	return out, nil
 }

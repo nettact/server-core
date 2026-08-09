@@ -272,8 +272,8 @@ func (s *Service) Enroll(ctx context.Context, req enroll.EnrollRequest) (enroll.
 			INSERT INTO agents(id, site_id, public_key, token_hash, display_name, hostname, platform, agent_version,
 			                   perm_supported, perm_granted, perm_effective, perm_unsupported_reasons,
 			                   policy_source, policy_hash,
-			                   status, reported_config_version, last_seen_at, created_at)
-			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'online', 0, ?, ?)`,
+			                   status, last_seen_at, created_at)
+			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'online', ?, ?)`,
 			agentID, siteID, []byte(req.PublicKey), sha256hex(agentToken), displayName,
 			req.Hostname, req.Platform, req.AgentVersion,
 			marshalStrings(req.Permissions.Supported), marshalStrings(req.Permissions.Granted),
@@ -312,9 +312,11 @@ func (s *Service) Enroll(ctx context.Context, req enroll.EnrollRequest) (enroll.
 	}
 	committed = true
 
-	// A reenrollment reused an identity whose WAL was wiped; clear the ingest
-	// service's in-memory sequence watermark so the first ack re-derives from the
-	// (now empty) agent_packets instead of reporting the old installation's high.
+	// A reenrollment reused an identity whose WAL was wiped; reset the ingest
+	// service's in-memory sequence watermark (and bump its epoch, discarding any
+	// straggler advance from a session that authenticated before the rotation)
+	// so the first ack reflects the zeroed agents.high_sequence instead of the
+	// old installation's high.
 	if reclaimed && s.ResetSeqWatermark != nil {
 		s.ResetSeqWatermark(ctx, agentID)
 	}
@@ -359,10 +361,10 @@ func (s *Service) reinstallTarget(ctx context.Context, token string) string {
 // offline means a reinstall that never connects stays visibly offline, and the
 // reconnect publishes the normal offline→online liveness event.
 //
-// The old installation's (agent_id, sequence) rows in agent_packets are the
-// ingest dedup watermark; the reinstalled machine's fresh WAL starts again at
-// sequence 1, so without clearing them its first batch would be misread as
-// replays and silently dropped.
+// The old installation's packet-sequence watermark (agents.high_sequence) is
+// the ingest dedup boundary; the reinstalled machine's fresh WAL starts again
+// at sequence 1, so without resetting it every batch the new install sends
+// would be misread as a replay and silently dropped.
 //
 // Runs inside Enroll's transaction (the caller commits), so a failure rolls the
 // token consumption back together with the row update. Returns ErrReinstallAgent
@@ -393,7 +395,7 @@ func (s *Service) reenrollAgent(ctx context.Context, tx *sql.Tx, agentID string,
 			public_key=?, token_hash=?, hostname=?, platform=?, agent_version=?,
 			perm_supported=?, perm_granted=?, perm_effective=?, perm_unsupported_reasons=?,
 			policy_source=?, policy_hash=?,
-			status='offline', reported_config_version=0, last_status_config_version=-1,
+			status='offline', high_sequence=0, last_status_config_version=-1,
 			upload_interval_seconds=0,
 			last_disconnect_kind=''
 		WHERE id=?`,
@@ -406,17 +408,19 @@ func (s *Service) reenrollAgent(ctx context.Context, tx *sql.Tx, agentID string,
 		agentID); err != nil {
 		return "", 0, "", err
 	}
-	// The new session has not connected yet, so no ingest transaction can race
-	// these deletes. agent_packets is the (agent_id, sequence) dedup watermark;
-	// agent_wifi.last_sequence is a second sequence guard that applyInterfaceSnapshot
-	// would otherwise use to reject the fresh WAL's low-sequence snapshots, leaving
-	// the interfaces/Wi-Fi state stale until the new machine out-paces the old one.
-	if _, err := tx.ExecContext(ctx, `DELETE FROM agent_packets WHERE agent_id=?`, agentID); err != nil {
-		return "", 0, "", err
-	}
+	// The old session was fenced (DisconnectSession) before this transaction and
+	// the new one has not connected yet, so no ingest can race this reset.
+	// high_sequence went to 0 in the UPDATE above; agent_wifi.last_sequence is a
+	// second sequence guard that applyInterfaceSnapshot would otherwise use to
+	// reject the fresh WAL's low-sequence snapshots, leaving the interfaces/Wi-Fi
+	// state stale until the new machine out-paces the old one.
 	if _, err := tx.ExecContext(ctx, `DELETE FROM agent_wifi WHERE agent_id=?`, agentID); err != nil {
 		return "", 0, "", err
 	}
+	// Throttle hygiene: the entry describes the previous installation. Clearing
+	// it early (pre-commit) is safe — a cleared throttle only means the next
+	// touch writes, never that a write is skipped.
+	s.forgetTouch(agentID)
 	if err := tx.QueryRowContext(ctx,
 		`SELECT config_serial FROM sites WHERE id=?`, siteID).Scan(&siteSerial); err != nil {
 		return "", 0, "", err
@@ -442,27 +446,22 @@ func (s *Service) AuthenticateAgent(ctx context.Context, token string) (agentID,
 
 // --- config version (agents table) ---
 
-// ConfigStatus is an agent's desired vs reported config version. The desired
-// version is the site-level config_serial (the single desired-config axis);
-// reported is the per-agent watermark of what the agent last applied.
+// ConfigStatus is an agent's site plus the site-level desired config serial
+// (the single desired-config axis). What the agent has APPLIED is not tracked
+// here — the MonitorStatus frame's config-version echo is that signal
+// (agents.last_status_config_version, maintained by opissue).
 type ConfigStatus struct {
-	SiteID          string
-	ConfigVersion   int
-	ReportedVersion int
+	SiteID        string
+	ConfigVersion int
 }
 
 func (s *Service) ConfigStatus(ctx context.Context, agentID string) (ConfigStatus, error) {
 	var c ConfigStatus
 	err := s.db.QueryRowContext(ctx,
-		`SELECT a.site_id, COALESCE(st.config_serial,0), a.reported_config_version
+		`SELECT a.site_id, COALESCE(st.config_serial,0)
 		 FROM agents a JOIN sites st ON st.id = a.site_id WHERE a.id=?`, agentID).
-		Scan(&c.SiteID, &c.ConfigVersion, &c.ReportedVersion)
+		Scan(&c.SiteID, &c.ConfigVersion)
 	return c, err
-}
-
-func (s *Service) SetReportedConfigVersion(ctx context.Context, agentID string, v int) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE agents SET reported_config_version=? WHERE id=?`, v, agentID)
-	return err
 }
 
 // AgentCount / MaxAgents feed the "X / max" quota display.

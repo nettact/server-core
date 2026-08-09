@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/nettact/protocol/telemetry"
+	"github.com/nettact/server-core/tsstore"
 )
 
 // TestPurgeRangeRawAndBuckets deletes a middle time range and verifies raw
@@ -48,10 +49,18 @@ func TestPurgeRangeRawAndBuckets(t *testing.T) {
 	}
 
 	// Raw: no samples remain in [from,to); samples before and after survive.
-	var inWindow, before, after int
-	db.QueryRowContext(ctx, `SELECT COUNT(*) FROM samples WHERE series_id=? AND ts>=? AND ts<?`, id, from, to).Scan(&inWindow)
-	db.QueryRowContext(ctx, `SELECT COUNT(*) FROM samples WHERE series_id=? AND ts<?`, id, from).Scan(&before)
-	db.QueryRowContext(ctx, `SELECT COUNT(*) FROM samples WHERE series_id=? AND ts>=?`, id, to).Scan(&after)
+	inWindow, err := s.ts.RawCount(ctx, id, from, to)
+	if err != nil {
+		t.Fatalf("RawCount in-window: %v", err)
+	}
+	before, err := s.ts.RawCount(ctx, id, 0, from)
+	if err != nil {
+		t.Fatalf("RawCount before: %v", err)
+	}
+	after, err := s.ts.RawCount(ctx, id, to, 0)
+	if err != nil {
+		t.Fatalf("RawCount after: %v", err)
+	}
 	if inWindow != 0 {
 		t.Errorf("raw samples in window = %d, want 0", inWindow)
 	}
@@ -60,10 +69,12 @@ func TestPurgeRangeRawAndBuckets(t *testing.T) {
 	}
 
 	// Rollup 1m buckets in the window are gone (10 buckets), others remain.
-	var m1InWindow int
-	db.QueryRowContext(ctx, `SELECT COUNT(*) FROM rollup_1m WHERE series_id=? AND ts>=? AND ts<?`, id, from, to).Scan(&m1InWindow)
-	if m1InWindow != 0 {
-		t.Errorf("rollup_1m buckets in window = %d, want 0", m1InWindow)
+	m1, err := s.ts.ReadBuckets(ctx, tsstore.TierM1, id, from, to)
+	if err != nil {
+		t.Fatalf("ReadBuckets: %v", err)
+	}
+	if len(m1) != 0 {
+		t.Errorf("rollup_1m buckets in window = %d, want 0", len(m1))
 	}
 }
 
@@ -104,8 +115,10 @@ func TestPurgeRangeKeepsEmptiedSeries(t *testing.T) {
 	if len(left) != 1 {
 		t.Errorf("series row should survive an empty range delete, got %v", left)
 	}
-	var nSamples int
-	db.QueryRowContext(ctx, `SELECT COUNT(*) FROM samples WHERE series_id=?`, ids[0]).Scan(&nSamples)
+	nSamples, err := s.ts.RawCount(ctx, ids[0], 0, 0)
+	if err != nil {
+		t.Fatalf("RawCount: %v", err)
+	}
 	if nSamples != 0 {
 		t.Errorf("samples remain after full-span range delete: %d", nSamples)
 	}

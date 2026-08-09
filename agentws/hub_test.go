@@ -26,6 +26,7 @@ import (
 	"github.com/nettact/server-core/site"
 	"github.com/nettact/server-core/store"
 	"github.com/nettact/server-core/store/storetest"
+	"github.com/nettact/server-core/tsstore/tsstoretest"
 )
 
 // testEnv wires the real services the hub needs against a throwaway SQLite DB
@@ -60,7 +61,7 @@ func newTestEnv(t *testing.T) *testEnv {
 	hostLive := hostlive.New()
 	hub := New(Deps{
 		Registry: reg,
-		Ingest:   ingest.New(db, bus, metrics.New(db), nil, nil, nil),
+		Ingest:   ingest.New(db, bus, metrics.New(db, tsstoretest.Open(t)), nil, nil, nil),
 		Config:   cfg,
 		HostLive: hostLive,
 		OpIssue:  opissue.New(db, bus),

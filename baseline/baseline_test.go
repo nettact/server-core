@@ -7,6 +7,8 @@ import (
 
 	"github.com/nettact/server-core/store"
 	"github.com/nettact/server-core/store/storetest"
+	"github.com/nettact/server-core/tsstore"
+	"github.com/nettact/server-core/tsstore/tsstoretest"
 )
 
 // The baseline's contract: buckets are server-local and tile the timeline without
@@ -19,12 +21,14 @@ type bh struct {
 	db  *store.DB
 	svc *Service
 	ctx context.Context
+	ts  tsstore.SeriesStore
 }
 
 func newBH(t *testing.T) *bh {
 	t.Helper()
 	db := storetest.Open(t)
-	h := &bh{t: t, db: db, svc: New(db), ctx: context.Background()}
+	h := &bh{t: t, db: db, ts: tsstoretest.Open(t), ctx: context.Background()}
+	h.svc = New(db, h.ts)
 	h.exec(`INSERT INTO sites(id,name,created_at) VALUES('site_default','def',?)`, time.Now().UTC())
 	h.exec(`INSERT INTO monitor_groups(id,site_id,name,is_default,merge_enabled,all_agents) VALUES('mg','site_default','Default',1,0,1)`)
 	h.exec(`INSERT INTO probe_tasks(id,site_id,group_id,kind,name,target,params,enabled,config_serial)
@@ -54,11 +58,16 @@ func (h *bh) seriesFor(configSerial int) int64 {
 	return id
 }
 
-// samples writes n samples of value v starting at ts, one second apart.
+// samples appends n samples of value v starting at ts, one second apart, to the
+// raw tier.
 func (h *bh) samples(seriesID, ts int64, n int, v float64) {
 	h.t.Helper()
-	for i := range n {
-		h.exec(`INSERT OR REPLACE INTO samples(series_id, ts, value) VALUES(?,?,?)`, seriesID, ts+int64(i), v)
+	raws := make([]tsstore.RawSample, n)
+	for i := range raws {
+		raws[i] = tsstore.RawSample{SID: seriesID, TS: ts + int64(i), Value: v}
+	}
+	if _, err := h.ts.AppendRaw(h.ctx, raws); err != nil {
+		h.t.Fatalf("append raw: %v", err)
 	}
 }
 
@@ -222,10 +231,15 @@ func TestFoldSkipsStaleGenerationSeries(t *testing.T) {
 
 // seedDays writes one full midday bucket per weekday for the n most recent
 // weekdays, each with `per` samples of the given value, and folds them.
+//
+// The noons are appended OLDEST-FIRST: the head's out-of-order acceptance window
+// only reaches 75h behind its newest sample, so seeding newest-first would drop
+// every day more than three back.
 func (h *bh) seedDays(sid int64, days int, per int, v float64) {
 	h.t.Helper()
-	for _, noon := range weekdayNoons(days) {
-		h.samples(sid, noon.Unix(), per, v)
+	noons := weekdayNoons(days)
+	for i := len(noons) - 1; i >= 0; i-- {
+		h.samples(sid, noons[i].Unix(), per, v)
 	}
 	if err := h.svc.Fold(h.ctx); err != nil {
 		h.t.Fatalf("fold: %v", err)
@@ -442,14 +456,23 @@ func TestFoldExcludesFutureSamples(t *testing.T) {
 	h := newBH(t)
 	sid := h.seriesFor(1)
 	noons := weekdayNoons(1)
+	// Seed the honest history first — 200 samples in the noon bucket — so the
+	// bucket is built before the bad clock shows up. (A future-stamped append
+	// advances the head's newest sample, and honest samples more than 75h behind
+	// it are then outside the out-of-order window and dropped, so the ordering
+	// matters.)
 	h.samples(sid, noons[0].Unix(), 100, 30)
-	// An Agent whose clock runs ahead by a week. Folding these would park the
-	// watermark in the future and stall the baseline until wall time caught up.
-	future := time.Now().Add(7 * 24 * time.Hour).Unix()
-	h.samples(sid, future, 50, 999)
-
+	h.samples(sid, noons[0].Unix()+100, 100, 30)
 	if err := h.svc.Fold(h.ctx); err != nil {
 		t.Fatalf("fold: %v", err)
+	}
+	// An Agent whose clock runs ahead by a week. foldOne reads raw up to a horizon
+	// bounded by SERVER time, so these can neither create a row nor park the
+	// watermark in the future.
+	future := time.Now().Add(7 * 24 * time.Hour).Unix()
+	h.samples(sid, future, 50, 999)
+	if err := h.svc.Fold(h.ctx); err != nil {
+		t.Fatalf("fold with future samples present: %v", err)
 	}
 	var last int64
 	if err := h.db.Read().QueryRowContext(h.ctx,
@@ -468,20 +491,16 @@ func TestFoldExcludesFutureSamples(t *testing.T) {
 	if rows != 0 {
 		t.Fatalf("%d baseline rows built from future samples", rows)
 	}
-
-	// The real point: honest samples arriving afterwards must still fold.
-	h.samples(sid, weekdayNoons(2)[1].Unix(), 100, 30)
-	h.samples(sid, noons[0].Unix()+100, 100, 30)
-	if err := h.svc.Fold(h.ctx); err != nil {
-		t.Fatalf("second fold: %v", err)
-	}
+	// The honest history is intact: a fold that saw future data must not have
+	// disturbed the bucket it had already built.
+	day, _, _ := BucketOf(noons[0].Unix())
 	var cnt int
 	if err := h.db.Read().QueryRowContext(h.ctx,
-		`SELECT cnt FROM baseline_daily WHERE p50 = 30 LIMIT 1`).Scan(&cnt); err != nil {
+		`SELECT cnt FROM baseline_daily WHERE target_id='t_icmp' AND day=?`, day).Scan(&cnt); err != nil {
 		t.Fatalf("read: %v", err)
 	}
-	if cnt < 200 {
-		t.Fatalf("bucket holds %d samples; the fold stalled behind the bad clock", cnt)
+	if cnt != 200 {
+		t.Fatalf("bucket holds %d samples, want 200 — the fold stalled behind the bad clock", cnt)
 	}
 }
 

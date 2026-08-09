@@ -23,14 +23,13 @@ type DB struct {
 }
 
 // Shared PRAGMAs (DSN form so every pooled connection gets them):
-// cache_size is negative-KiB (64 MiB) and mmap_size 256 MiB — the defaults
-// (~2 MiB cache, no mmap) thrash once the samples table grows to GBs.
-// wal_autocheckpoint is raised from the default 1000 pages (4 MiB) to 8192
-// (32 MiB): ingest rewrites the same hot pages — every series' b-tree tail,
-// the dedup and detector rows — on every commit, and each checkpoint copies
-// each distinct hot page into the main file once more. Checkpointing 8× less
-// often coalesces 8× more of those rewrites into one back-copy, cutting total
-// block writes roughly in half for the cost of a WAL that can reach ~32 MiB.
+// cache_size is negative-KiB (16 MiB) — the DB is relational control-plane
+// data now (agents, config, incidents, dictionaries); the GB-scale samples
+// table that once justified a 64 MiB cache + mmap lives in the tsstore data
+// plane. mmap stays for cheap reads of the mid-sized tables (events, game).
+// wal_autocheckpoint stays at 8192 (32 MiB): ingest still rewrites a small hot
+// set (detector rows, the agents row) every commit, and checkpointing 8× less
+// often coalesces those rewrites into one back-copy.
 //
 // busy_timeout comes first so every pragma after it is already covered by the
 // busy handler rather than failing outright on a contended file.
@@ -48,7 +47,7 @@ type DB struct {
 // database only (see autoVacuumPragma), which is the only time it does anything.
 const dsnPragmas = "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)" +
 	"&_pragma=foreign_keys(ON)&_pragma=synchronous(NORMAL)" +
-	"&_pragma=cache_size(-65536)&_pragma=mmap_size(268435456)&_pragma=temp_store(MEMORY)" +
+	"&_pragma=cache_size(-16384)&_pragma=mmap_size(268435456)&_pragma=temp_store(MEMORY)" +
 	"&_pragma=wal_autocheckpoint(8192)"
 
 // autoVacuumPragma switches a database to incremental auto-vacuum. It has to

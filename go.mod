@@ -7,6 +7,8 @@ require (
 	github.com/go-chi/chi/v5 v5.2.1
 	github.com/google/uuid v1.6.0
 	github.com/nettact/protocol v0.0.0-00010101000000-000000000000
+	github.com/prometheus/client_golang v1.23.2
+	github.com/prometheus/prometheus v0.313.2
 	golang.org/x/crypto v0.34.0
 	golang.org/x/sys v0.30.0
 	google.golang.org/protobuf v1.36.11

@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/nettact/protocol/telemetry"
+	"github.com/nettact/server-core/tsstore"
 )
 
 // TestOfflineBacklogStillReachesRollups pins the agent-WAL promise end to end:
@@ -53,30 +54,27 @@ func TestOfflineBacklogStillReachesRollups(t *testing.T) {
 	}
 
 	// Every backlog minute must be in the 1m tier…
-	var got int
-	err := db.QueryRowContext(ctx, `
-		SELECT COUNT(*) FROM rollup_1m r
-		JOIN series se ON se.id = r.series_id
-		WHERE se.agent_id='agent_a' AND se.monitor_id='probe_m1'
-		  AND r.ts >= ? AND r.ts < ?`,
-		now.Add(-2*time.Hour).Unix(), now.Add(-time.Hour).Unix()).Scan(&got)
-	if err != nil {
-		t.Fatalf("count 1m buckets: %v", err)
+	var seriesID int64
+	if err := db.QueryRowContext(ctx,
+		`SELECT id FROM series WHERE agent_id='agent_a' AND monitor_id='probe_m1'`).Scan(&seriesID); err != nil {
+		t.Fatalf("series id: %v", err)
 	}
-	if got != 3 {
-		t.Fatalf("1m buckets covering the backlog window = %d, want 3: late samples never reached the rollups", got)
+	m1, err := s.ts.ReadBuckets(ctx, tsstore.TierM1, seriesID, now.Add(-2*time.Hour).Unix(), now.Add(-time.Hour).Unix())
+	if err != nil {
+		t.Fatalf("ReadBuckets 1m: %v", err)
+	}
+	if len(m1) != 3 {
+		t.Fatalf("1m buckets covering the backlog window = %d, want 3: late samples never reached the rollups", len(m1))
 	}
 
 	// …and the hour tier must have re-aggregated on top of them in the same pass.
-	var cnt int
-	err = db.QueryRowContext(ctx, `
-		SELECT COALESCE(SUM(cnt),0) FROM rollup_1h r
-		JOIN series se ON se.id = r.series_id
-		WHERE se.agent_id='agent_a' AND se.monitor_id='probe_m1'
-		  AND r.ts >= ? AND r.ts < ?`,
-		now.Add(-2*time.Hour).Truncate(time.Hour).Unix(), now.Unix()).Scan(&cnt)
+	h1, err := s.ts.ReadBuckets(ctx, tsstore.TierH1, seriesID, now.Add(-2*time.Hour).Truncate(time.Hour).Unix(), now.Unix())
 	if err != nil {
-		t.Fatalf("sum 1h cnt: %v", err)
+		t.Fatalf("ReadBuckets 1h: %v", err)
+	}
+	var cnt int64
+	for _, b := range h1 {
+		cnt += b.Cnt
 	}
 	if cnt != 3 {
 		t.Fatalf("1h tier aggregated %d backlog samples, want 3", cnt)
@@ -139,16 +137,20 @@ func TestRewindSurvivesAConcurrentRollupPass(t *testing.T) {
 	// asserted on content: it only ever materializes COMPLETED days (upTo is
 	// aligned down to midnight), so today's backlog is legitimately absent from it
 	// — its watermark is checked below instead.
-	for _, tc := range []struct{ table, label string }{
-		{"rollup_1m", "minute"},
-		{"rollup_1h", "hour"},
+	for _, tc := range []struct {
+		tier  tsstore.Tier
+		label string
+	}{
+		{tsstore.TierM1, "minute"},
+		{tsstore.TierH1, "hour"},
 	} {
-		var cnt int
-		err := db.QueryRowContext(ctx,
-			`SELECT COALESCE(SUM(cnt),0) FROM `+tc.table+` WHERE series_id=? AND ts>=? AND ts<?`,
-			seriesID, old.Add(-time.Hour).Unix(), old.Add(time.Hour).Unix()).Scan(&cnt)
+		buckets, err := s.ts.ReadBuckets(ctx, tc.tier, seriesID, old.Add(-time.Hour).Unix(), old.Add(time.Hour).Unix())
 		if err != nil {
-			t.Fatalf("sum %s: %v", tc.table, err)
+			t.Fatalf("ReadBuckets %s: %v", tc.label, err)
+		}
+		var cnt int64
+		for _, b := range buckets {
+			cnt += b.Cnt
 		}
 		if cnt != 2 {
 			t.Fatalf("%s tier aggregated %d backlog samples, want 2: a rewind erased by a "+
@@ -169,10 +171,13 @@ func TestRewindSurvivesAConcurrentRollupPass(t *testing.T) {
 	}
 }
 
-// TestDuplicateSamplesDoNotRewind: a replayed packet under a fresh sequence, or
-// an InsertSamples retry, changes no history — INSERT OR IGNORE stores nothing.
-// Rewinding for it would drag the watermark back over everything still retained
-// and make the next pass rescan it for no reason.
+// TestDuplicateSamplesDoNotRewriteHistory: a replayed packet under a fresh
+// sequence, or a re-ingest retry, changes no history — the data plane keeps one
+// sample and the rollup recompute writes nothing new. The 1m watermark may
+// still be rewound on the replay (RewindForBatch computes from the whole batch
+// by design; the recompute then finds no change and the rollup upsert's
+// unchanged-guard writes nothing), so the pinned observable is the bucket
+// CONTENT, not the watermark.
 func TestDuplicateSamplesDoNotRewind(t *testing.T) {
 	db, s := openStore(t)
 	ctx := context.Background()
@@ -188,25 +193,27 @@ func TestDuplicateSamplesDoNotRewind(t *testing.T) {
 		t.Fatalf("rollup: %v", err)
 	}
 
-	var seriesID, before int64
+	var seriesID int64
 	if err := db.QueryRowContext(ctx,
 		`SELECT id FROM series WHERE agent_id='agent_a' AND monitor_id='probe_m1'`).Scan(&seriesID); err != nil {
 		t.Fatalf("series id: %v", err)
 	}
-	if err := db.QueryRowContext(ctx,
-		`SELECT last_ts FROM rollup_state WHERE resolution='1m' AND series_id=?`, seriesID).Scan(&before); err != nil {
-		t.Fatalf("watermark: %v", err)
+	winLo, winHi := old.Add(-time.Hour).Unix(), old.Add(time.Hour).Unix()
+	before, err := s.ts.ReadBuckets(ctx, tsstore.TierM1, seriesID, winLo, winHi)
+	if err != nil {
+		t.Fatalf("ReadBuckets before: %v", err)
 	}
 
 	// The very same sample arrives again.
 	ingestBatch(t, db, s, "agent_a", []telemetry.Metric{m})
-
-	var after int64
-	if err := db.QueryRowContext(ctx,
-		`SELECT last_ts FROM rollup_state WHERE resolution='1m' AND series_id=?`, seriesID).Scan(&after); err != nil {
-		t.Fatalf("watermark after: %v", err)
+	if err := s.Rollup(ctx); err != nil {
+		t.Fatalf("rollup after replay: %v", err)
 	}
-	if after != before {
-		t.Fatalf("a duplicate sample rewound the watermark %d -> %d; it changed no history", before, after)
+	after, err := s.ts.ReadBuckets(ctx, tsstore.TierM1, seriesID, winLo, winHi)
+	if err != nil {
+		t.Fatalf("ReadBuckets after: %v", err)
+	}
+	if len(after) != 1 || len(before) != 1 || after[0].Cnt != before[0].Cnt || after[0].Sum != before[0].Sum {
+		t.Fatalf("a duplicate sample changed rollup history: before=%+v after=%+v", before, after)
 	}
 }

@@ -14,7 +14,51 @@ import (
 
 	"github.com/nettact/protocol/telemetry"
 	"github.com/nettact/server-core/metrics"
+	"github.com/nettact/server-core/store"
+	"github.com/nettact/server-core/tsstore/tsstoretest"
 )
+
+// openMetricsStore returns a status-fixture DB plus a metrics store over a
+// throwaway data plane.
+func openMetricsStore(t *testing.T) (*store.DB, *metrics.Store) {
+	t.Helper()
+	db := openStatusDB(t)
+	return db, metrics.New(db, tsstoretest.Open(t))
+}
+
+// seedMetrics lands a batch through the production write path: series resolved
+// pre-transaction, the 1m rollup watermark rewound inside it, raw samples
+// appended after commit, latest cache folded.
+func seedMetrics(t *testing.T, db *store.DB, ms *metrics.Store, agentID string, batch []telemetry.Metric) {
+	t.Helper()
+	ctx := context.Background()
+	ids, err := ms.EnsureSeries(ctx, agentID, "site_default", batch)
+	if err != nil {
+		t.Fatalf("EnsureSeries: %v", err)
+	}
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("BeginTx: %v", err)
+	}
+	if err := ms.RewindForBatch(ctx, tx, agentID, ids, batch); err != nil {
+		t.Fatalf("RewindForBatch: %v", err)
+	}
+	pendingDone := ms.BeginPendingAppend(ids)
+	defer func() {
+		if pendingDone != nil {
+			pendingDone()
+		}
+	}()
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	if _, err := ms.AppendRawSamples(ctx, agentID, ids, batch); err != nil {
+		t.Fatalf("AppendRawSamples: %v", err)
+	}
+	pendingDone()
+	pendingDone = nil
+	ms.UpdateLatest(agentID, ids, batch)
+}
 
 // TestAgentMetricsUntilWindow covers the optional absolute upper bound on the
 // series endpoint. since_seconds stays RELATIVE (seconds before now) while until
@@ -22,9 +66,7 @@ import (
 // [now − since_seconds, min(now, until)] — which is what lets the console chart a
 // historical game run without the range silently stretching to now.
 func TestAgentMetricsUntilWindow(t *testing.T) {
-	db := openStatusDB(t)
-	ctx := context.Background()
-	ms := metrics.New(db)
+	db, ms := openMetricsStore(t)
 	d := Deps{Metrics: ms}
 
 	now := time.Now()
@@ -33,20 +75,7 @@ func TestAgentMetricsUntilWindow(t *testing.T) {
 		{TS: now.Add(-40 * time.Minute), Kind: telemetry.ICMPRTTms, Target: "1.1.1.1", Layer: "internet", Value: 20, Unit: "ms", MonitorID: "target-1"},
 		{TS: now.Add(-30 * time.Minute), Kind: telemetry.ICMPRTTms, Target: "1.1.1.1", Layer: "internet", Value: 30, Unit: "ms", MonitorID: "target-1"},
 	}
-	ids, err := ms.EnsureSeries(ctx, "agent-1", "site_default", batch)
-	if err != nil {
-		t.Fatalf("EnsureSeries: %v", err)
-	}
-	tx, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		t.Fatalf("BeginTx: %v", err)
-	}
-	if err := ms.InsertSamples(ctx, tx, "agent-1", ids, batch); err != nil {
-		t.Fatalf("InsertSamples: %v", err)
-	}
-	if err := tx.Commit(); err != nil {
-		t.Fatalf("Commit: %v", err)
-	}
+	seedMetrics(t, db, ms, "agent-1", batch)
 
 	get := func(query string) *httptest.ResponseRecorder {
 		t.Helper()
@@ -112,9 +141,7 @@ func TestAgentMetricsUntilWindow(t *testing.T) {
 // TestAgentMetricsSummary covers the PERF-001 aggregation endpoint: JSON shape
 // (including nulls for kinds with no samples) and the 400 guards.
 func TestAgentMetricsSummary(t *testing.T) {
-	db := openStatusDB(t)
-	ctx := context.Background()
-	ms := metrics.New(db)
+	db, ms := openMetricsStore(t)
 	d := Deps{Metrics: ms}
 
 	now := time.Now()
@@ -123,20 +150,7 @@ func TestAgentMetricsSummary(t *testing.T) {
 		{TS: now.Add(-20 * time.Second), Kind: telemetry.ICMPRTTms, Target: "1.1.1.1", Layer: "internet", Value: 20, Unit: "ms", MonitorID: "target-1"},
 		{TS: now.Add(-10 * time.Second), Kind: telemetry.ICMPRTTms, Target: "1.1.1.1", Layer: "internet", Value: 35, Unit: "ms", MonitorID: "target-1"},
 	}
-	ids, err := ms.EnsureSeries(ctx, "agent-1", "site_default", batch)
-	if err != nil {
-		t.Fatalf("EnsureSeries: %v", err)
-	}
-	tx, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		t.Fatalf("BeginTx: %v", err)
-	}
-	if err := ms.InsertSamples(ctx, tx, "agent-1", ids, batch); err != nil {
-		t.Fatalf("InsertSamples: %v", err)
-	}
-	if err := tx.Commit(); err != nil {
-		t.Fatalf("Commit: %v", err)
-	}
+	seedMetrics(t, db, ms, "agent-1", batch)
 
 	get := func(query string) *httptest.ResponseRecorder {
 		t.Helper()

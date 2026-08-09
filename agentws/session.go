@@ -142,7 +142,7 @@ func (s *session) pingLoop(reg *registry.Service) {
 				return
 			}
 			tctx, tcancel := context.WithTimeout(context.Background(), pingTimeout)
-			_ = reg.TouchLastSeen(tctx, s.agentID)
+			_ = reg.TouchLastSeenThrottled(tctx, s.agentID)
 			tcancel()
 		case <-s.done:
 			return
@@ -182,8 +182,8 @@ func (h *Hub) readLoop(ctx context.Context, s *session) error {
 				s.shutdown(wire.CloseInternalError, "ingest failed")
 				return nil
 			}
-			_ = h.deps.Registry.TouchLastSeen(ctx, s.agentID)
-			_ = h.deps.Registry.SetReportedConfigVersion(ctx, s.agentID, frame.Packet.ReportedConfigVersion)
+			// Liveness rides inside Ingest's transaction (TouchAgentTx); nothing
+			// to stamp here — the ack goes straight back.
 			wack := wire.Ack(ack)
 			if !s.enqueue(wire.Frame{Ack: &wack}) {
 				return nil

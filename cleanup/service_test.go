@@ -9,6 +9,7 @@ import (
 	"github.com/nettact/server-core/metrics"
 	"github.com/nettact/server-core/store"
 	"github.com/nettact/server-core/store/storetest"
+	"github.com/nettact/server-core/tsstore/tsstoretest"
 )
 
 // newTestService opens a fresh DB with the minimal fixtures a cleanup job needs
@@ -28,7 +29,7 @@ func newTestService(t *testing.T) (*store.DB, *metrics.Store, *Service) {
 	exec(`INSERT INTO agents(id, site_id, public_key, token_hash, hostname, display_name) VALUES('ag1','site_default',x'00','h','host1','Agent One')`)
 	exec(`INSERT INTO probe_tasks(id, site_id, group_id, kind, target, name) VALUES('probe_live','site_default','g1','icmp.rtt.ms','1.1.1.1','Live ping')`)
 
-	m := metrics.New(db)
+	m := metrics.New(db, tsstoretest.Open(t))
 	now := alignDown(time.Now().Unix(), 60)
 	seed := func(monitorID, kind, target string) {
 		ms := []telemetry.Metric{}
@@ -42,11 +43,28 @@ func newTestService(t *testing.T) (*store.DB, *metrics.Store, *Service) {
 		if err != nil {
 			t.Fatalf("EnsureSeries: %v", err)
 		}
-		tx, _ := db.BeginTx(ctx, nil)
-		if err := m.InsertSamples(ctx, tx, "ag1", ids, ms); err != nil {
-			t.Fatalf("InsertSamples: %v", err)
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			t.Fatalf("BeginTx: %v", err)
 		}
-		tx.Commit()
+		if err := m.RewindForBatch(ctx, tx, "ag1", ids, ms); err != nil {
+			t.Fatalf("RewindForBatch: %v", err)
+		}
+		pendingDone := m.BeginPendingAppend(ids)
+		defer func() {
+			if pendingDone != nil {
+				pendingDone()
+			}
+		}()
+		if err := tx.Commit(); err != nil {
+			t.Fatalf("Commit: %v", err)
+		}
+		if _, err := m.AppendRawSamples(ctx, "ag1", ids, ms); err != nil {
+			t.Fatalf("AppendRawSamples: %v", err)
+		}
+		pendingDone()
+		pendingDone = nil
+		m.UpdateLatest("ag1", ids, ms)
 	}
 	seed("probe_live", "icmp.rtt.ms", "1.1.1.1")
 	seed("probe_gone", "icmp.rtt.ms", "9.9.9.9") // no probe_tasks row -> orphan
@@ -168,11 +186,21 @@ func TestDeleteAllMode(t *testing.T) {
 	if job.State != "done" {
 		t.Fatalf("job state = %q, want done", job.State)
 	}
-	// All sample data is gone.
-	var nSamples int
-	db.QueryRowContext(ctx, `SELECT COUNT(*) FROM samples`).Scan(&nSamples)
-	if nSamples != 0 {
-		t.Errorf("samples remaining after delete-all = %d, want 0", nSamples)
+	// All sample data is gone. The orphan series' data was purged outright; the
+	// live/system series were cut off (series.purge_cutoff), so nothing reads as
+	// data anymore.
+	entries, err := m.CleanupInventory(ctx, "site_default")
+	if err != nil {
+		t.Fatalf("CleanupInventory: %v", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("series rows after delete-all = %d, want 2 (live + system kept)", len(entries))
+	}
+	for _, e := range entries {
+		if e.Earliest != 0 || e.Latest != 0 || e.EstSamples != 0 {
+			t.Errorf("series %s/%s still reports data after delete-all: earliest=%d latest=%d est=%d",
+				e.MonitorID, e.Kind, e.Earliest, e.Latest, e.EstSamples)
+		}
 	}
 	// The orphan (deleted-monitor) series row is removed; the live monitor and the
 	// present agent's system series rows are KEPT (they may be ingesting), just emptied.
@@ -203,7 +231,7 @@ func TestCrashWindowCountsPreserved(t *testing.T) {
 		t.Fatalf("persist planned: %v", err)
 	}
 	ids, _ := m.ResolveSeriesIDs(ctx, "site_default", "ag1", "probe_gone", "icmp.rtt.ms", "9.9.9.9")
-	if _, err := db.ExecContext(ctx, `DELETE FROM samples WHERE series_id=?`, ids[0]); err != nil {
+	if _, err := m.ClearSeriesHistory(ctx, ids); err != nil {
 		t.Fatalf("simulate delete: %v", err)
 	}
 	if err := svc.Tick(ctx); err != nil {

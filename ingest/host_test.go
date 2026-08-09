@@ -11,6 +11,7 @@ import (
 	"github.com/nettact/server-core/metrics"
 	"github.com/nettact/server-core/store"
 	"github.com/nettact/server-core/store/storetest"
+	"github.com/nettact/server-core/tsstore/tsstoretest"
 )
 
 // openHostIngest wires a real fault engine behind ingest, so these tests exercise
@@ -37,7 +38,7 @@ func openHostIngest(t *testing.T, allAgents bool) (*store.DB, *Service) {
 	      VALUES('mg','site_default','Default',1,0,?)`, all)
 	exec(`INSERT INTO probe_tasks(id,site_id,group_id,kind,name,target,params,enabled,config_serial)
 	      VALUES('h1','site_default','mg','host','Server','host','{}',1,1)`)
-	m := metrics.New(db)
+	m := metrics.New(db, tsstoretest.Open(t))
 	return db, New(db, nil, m, fault.New(db, nil, nil), nil, nil)
 }
 
@@ -91,13 +92,19 @@ func TestIngestConfirmsHostFaultInTheSampleTransaction(t *testing.T) {
 	if n := firingHostSignals(t, db); n != 1 {
 		t.Fatalf("host signals = %d after the tenth reading, want 1", n)
 	}
-	// The samples that prove it committed with it.
-	var samples int
-	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM samples`).Scan(&samples); err != nil {
+	// The samples that prove it committed with it. The raw data plane lives in the
+	// embedded TSDB now, so count the host.cpu.pct series via the exported read
+	// (MonitorID is empty on host samples, matching the series key).
+	ids, err := svc.metrics.ResolveSeriesIDs(ctx, "site_default", "agent_h", "", string(telemetry.HostCPUPct), "host")
+	if err != nil {
+		t.Fatalf("resolve host cpu series: %v", err)
+	}
+	rc, err := svc.metrics.CountRange(ctx, ids, 0, 0)
+	if err != nil {
 		t.Fatalf("count samples: %v", err)
 	}
-	if samples != 10 {
-		t.Errorf("stored %d samples alongside the fault, want 10", samples)
+	if rc.Samples != 10 {
+		t.Errorf("stored %d samples alongside the fault, want 10", rc.Samples)
 	}
 }
 

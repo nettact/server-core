@@ -12,6 +12,7 @@ import (
 	"github.com/nettact/server-core/metrics"
 	"github.com/nettact/server-core/store"
 	"github.com/nettact/server-core/store/storetest"
+	"github.com/nettact/server-core/tsstore/tsstoretest"
 )
 
 func openWiFiIngest(t *testing.T) (*store.DB, *Service, *inventory.Service, *metrics.Store) {
@@ -25,7 +26,7 @@ func openWiFiIngest(t *testing.T) (*store.DB, *Service, *inventory.Service, *met
 	if _, err := db.ExecContext(ctx, `INSERT INTO agents(id,site_id,public_key,token_hash,status) VALUES('agent_wifi','site_default',x'00','h','online')`); err != nil {
 		t.Fatalf("seed agent: %v", err)
 	}
-	m := metrics.New(db)
+	m := metrics.New(db, tsstoretest.Open(t))
 	return db, New(db, nil, m, nil, nil, nil), inventory.New(db, nil), m
 }
 
@@ -83,8 +84,11 @@ func TestInterfaceSnapshotUsesSequenceAndExactRoundNumerics(t *testing.T) {
 		t.Fatalf("current-round Wi-Fi values=%+v", w)
 	}
 
-	// A newly seen but lower packet sequence must not replace authoritative
-	// current state, even if its wall-clock sample is later.
+	// A below-watermark sequence is a replay by the agent WAL's FIFO contract
+	// (single in-flight packet, resent under its original sequence until acked):
+	// the whole packet is skipped — snapshot, metrics and all — so neither the
+	// authoritative Wi-Fi state nor the history may change, even though its
+	// wall-clock sample is later.
 	if _, err := svc.Ingest(ctx, "agent_wifi", "site_default", wifiPacket(9, t1.Add(time.Hour), telemetry.WiFiConnected, "wrong", true)); err != nil {
 		t.Fatalf("ingest lower sequence: %v", err)
 	}
@@ -106,8 +110,10 @@ func TestInterfaceSnapshotUsesSequenceAndExactRoundNumerics(t *testing.T) {
 
 	// Wi-Fi history remains queryable, but /latest's Store method excludes it
 	// because current Dashboard values come from the authoritative snapshot.
+	// Only the seq-10 sample exists: the below-watermark packet was dropped
+	// wholesale, and the disconnect round (seq 11) carried no Wi-Fi metrics.
 	pts, err := metricStore.Query(ctx, metrics.Query{AgentID: "agent_wifi", Kind: string(telemetry.WiFiSignalDBm), SinceUnix: t1.Add(-time.Minute).Unix()})
-	if err != nil || len(pts) != 2 { // seq 10 and the lower-sequence packet both remain valid history
+	if err != nil || len(pts) != 1 {
 		t.Fatalf("Wi-Fi history=%+v err=%v", pts, err)
 	}
 	latest, err := metricStore.LatestSnapshot(ctx, "agent_wifi", t1.Add(-time.Minute).Unix())

@@ -301,7 +301,7 @@ func TestCloseAbandonedGraceRunsFromDisconnect(t *testing.T) {
 
 	// Same run, same staleness; only the disconnect has aged past the grace.
 	if _, err := db.ExecContext(ctx, `UPDATE agents SET last_seen_at=? WHERE id='agent_blip'`,
-		time.Now().UTC().Add(-3*time.Minute)); err != nil {
+		time.Now().UTC().Add(-runAbandonedAfterOffline-time.Minute)); err != nil {
 		t.Fatalf("age the disconnect: %v", err)
 	}
 	if n, err := svc.CloseAbandonedRuns(ctx); err != nil || n != 1 {

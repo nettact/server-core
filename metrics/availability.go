@@ -2,7 +2,6 @@ package metrics
 
 import (
 	"context"
-	"strings"
 )
 
 // RoundOKKind is the server-derived series that records each probe round's
@@ -12,10 +11,10 @@ import (
 // are absent rather than zero, they never drag a target's availability down.
 //
 // Availability rides the ordinary time-series pipeline instead of a bespoke
-// aggregate table, which is what makes it cheap and correct for free: the
-// samples primary key makes a replayed packet idempotent, the rollup worker
-// turns each bucket into (cnt, total) — exactly rounds and successful rounds for
-// a 0/1 series — and the tiered retention already keeps 30 days of minute
+// aggregate table, which is what makes it cheap and correct for free: replayed
+// packets are deduplicated at the packet watermark, the rollup worker turns
+// each minute of the 0/1 series into a (cnt, sum) bucket — exactly rounds and
+// successful rounds — and the tiered retention already keeps 30 days of minute
 // buckets, covering every window the console offers.
 //
 // The kind matches no probe family in telemetry.MetricAllowedForProbeKind, so it
@@ -41,31 +40,6 @@ func (a AvailabilityRatio) withRatio() AvailabilityRatio {
 	return a
 }
 
-// availabilitySQL sums a window from two non-overlapping sources: completed
-// minute buckets below each series' own rollup watermark, and raw samples at or
-// above it. Splitting per series (rather than at one global watermark) means a
-// brand-new series with no watermark yet reads entirely from raw while every
-// established series still reads the cheap aggregate — and because a bucket at
-// ts covers exactly [ts, ts+60) and the watermark is minute-aligned, the two
-// ranges meet without a gap or a double count.
-const availabilitySQL = `
-SELECT monitor_id, agent_id, SUM(c), SUM(t) FROM (
-  SELECT s.monitor_id AS monitor_id, s.agent_id AS agent_id, r.cnt AS c, r.total AS t
-  FROM rollup_1m r
-  JOIN series s ON s.id = r.series_id
-  LEFT JOIN rollup_state st ON st.resolution='1m' AND st.series_id = s.id
-  WHERE s.kind = '` + RoundOKKind + `' AND %SCOPE%
-    AND r.ts >= ? AND r.ts < ? AND r.ts < COALESCE(st.last_ts, 0)
-  UNION ALL
-  SELECT s.monitor_id AS monitor_id, s.agent_id AS agent_id, 1 AS c, sa.value AS t
-  FROM samples sa
-  JOIN series s ON s.id = sa.series_id
-  LEFT JOIN rollup_state st ON st.resolution='1m' AND st.series_id = s.id
-  WHERE s.kind = '` + RoundOKKind + `' AND %SCOPE%
-    AND sa.ts >= ? AND sa.ts < ? AND sa.ts >= COALESCE(st.last_ts, 0)
-)
-GROUP BY monitor_id, agent_id`
-
 // AvailabilityForSite returns each target's availability across every Agent that
 // probed it, for the window [since, until) in Unix seconds. Targets with no
 // verdict rounds in the window are absent from the map rather than reported as
@@ -81,7 +55,8 @@ func (s *Store) AvailabilityForSite(ctx context.Context, siteID string, since, u
 
 // AvailabilityForSiteWithAgents returns the same per-target totals as
 // AvailabilityForSite together with each target's per-Agent breakdown. Both
-// views come from one query so batch status reads do not introduce an N+1 query.
+// views come from one series scan so batch status reads do not introduce an
+// N+1 lookup.
 func (s *Store) AvailabilityForSiteWithAgents(ctx context.Context, siteID string, since, until int64) (map[string]AvailabilityRatio, map[string]map[string]AvailabilityRatio, error) {
 	rows, err := s.availability(ctx, `s.site_id = ?`, []any{siteID}, since, until)
 	if err != nil {
@@ -127,29 +102,98 @@ func (s *Store) AvailabilityForTarget(ctx context.Context, monitorID string, sin
 	return total.withRatio(), perAgent, nil
 }
 
-// availability runs the two-source sum with the given series scope predicate.
+// availability sums each in-scope round.ok series over [since, until) from two
+// non-overlapping sources: completed minute buckets below the series' own 1m
+// rollup watermark, and raw samples at or above it. Splitting per series
+// (rather than at one global watermark) means a brand-new series with no
+// watermark yet reads entirely from raw while every established series still
+// reads the cheap aggregate — and because a bucket at ts covers exactly
+// [ts, ts+60) and the watermark is minute-aligned, the two ranges meet without
+// a gap or a double count. The series set, its per-series watermarks and the
+// purge cutoffs come from one SQLite read; the sums come from the data plane.
 func (s *Store) availability(ctx context.Context, scope string, scopeArgs []any, since, until int64) ([]AvailabilityRatio, error) {
-	q := strings.ReplaceAll(availabilitySQL, "%SCOPE%", scope)
-	args := make([]any, 0, len(scopeArgs)*2+4)
-	args = append(args, scopeArgs...)
-	args = append(args, since, until)
-	args = append(args, scopeArgs...)
-	args = append(args, since, until)
-	rows, err := s.db.Read().QueryContext(ctx, q, args...)
+	q := `SELECT s.id, s.monitor_id, s.agent_id, s.purge_cutoff, COALESCE(st.last_ts, 0)
+	      FROM series s
+	      LEFT JOIN rollup_state st ON st.resolution='1m' AND st.series_id = s.id
+	      WHERE s.kind = '` + RoundOKKind + `' AND ` + scope
+	rows, err := s.db.Read().QueryContext(ctx, q, scopeArgs...)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	var out []AvailabilityRatio
+	type roundSeries struct {
+		id, cutoff, wm     int64
+		monitorID, agentID string
+	}
+	var series []roundSeries
 	for rows.Next() {
-		var r AvailabilityRatio
-		var rounds, ok float64
-		if err := rows.Scan(&r.MonitorID, &r.AgentID, &rounds, &ok); err != nil {
+		var rs roundSeries
+		if err := rows.Scan(&rs.id, &rs.monitorID, &rs.agentID, &rs.cutoff, &rs.wm); err != nil {
+			rows.Close()
 			return nil, err
 		}
-		r.Rounds = int64(rounds)
-		r.OKRounds = int64(ok + 0.5) // the 0/1 sum is exact; round defensively
-		out = append(out, r)
+		series = append(series, rs)
 	}
-	return out, rows.Err()
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	// Sum per (monitor, agent): several config generations of one pair fold
+	// into one continuous history.
+	type pairKey struct{ monitorID, agentID string }
+	sums := make(map[pairKey]*AvailabilityRatio)
+	for _, rs := range series {
+		lo := since
+		if rs.cutoff > lo {
+			lo = rs.cutoff
+		}
+		if lo >= until {
+			continue
+		}
+		key := pairKey{rs.monitorID, rs.agentID}
+		agg := sums[key]
+		if agg == nil {
+			agg = &AvailabilityRatio{MonitorID: rs.monitorID, AgentID: rs.agentID}
+			sums[key] = agg
+		}
+		// Buckets strictly below the watermark…
+		bucketHi := until
+		if rs.wm < bucketHi {
+			bucketHi = rs.wm
+		}
+		if bucketHi > lo {
+			buckets, err := s.ts.ReadBuckets(ctx, tierOf("rollup_1m"), rs.id, lo, bucketHi)
+			if err != nil {
+				return nil, err
+			}
+			for _, b := range buckets {
+				agg.Rounds += b.Cnt
+				agg.OKRounds += int64(b.Sum + 0.5) // the 0/1 sum is exact; round defensively
+			}
+		}
+		// …and raw at or above it.
+		rawLo := lo
+		if rs.wm > rawLo {
+			rawLo = rs.wm
+		}
+		if until > rawLo {
+			samples, err := s.ts.RawRange(ctx, rs.id, rawLo, until, 0)
+			if err != nil {
+				return nil, err
+			}
+			for _, smp := range samples {
+				agg.Rounds++
+				agg.OKRounds += int64(smp.Value + 0.5)
+			}
+		}
+	}
+
+	out := make([]AvailabilityRatio, 0, len(sums))
+	for _, agg := range sums {
+		if agg.Rounds == 0 {
+			continue // no verdicts in window: absent, not 0%
+		}
+		out = append(out, *agg)
+	}
+	return out, nil
 }

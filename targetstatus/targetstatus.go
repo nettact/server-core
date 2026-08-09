@@ -830,11 +830,19 @@ func (s *Service) loadMonitorStatus(ctx context.Context, tx *sql.Tx, siteID stri
 // material change are simply not joined, so an old good sample can never surface
 // as current (and a pending pair, whose new-generation series does not exist yet,
 // yields no row → honest no_data).
+//
+// The SERIES SET — the config-consistency half — still resolves inside the
+// snapshot transaction. The VALUES come from the metrics latest cache: the
+// samples themselves live in the time-series data plane now, so an in-tx value
+// read stopped being possible, and the cache is the post-commit,
+// purge/cutoff-aware truth (a fresh series with no cached value is skipped,
+// preserving the honest no_data). The one semantic shift is a sample-vs-config
+// race of a single poll's width: a packet committing between this query and
+// the cache read can surface a value one beat newer than the snapshot — values
+// were never part of the config snapshot's consistency story.
 func (s *Service) loadLatestSamples(ctx context.Context, tx *sql.Tx, siteID string) (map[string]*sampleVal, error) {
 	rows, err := tx.QueryContext(ctx, `
-		SELECT s.monitor_id, s.agent_id, s.kind, s.unit,
-		       (SELECT ts    FROM samples WHERE series_id=s.id ORDER BY ts DESC LIMIT 1),
-		       (SELECT value FROM samples WHERE series_id=s.id ORDER BY ts DESC LIMIT 1)
+		SELECT s.id, s.agent_id, s.monitor_id, s.kind, s.unit
 		FROM series s
 		JOIN probe_tasks pt ON pt.id = s.monitor_id AND s.config_serial = pt.config_serial
 		WHERE s.site_id=? AND s.monitor_id <> ''`, siteID)
@@ -842,23 +850,50 @@ func (s *Service) loadLatestSamples(ctx context.Context, tx *sql.Tx, siteID stri
 		return nil, err
 	}
 	defer rows.Close()
-	out := map[string]*sampleVal{}
+	type ref struct {
+		id                 int64
+		agentID, monitorID string
+		kind, unit         string
+	}
+	var refs []ref
+	agents := map[string]bool{}
 	for rows.Next() {
-		var monitorID, agentID string
-		var ts sql.NullInt64
-		var value sql.NullFloat64
-		sv := &sampleVal{}
-		if err := rows.Scan(&monitorID, &agentID, &sv.kind, &sv.unit, &ts, &value); err != nil {
+		var r ref
+		if err := rows.Scan(&r.id, &r.agentID, &r.monitorID, &r.kind, &r.unit); err != nil {
 			return nil, err
 		}
-		if !ts.Valid { // a series with no samples yet
-			continue
-		}
-		sv.ts = ts.Int64
-		sv.value = value.Float64
-		out[monitorID+"\x00"+agentID+"\x00"+sv.kind] = sv
+		refs = append(refs, r)
+		agents[r.agentID] = true
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	out := map[string]*sampleVal{}
+	if s.metrics == nil || len(refs) == 0 {
+		return out, nil
+	}
+	agentIDs := make([]string, 0, len(agents))
+	for a := range agents {
+		agentIDs = append(agentIDs, a)
+	}
+	ids := make([]int64, len(refs))
+	for i, r := range refs {
+		ids[i] = r.id
+	}
+	vals, err := s.metrics.LatestForSeries(ctx, agentIDs, ids)
+	if err != nil {
+		return nil, err
+	}
+	for _, r := range refs {
+		lv, ok := vals[r.id]
+		if !ok {
+			continue // a series with no samples yet
+		}
+		out[r.monitorID+"\x00"+r.agentID+"\x00"+r.kind] = &sampleVal{
+			kind: r.kind, unit: r.unit, ts: lv.TS, value: lv.Value,
+		}
+	}
+	return out, nil
 }
 
 // loadDetectorState returns the site's built-in availability detector counters,

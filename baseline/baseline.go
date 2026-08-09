@@ -50,6 +50,7 @@ import (
 
 	"github.com/nettact/protocol/telemetry"
 	"github.com/nettact/server-core/store"
+	"github.com/nettact/server-core/tsstore"
 )
 
 const (
@@ -108,9 +109,12 @@ type BandKey struct {
 }
 
 // Service reads and maintains the baseline tables.
-type Service struct{ db *store.DB }
+type Service struct {
+	db *store.DB
+	ts tsstore.SeriesStore // raw-sample reads; the fold's writes stay in SQLite
+}
 
-func New(db *store.DB) *Service { return &Service{db: db} }
+func New(db *store.DB, ts tsstore.SeriesStore) *Service { return &Service{db: db, ts: ts} }
 
 // ---- bucketing ----
 
@@ -305,7 +309,7 @@ func (s *Service) foldBatch(ctx context.Context, batch []foldSeries, now time.Ti
 		}
 	}()
 	for _, f := range batch {
-		if err := foldOne(ctx, tx, f, now); err != nil {
+		if err := s.foldOne(ctx, tx, f, now); err != nil {
 			return err
 		}
 	}
@@ -316,7 +320,7 @@ func (s *Service) foldBatch(ctx context.Context, batch []foldSeries, now time.Ti
 	return nil
 }
 
-func foldOne(ctx context.Context, tx *sql.Tx, f foldSeries, now time.Time) error {
+func (s *Service) foldOne(ctx context.Context, tx *sql.Tx, f foldSeries, now time.Time) error {
 	// Bounded above by server time, and this is load-bearing rather than tidy.
 	// Sample timestamps come from the AGENT's clock. One running ahead writes
 	// samples stamped in the future; folding them would park this series'
@@ -328,28 +332,26 @@ func foldOne(ctx context.Context, tx *sql.Tx, f foldSeries, now time.Time) error
 	// they fold normally once they are no longer in the future (or age out of raw
 	// retention first, which is equally fine).
 	horizon := now.Unix()
-	var minTS, maxTS sql.NullInt64
-	if err := tx.QueryRowContext(ctx,
-		`SELECT MIN(ts), MAX(ts) FROM samples WHERE series_id=? AND ts>? AND ts<=?`,
-		f.seriesID, f.lastTS, horizon).
-		Scan(&minTS, &maxTS); err != nil {
+	tail, err := s.ts.RawRange(ctx, f.seriesID, f.lastTS+1, horizon+1, 0)
+	if err != nil {
 		return err
 	}
-	if !minTS.Valid {
+	if len(tail) == 0 {
 		return nil // nothing new; leave the watermark where it is
 	}
+	minTS, maxTS := tail[0].TS, tail[len(tail)-1].TS
 
-	watermark := maxTS.Int64
-	cursor, _ := bucketRange(minTS.Int64)
+	watermark := maxTS
+	cursor, _ := bucketRange(minTS)
 	for i := 0; i < foldBucketCap; i++ {
 		bStart, bEnd := bucketRange(cursor)
 		if bEnd <= bStart {
 			break // defensive: a degenerate range would loop forever
 		}
-		if err := foldBucket(ctx, tx, f, bStart, bEnd, now); err != nil {
+		if err := s.foldBucket(ctx, tx, f, bStart, bEnd, now); err != nil {
 			return err
 		}
-		if bEnd > maxTS.Int64 {
+		if bEnd > maxTS {
 			break
 		}
 		cursor = bEnd
@@ -359,38 +361,31 @@ func foldOne(ctx context.Context, tx *sql.Tx, f foldSeries, now time.Time) error
 			watermark = bEnd - 1
 		}
 	}
-	_, err := tx.ExecContext(ctx,
+	_, err = tx.ExecContext(ctx,
 		`INSERT INTO baseline_state(series_id, last_ts) VALUES(?,?)
 		 ON CONFLICT(series_id) DO UPDATE SET last_ts=excluded.last_ts`,
 		f.seriesID, watermark)
 	return err
 }
 
-// foldBucket recomputes one day-bucket's quantiles from every raw sample in it and
-// upserts the row. An emptied bucket (every sample aged out of raw retention
-// between two runs) leaves any existing row alone: a stale reference is better
-// than silently dropping a day out of the median.
-func foldBucket(ctx context.Context, tx *sql.Tx, f foldSeries, bStart, bEnd int64, now time.Time) error {
-	rows, err := tx.QueryContext(ctx,
-		`SELECT value FROM samples WHERE series_id=? AND ts>=? AND ts<?`, f.seriesID, bStart, bEnd)
+// foldBucket recomputes one day-bucket's quantiles from EVERY raw sample in it
+// — the full window, not just the tail above the watermark: an incremental
+// re-fold of a partially-folded bucket must not overwrite a 100-sample
+// statistic with one computed from the 50 new arrivals — and upserts the row.
+// An emptied bucket (every sample aged out of raw retention between two runs)
+// leaves any existing row alone: a stale reference is better than silently
+// dropping a day out of the median.
+func (s *Service) foldBucket(ctx context.Context, tx *sql.Tx, f foldSeries, bStart, bEnd int64, now time.Time) error {
+	samples, err := s.ts.RawRange(ctx, f.seriesID, bStart, bEnd, 0)
 	if err != nil {
 		return err
 	}
-	var values []float64
-	for rows.Next() {
-		var v float64
-		if err := rows.Scan(&v); err != nil {
-			rows.Close()
-			return err
-		}
-		values = append(values, v)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return err
-	}
-	if len(values) == 0 {
+	if len(samples) == 0 {
 		return nil
+	}
+	values := make([]float64, len(samples))
+	for i, smp := range samples {
+		values[i] = smp.Value
 	}
 	sort.Float64s(values)
 	day, daypart, weekend := BucketOf(bStart)
