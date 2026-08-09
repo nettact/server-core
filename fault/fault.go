@@ -252,6 +252,46 @@ type IncidentScope struct {
 	// vantage point, deliberately left empty on these incidents so an offline
 	// Agent never correlates into a storm).
 	AgentConnectivity bool
+
+	// ReplayLag is how far the confirming evidence lags the transaction's wall
+	// clock. It is ~0 for telemetry arriving live and large for a backlog an agent
+	// buffered through an outage and uploaded on reconnect.
+	//
+	// The policy layer needs it because a replayed fault arrives already finished:
+	// the rounds that confirm it and the rounds that resolve it are seconds apart
+	// on the wire even though they are twenty minutes apart in the evidence. The
+	// notification delay is what normally lets a fault that recovered quickly go
+	// unannounced, but that delay is configurable down to zero, and at zero the
+	// worker can send an alarm about an outage that ended before the message was
+	// composed. See notifypolicy for what it does with this.
+	ReplayLag time.Duration
+}
+
+// ReplayThreshold is how far behind the wall clock a confirmation's evidence has
+// to be before it counts as replayed rather than live.
+//
+// Two minutes is comfortably above the ordinary agent-to-server lag — probe
+// instant, batching, drain interval, ingest — and far below the outage lengths
+// this distinction exists for. It is not tunable: it separates two kinds of
+// event, not two tastes in alerting.
+const ReplayThreshold = 2 * time.Minute
+
+// replayLag is how far behind now a confirmation's evidence is, never negative.
+//
+// An agent whose clock runs ahead would otherwise produce a negative lag that
+// compares as "very live", which is the one direction that matters: it would let
+// a genuinely replayed fault be treated as live merely because the timestamps
+// are wrong in the other direction. Clamping keeps a bad clock from buying a
+// notification, and the agent's own correction (agent/internal/clockmon) is what
+// stops it happening in the first place.
+func replayLag(evidence, now time.Time) time.Duration {
+	if evidence.IsZero() {
+		return 0
+	}
+	if d := now.Sub(evidence); d > 0 {
+		return d
+	}
+	return 0
 }
 
 // Planner is the notification-policy surface the engine calls inside its write

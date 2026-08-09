@@ -74,12 +74,17 @@ func (s *Service) OpenAgentSignal(ctx context.Context, in AgentSignalInput, now 
 		ReasonDetail: in.Reason, ObservedAt: observed.UTC(), ConfirmedAt: now,
 	}
 	incidentID, opened, _, err := findOrCreateIncident(ctx, tx,
-		"agent:"+in.AgentID, in.SiteID, "", "", SignalTitle(sig), sig.Severity, sig.Layer, now)
+		"agent:"+in.AgentID, in.SiteID, "", "", SignalTitle(sig), sig.Severity, sig.Layer, observed, now)
 	if err != nil {
 		return "", err
 	}
 	sig.IncidentID = incidentID
 	if err := insertSignal(ctx, tx, sig, 0); err != nil {
+		return "", err
+	}
+	// The Agent went offline when it was last seen, not when the grace period
+	// expired — the same distinction observed_at already carries on the signal.
+	if err := lowerFirstObserved(ctx, tx, incidentID, observed); err != nil {
 		return "", err
 	}
 	if _, err := tx.ExecContext(ctx,
@@ -107,6 +112,11 @@ func (s *Service) OpenAgentSignal(ctx context.Context, in AgentSignalInput, now 
 			if err := s.planner.PlanOpenTx(ctx, tx, IncidentScope{
 				IncidentID: incidentID, SiteID: in.SiteID, Severity: sig.Severity,
 				AgentConnectivity: true,
+				// Confirmed by the sweeper against the wall clock, so this is always
+				// live evidence — the Agent is offline right now. Stated rather than
+				// left to the zero value so the contrast with the replayed target
+				// faults is on the page.
+				ReplayLag: 0,
 			}, now); err != nil {
 				return "", err
 			}

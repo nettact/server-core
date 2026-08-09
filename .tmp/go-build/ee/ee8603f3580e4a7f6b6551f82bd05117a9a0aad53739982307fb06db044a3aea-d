@@ -1,0 +1,8 @@
+./event.go
+./health.go
+./hostsnapshot.go
+./incident.go
+./inventory.go
+./metric.go
+./packet.go
+./wireless.go

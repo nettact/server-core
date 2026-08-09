@@ -103,6 +103,10 @@ type baseTarget struct {
 // recentSampleLimit bounds how many recent points the base freezes per condition.
 const recentSampleLimit = 12
 
+// recentSampleWindow is how far back the frozen chart reaches. See recentSamples
+// for why it is measured from the fault's evidence rather than from now.
+const recentSampleWindow = 5 * time.Minute
+
 // WriteIncidentBase writes the one immutable incident snapshot's server base row
 // synchronously, inside the caller's incident-open transaction. It reads the
 // just-inserted incident/alert/evidence rows through tx (so it sees uncommitted
@@ -213,7 +217,7 @@ func (s *Service) baseMembers(ctx context.Context, tx *sql.Tx, incidentID string
 		return nil, nil, nil, err
 	}
 	for i := range members {
-		members[i].Evidence.RecentSamples = s.recentSamples(ctx, members[i].AgentID, members[i].Evidence)
+		members[i].Evidence.RecentSamples = s.recentSamples(ctx, members[i].AgentID, members[i].Evidence, members[i].ObservedAt)
 	}
 	return members, agentIDs, targetIDs, nil
 }
@@ -222,12 +226,27 @@ func (s *Service) baseMembers(ctx context.Context, tx *sql.Tx, incidentID string
 // from the read pool. Best-effort: on any error, a missing metrics store, or a
 // member with no metric (Agent connectivity) it returns nil, so a snapshot never
 // fails on a chart read.
-func (s *Service) recentSamples(ctx context.Context, agentID string, e baseEvidence) []baseSample {
+//
+// The window is anchored on the fault's OWN evidence rather than on the wall
+// clock. A snapshot is written in the same transaction that confirms the fault,
+// so for live telemetry the two are the same thing — but a fault confirmed from
+// a backlog an agent replayed on reconnect is evidence from twenty minutes ago,
+// and a window measured back from now would find nothing at all and freeze an
+// empty chart into the one immutable record of what the failure looked like.
+func (s *Service) recentSamples(ctx context.Context, agentID string, e baseEvidence, observedAt time.Time) []baseSample {
 	if s.metrics == nil || e.MetricKind == "" || e.TargetID == "" {
 		return nil
 	}
+	// Reach back from the first failing round, not from the confirmation: the
+	// samples worth freezing are the ones leading INTO the failure.
+	since := time.Now().Add(-recentSampleWindow)
+	if !observedAt.IsZero() {
+		if s := observedAt.Add(-recentSampleWindow); s.Before(since) {
+			since = s
+		}
+	}
 	q := metrics.Query{AgentID: agentID, Kind: e.MetricKind, MonitorID: e.TargetID,
-		Limit: recentSampleLimit, SinceUnix: time.Now().Add(-5 * time.Minute).Unix()}
+		Limit: recentSampleLimit, SinceUnix: since.Unix()}
 	pts, err := s.metrics.Query(ctx, q)
 	if err != nil || len(pts) == 0 {
 		return nil

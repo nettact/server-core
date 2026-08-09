@@ -100,13 +100,47 @@ func (s *Service) PlanOpenTx(ctx context.Context, tx *sql.Tx, sc fault.IncidentS
 		return err
 	}
 	if eff.Policy != nil && eff.Policy.Covers(sc.Severity) && len(eff.Policy.ChannelIDs) > 0 {
-		due := now.Add(eff.Policy.Delay(sc.Severity))
+		due := now.Add(dueDelay(eff.Policy.Delay(sc.Severity), sc.ReplayLag))
 		if err := insertDeliveries(ctx, tx, subject{incidentID: sc.IncidentID}, sc.SiteID,
 			eventOpened, *eff.Policy, due, now); err != nil {
 			return err
 		}
 	}
 	return s.correlateStormTx(ctx, tx, sc, now)
+}
+
+// replaySettle is the floor a replayed fault's notification waits out, on top of
+// whatever the policy asks for.
+//
+// It has to exist because the notification delay cannot carry this on its own.
+// The delay is what normally keeps a fault that recovered quickly from ever
+// being announced — ResolveTx cancels every pending delivery — but it is
+// configurable, and zero is a legal value. At zero, an agent reconnecting after
+// a twenty-minute outage plans an alarm the instant its backlog confirms the
+// fault, and the delivery worker can send it before the very next packet (or the
+// rest of the same one) delivers the rounds that show the fault ended nineteen
+// minutes ago.
+//
+// A minute is chosen against how a backlog actually drains: batches follow each
+// other as fast as the socket allows, so the rounds that resolve a replayed
+// fault arrive within seconds of the ones that confirmed it. A minute is far
+// more than that and still short enough that a fault which is genuinely STILL
+// broken — the agent reconnected but the target is still down — is announced
+// while it is news.
+//
+// It is not a suppression: a replayed fault that never recovered is notified
+// normally, one minute later than it would otherwise have been.
+const replaySettle = time.Minute
+
+// dueDelay is how long an open notification waits before it may be sent.
+func dueDelay(policyDelay, replayLag time.Duration) time.Duration {
+	if replayLag < fault.ReplayThreshold {
+		return policyDelay
+	}
+	if policyDelay < replaySettle {
+		return replaySettle
+	}
+	return policyDelay
 }
 
 // EscalateTx reacts to a merged incident's severity rising. A pending open
@@ -122,7 +156,7 @@ func (s *Service) EscalateTx(ctx context.Context, tx *sql.Tx, sc fault.IncidentS
 		return err
 	}
 	if eff.Policy != nil && eff.Policy.Covers(sc.Severity) && len(eff.Policy.ChannelIDs) > 0 {
-		due := now.Add(eff.Policy.Delay(sc.Severity))
+		due := now.Add(dueDelay(eff.Policy.Delay(sc.Severity), sc.ReplayLag))
 		if _, err := tx.ExecContext(ctx, `
 			UPDATE notification_deliveries SET due_at=MIN(due_at, ?)
 			WHERE incident_id=? AND event_kind=? AND status=?`,

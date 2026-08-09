@@ -979,7 +979,28 @@ CREATE TABLE incidents(
   summary         TEXT NOT NULL DEFAULT '',
   resolve_reason  TEXT NOT NULL DEFAULT '',
   evidence_expired INTEGER NOT NULL DEFAULT 0,
+  -- Two different times, and the difference is the whole point.
+  --
+  -- opened_at is when the SERVER recorded the incident — wall clock at the
+  -- confirming transaction. Ordering, the since/until filters and the 24h
+  -- statistics are all built on it, and all of them want receipt time: an
+  -- operator asking "what happened today" means what arrived today, and storm
+  -- correlation only works because a burst of faults uploaded together shares a
+  -- wall-clock instant.
+  --
+  -- first_observed_at is when the fault actually STARTED, taken as the running
+  -- minimum of observed_at over its member signals. For live telemetry the two
+  -- are seconds apart. For a backlog an agent buffered through an outage and
+  -- uploaded on reconnect they differ by the length of the outage, and only this
+  -- one can say how long the outage was — which is exactly what the fault list
+  -- shows.
+  --
+  -- Nullable because a detector can legitimately have no evidence time to give
+  -- (an Agent-connectivity fault whose last-seen is unknown). Readers COALESCE
+  -- it to opened_at, so the API still always carries a usable instant and no
+  -- consumer needs a fallback of its own.
   opened_at       TIMESTAMP NOT NULL,
+  first_observed_at TIMESTAMP,
   resolved_at     TIMESTAMP,
   storm_id        TEXT REFERENCES alert_storms(id)   -- set when merged into a storm
 );

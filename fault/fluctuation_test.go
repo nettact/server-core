@@ -444,6 +444,12 @@ func TestLinkedFluctuationSurvivesRetention(t *testing.T) {
 // detector's counters exactly as they were, because its own connectivity fault
 // covers the outage — so a streak could otherwise be stitched across a day-long
 // hole and reported as consecutive rounds.
+//
+// The streak is abandoned, but it is not erased: those rounds really did fail,
+// and a target that failed twice and then went unobserved (a rebooting router, a
+// replayed backlog) would otherwise leave nothing at all to explain the dip in
+// its availability. What must never happen is the dip being recorded as the
+// width of the HOLE, so the record ends at the last failing round.
 func TestEvaluationGapBreaksTheStreak(t *testing.T) {
 	h := newHarness(t)
 	det := DefaultDetection() // 3 to confirm
@@ -452,12 +458,22 @@ func TestEvaluationGapBreaksTheStreak(t *testing.T) {
 	h.evaluate(det, loss(200000, 100), reason(200000, telemetry.ProbeReasonTimeout, "before"))
 	h.evaluate(det, loss(200010, 100), reason(200010, telemetry.ProbeReasonTimeout, "before"))
 
-	// A day later it comes back and answers. The streak must not be recorded as a
-	// 19-hour "2 of 3" dip — beyond the gap there was no evidence at all.
+	// A day later it comes back and answers.
 	h.evaluate(det, loss(200000+86400, 0))
 
-	if got := h.countFluctuations(); got != 0 {
-		t.Fatalf("a streak split by a day-long evaluation gap must not be recorded, got %d", got)
+	if got := h.countFluctuations(); got != 1 {
+		t.Fatalf("the abandoned streak must be recorded, got %d", got)
+	}
+	f := h.fluctuations()[0]
+	// The decisive assertion: a 19-hour "2 of 3" dip would be a fabrication.
+	if got := f.StartedAt.Unix(); got != 200000 {
+		t.Fatalf("started_at = %d, want the first failing round (200000)", got)
+	}
+	if got := f.EndedAt.Unix(); got != 200010 {
+		t.Fatalf("ended_at = %d, want the last FAILING round (200010), not the far side of the gap", got)
+	}
+	if f.FailRounds != 2 {
+		t.Fatalf("fail_rounds = %d, want the 2 rounds that were actually observed", f.FailRounds)
 	}
 	failRounds, _, _ := h.detector()
 	if failRounds != 0 {

@@ -199,7 +199,22 @@ func (s *Service) advanceAvailabilityRound(ctx context.Context, tx *sql.Tx, agen
 	//
 	// Beyond the gap there is simply no evidence, so the streak is abandoned and
 	// counting starts fresh rather than being stitched across the hole.
+	//
+	// Abandoned is not the same as never happened, though. The rounds before the
+	// gap really did fail, and until now they vanished without trace: a target
+	// that failed twice and then went unobserved — which is precisely what a
+	// rebooting router or a replayed backlog produces — left nothing behind to
+	// explain the dip in its availability. The streak is therefore recorded as a
+	// fluctuation on its way out, ended at its last FAILING round so the record
+	// describes the evidence rather than the hole after it.
 	if st.failRounds > 0 && st.lastRoundTS > 0 && r.TS-st.lastRoundTS > int64(r.Meta.maxRoundGap().Seconds()) {
+		if !st.signalID.Valid {
+			// A streak that confirmed is already a fault; the fault centre tells that
+			// story in full and a fluctuation would report the same failures twice.
+			if err := insertFluctuation(ctx, tx, agentID, siteID, agentName, r, *st, timeFromUnix(st.lastRoundTS)); err != nil {
+				return err
+			}
+		}
 		st.failRounds, st.okRounds = 0, 0
 		st.firstFailTS = sql.NullInt64{}
 		st.pendingFails = nil
@@ -238,7 +253,7 @@ func (s *Service) advanceAvailabilityRound(ctx context.Context, tx *sql.Tx, agen
 	// confirm is excluded (signalID set): that is a fault recovering, which the
 	// fault centre already tells in full.
 	if st.failRounds > 0 && !st.signalID.Valid {
-		if err := insertFluctuation(ctx, tx, agentID, siteID, agentName, r, *st); err != nil {
+		if err := insertFluctuation(ctx, tx, agentID, siteID, agentName, r, *st, timeFromUnix(r.TS)); err != nil {
 			return err
 		}
 	}
@@ -325,12 +340,19 @@ func (s *Service) confirmSignal(ctx context.Context, tx *sql.Tx, agentID, siteID
 func (s *Service) openSignal(ctx context.Context, tx *sql.Tx, sig Signal, port int,
 	openKey, title string, precursorsFrom, now time.Time, out *txOut) error {
 	incidentID, opened, oldSeverity, err := findOrCreateIncident(ctx, tx,
-		openKey, sig.SiteID, sig.GroupID, sig.GroupName, title, sig.Severity, sig.Layer, now)
+		openKey, sig.SiteID, sig.GroupID, sig.GroupName, title, sig.Severity, sig.Layer, sig.ObservedAt, now)
 	if err != nil {
 		return err
 	}
 	sig.IncidentID = incidentID
 	if err := insertSignal(ctx, tx, sig, port); err != nil {
+		return err
+	}
+	// A merged incident's start is the earliest of its members', which the member
+	// joining now may well be: two targets of one group go down at slightly
+	// different moments, and a replayed backlog can attach evidence older than
+	// anything the incident already holds.
+	if err := lowerFirstObserved(ctx, tx, incidentID, sig.ObservedAt); err != nil {
 		return err
 	}
 	newSeverity, err := recomputeIncident(ctx, tx, incidentID)
@@ -350,6 +372,10 @@ func (s *Service) openSignal(ctx context.Context, tx *sql.Tx, sig Signal, port i
 	scope := IncidentScope{
 		IncidentID: incidentID, SiteID: sig.SiteID, GroupID: sig.GroupID,
 		AgentID: sig.AgentID, Severity: newSeverity,
+		// How far behind the wall clock this confirmation's evidence is. Live
+		// telemetry lands near zero; a backlog an agent buffered through an outage
+		// and uploaded on reconnect lands at the length of the outage.
+		ReplayLag: replayLag(sig.ConfirmedAt, now),
 	}
 	if opened {
 		// One immutable base snapshot per incident, written synchronously in this
@@ -452,6 +478,29 @@ func (s *Service) resolveSignal(ctx context.Context, tx *sql.Tx, signalID, reaso
 
 // ---- persistence helpers ----
 
+// lowerFirstObserved pulls an incident's start back to observed if that is
+// earlier, and leaves it alone otherwise.
+//
+// It is the running minimum of its members' observed_at, maintained here — at
+// the one place a member ever joins an incident — rather than recomputed from
+// the member set. Recomputing would mean a MIN() over signals on every recompute
+// pass, and would also let a resolved member's start silently drop out of an
+// incident's recorded duration; the running minimum is monotone by construction.
+//
+// The comparison is in SQL rather than in Go so it is one statement rather than
+// a read followed by a conditional write inside a transaction other writers are
+// interleaved with.
+func lowerFirstObserved(ctx context.Context, tx *sql.Tx, incidentID string, observed time.Time) error {
+	if observed.IsZero() {
+		return nil
+	}
+	_, err := tx.ExecContext(ctx,
+		`UPDATE incidents SET first_observed_at=?
+		 WHERE id=? AND (first_observed_at IS NULL OR first_observed_at>?)`,
+		observed, incidentID, observed)
+	return err
+}
+
 func loadDetectorState(ctx context.Context, tx *sql.Tx, targetID, agentID, detector string) (detectorState, error) {
 	var st detectorState
 	var pending string
@@ -551,7 +600,7 @@ func insertSignal(ctx context.Context, tx *sql.Tx, sig Signal, port int) error {
 // re-selects the winner. Ended incidents never reopen — a new fault under the
 // same key opens a new incident. oldSeverity is the severity before this
 // attachment (empty for a freshly opened incident).
-func findOrCreateIncident(ctx context.Context, tx *sql.Tx, openKey, siteID, groupID, groupName, title, severity, layer string, now time.Time) (id string, opened bool, oldSeverity string, err error) {
+func findOrCreateIncident(ctx context.Context, tx *sql.Tx, openKey, siteID, groupID, groupName, title, severity, layer string, firstObserved, now time.Time) (id string, opened bool, oldSeverity string, err error) {
 	err = tx.QueryRowContext(ctx,
 		`SELECT id, severity FROM incidents WHERE open_key=? AND state='open'`, openKey).Scan(&id, &oldSeverity)
 	if err == nil {
@@ -561,10 +610,14 @@ func findOrCreateIncident(ctx context.Context, tx *sql.Tx, openKey, siteID, grou
 		return "", false, "", err
 	}
 	id = "inc_" + uuid.NewString()
+	var firstObs any
+	if !firstObserved.IsZero() {
+		firstObs = firstObserved
+	}
 	_, err = tx.ExecContext(ctx,
-		`INSERT INTO incidents(id, site_id, group_id, group_name, open_key, title, suspected_layer, state, severity, opened_at)
-		 VALUES(?,?,?,?,?,?,?, 'open', ?, ?)`,
-		id, siteID, groupID, groupName, openKey, title, layer, severity, now)
+		`INSERT INTO incidents(id, site_id, group_id, group_name, open_key, title, suspected_layer, state, severity, opened_at, first_observed_at)
+		 VALUES(?,?,?,?,?,?,?, 'open', ?, ?, ?)`,
+		id, siteID, groupID, groupName, openKey, title, layer, severity, now, firstObs)
 	if err != nil {
 		var id2, sev2 string
 		if e2 := tx.QueryRowContext(ctx,

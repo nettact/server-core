@@ -50,8 +50,15 @@ type Incident struct {
 	Attribution         string          `json:"attribution"`
 	AttributionEvidence json.RawMessage `json:"attribution_evidence,omitempty"`
 	StormID             string          `json:"storm_id,omitempty"`
-	OpenedAt            time.Time       `json:"opened_at"`
-	ResolvedAt          *time.Time      `json:"resolved_at"`
+	// OpenedAt is when the server recorded this incident; FirstObservedAt is when
+	// the fault actually started, from the earliest member's evidence. They are
+	// seconds apart for live telemetry and an outage apart for a backlog an agent
+	// replayed on reconnect — so the list sorts and filters on OpenedAt (receipt
+	// order is what "what happened today" means, and what storm correlation is
+	// built on) and shows duration from FirstObservedAt.
+	OpenedAt        time.Time  `json:"opened_at"`
+	FirstObservedAt time.Time  `json:"first_observed_at"`
+	ResolvedAt      *time.Time `json:"resolved_at"`
 }
 
 // TimelineEntry is one incident timeline row, including the entity ref the fault
@@ -79,7 +86,7 @@ func New(db *store.DB) *Service { return &Service{db: db} }
 
 const incidentCols = `i.id, i.site_id, i.group_id, COALESCE(i.group_name,''), COALESCE(i.title,''),
 	COALESCE(i.suspected_layer,''), i.state, i.severity, COALESCE(i.summary,''),
-	COALESCE(i.resolve_reason,''), i.evidence_expired, i.opened_at, i.resolved_at,
+	COALESCE(i.resolve_reason,''), i.evidence_expired, i.opened_at, i.first_observed_at, i.resolved_at,
 	COALESCE(i.attribution,''), COALESCE(i.attribution_evidence,'[]'),
 	(SELECT COUNT(*) FROM fault_signals s WHERE s.incident_id=i.id),
 	(SELECT COUNT(*) FROM fault_signals s WHERE s.incident_id=i.id AND s.state='firing'),
@@ -261,18 +268,26 @@ type scanner interface {
 
 func scanIncident(row scanner) (Incident, error) {
 	var inc Incident
-	var resolved sql.NullTime
+	var resolved, firstObserved sql.NullTime
 	var evidenceExpired int
 	var attrEv string
 	err := row.Scan(&inc.ID, &inc.SiteID, &inc.GroupID, &inc.GroupName, &inc.Title, &inc.SuspectedLayer,
 		&inc.State, &inc.Severity, &inc.Summary, &inc.ResolveReason, &evidenceExpired,
-		&inc.OpenedAt, &resolved, &inc.Attribution, &attrEv,
+		&inc.OpenedAt, &firstObserved, &resolved, &inc.Attribution, &attrEv,
 		&inc.MemberCount, &inc.ActiveMemberCount, &inc.SnapshotStatus, &inc.TraceCount,
 		&inc.NotifiedCount, &inc.PendingNotifyCount, &inc.StormID)
 	if err != nil {
 		return Incident{}, err
 	}
 	inc.EvidenceExpired = evidenceExpired == 1
+	// The fallback lives here rather than in a SQL COALESCE so the column is read
+	// as the TIMESTAMP it is declared to be: an expression has no declared type,
+	// and the driver hands one back as a string. Either way the field is never
+	// zero, which is what lets every consumer treat it as always present.
+	inc.FirstObservedAt = inc.OpenedAt
+	if firstObserved.Valid {
+		inc.FirstObservedAt = firstObserved.Time
+	}
 	if resolved.Valid {
 		t := resolved.Time
 		inc.ResolvedAt = &t

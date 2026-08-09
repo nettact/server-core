@@ -108,14 +108,22 @@ const fluctuationCols = `id, site_id, agent_id, agent_name, target_id, target_na
 	comparator, value, threshold, reason_code, reason_detail, rounds_json, started_at, ended_at,
 	COALESCE(incident_id,'')`
 
-// insertFluctuation records a recovered sub-threshold streak inside the ingest
-// transaction. r is the recovering round (the source of the current display facts
-// and of the end time); st is the detector state as it stood BEFORE the success
-// branch cleared it, holding the streak's length, start and per-round evidence.
+// insertFluctuation records a recovered or abandoned sub-threshold streak inside
+// the ingest transaction. r is the round that ENDS the streak (the source of the
+// current display facts); st is the detector state as it stood BEFORE it was
+// cleared, holding the streak's length, start and per-round evidence. ended is
+// when the streak actually stopped failing.
+//
+// ended is a parameter rather than r.TS because the two callers end a streak for
+// different reasons. A recovering round ends it at its own timestamp — the
+// failure stopped when the success arrived. A round beyond the consecutive-rounds
+// gap ends it at the last FAILING round instead: the streak was abandoned for
+// want of evidence, and stamping it with the far side of the gap would file a dip
+// as wide as the hole the gap rule exists to refuse to reason across.
 //
 // Idempotent on (target, agent, detector, started_at): a streak begins once, so a
 // replay of the same rounds updates nothing rather than filing the same dip twice.
-func insertFluctuation(ctx context.Context, tx *sql.Tx, agentID, siteID, agentName string, r Round, st detectorState) error {
+func insertFluctuation(ctx context.Context, tx *sql.Tx, agentID, siteID, agentName string, r Round, st detectorState, ended time.Time) error {
 	started := timeFromUnix(r.TS)
 	if st.firstFailTS.Valid {
 		started = timeFromUnix(st.firstFailTS.Int64)
@@ -124,7 +132,7 @@ func insertFluctuation(ctx context.Context, tx *sql.Tx, agentID, siteID, agentNa
 	// signal's summary describes its confirming round: the most recent evidence is
 	// the one that characterises the streak. Every round is kept in rounds_json.
 	//
-	// comparator/threshold come from the recovering round rather than the staged
+	// comparator/threshold come from the ending round rather than the staged
 	// evidence because they are properties of the probe kind and the sensitivity, not
 	// of an individual round, and a sensitivity change would have reset the streak
 	// before it could be recorded here.
@@ -134,7 +142,7 @@ func insertFluctuation(ctx context.Context, tx *sql.Tx, agentID, siteID, agentNa
 		ProbeKind: r.Kind, GroupID: r.GroupID, Layer: r.Layer, DetectorKey: DetectorAvailability,
 		FailRounds: st.failRounds, FailThreshold: r.Det.FailRounds,
 		Comparator: r.Comparator, Threshold: r.Threshold,
-		Rounds: st.pendingFails, StartedAt: started, EndedAt: timeFromUnix(r.TS),
+		Rounds: st.pendingFails, StartedAt: started, EndedAt: ended,
 	})
 }
 
