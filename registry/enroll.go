@@ -381,12 +381,20 @@ func (s *Service) reenrollAgent(ctx context.Context, tx *sql.Tx, agentID string,
 	}
 
 	agentToken = randToken()
+	// Every field the MACHINE owns is reset, not merged: this row now describes a
+	// different installation, and a value it never reported must not be attributed
+	// to it. The upload cadence matters particularly, because a frame that omits
+	// it deliberately keeps the last known one — so without the reset an older
+	// replacement would inherit its predecessor's cadence indefinitely, and the
+	// host detectors would judge its readings' lateness against a window nobody
+	// reported.
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE agents SET
 			public_key=?, token_hash=?, hostname=?, platform=?, agent_version=?,
 			perm_supported=?, perm_granted=?, perm_effective=?, perm_unsupported_reasons=?,
 			policy_source=?, policy_hash=?,
 			status='offline', reported_config_version=0, last_status_config_version=-1,
+			upload_interval_seconds=0,
 			last_disconnect_kind=''
 		WHERE id=?`,
 		[]byte(req.PublicKey), sha256hex(agentToken),

@@ -519,6 +519,11 @@ func TestReinstallTokenRejoinsSameAgent(t *testing.T) {
 	mustExec(t, db, `INSERT INTO agent_packets(agent_id, sequence, received_at, sent_at) VALUES(?,1,?,NULL)`, agentID, time.Now().UTC())
 	mustExec(t, db, `INSERT INTO agent_wifi(agent_id, state, sampled_at, last_sequence) VALUES(?,'ok',?,999)`, agentID, time.Now().UTC())
 	mustExec(t, db, `UPDATE agents SET status='offline' WHERE id=?`, agentID)
+	// The old installation also attested a batch-upload cadence. A MonitorStatus
+	// frame that omits the value deliberately keeps the last known one, so without
+	// a reset here an older replacement would inherit this indefinitely and the
+	// host detectors would judge its readings against a window it never reported.
+	mustExec(t, db, `UPDATE agents SET upload_interval_seconds=300 WHERE id=?`, agentID)
 
 	// Mint a reinstall token bound to this agent and redeem it as a fresh machine
 	// (a NEW ed25519 key — this is the "key lost with the old disk" scenario).
@@ -555,6 +560,14 @@ func TestReinstallTokenRejoinsSameAgent(t *testing.T) {
 	var siteAfter, createdAtAfter string
 	if err := db.QueryRowContext(ctx, `SELECT public_key, site_id, created_at FROM agents WHERE id=?`, agentID).Scan(&pubNow, &siteAfter, &createdAtAfter); err != nil {
 		t.Fatalf("read agent: %v", err)
+	}
+	var cadenceAfter int
+	if err := db.QueryRowContext(ctx, `SELECT upload_interval_seconds FROM agents WHERE id=?`, agentID).Scan(&cadenceAfter); err != nil {
+		t.Fatalf("read cadence: %v", err)
+	}
+	if cadenceAfter != 0 {
+		t.Errorf("upload_interval_seconds = %d after a reinstall, want 0: a new "+
+			"installation must not inherit its predecessor's cadence", cadenceAfter)
 	}
 	if !bytes.Equal(pubNow, pubB) {
 		t.Errorf("public_key = %x, want the new machine's %x", pubNow, pubB)
