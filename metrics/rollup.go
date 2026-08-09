@@ -206,6 +206,26 @@ func (s *Store) rollupTier(ctx context.Context, series []rollupSeries, res strin
 		return err
 	}
 
+	// The pass runs in three phases per tier so the SQLite side stays a couple
+	// of transactions instead of one autocommit per series (which measurably
+	// rivaled the data-plane writes it was bookkeeping for): all parent
+	// rewinds in one tx FIRST, then the data-plane appends, then all watermark
+	// CASes in one tx. The per-series crash guarantees are unchanged — a
+	// committed rewind without its append recomputes into the unchanged-guard,
+	// an append without its CAS recomputes likewise (see the ordering comment
+	// above); batching only widens how many series share each benign window.
+	type pendingRepair struct {
+		rs      rollupSeries
+		changed []tsstore.Bucket
+		oldest  int64
+	}
+	type pendingCAS struct {
+		id   int64
+		from int64
+	}
+	var repairs []pendingRepair
+	var casses []pendingCAS
+
 	for _, rs := range series {
 		if srcRaw && s.isPendingAppend(rs.id) {
 			continue // its rewind is durable but the samples are mid-flight; next pass
@@ -250,31 +270,60 @@ func (s *Store) rollupTier(ctx context.Context, series []rollupSeries, res strin
 					oldest = b.TS
 				}
 			}
-			if parentRes != "" {
-				// Step 2 (see Rollup's comment): durable rewind intent FIRST.
-				if _, err := s.db.ExecContext(ctx,
-					`UPDATE rollup_state SET last_ts=? WHERE resolution=? AND series_id=? AND last_ts>?`,
-					alignDown(oldest, parentBucket), parentRes, rs.id, alignDown(oldest, parentBucket)); err != nil {
-					return err
-				}
-			}
-			// Step 3: the repair itself.
-			if err := s.ts.AppendBuckets(ctx, tier, rs.id, changed); err != nil {
-				return err
-			}
+			repairs = append(repairs, pendingRepair{rs: rs, changed: changed, oldest: oldest})
 		}
-		// Step 4: CAS against the watermark this pass read — ingest may have
+		// CAS-advance against the watermark this pass read — ingest may have
 		// rewound the series mid-pass, and an unconditional write would erase
 		// that rewind (the repair would then never happen). Losing the CAS
 		// means someone moved the watermark backwards on purpose; leaving it
 		// alone is exactly right, and the next pass picks it up.
 		if len(recomputed) > 0 || upTo-states[rs.id] >= idleWatermarkAdvance {
-			if _, err := s.db.ExecContext(ctx, `
-				INSERT INTO rollup_state(resolution, series_id, last_ts) VALUES(?,?,?)
-				ON CONFLICT(resolution, series_id) DO UPDATE SET last_ts=excluded.last_ts
-				WHERE last_ts=?`, res, rs.id, upTo, states[rs.id]); err != nil {
+			casses = append(casses, pendingCAS{id: rs.id, from: states[rs.id]})
+		}
+	}
+
+	// Phase B: every changed series' parent rewind, one transaction, BEFORE any
+	// append (the durable intent — see the ordering comment on Rollup).
+	if parentRes != "" && len(repairs) > 0 {
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		for _, r := range repairs {
+			if _, err := tx.ExecContext(ctx,
+				`UPDATE rollup_state SET last_ts=? WHERE resolution=? AND series_id=? AND last_ts>?`,
+				alignDown(r.oldest, parentBucket), parentRes, r.rs.id, alignDown(r.oldest, parentBucket)); err != nil {
+				_ = tx.Rollback()
 				return err
 			}
+		}
+		if err := tx.Commit(); err != nil {
+			return err
+		}
+	}
+	// Phase C: the repairs themselves.
+	for _, r := range repairs {
+		if err := s.ts.AppendBuckets(ctx, tier, r.rs.id, r.changed); err != nil {
+			return err
+		}
+	}
+	// Phase D: watermark advances, one transaction.
+	if len(casses) > 0 {
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		for _, c := range casses {
+			if _, err := tx.ExecContext(ctx, `
+				INSERT INTO rollup_state(resolution, series_id, last_ts) VALUES(?,?,?)
+				ON CONFLICT(resolution, series_id) DO UPDATE SET last_ts=excluded.last_ts
+				WHERE last_ts=?`, res, c.id, upTo, c.from); err != nil {
+				_ = tx.Rollback()
+				return err
+			}
+		}
+		if err := tx.Commit(); err != nil {
+			return err
 		}
 	}
 	return nil
