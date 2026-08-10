@@ -656,26 +656,28 @@ func TestReconcileClaimsASceneWhoseConfirmationWasMissed(t *testing.T) {
 
 // Retention deliberately outlives the claim horizon so the last pass that can
 // claim a scene precedes the pass that may delete it. That grace is only real if
-// the reconciler scans to the RETENTION horizon: bounding its scan by the claim
-// window instead keeps the scene on disk and skips it on every pass, which
-// deletes it just as surely and two hours later.
-func TestReconcileScansToTheRetentionHorizon(t *testing.T) {
+// BOTH claim paths reach into it. A receipt cutoff on either one keeps the scene
+// on disk and refuses it anyway, which deletes it just as surely and two hours
+// later — and a cutoff on only the confirmation path is worse than obvious
+// breakage, because the hourly backstop hides it behind a schedule.
+func TestGraceWindowScenesAreClaimableByBothPaths(t *testing.T) {
 	db, ctx := openIncidentOpsTest(t)
 	now := time.Now().UTC()
 	edge := now.Add(-sceneClaimWindow - time.Hour)
 	svc := New(db, nil, settings.New(db), eventbus.New())
 
 	ingestScenes(t, svc, ctx, "agent_a",
-		basicScene("scene_edge", edge, probeTrigger("probe_e", 2, edge)))
-	// Age it past the claim horizon but still inside retention — the grace window.
-	if _, err := db.ExecContext(ctx,
-		`UPDATE scene_reports SET received_at=? WHERE id='scene_edge'`, edge); err != nil {
+		basicScene("scene_edge", edge, probeTrigger("probe_e", 2, edge)),
+		basicScene("scene_confirm", edge, probeTrigger("probe_c", 2, edge)))
+	// Age both past the claim horizon but still inside retention — the grace window.
+	if _, err := db.ExecContext(ctx, `UPDATE scene_reports SET received_at=?`, edge); err != nil {
 		t.Fatalf("age receipt: %v", err)
 	}
 	if now.Sub(edge) <= sceneClaimWindow || now.Sub(edge) >= unreferencedSceneRetention {
-		t.Fatalf("test scene is not inside the grace window: aged %s", now.Sub(edge))
+		t.Fatalf("test scenes are not inside the grace window: aged %s", now.Sub(edge))
 	}
 
+	// The backstop.
 	seedSceneSignal(t, db, "inc_edge", "sig_edge", "agent_a", "probe_e", 2, edge)
 	if err := svc.ReconcileSceneClaims(ctx); err != nil {
 		t.Fatalf("reconcile: %v", err)
@@ -683,6 +685,19 @@ func TestReconcileScansToTheRetentionHorizon(t *testing.T) {
 	if n := countRows(t, db,
 		`SELECT COUNT(*) FROM scene_report_refs WHERE report_id='scene_edge' AND incident_id='inc_edge'`); n != 1 {
 		t.Fatalf("a scene inside the retention grace was skipped by reconciliation (%d refs)", n)
+	}
+
+	// The immediate path, which must not need the backstop to cover for it.
+	seedSceneSignal(t, db, "inc_confirm", "sig_confirm", "agent_a", "probe_c", 2, edge)
+	if err := svc.OnSignalConfirmed(ctx, fault.SignalEvent{
+		SignalID: "sig_confirm", IncidentID: "inc_confirm", AgentID: "agent_a", SiteID: "site_default",
+		TargetID: "probe_c", DetectorKey: fault.DetectorAvailability,
+	}); err != nil {
+		t.Fatalf("on signal confirmed: %v", err)
+	}
+	if n := countRows(t, db,
+		`SELECT COUNT(*) FROM scene_report_refs WHERE report_id='scene_confirm' AND incident_id='inc_confirm'`); n != 1 {
+		t.Fatalf("a confirmation refused a scene inside the retention grace (%d refs)", n)
 	}
 }
 

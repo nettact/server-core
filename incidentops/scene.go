@@ -49,13 +49,21 @@ const sceneClaimWindow = 7 * 24 * time.Hour
 // failed in the last hour of its life would be deleted by the retention call in
 // the very same pass that could still have claimed it — the durable backstop
 // losing evidence exactly at the edge it exists to cover. The grace is
-// comfortably more than one scheduling interval, so the last pass that can claim
-// a scene always precedes the pass that may delete it.
+// comfortably more than one scheduling interval, so at least two reconcile
+// passes follow the last moment an owning signal can appear.
 //
-// The grace only works because the reconciler scans to the RETENTION horizon
-// rather than the claim one. Extending retention while leaving the scan bounded
-// by sceneClaimWindow keeps the scene on disk and skips it on every pass, which
-// deletes it just as surely and two hours later.
+// The margin is only real because neither claim path bounds on RECEIPT age: a
+// scene is claimable for exactly as long as it is stored, and sceneClaimWindow
+// bounds which signals may own an edge instead. Reintroducing a receipt cutoff
+// on either path — the reconciler's scan or claimableScenes' — re-opens the hole
+// this constant exists to close, in the quietest possible way: the scene is kept
+// on disk and skipped by every pass during the grace, which deletes it just as
+// surely and two hours later.
+//
+// It also means the ordering inside the hourly worker is not load-bearing. That
+// worker does reconcile before it deletes, but a grace shorter than its interval
+// would make that incidental ordering the only thing standing between a late
+// confirmation and lost evidence.
 const sceneRetentionGrace = 2 * time.Hour
 
 // unreferencedSceneRetention is how long a scene that never found a fault is
@@ -645,17 +653,16 @@ func addSceneTimeline(ctx context.Context, tx *sql.Tx, incidentID, reportID stri
 func (s *Service) claimScenes(ctx context.Context, ev fault.SignalEvent) error {
 	var targetID string
 	var configSerial int
-	var observedAt time.Time
 	err := s.db.Read().QueryRowContext(ctx,
-		`SELECT COALESCE(target_id,''), target_config_serial, observed_at FROM fault_signals WHERE id=?`, ev.SignalID).
-		Scan(&targetID, &configSerial, &observedAt)
+		`SELECT COALESCE(target_id,''), target_config_serial FROM fault_signals WHERE id=?`, ev.SignalID).
+		Scan(&targetID, &configSerial)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil
 	}
 	if err != nil {
 		return err
 	}
-	reportIDs, err := s.claimableScenes(ctx, ev, targetID, configSerial, observedAt)
+	reportIDs, err := s.claimableScenes(ctx, ev, targetID, configSerial)
 	if err != nil || len(reportIDs) == 0 {
 		return err
 	}
@@ -725,12 +732,16 @@ func (s *Service) ReconcileSceneClaims(ctx context.Context) error {
 		trigger                   telemetry.SceneTrigger
 	}
 	now := time.Now().UTC()
-	// Scanned to the RETENTION horizon, not the claim horizon. Bounding this by
-	// sceneClaimWindow is the mistake the grace period exists to prevent: the scene
-	// would be kept for two more hours and skipped by every pass during them, which
-	// is a longer way of deleting it. A scene is reconcilable for exactly as long
-	// as it is stored; sceneClaimWindow still bounds which SIGNALS may own an edge,
-	// which is a different question.
+	// No receipt bound. A scene is reconcilable for exactly as long as it is
+	// stored, and retention alone decides that — pairing a scan cutoff with a
+	// deletion cutoff means keeping two constants in lockstep, and being wrong in
+	// either direction is silent. Too narrow keeps the scene on disk and skips it
+	// on every pass (a slower way of deleting it); too wide scans for rows that no
+	// longer exist. sceneClaimWindow still bounds which SIGNALS may own an edge,
+	// which is the question that decides whether a claim is right; receipt age
+	// never answered it. The set walked here is bounded by retention rather than
+	// by the query: an unclaimed scene lives at most sceneClaimWindow +
+	// sceneRetentionGrace.
 	//
 	// A report is worth revisiting while it holds FEWER references than triggers.
 	// "No references at all" was wrong: a scene carries several independently
@@ -743,10 +754,9 @@ func (s *Service) ReconcileSceneClaims(ctx context.Context) error {
 		       t.first_failed_at, t.disconnected_at
 		FROM scene_reports sr
 		JOIN scene_report_triggers t ON t.report_id = sr.id
-		WHERE sr.received_at >= ?
-		  AND (SELECT COUNT(*) FROM scene_report_triggers t2 WHERE t2.report_id = sr.id)
+		WHERE (SELECT COUNT(*) FROM scene_report_triggers t2 WHERE t2.report_id = sr.id)
 		    > (SELECT COUNT(*) FROM scene_report_refs r WHERE r.report_id = sr.id)
-		ORDER BY sr.id, t.idx`, now.Add(-unreferencedSceneRetention))
+		ORDER BY sr.id, t.idx`)
 	if err != nil {
 		return err
 	}
@@ -851,15 +861,16 @@ func (s *Service) fileReconciledScene(ctx context.Context, reportID, siteID stri
 // the edge is the question that has one answer, and routing both paths through
 // one function is what keeps them from drifting apart.
 //
-// The receipt window is therefore only a bound on the search, which is why it can
-// afford to be the full retention period: see sceneClaimWindow for why anything
-// shorter strands the scenes of slow monitors outright.
-func (s *Service) claimableScenes(ctx context.Context, ev fault.SignalEvent, targetID string, configSerial int, observedAt time.Time) ([]string, error) {
+// There is no receipt-age filter, for the same reason the reconciler has none:
+// the two paths answer the same question and a cutoff on only one of them means
+// a scene the hourly backstop would file is refused by the confirmation that
+// could have filed it immediately — evidence surviving on a schedule instead of
+// on the event that wanted it. See sceneRetentionGrace.
+func (s *Service) claimableScenes(ctx context.Context, ev fault.SignalEvent, targetID string, configSerial int) ([]string, error) {
 	now := time.Now().UTC()
-	cutoff := now.Add(-sceneClaimWindow)
 
 	if ev.DetectorKey == fault.DetectorAgentConnectivity {
-		return s.claimableDisconnectScenes(ctx, ev, cutoff, now)
+		return s.claimableDisconnectScenes(ctx, ev, now)
 	}
 	if targetID == "" {
 		return nil, nil
@@ -867,9 +878,9 @@ func (s *Service) claimableScenes(ctx context.Context, ev fault.SignalEvent, tar
 	rows, err := s.db.Read().QueryContext(ctx, `
 		SELECT sr.id, t.first_failed_at FROM scene_reports sr
 		JOIN scene_report_triggers t ON t.report_id = sr.id
-		WHERE sr.agent_id=? AND sr.received_at >= ? AND t.kind='probe_fault'
+		WHERE sr.agent_id=? AND t.kind='probe_fault'
 		  AND t.monitor_id=? AND t.config_serial=?
-		ORDER BY sr.id`, ev.AgentID, cutoff, targetID, configSerial)
+		ORDER BY sr.id`, ev.AgentID, targetID, configSerial)
 	if err != nil {
 		return nil, err
 	}
@@ -916,12 +927,12 @@ func scanCandidates(rows *sql.Rows) ([]sceneCandidate, error) {
 
 // claimableDisconnectScenes narrows this agent's recent disconnect scenes to the
 // ones this connectivity signal actually owns.
-func (s *Service) claimableDisconnectScenes(ctx context.Context, ev fault.SignalEvent, cutoff, now time.Time) ([]string, error) {
+func (s *Service) claimableDisconnectScenes(ctx context.Context, ev fault.SignalEvent, now time.Time) ([]string, error) {
 	rows, err := s.db.Read().QueryContext(ctx, `
 		SELECT sr.id, t.disconnected_at FROM scene_reports sr
 		JOIN scene_report_triggers t ON t.report_id = sr.id
-		WHERE sr.agent_id=? AND sr.received_at >= ? AND t.kind='server_disconnect'
-		ORDER BY sr.id`, ev.AgentID, cutoff)
+		WHERE sr.agent_id=? AND t.kind='server_disconnect'
+		ORDER BY sr.id`, ev.AgentID)
 	if err != nil {
 		return nil, err
 	}
