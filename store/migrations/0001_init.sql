@@ -1481,3 +1481,56 @@ CREATE TABLE cleanup_job_items(
   detail     TEXT NOT NULL DEFAULT '',               -- error text (failed) or deleted-count note (done)
   PRIMARY KEY(job_id, idx)
 );
+
+-- ===== public status pages =====
+
+-- A status page is an anonymous, slug-addressed, read-only view over an
+-- admin-chosen subset of a site's agents and monitoring targets — the only
+-- unauthenticated surface in the product that carries monitoring data. Two
+-- consequences are baked into the schema. First, membership is explicit and
+-- per-page: nothing is published because it exists, only because someone picked
+-- it, so an agent or target added later is invisible until an admin selects it.
+-- Second, the visibility toggles live on the row rather than in the frontend,
+-- because the public API enforces them server-side (a viewer who calls the
+-- endpoint directly must not see what the page's UI would have hidden).
+--
+-- enabled=0 is a kill switch that reads as "no such page" publicly: the API
+-- answers a disabled slug and an unknown slug identically, so taking a page down
+-- leaks nothing about whether it ever existed.
+CREATE TABLE status_pages(
+  id                  TEXT PRIMARY KEY,                    -- 'spg_' + uuid
+  site_id             TEXT NOT NULL REFERENCES sites(id),
+  -- The public address (/status/#/<slug>). UNIQUE across sites, not per site:
+  -- the public route resolves a page by slug alone, with no site in the URL.
+  slug                TEXT NOT NULL UNIQUE,
+  title               TEXT NOT NULL,
+  description         TEXT NOT NULL DEFAULT '',
+  enabled             INTEGER NOT NULL DEFAULT 1,
+  -- Opt-in reveal of raw probe addresses (IPs, hostnames, URLs). Default off:
+  -- a home/SMB network's target list is an internal topology map.
+  show_target_address INTEGER NOT NULL DEFAULT 0,
+  show_agent_view     INTEGER NOT NULL DEFAULT 1,
+  show_target_view    INTEGER NOT NULL DEFAULT 1,
+  created_at          TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at          TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX idx_status_pages_site ON status_pages(site_id);
+
+-- Membership cascades from both sides: dropping a page takes its selections with
+-- it, and deleting an agent/target removes it from every page that published it.
+-- That second direction is the important one — a revoked agent must not linger as
+-- a published row — and it is why these reference agents(id)/probe_tasks(id)
+-- rather than storing loose ids.
+CREATE TABLE status_page_agents(
+  page_id  TEXT NOT NULL REFERENCES status_pages(id) ON DELETE CASCADE,
+  agent_id TEXT NOT NULL REFERENCES agents(id)       ON DELETE CASCADE,
+  PRIMARY KEY(page_id, agent_id)
+);
+CREATE INDEX idx_spa_agent ON status_page_agents(agent_id);
+
+CREATE TABLE status_page_targets(
+  page_id   TEXT NOT NULL REFERENCES status_pages(id) ON DELETE CASCADE,
+  target_id TEXT NOT NULL REFERENCES probe_tasks(id)  ON DELETE CASCADE,
+  PRIMARY KEY(page_id, target_id)
+);
+CREATE INDEX idx_spt_target ON status_page_targets(target_id);

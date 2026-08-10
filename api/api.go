@@ -54,6 +54,7 @@ import (
 	"github.com/nettact/server-core/settings"
 	"github.com/nettact/server-core/site"
 	"github.com/nettact/server-core/sse"
+	"github.com/nettact/server-core/statuspage"
 	"github.com/nettact/server-core/targetstatus"
 	"github.com/nettact/server-core/updatecheck"
 
@@ -84,6 +85,7 @@ type Deps struct {
 	OpIssue           *opissue.Service          // operational-issue engine (monitor status + issues)
 	TargetStatus      *targetstatus.Service     // authoritative current target-status aggregation (read-time)
 	AgentStatus       *agentstatus.Service      // per-agent health/resource rollup for the Agent status list (read-time)
+	StatusPage        *statuspage.Service       // public status pages: admin CRUD + the anonymous sanitized reads
 	AgentConnectivity *agentconnectivity.Engine // agent offline/recovery liveness-fault engine
 	SSE               *sse.Broker               // Server-Sent Events fan-out for live issue + target-status updates
 	AgentWS           *agentws.Hub              // persistent agent WebSocket channel (telemetry + config downlink)
@@ -149,6 +151,17 @@ func Router(d Deps) http.Handler {
 		r.Post("/auth/login", d.handleLogin)
 		r.Post("/enroll", d.handleEnroll)
 		r.Get("/agent/ws", d.AgentWS.HandleUpgrade)
+
+		// Public status pages: the product's only anonymous data surface. Mounted
+		// here, OUTSIDE the session group, so the boundary is visible in the route
+		// table rather than buried in a handler; everything it serves is sanitized
+		// and CORS-open by design (see statuspage.go).
+		r.Route("/public", func(r chi.Router) {
+			r.Use(publicCORS)
+			r.Get("/pages/{slug}", d.handlePublicStatusPage)
+			r.Get("/pages/{slug}/agent-statuses", d.handlePublicStatusPageAgents)
+			r.Get("/pages/{slug}/target-statuses", d.handlePublicStatusPageTargets)
+		})
 
 		// session-protected UI
 		r.Group(func(r chi.Router) {
@@ -243,6 +256,13 @@ func Router(d Deps) http.Handler {
 			r.Get("/targets/{id}/availability", d.handleTargetAvailability)
 			// Per-agent health + resource rollup for the Agent status list (AGENT-001).
 			r.Get("/sites/{id}/agent-statuses", d.handleAgentStatuses)
+			// Public status pages: what the anonymous /public routes above serve is
+			// curated from here.
+			r.Get("/status-pages", d.handleListStatusPages)
+			r.Post("/status-pages", d.handleCreateStatusPage)
+			r.Get("/status-pages/{id}", d.handleGetStatusPage)
+			r.Put("/status-pages/{id}", d.handleUpdateStatusPage)
+			r.Delete("/status-pages/{id}", d.handleDeleteStatusPage)
 			// Server-Sent Events stream for live issue + target-status updates.
 			r.Get("/events", d.handleEvents)
 			// Agent groups: named sets of agents that scope monitoring targets.
