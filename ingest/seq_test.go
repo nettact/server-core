@@ -103,6 +103,62 @@ func TestSequenceWatermarkDedup(t *testing.T) {
 	}
 }
 
+// TestStaleWatermarkReadDoesNotAdmitTheBatch pins the admission gate. The
+// replay check reads the watermark BEFORE the transaction, which is a
+// check-then-act: two sessions for one agent (hub supersession closes the old
+// socket asynchronously, so they overlap briefly) can read the same value and
+// both call their packet new. Only the guarded UPDATE can settle it, so its
+// RowsAffected — not the earlier read — has to decide whether the batch is
+// processed. Otherwise the loser re-runs detector evaluation and re-stores the
+// batch under a sequence the winner already claimed.
+//
+// A stale in-memory watermark reproduces the loser's exact view: the column has
+// moved on, this Service has not noticed.
+func TestStaleWatermarkReadDoesNotAdmitTheBatch(t *testing.T) {
+	db, svc := openSeqIngest(t)
+	ctx := context.Background()
+	t0 := time.Now().UTC().Add(-time.Minute)
+
+	if _, err := svc.Ingest(ctx, "agent_seq", "site_default", seqPacket(1, t0)); err != nil {
+		t.Fatalf("seq 1: %v", err)
+	}
+	countEvents := func() int {
+		t.Helper()
+		var n int
+		if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE agent_id='agent_seq'`).Scan(&n); err != nil {
+			t.Fatalf("count events: %v", err)
+		}
+		return n
+	}
+	if countEvents() != 1 {
+		t.Fatalf("events after seq 1 = %d, want 1", countEvents())
+	}
+
+	// The winning session committed sequence 5; this Service still believes the
+	// high is 1, so sequence 3 looks new to it and nothing before the UPDATE can
+	// tell it otherwise.
+	mustSeqExec(t, db, `UPDATE agents SET high_sequence=5 WHERE id='agent_seq'`)
+
+	ack, err := svc.Ingest(ctx, "agent_seq", "site_default", seqPacket(3, t0))
+	if err != nil {
+		t.Fatalf("seq 3 on a stale watermark: %v", err)
+	}
+	if countEvents() != 1 {
+		t.Fatalf("a batch the guarded UPDATE refused still wrote its events (%d): the pre-transaction "+
+			"read admitted work the watermark had already claimed", countEvents())
+	}
+	if ack.HighestSequence != 5 {
+		t.Fatalf("ack.HighestSequence=%d, want 5 — the ack must restate the committed watermark", ack.HighestSequence)
+	}
+	var high int
+	if err := db.QueryRowContext(ctx, `SELECT high_sequence FROM agents WHERE id='agent_seq'`).Scan(&high); err != nil {
+		t.Fatalf("high_sequence: %v", err)
+	}
+	if high != 5 {
+		t.Fatalf("high_sequence=%d, want 5 — a refused batch must not move the watermark", high)
+	}
+}
+
 type failingTracer struct{}
 
 func (failingTracer) IngestTracesTx(context.Context, *sql.Tx, string, string, []telemetry.TraceResult) (*incidentops.TraceOutcome, error) {

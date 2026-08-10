@@ -125,7 +125,7 @@ func Open(dir string, cfg Config, datasetUUID string) (*Prom, error) {
 		{"raw", defaultRetention(cfg.RawRetention, 5*24*time.Hour), 2 * time.Hour},
 		{"m1", defaultRetention(cfg.M1Retention, 30*24*time.Hour), 24 * time.Hour},
 		{"h1", defaultRetention(cfg.H1Retention, 2*365*24*time.Hour), 31 * 24 * time.Hour},
-		{"d1", defaultRetention(cfg.D1Retention, 100*365*24*time.Hour), 31 * 24 * time.Hour},
+		{"d1", defaultRetention(cfg.D1Retention, Forever), 31 * 24 * time.Hour},
 	}
 
 	p := &Prom{dir: dir, datasetUUID: datasetUUID, highWater: hw}

@@ -9,6 +9,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"hash/fnv"
 	"log"
 	"net"
@@ -247,6 +248,28 @@ func (s *Service) Ingest(ctx context.Context, agentID, siteID string, pkt teleme
 		return Ack{}, err
 	}
 	isNew := pkt.Sequence > high
+	// Set when the guarded UPDATE refuses the batch: the watermark the column
+	// actually holds, adopted before the ack is built.
+	var adoptHigh uint64
+
+	// Mark the batch's series in-flight before the transaction opens, not just
+	// before the commit. EnsureSeries above ALREADY committed any new series
+	// row, so from that moment a concurrent rollup pass can load the series,
+	// see no rollup_state row and no pending mark, and later insert
+	// last_ts=upTo — while this batch's in-transaction rewind updates zero rows
+	// precisely because the row did not exist yet. A first batch older than the
+	// pass's overlap would then never be aggregated by any pass. Marking here
+	// shrinks that window to EnsureSeries→here; the rollup CAS re-checks the
+	// mark as well, which is what actually closes it.
+	var pendingDone func()
+	if isNew && len(seriesIDs) > 0 {
+		pendingDone = s.metrics.BeginPendingAppend(seriesIDs)
+		defer func() {
+			if pendingDone != nil {
+				pendingDone()
+			}
+		}()
+	}
 
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -270,16 +293,48 @@ func (s *Service) Ingest(ctx context.Context, agentID, siteID string, pkt teleme
 	}
 
 	if isNew {
-		// Persist the dedup watermark with the batch it admits. The monotone
-		// guard makes a stale writer harmless: a session that lost a reenrollment
-		// race writes nothing once the column was reset and re-raised past it,
-		// and affected==0 on a deleted agent matches the old FK-less dedup row's
-		// indifference.
-		if _, err := tx.ExecContext(ctx,
+		// Persist the dedup watermark with the batch it admits — and let this
+		// UPDATE, not the pre-tx read, be the admission gate.
+		//
+		// Reading currentHigh outside the transaction is a check-then-act: two
+		// overlapping sessions for one agent (hub supersession closes the old
+		// socket asynchronously, so they coexist briefly) can read the same
+		// watermark and both conclude the packet is new. Only one of them can
+		// raise the column; the loser must NOT go on to evaluate faults and
+		// store the batch a second time, or equal sequences double-advance
+		// detector state and a lower sequence can land after a higher one. The
+		// removed agent_packets UNIQUE insert was exactly this atomic
+		// test-and-set — the monotone guard restores it only if its result is
+		// what admits the work.
+		//
+		// affected==0 also covers a deleted agent (no row left to raise) and a
+		// session that lost a reenrollment race. Dropping the batch is right in
+		// both: the watermark it would advance no longer belongs to it. The ack
+		// still goes out, so nothing replays forever.
+		res, err := tx.ExecContext(ctx,
 			`UPDATE agents SET high_sequence=? WHERE id=? AND high_sequence<?`,
-			pkt.Sequence, agentID, pkt.Sequence); err != nil {
+			pkt.Sequence, agentID, pkt.Sequence)
+		if err != nil {
 			return Ack{}, err
 		}
+		admitted, err := res.RowsAffected()
+		if err != nil {
+			return Ack{}, err
+		}
+		if admitted == 0 {
+			// The column has already moved past this read. Adopt its value so
+			// the ack tells the agent where the watermark actually stands
+			// instead of restating our stale one — otherwise it would prune to
+			// a lower point and resend batches that can only be refused again.
+			// No row (deleted agent) leaves it at zero and the ack falls back to
+			// the ordinary replay answer.
+			if err := tx.QueryRowContext(ctx,
+				`SELECT high_sequence FROM agents WHERE id=?`, agentID).Scan(&adoptHigh); err != nil &&
+				!errors.Is(err, sql.ErrNoRows) {
+				return Ack{}, err
+			}
+		}
+		isNew = admitted > 0
 	}
 
 	var acceptedTx []telemetry.Metric
@@ -392,19 +447,6 @@ func (s *Service) Ingest(ctx context.Context, agentID, siteID string, pkt teleme
 		}
 	}
 
-	// Mark the batch's series in-flight BEFORE the commit makes the rewind
-	// durable, so no rollup pass can slip into the gap, consume the rewind and
-	// advance past samples that have not reached the data plane yet.
-	var pendingDone func()
-	if isNew && len(storedTx) > 0 {
-		pendingDone = s.metrics.BeginPendingAppend(seriesIDs)
-		defer func() {
-			if pendingDone != nil {
-				pendingDone()
-			}
-		}()
-	}
-
 	if err := tx.Commit(); err != nil {
 		return Ack{}, err
 	}
@@ -471,7 +513,7 @@ func (s *Service) Ingest(ctx context.Context, agentID, siteID string, pkt teleme
 	}
 
 	return Ack{
-		HighestSequence: s.noteCommittedSeq(agentID, pkt.Sequence, epoch, isNew),
+		HighestSequence: s.ackSequence(agentID, pkt.Sequence, epoch, isNew, adoptHigh),
 		ServerTime:      now,
 	}, nil
 }
@@ -734,6 +776,23 @@ func (s *Service) currentHigh(ctx context.Context, agentID string) (high, epoch 
 		s.seq[agentID] = st
 	}
 	return st.high, st.epoch, nil
+}
+
+// ackSequence produces the value the agent prunes its WAL by. adoptHigh is
+// nonzero only when the guarded UPDATE refused this batch because the column
+// had already moved past the pre-transaction read; raising the in-memory
+// watermark to it first keeps the ack honest, so the agent prunes to where the
+// watermark really is instead of resending batches that can only be refused
+// again.
+func (s *Service) ackSequence(agentID string, seq, epoch uint64, committed bool, adoptHigh uint64) uint64 {
+	if adoptHigh > 0 {
+		s.seqMu.Lock()
+		if st, ok := s.seq[agentID]; ok && st.epoch == epoch && adoptHigh > st.high {
+			st.high = adoptHigh
+		}
+		s.seqMu.Unlock()
+	}
+	return s.noteCommittedSeq(agentID, seq, epoch, committed)
 }
 
 // noteCommittedSeq folds a sequence whose transaction has COMMITTED into the

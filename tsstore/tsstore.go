@@ -34,14 +34,22 @@
 // # Bucket immutability and the k-encoding
 //
 // Prometheus samples are immutable and its tombstones are TIME-INTERVAL masks
-// applied at query and compaction time — to every sample in the interval,
-// including ones appended AFTER the Delete call. So "delete the bucket and
-// re-append the corrected value" silently destroys the correction. Repairs are
-// therefore APPEND-ONLY: a bucket whose window starts at second ts stores its
-// (cnt, sum) pair at millisecond timestamp ts*1000+k. The first write uses
-// k=0; a repair appends the corrected pair at (window's current max ms)+1; a
-// reader folds each window down to the sample with the LARGEST ms. Steady
-// state writes one pair per bucket and zero tombstones; slot capacity is
+// applied at query and compaction time — including to samples appended after
+// the Delete, as long as they fall inside the interval that was actually
+// recorded. That last clause is the trap: Delete CLAMPS the interval it stores
+// to the range the series holds at the time (Head.Delete → clampInterval
+// against the series' current min/max). So "delete the bucket and re-append the
+// corrected value" silently destroys the correction — the re-append lands on
+// the same timestamp, inside the clamped interval, and stays masked — while a
+// sample appended later BEYOND that clamped edge is not masked at all. Callers
+// deleting a range must therefore make sure everything they mean to delete is
+// already stored before they call (see metrics.Store.waitForPendingAppends).
+//
+// Repairs are consequently APPEND-ONLY: a bucket whose window starts at second
+// ts stores its (cnt, sum) pair at millisecond timestamp ts*1000+k. The first
+// write uses k=0; a repair appends the corrected pair at (window's current max
+// ms)+1; a reader folds each window down to the sample with the LARGEST ms.
+// Steady state writes one pair per bucket and zero tombstones; slot capacity is
 // width*1000 rewrites per bucket, unreachable in practice. Tombstones remain
 // only where nothing is ever appended again: whole-series deletion, raw range
 // purges, and the interior buckets of a range purge (their source data is
@@ -149,23 +157,33 @@ type Stats struct {
 	D1  TierStats `json:"d1"`
 }
 
+// Forever is the retention to pass for a tier that must never drop a block.
+// It exists because tsdb.Open reads a nonpositive RetentionDuration as "unset"
+// and substitutes its own 15-day default, so "keep forever" has to be spelled
+// as a duration long enough to outlive any deployment. 100 years is far below
+// the int64 nanosecond ceiling (~292 years), so it survives every conversion
+// on the way down.
+const Forever = 100 * 365 * 24 * time.Hour
+
 // Config sets each instance's physical retention. Zero means the tier's
-// default. Raw's PHYSICAL retention deliberately exceeds the 2-day window the
-// query planner serves from raw: it must cover the 75h out-of-order ingest
-// window plus rollup scheduling and compaction slack, or a backfilled block
-// could be retention-dropped before the rollup job ever reads it. The logical
-// 2-day cut is the reader's job (package metrics clamps query ranges).
+// default; pass Forever for a tier that must keep everything (callers whose own
+// config spells "forever" as zero MUST translate — see metrics.TSStoreConfig).
+// Raw's PHYSICAL retention deliberately exceeds the 2-day window the query
+// planner serves from raw: it must cover the 75h out-of-order ingest window
+// plus rollup scheduling and compaction slack, or a backfilled block could be
+// retention-dropped before the rollup job ever reads it. The logical 2-day cut
+// is the reader's job (package metrics clamps query ranges).
 type Config struct {
 	RawRetention time.Duration // default 5d (physical; logical raw window is 2d)
 	M1Retention  time.Duration // default 30d
 	H1Retention  time.Duration // default 2y
-	D1Retention  time.Duration // default 100y ("forever" — tsdb.Open treats <=0 as 15d, so forever must be explicit)
+	D1Retention  time.Duration // default Forever
 }
 
 // SeriesStore is the storage interface package metrics programs against. The
 // only implementation is *Prom; the seam exists so the engine can be swapped
 // (or faked in tests) without re-teaching every consumer.
-type SeriesStore interface {	// AppendRaw writes a batch in one appender/commit. Per-sample permanent
+type SeriesStore interface { // AppendRaw writes a batch in one appender/commit. Per-sample permanent
 	// errors are dropped and counted (see AppendResult); any other error rolls
 	// the whole batch back. Re-appending an identical (sid, ts, value) is a
 	// silent no-op, which is what makes packet replay idempotent.

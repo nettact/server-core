@@ -2,6 +2,15 @@ module github.com/nettact/server-core
 
 go 1.25
 
+// Do NOT run `go mod tidy` here. This module is only ever built inside the
+// workspace (the root go.work locally, `go work init` in the release
+// workflows), which is also what resolves the versionless nettact/protocol
+// require above — tidy cannot resolve it and, given the chance, rewrites this
+// file with ~90 transitive indirect requires from the Prometheus TSDB graph
+// (AWS/Azure/GCP/k8s discovery) and quietly upgrades golang.org/x/crypto and
+// x/sys. Requires are added by hand; workspace mode writes the hashes into the
+// workspace's go.work.sum, so the absence of Prometheus entries in this
+// module's go.sum is expected and does not break a `-mod=readonly` build.
 require (
 	github.com/coder/websocket v1.8.14
 	github.com/go-chi/chi/v5 v5.2.1

@@ -57,6 +57,11 @@ func (s *Store) PurgeRange(ctx context.Context, ids []int64, from, to int64) (Pu
 	if len(ids) == 0 || to <= from {
 		return PurgeCounts{}, nil
 	}
+	// Let already-issued appends land before any tombstone is computed: a
+	// tombstone is clamped to what the series holds at Delete time, so a batch
+	// that committed to SQLite before this purge but appends after it would
+	// survive the delete outright (see Store.waitForPendingAppends).
+	s.waitForPendingAppends()
 	s.rollupMu.Lock()
 	defer s.rollupMu.Unlock()
 	s.mu.Lock()
@@ -188,15 +193,27 @@ func (s *Store) repairEdgeBucketLocked(ctx context.Context, tier tsstore.Tier, w
 }
 
 // ClearSeriesHistory hides a live series' entire recorded history without a
-// single tombstone: series.purge_cutoff is set to now and every read path
-// clamps below it, while the old blocks age out through ordinary retention.
-// This replaces "PurgeRange(0, maxTS)" — a tombstone over the future would
-// mask the very samples the still-live series keeps appending, and
-// compaction-time application would make the breakage permanent.
+// single tombstone: series.purge_cutoff is raised past everything stored and
+// every read path clamps below it, while the old blocks age out through
+// ordinary retention. This replaces "PurgeRange(0, maxTS)" — a tombstone over
+// the future would mask the very samples the still-live series keeps
+// appending, and compaction-time application would make the breakage permanent.
+//
+// purge_cutoff is the OLDEST SECOND STILL VISIBLE, so every reader can keep
+// using it directly as an inclusive lower bound. It is set past the newest
+// sample the series actually holds, not merely to now: ingest accepts
+// timestamps up to two minutes ahead of the clock, so a cutoff of now would
+// leave those future-stamped samples — and any sample landing exactly on the
+// cutoff second — visible after a clear that claims to hide everything
+// recorded.
 func (s *Store) ClearSeriesHistory(ctx context.Context, ids []int64) (PurgeCounts, error) {
 	if len(ids) == 0 {
 		return PurgeCounts{}, nil
 	}
+	// As in PurgeRange: a batch that has committed but not yet appended is part
+	// of "everything recorded", so let it land before reading the extent the
+	// cutoff is derived from.
+	s.waitForPendingAppends()
 	s.rollupMu.Lock()
 	defer s.rollupMu.Unlock()
 	s.mu.Lock()
@@ -204,23 +221,49 @@ func (s *Store) ClearSeriesHistory(ctx context.Context, ids []int64) (PurgeCount
 
 	now := time.Now().Unix()
 	var counts PurgeCounts
+	windows := make(map[int64]purgeWindow, len(ids))
 	for _, id := range ids {
 		n, err := s.ts.RawCount(ctx, id, 0, 0)
 		if err != nil {
 			return counts, err
 		}
 		counts.Samples += n
+		cutoff := now + 1
+		if _, rawMax, ok, err := s.ts.RawExtent(ctx, id); err != nil {
+			return counts, err
+		} else if ok && rawMax >= cutoff {
+			cutoff = rawMax + 1
+		}
 		if _, err := s.db.ExecContext(ctx,
-			`UPDATE series SET purge_cutoff=? WHERE id=? AND purge_cutoff<?`, now, id, now); err != nil {
+			`UPDATE series SET purge_cutoff=? WHERE id=? AND purge_cutoff<?`, cutoff, id, cutoff); err != nil {
 			return counts, err
 		}
-		// The cutoff hides everything at or before it; the latest cache must
-		// follow immediately (refresh reads via the cutoff-clamped path).
+		windows[id] = purgeWindow{from: 0, to: cutoff}
+		// The cutoff hides everything below it; the latest cache must follow
+		// immediately (refresh reads via the cutoff-clamped path).
 		if err := s.refreshLatestLocked(ctx, id); err != nil {
 			delete(s.latest, id)
 		}
 		// Rollup watermarks stay where they are: recompute clamps to the cutoff
 		// (see rollupTier), so history below it is simply never revisited.
+	}
+
+	// Same fold guard PurgeRange installs, and for the same reason: an ingest
+	// that committed before this clear folds its batch into the latest cache
+	// after it, outside s.mu. Without a recorded window that fold walks straight
+	// past the cutoff and republishes a sample the clear just hid.
+	for id, w := range s.purged {
+		if now > w.until {
+			delete(s.purged, id)
+		}
+	}
+	until := now + purgeGuardSeconds
+	for id, w := range windows {
+		if prev, ok := s.purged[id]; ok && prev.to > w.to {
+			w.to = prev.to
+		}
+		w.until = until
+		s.purged[id] = w
 	}
 	return counts, nil
 }
@@ -304,7 +347,9 @@ func (s *Store) fillEntryStats(ctx context.Context, e *InventoryEntry, cutoff in
 	if cutoff > 0 && earliest != 0 && earliest < cutoff {
 		earliest = cutoff
 	}
-	if cutoff > 0 && latest != 0 && latest <= cutoff {
+	// cutoff is the oldest visible second, so a series whose newest point sits
+	// strictly below it has nothing left to show.
+	if cutoff > 0 && latest != 0 && latest < cutoff {
 		earliest, latest = 0, 0 // everything recorded is hidden
 	}
 	e.Earliest, e.Latest = earliest, latest

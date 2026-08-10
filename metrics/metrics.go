@@ -88,8 +88,21 @@ type Store struct {
 	// the durable rewind makes the next pass recompute — the unchanged-guard
 	// then absorbs it. Guarded by pendingMu (not mu: ingest holds it across a
 	// data-plane write and must not block cache reads).
-	pendingMu     sync.Mutex
-	pendingAppend map[int64]int
+	//
+	// pendingTickets is the same set keyed by an issue order, for the OTHER
+	// waiter: a purge. Prometheus clamps a tombstone to the samples a series
+	// actually holds when Delete runs (Head.Delete → clampInterval against the
+	// series' current min/max), so a sample appended afterwards INSIDE the
+	// requested range is not masked by it — it survives a delete that reported
+	// success. A purge therefore has to let already-committed batches land
+	// first. Waiting on the ticket numbers outstanding at entry (rather than on
+	// the set being empty) makes that wait finite: batches arriving during the
+	// wait get higher tickets and are none of this purge's business.
+	pendingMu      sync.Mutex
+	pendingCond    *sync.Cond // on pendingMu; broadcast when a ticket retires
+	pendingAppend  map[int64]int
+	pendingTickets map[uint64]struct{}
+	nextTicket     uint64
 }
 
 // purgeWindow is a deleted [from, to) sample range. An UpdateLatest fold whose
@@ -111,17 +124,20 @@ type purgeWindow struct{ from, to, until int64 }
 const purgeGuardSeconds = 30
 
 func New(db *store.DB, ts tsstore.SeriesStore) *Store {
-	return &Store{
-		db:            db,
-		ts:            ts,
-		cache:         make(map[string]int64),
-		byAgent:       make(map[string]map[int64]*seriesIdent),
-		latest:        make(map[int64]latestVal),
-		warmed:        make(map[string]bool),
-		purged:        make(map[int64]purgeWindow),
-		pendingAppend: make(map[int64]int),
-		retention:     DefaultRetention(),
+	s := &Store{
+		db:             db,
+		ts:             ts,
+		cache:          make(map[string]int64),
+		byAgent:        make(map[string]map[int64]*seriesIdent),
+		latest:         make(map[int64]latestVal),
+		warmed:         make(map[string]bool),
+		purged:         make(map[int64]purgeWindow),
+		pendingAppend:  make(map[int64]int),
+		pendingTickets: make(map[uint64]struct{}),
+		retention:      DefaultRetention(),
 	}
+	s.pendingCond = sync.NewCond(&s.pendingMu)
+	return s
 }
 
 // SetRetention tells reads which windows the pruner is actually deleting by.
@@ -191,7 +207,14 @@ func (s *Store) warmAgentLocked(ctx context.Context, agentID string) error {
 	// are already newer (ingested since startup) are kept. The lower bound is
 	// the raw tier's LOGICAL window — anything older would not be served as
 	// "current" anyway — raised to the series' own purge cutoff where one is set.
-	bound := time.Now().Unix() - s.retention.RawSeconds
+	// RawSeconds==0 means keep forever, so the bound must be 0 (unbounded), not
+	// now: subtracting zero would put the floor at the present instant and skip
+	// every pre-restart sample, leaving latest and target status on no_data
+	// until the next packet arrives.
+	var bound int64
+	if s.retention.RawSeconds > 0 {
+		bound = time.Now().Unix() - s.retention.RawSeconds
+	}
 	var missing []int64
 	for _, si := range idents {
 		if _, ok := s.latest[si.id]; ok {
@@ -310,12 +333,16 @@ func (s *Store) AppendRawSamples(ctx context.Context, agentID string, ids map[st
 // pendingAppend field comment for why the gap matters.
 func (s *Store) BeginPendingAppend(ids map[string]int64) (done func()) {
 	s.pendingMu.Lock()
+	ticket := s.nextTicket
+	s.nextTicket++
+	s.pendingTickets[ticket] = struct{}{}
 	for _, id := range ids {
 		s.pendingAppend[id]++
 	}
 	s.pendingMu.Unlock()
 	return func() {
 		s.pendingMu.Lock()
+		delete(s.pendingTickets, ticket)
 		for _, id := range ids {
 			if s.pendingAppend[id] <= 1 {
 				delete(s.pendingAppend, id)
@@ -323,7 +350,35 @@ func (s *Store) BeginPendingAppend(ids map[string]int64) (done func()) {
 				s.pendingAppend[id]--
 			}
 		}
+		s.pendingCond.Broadcast()
 		s.pendingMu.Unlock()
+	}
+}
+
+// waitForPendingAppends blocks until every append that had already been issued
+// when it was called has reached the data plane. A purge calls it before
+// computing tombstones: a batch whose SQLite transaction committed before the
+// purge began must be visible to Delete, or the tombstone gets clamped short of
+// it and the sample survives the purge (see pendingTickets).
+//
+// Only tickets issued before this call are waited on, so a steady ingest stream
+// cannot starve the purge.
+func (s *Store) waitForPendingAppends() {
+	s.pendingMu.Lock()
+	defer s.pendingMu.Unlock()
+	cutoff := s.nextTicket
+	for {
+		outstanding := false
+		for t := range s.pendingTickets {
+			if t < cutoff {
+				outstanding = true
+				break
+			}
+		}
+		if !outstanding {
+			return
+		}
+		s.pendingCond.Wait()
 	}
 }
 

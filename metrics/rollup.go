@@ -39,12 +39,25 @@ func DefaultRetention() RetentionConfig {
 // retention, in one place so the two can never drift apart: raw gets the
 // logical window plus three days of backfill/rollup slack, the tiers map
 // directly (their buckets are written once settled, no slack needed).
+//
+// Zero has OPPOSITE meanings on the two sides and must be translated, never
+// passed through: here it means "keep forever", while tsstore.Config treats a
+// nonpositive duration as "use this tier's default" (raw 5d, m1 30d, h1 2y).
+// Forwarding a zero would quietly bound a tier the query planner still treats
+// as unbounded — blocks dropped underneath reads that expect them. Every tier
+// is therefore sent an explicit duration.
 func (c RetentionConfig) TSStoreConfig() tsstore.Config {
-	sec := func(s int64) time.Duration { return time.Duration(s) * time.Second }
+	sec := func(s int64) time.Duration {
+		if s <= 0 {
+			return tsstore.Forever
+		}
+		return time.Duration(s) * time.Second
+	}
 	cfg := tsstore.Config{
-		M1Retention: sec(c.M1Seconds),
-		H1Retention: sec(c.H1Seconds),
-		D1Retention: sec(c.D1Seconds),
+		M1Retention:  sec(c.M1Seconds),
+		H1Retention:  sec(c.H1Seconds),
+		D1Retention:  sec(c.D1Seconds),
+		RawRetention: tsstore.Forever,
 	}
 	if c.RawSeconds > 0 {
 		cfg.RawRetention = sec(c.RawSeconds + 3*86400)
@@ -314,6 +327,17 @@ func (s *Store) rollupTier(ctx context.Context, series []rollupSeries, res strin
 			return err
 		}
 		for _, c := range casses {
+			// Re-check the in-flight mark here, not only at the top of the pass.
+			// A series can be created (EnsureSeries commits it), picked up by
+			// this pass, and only then marked pending by the ingest that is
+			// about to append its first samples. That batch's rewind updates
+			// zero rows — there is no rollup_state row yet — so the INSERT
+			// below would be unconditional and would park the watermark at upTo
+			// with the samples still in flight. Skipping the advance leaves the
+			// series stateless, and the next pass aggregates it in full.
+			if srcRaw && s.isPendingAppend(c.id) {
+				continue
+			}
 			if _, err := tx.ExecContext(ctx, `
 				INSERT INTO rollup_state(resolution, series_id, last_ts) VALUES(?,?,?)
 				ON CONFLICT(resolution, series_id) DO UPDATE SET last_ts=excluded.last_ts
