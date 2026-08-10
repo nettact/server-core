@@ -45,12 +45,11 @@ const KeyOnboardingState = "onboarding_state"
 // here any more — how many traces may run at once is a property of the machine
 // running them, and it is configured on the Agent alongside its probe budget.
 const (
-	KeyIncidentSnapshotDeadlineMs = "incident_snapshot_deadline_ms"
-	KeyIncidentSnapshotMaxBytes   = "incident_snapshot_max_bytes"
-	KeyDiagEnabled                = "diag_enabled"
-	KeyDiagTotalTimeoutMs         = "diag_total_timeout_ms"
-	KeyDiagMaxHops                = "diag_max_hops"
-	KeyDiagAttemptsPerHop         = "diag_attempts_per_hop"
+	KeyIncidentSnapshotMaxBytes = "incident_snapshot_max_bytes"
+	KeyDiagEnabled              = "diag_enabled"
+	KeyDiagTotalTimeoutMs       = "diag_total_timeout_ms"
+	KeyDiagMaxHops              = "diag_max_hops"
+	KeyDiagAttemptsPerHop       = "diag_attempts_per_hop"
 	// KeyDiagConsecutiveFailures is how many consecutive failing rounds an Agent
 	// must see before it traces. It defaults to the same 3 as the balanced
 	// availability profile so a trace fires as the fault becomes real, rather than
@@ -167,14 +166,13 @@ type IntBounds struct {
 // accessors below read it to fall back to the default on unset/invalid values.
 // Booleans (diag_enabled) are modeled as 0/1 ints.
 var IntKeys = map[string]IntBounds{
-	KeyIncidentSnapshotDeadlineMs: {Default: 10000, Min: 1000, Max: 60000},
-	KeyIncidentSnapshotMaxBytes:   {Default: 262144, Min: 65536, Max: 1048576},
-	KeyDiagEnabled:                {Default: 1, Min: 0, Max: 1},
-	KeyDiagTotalTimeoutMs:         {Default: 300000, Min: 5000, Max: 600000},
-	KeyDiagMaxHops:                {Default: 30, Min: 1, Max: 64},
-	KeyDiagAttemptsPerHop:         {Default: 3, Min: 1, Max: 5},
-	KeyDiagConsecutiveFailures:    {Default: 3, Min: 1, Max: 20},
-	KeyDiagCooldownSec:            {Default: 900, Min: 60, Max: 86400},
+	KeyIncidentSnapshotMaxBytes: {Default: 262144, Min: 65536, Max: 1048576},
+	KeyDiagEnabled:              {Default: 1, Min: 0, Max: 1},
+	KeyDiagTotalTimeoutMs:       {Default: 300000, Min: 5000, Max: 600000},
+	KeyDiagMaxHops:              {Default: 30, Min: 1, Max: 64},
+	KeyDiagAttemptsPerHop:       {Default: 3, Min: 1, Max: 5},
+	KeyDiagConsecutiveFailures:  {Default: 3, Min: 1, Max: 20},
+	KeyDiagCooldownSec:          {Default: 900, Min: 60, Max: 86400},
 	// 0 means "derive it from the total budget and the probe count", which is the
 	// sane relationship; the range otherwise mirrors the Agent's own per-attempt
 	// clamp window, so a configured value is never silently reduced on arrival.

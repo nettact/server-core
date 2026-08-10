@@ -96,6 +96,12 @@ func (s *Service) OpenAgentSignal(ctx context.Context, in AgentSignalInput, now 
 	out.confirmed = append(out.confirmed, SignalEvent{
 		SignalID: signalID, IncidentID: incidentID, SiteID: in.SiteID,
 		AgentID: in.AgentID, Severity: sig.Severity,
+		// Stated, not left zero: a consumer that has to tell an Agent-connectivity
+		// verdict from a probe one has nothing else in the event to do it with. The
+		// scene claim-back needs exactly that — a disconnect scene is filed against
+		// this detector's per-agent signal, and every other detector's signal is
+		// matched by target instead.
+		DetectorKey: sig.DetectorKey,
 	})
 	if opened {
 		// Same immutable base snapshot a target fault gets. Without it the

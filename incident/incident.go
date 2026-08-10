@@ -19,21 +19,26 @@ import (
 
 // Incident is one incident with its frozen group identity and live member counts.
 type Incident struct {
-	ID                string `json:"id"`
-	SiteID            string `json:"site_id"`
-	GroupID           string `json:"group_id"`
-	GroupName         string `json:"group_name"`
-	Title             string `json:"title"`
-	SuspectedLayer    string `json:"suspected_layer"`
-	State             string `json:"state"`
-	Severity          string `json:"severity"`
-	Summary           string `json:"summary"`
-	ResolveReason     string `json:"resolve_reason,omitempty"`
-	EvidenceExpired   bool   `json:"evidence_expired"`
-	SnapshotStatus    string `json:"snapshot_status"`
-	TraceCount        int    `json:"trace_count"`
-	MemberCount       int    `json:"member_count"`
-	ActiveMemberCount int    `json:"active_member_count"`
+	ID              string `json:"id"`
+	SiteID          string `json:"site_id"`
+	GroupID         string `json:"group_id"`
+	GroupName       string `json:"group_name"`
+	Title           string `json:"title"`
+	SuspectedLayer  string `json:"suspected_layer"`
+	State           string `json:"state"`
+	Severity        string `json:"severity"`
+	Summary         string `json:"summary"`
+	ResolveReason   string `json:"resolve_reason,omitempty"`
+	EvidenceExpired bool   `json:"evidence_expired"`
+	// SceneCount is how many agent-collected scenes this incident has claimed as
+	// evidence, and TraceCount how many traceroutes. Both are counts rather than a
+	// status because there is no collection lifecycle to report on: agents decide
+	// and ship on their own initiative, so a fault either has their evidence or it
+	// does not, and "pending" is not a state anything can be in.
+	SceneCount        int `json:"scene_count"`
+	TraceCount        int `json:"trace_count"`
+	MemberCount       int `json:"member_count"`
+	ActiveMemberCount int `json:"active_member_count"`
 	// NotifiedCount / PendingNotifyCount summarize the notification records that
 	// speak for this fault — its own AND those of the storm that announced it on
 	// its behalf — so the list can distinguish "announced", "waiting out its delay"
@@ -90,7 +95,7 @@ const incidentCols = `i.id, i.site_id, i.group_id, COALESCE(i.group_name,''), CO
 	COALESCE(i.attribution,''), COALESCE(i.attribution_evidence,'[]'),
 	(SELECT COUNT(*) FROM fault_signals s WHERE s.incident_id=i.id),
 	(SELECT COUNT(*) FROM fault_signals s WHERE s.incident_id=i.id AND s.state='firing'),
-	COALESCE((SELECT status FROM incident_snapshots sn WHERE sn.incident_id=i.id),''),
+	(SELECT COUNT(DISTINCT report_id) FROM scene_report_refs srr WHERE srr.incident_id=i.id),
 	(SELECT COUNT(DISTINCT report_id) FROM trace_report_refs trr WHERE trr.incident_id=i.id),
 	(SELECT COUNT(*) FROM notification_deliveries nd WHERE ` + deliveryForIncident + ` AND nd.status='sent'),
 	(SELECT COUNT(*) FROM notification_deliveries nd WHERE ` + deliveryForIncident + ` AND nd.status='pending'),
@@ -274,7 +279,7 @@ func scanIncident(row scanner) (Incident, error) {
 	err := row.Scan(&inc.ID, &inc.SiteID, &inc.GroupID, &inc.GroupName, &inc.Title, &inc.SuspectedLayer,
 		&inc.State, &inc.Severity, &inc.Summary, &inc.ResolveReason, &evidenceExpired,
 		&inc.OpenedAt, &firstObserved, &resolved, &inc.Attribution, &attrEv,
-		&inc.MemberCount, &inc.ActiveMemberCount, &inc.SnapshotStatus, &inc.TraceCount,
+		&inc.MemberCount, &inc.ActiveMemberCount, &inc.SceneCount, &inc.TraceCount,
 		&inc.NotifiedCount, &inc.PendingNotifyCount, &inc.StormID)
 	if err != nil {
 		return Incident{}, err

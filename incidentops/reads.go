@@ -10,42 +10,74 @@ import (
 
 // ---- snapshot reads ----
 
-// SnapshotView is one incident's immutable snapshot for the console: the frozen
-// server base plus every per-Agent scene entry with its collection status.
+// SnapshotView is one incident's evidence scene for the console: the frozen
+// server base, plus every agent-collected scene claimed as this incident's
+// evidence.
+//
+// There is no status field and no deadline, because there is no collection state
+// machine left: an agent decides on its own edge, ships the scene through the
+// WAL, and the server claims it. A scene has therefore either been claimed by
+// this incident or it has not, and "not yet" is indistinguishable from "never" —
+// which is the honest answer, since nothing was ever promised.
 type SnapshotView struct {
 	IncidentID string          `json:"incident_id"`
-	Status     string          `json:"status"`
 	Base       json.RawMessage `json:"base"`
-	TotalBytes int             `json:"total_bytes"`
 	Truncated  bool            `json:"truncated"`
-	DeadlineAt time.Time       `json:"deadline_at"`
 	CreatedAt  time.Time       `json:"created_at"`
-	Entries    []SnapshotEntry `json:"entries"`
+	// Scenes are ordered newest received_at first. Receipt order rather than
+	// collection order, because that is the order an operator watched them appear
+	// and because a scene collected during an outage carries an agent clock that
+	// may not be comparable with anything else on the page.
+	Scenes []SceneEntry `json:"scenes"`
 }
 
-// SnapshotEntry is one Agent's scene-collection outcome and payload.
-type SnapshotEntry struct {
-	AgentID     string          `json:"agent_id"`
-	AgentName   string          `json:"agent_name"`
-	Status      string          `json:"status"`
-	Reason      string          `json:"reason,omitempty"`
-	ClockSkewMs int64           `json:"clock_skew_ms"`
-	Skewed      bool            `json:"skewed"`
-	Payload     json.RawMessage `json:"payload,omitempty"`
-	RequestedAt time.Time       `json:"requested_at"`
-	ReceivedAt  *time.Time      `json:"received_at"`
+// SceneEntry is one agent-collected scene as this incident references it.
+type SceneEntry struct {
+	ReportID  string `json:"report_id"`
+	AgentID   string `json:"agent_id"`
+	AgentName string `json:"agent_name"`
+	// CollectedAt is the agent's clock and ReceivedAt this server's. They are
+	// seconds apart for a live fault and an outage apart for a scene that waited in
+	// the agent's outbox — which is the normal case for the network faults this
+	// evidence exists for, and therefore NOT a clock complaint. DeliveryLagMs is
+	// that wait, signed; ClockAhead is the one shape delivery cannot explain, an
+	// agent that stamped the scene in this server's future.
+	CollectedAt   *time.Time `json:"collected_at"`
+	ReceivedAt    time.Time  `json:"received_at"`
+	DeliveryLagMs int64      `json:"delivery_lag_ms"`
+	ClockAhead    bool       `json:"clock_ahead"`
+	Truncated     bool       `json:"truncated"`
+	// Triggers is why the agent collected this scene, in its own words. Nothing
+	// server-side asked for it, so without them the scene reads as evidence that
+	// appeared from nowhere.
+	Triggers []SceneTriggerView `json:"triggers"`
+	Payload  json.RawMessage    `json:"payload,omitempty"`
 }
 
-// Snapshot returns an incident's snapshot with its entries, or ok=false when the
-// incident has none yet.
+// SceneTriggerView is one fault edge a scene answers for. The probe_fault fields
+// and the server_disconnect fields are mutually exclusive; Kind says which set is
+// meaningful.
+type SceneTriggerView struct {
+	Kind           string     `json:"kind"`
+	MonitorID      string     `json:"monitor_id,omitempty"`
+	ConfigSerial   int        `json:"config_serial,omitempty"`
+	TriggerStreak  int        `json:"trigger_streak,omitempty"`
+	FirstFailedAt  *time.Time `json:"first_failed_at,omitempty"`
+	DisconnectedAt *time.Time `json:"disconnected_at,omitempty"`
+	Reason         string     `json:"reason,omitempty"`
+	EdgeCount      int        `json:"edge_count,omitempty"`
+}
+
+// Snapshot returns an incident's snapshot with the scenes claimed for it, or
+// ok=false when the incident has none.
 func (s *Service) Snapshot(ctx context.Context, incidentID string) (SnapshotView, bool, error) {
 	var v SnapshotView
-	var snapID, base string
+	var base string
 	var truncated int
 	err := s.db.Read().QueryRowContext(ctx, `
-		SELECT id, status, COALESCE(base,''), total_bytes, truncated, deadline_at, created_at
+		SELECT COALESCE(base,''), truncated, created_at
 		FROM incident_snapshots WHERE incident_id=?`, incidentID).
-		Scan(&snapID, &v.Status, &base, &v.TotalBytes, &truncated, &v.DeadlineAt, &v.CreatedAt)
+		Scan(&base, &truncated, &v.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return SnapshotView{}, false, nil
 	}
@@ -57,32 +89,72 @@ func (s *Service) Snapshot(ctx context.Context, incidentID string) (SnapshotView
 	if base != "" {
 		v.Base = json.RawMessage(base)
 	}
+
 	rows, err := s.db.Read().QueryContext(ctx, `
-		SELECT agent_id, COALESCE(agent_name,''), status, COALESCE(reason,''), clock_skew_ms, skewed,
-		       COALESCE(payload,''), requested_at, received_at
-		FROM incident_snapshot_entries WHERE snapshot_id=? ORDER BY agent_id`, snapID)
+		SELECT sr.id, sr.agent_id, COALESCE(sr.agent_name,''), sr.collected_at, sr.received_at,
+		       sr.delivery_lag_ms, sr.clock_ahead, sr.truncated, COALESCE(sr.payload,'')
+		FROM scene_reports sr
+		WHERE sr.id IN (SELECT DISTINCT report_id FROM scene_report_refs WHERE incident_id=?)
+		ORDER BY sr.received_at DESC, sr.id`, incidentID)
 	if err != nil {
 		return SnapshotView{}, false, err
 	}
 	defer rows.Close()
-	v.Entries = []SnapshotEntry{}
+	v.Scenes = []SceneEntry{}
 	for rows.Next() {
-		var e SnapshotEntry
-		var skewed int
+		var e SceneEntry
+		var clockAhead, sceneTrunc int
 		var payload string
-		var received sql.NullTime
-		if err := rows.Scan(&e.AgentID, &e.AgentName, &e.Status, &e.Reason, &e.ClockSkewMs, &skewed,
-			&payload, &e.RequestedAt, &received); err != nil {
+		var collected sql.NullTime
+		if err := rows.Scan(&e.ReportID, &e.AgentID, &e.AgentName, &collected, &e.ReceivedAt,
+			&e.DeliveryLagMs, &clockAhead, &sceneTrunc, &payload); err != nil {
 			return SnapshotView{}, false, err
 		}
-		e.Skewed = skewed == 1
+		e.CollectedAt = timePtr(collected)
+		e.ClockAhead = clockAhead == 1
+		e.Truncated = sceneTrunc == 1
 		if payload != "" {
 			e.Payload = json.RawMessage(payload)
 		}
-		e.ReceivedAt = timePtr(received)
-		v.Entries = append(v.Entries, e)
+		v.Scenes = append(v.Scenes, e)
 	}
-	return v, true, rows.Err()
+	if err := rows.Err(); err != nil {
+		return SnapshotView{}, false, err
+	}
+	for i := range v.Scenes {
+		triggers, err := s.sceneTriggers(ctx, v.Scenes[i].ReportID)
+		if err != nil {
+			return SnapshotView{}, false, err
+		}
+		v.Scenes[i].Triggers = triggers
+	}
+	return v, true, nil
+}
+
+// sceneTriggers reads one scene's fault edges in the order the agent listed
+// them, which is the order they were crossed.
+func (s *Service) sceneTriggers(ctx context.Context, reportID string) ([]SceneTriggerView, error) {
+	rows, err := s.db.Read().QueryContext(ctx, `
+		SELECT kind, COALESCE(monitor_id,''), config_serial, trigger_streak,
+		       first_failed_at, disconnected_at, COALESCE(reason,''), edge_count
+		FROM scene_report_triggers WHERE report_id=? ORDER BY idx`, reportID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []SceneTriggerView{}
+	for rows.Next() {
+		var t SceneTriggerView
+		var firstFailed, disconnected sql.NullTime
+		if err := rows.Scan(&t.Kind, &t.MonitorID, &t.ConfigSerial, &t.TriggerStreak,
+			&firstFailed, &disconnected, &t.Reason, &t.EdgeCount); err != nil {
+			return nil, err
+		}
+		t.FirstFailedAt = timePtr(firstFailed)
+		t.DisconnectedAt = timePtr(disconnected)
+		out = append(out, t)
+	}
+	return out, rows.Err()
 }
 
 // ---- trace reads ----

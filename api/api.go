@@ -75,7 +75,7 @@ type Deps struct {
 	Fault             *fault.Service
 	NotifyPolicy      *notifypolicy.Service
 	Incident          *incident.Service
-	IncidentOps       *incidentops.Service // incident snapshot + traceroute orchestration reads
+	IncidentOps       *incidentops.Service // incident snapshot base + agent scene/traceroute evidence reads
 	Notification      *notification.Service
 	Settings          *settings.Service
 	Audit             *audit.Service
@@ -1698,8 +1698,9 @@ func (d Deps) incidentOwned(w http.ResponseWriter, r *http.Request, id string) b
 	return true
 }
 
-// handleIncidentSnapshot returns an incident's immutable snapshot (server base +
-// per-Agent scene entries). Site-owned.
+// handleIncidentSnapshot returns an incident's evidence scene: the immutable
+// server-authored base plus every agent-collected scene claimed for it.
+// Site-owned.
 func (d Deps) handleIncidentSnapshot(w http.ResponseWriter, r *http.Request) {
 	if d.IncidentOps == nil {
 		writeError(w, http.StatusServiceUnavailable, "incident snapshots not available")

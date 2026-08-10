@@ -1,19 +1,21 @@
-// Package incidentops is the server-side orchestration for an incident's
-// immutable state snapshot (INCIDENT-002) and its automatic detecting-Agent
-// traceroute reports (DIAG-001). It owns the snapshot/trace persistence, the
-// per-Agent collecting/dispatch lifecycle over the agent WebSocket, result
-// ingest with idempotent matching, single-flight trace sharing scoped to
-// overlapping alert lifecycles, startup recovery, callable worker ticks, and the
-// hourly evidence-retention pass.
+// Package incidentops is the server-side custody of an incident's evidence: the
+// immutable server-authored snapshot base (INCIDENT-002), the scenes agents
+// collect on their own fault edges (INCIDENT-005), and the traceroutes they run
+// on their own initiative (DIAG-001). It owns the persistence of all three,
+// idempotent ingest inside the telemetry write transaction, the two-way claim
+// between evidence and the fault it explains, startup recovery, callable worker
+// ticks, and the hourly evidence-retention pass.
 //
-// Dependency direction is one-way: the fault engine (package rules) calls
-// WriteIncidentBase inside its incident-open transaction; the agent hub (package
-// agentws) routes inbound IncidentSnapshot/TraceResult frames here and pushes
-// outbound requests through the injected Pusher (satisfied by *agentws.Hub) so
-// this package never imports agentws. Post-commit triggers (OnIncidentOpened /
-// OnEvidence / OnAlertResolved) are wired by the server onto the event bus — no
-// goroutine is spawned here and no DB-writing bus handler runs inside the open
-// fault transition transaction.
+// Dependency direction is one-way and there is no longer any server→agent leg:
+// the fault engine (package fault) calls WriteIncidentBase inside its
+// incident-open transaction, telemetry ingest calls IngestScenesTx /
+// IngestTracesTx inside its own, and the post-commit claim triggers
+// (OnSignalConfirmed / OnSignalResolved) are wired by the server onto the event
+// bus. Nothing here pushes down the agent WebSocket, so this package neither
+// imports agentws nor needs anything injected from it — an evidence collection
+// that has to be commanded is a collection that never happens for the offline
+// agent it is most needed from. No goroutine is spawned here and no DB-writing
+// bus handler runs inside the open fault transition transaction.
 package incidentops
 
 import (
@@ -23,7 +25,6 @@ import (
 	"strings"
 	"time"
 
-	pcfg "github.com/nettact/protocol/config"
 	"github.com/nettact/protocol/permission"
 	"github.com/nettact/server-core/eventbus"
 	"github.com/nettact/server-core/metrics"
@@ -31,34 +32,20 @@ import (
 	"github.com/nettact/server-core/store"
 )
 
-// Pusher pushes a server->agent request down an agent's live WebSocket session,
-// reporting false when the agent is not connected. It is satisfied by
-// *agentws.Hub; defining it here keeps the dependency one-way (incidentops never
-// imports agentws).
-type Pusher interface {
-	PushIncidentSnapshotRequest(agentID string, req pcfg.IncidentSnapshotRequest) bool
-}
-
-// Service orchestrates incident snapshots and traceroute reports.
+// Service orchestrates incident snapshots, agent scenes and traceroute reports.
 type Service struct {
 	db       *store.DB
 	metrics  *metrics.Store
 	settings *settings.Service
 	bus      *eventbus.Bus
-	pusher   Pusher
 }
 
-// New constructs the orchestration service. metrics/settings/bus may be nil in
-// tests (recent-sample summaries, tuned bounds and event publication degrade to
-// defaults/no-ops). The Pusher is injected later via SetPusher because the agent
-// hub needs a reference to this service too (construction is a cycle otherwise).
+// New constructs the evidence service. metrics/settings/bus may be nil in tests
+// (recent-sample summaries, tuned bounds and event publication degrade to
+// defaults/no-ops).
 func New(db *store.DB, m *metrics.Store, set *settings.Service, bus *eventbus.Bus) *Service {
 	return &Service{db: db, metrics: m, settings: set, bus: bus}
 }
-
-// SetPusher injects the agent-WebSocket pusher. Called once during wiring, before
-// serving, so no lock is needed.
-func (s *Service) SetPusher(p Pusher) { s.pusher = p }
 
 // ---- tuned settings (nil-safe: fall back to registered defaults) ----
 
@@ -67,10 +54,11 @@ func (s *Service) intSetting(ctx context.Context, key string) int {
 	return n
 }
 
-func (s *Service) snapshotDeadline(ctx context.Context) time.Duration {
-	return time.Duration(s.intSetting(ctx, settings.KeyIncidentSnapshotDeadlineMs)) * time.Millisecond
-}
-
+// snapshotMaxBytes is the hard cap on one stored evidence body — the server's
+// frozen incident base, and each agent scene payload. One knob covers both
+// because they are the two halves of the same page and an operator raising it
+// means "let me keep more of the scene", not "let me keep more of one of its
+// columns".
 func (s *Service) snapshotMaxBytes(ctx context.Context) int {
 	return s.intSetting(ctx, settings.KeyIncidentSnapshotMaxBytes)
 }
@@ -135,14 +123,6 @@ func canonicalDest(host string) (destKey, destHost string) {
 	lower := strings.ToLower(host)
 	return "host:" + lower, lower
 }
-
-// terminal snapshot / entry statuses.
-const (
-	statusCollecting = "collecting"
-	statusComplete   = "complete"
-	statusPartial    = "partial"
-	statusFailed     = "failed"
-)
 
 func boolInt(b bool) int {
 	if b {

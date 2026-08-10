@@ -393,29 +393,52 @@ func signalMatchesDest(ctx context.Context, tx *sql.Tx, signalID, destKey string
 // ---- claim-back (post-commit, on fault confirmation) ----
 
 // OnSignalConfirmed reacts to one newly-confirmed fault signal by claiming the
-// traceroute evidence the detecting Agent may already have produced for it.
+// evidence the detecting Agent may already have produced for it — the scene it
+// collected on its own fault edge, and the traceroute it ran.
 //
-// The Agent traced when its own failure streak crossed the threshold, which is
-// not the instant this server finished confirming the same rounds: during the
-// outages this feature exists for, the report is written while nothing can be
-// uploaded and lands in a burst afterwards. So a report frequently arrives
-// BEFORE its incident exists, ingest finds no firing fault to attach it to, and
-// it sits unreferenced. This is the other half of that handshake — the same
-// shape as the sub-threshold fluctuation claim in fault/fluctuation.go, which
-// exists for the same reason: evidence recorded before a verdict is still that
-// verdict's evidence.
+// The Agent acts when its own failure streak crosses the threshold, which is not
+// the instant this server finishes confirming the same rounds: during the
+// outages this feature exists for, both records are written while nothing can be
+// uploaded and land in a burst afterwards. So evidence frequently arrives BEFORE
+// its incident exists, ingest finds no firing fault to attach it to, and it sits
+// unreferenced. This is the other half of that handshake — the same shape as the
+// sub-threshold fluctuation claim in fault/fluctuation.go, which exists for the
+// same reason: evidence recorded before a verdict is still that verdict's
+// evidence.
 //
-// Reports the Agent has not sent yet are handled by the opposite path: ingest
+// Records the Agent has not sent yet are handled by the opposite path: ingest
 // attaches them to this now-firing signal on arrival.
 func (s *Service) OnSignalConfirmed(ctx context.Context, ev fault.SignalEvent) error {
-	if !s.diagEnabled(ctx) {
+	// A quality degradation is not a reachability fault: its target is answering,
+	// just more slowly than usual, and an Agent neither traces nor collects a scene
+	// for one. The trace eligibility test below is by metric-kind PREFIX and
+	// probe.icmp.rtt_ms passes it, so this has to be an explicit exclusion rather
+	// than a happy accident — and the scene claim, which keys on the monitor rather
+	// than on the metric, has nothing else that would keep a hard failure's scene
+	// out of a latency trend's evidence.
+	if fault.IsDegradation(ev.DetectorKey) {
 		return nil
 	}
-	// A quality degradation is not a reachability fault: its target is answering,
-	// just more slowly than usual, and an Agent never traces one. The eligibility
-	// test below is by metric-kind PREFIX and probe.icmp.rtt_ms passes it, so this
-	// has to be an explicit exclusion rather than a happy accident.
-	if fault.IsDegradation(ev.DetectorKey) {
+	// Scenes first, and deliberately outside the diagnostics gate below:
+	// diag_enabled states whether the server asks agents to run PATH DIAGNOSTICS.
+	// A scene is not one — it costs no probes, leaves the host's own network alone,
+	// and an operator who turned traceroute off did not thereby say "and do not
+	// tell me what the agent could see".
+	//
+	// Its error is carried, not returned. The two claims are independent bodies of
+	// evidence and nothing retries this handler — the bus logs what comes back and
+	// reconcileTraceRefs only deactivates references, it never claims — so
+	// returning early on a transient scene failure would permanently lose the
+	// trace evidence for this signal as collateral.
+	sceneErr := s.claimScenes(ctx, ev)
+	traceErr := s.claimTracesFor(ctx, ev)
+	return errors.Join(sceneErr, traceErr)
+}
+
+// claimTracesFor is the traceroute half of OnSignalConfirmed: the diagnostics
+// gate, the eligibility test, and the claim itself.
+func (s *Service) claimTracesFor(ctx context.Context, ev fault.SignalEvent) error {
+	if !s.diagEnabled(ctx) {
 		return nil
 	}
 	evd, metricKind, err := readSignalEvidence(ctx, s.db.Read(), ev.SignalID)

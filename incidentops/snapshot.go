@@ -4,14 +4,11 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
-	"errors"
 	"time"
 
 	"github.com/google/uuid"
 
 	pcfg "github.com/nettact/protocol/config"
-	"github.com/nettact/protocol/telemetry"
-	"github.com/nettact/server-core/eventbus"
 	"github.com/nettact/server-core/metrics"
 )
 
@@ -21,8 +18,12 @@ import (
 // frozen once at incident-open time. It carries stable IDs and the display facts
 // as they were at trigger time, the trigger/receive timestamps, and each firing
 // condition's threshold/current value plus a bounded recent-sample summary — so
-// later renames, edits or deletions can never rewrite the scene. Agent-collected
-// scene evidence lands separately in incident_snapshot_entries.
+// later renames, edits or deletions can never rewrite the scene.
+//
+// It is the SERVER's perspective and only that. What the detecting agent could
+// see when it decided something was broken arrives separately and on the agent's
+// own initiative, as a scene_report claimed against this incident (see scene.go);
+// the two complement each other and neither waits for the other.
 type SnapshotBase struct {
 	IncidentID     string    `json:"incident_id"`
 	SiteID         string    `json:"site_id"`
@@ -119,33 +120,31 @@ const recentSampleFetchCap = 600
 // state) and the bounded recent-sample summaries through the read pool (WAL lets
 // that run concurrently with the open write tx). The serialized base is hard-capped
 // to incident_snapshot_max_bytes here — optional base detail is dropped
-// deterministically rather than an oversized base stored — and entry payloads are
-// additionally accounted for and truncated at finalize. A build failure records a
-// deterministic failed/partial snapshot row instead of aborting: the returned
-// error is advisory (the caller logs and continues), and the incident still
-// opens. Idempotent via the incident_snapshots.incident_id UNIQUE constraint.
+// deterministically rather than an oversized base stored. A build failure records
+// whatever it managed to assemble instead of aborting: the returned error is
+// advisory (the caller logs and continues), and the incident still opens.
+// Idempotent via the incident_snapshots.incident_id UNIQUE constraint.
 func (s *Service) WriteIncidentBase(ctx context.Context, tx *sql.Tx, incidentID string, now time.Time) error {
-	base, status, buildErr := s.buildBase(ctx, tx, incidentID, now)
+	base, buildErr := s.buildBase(ctx, tx, incidentID, now)
 	payload := mustJSON(base)
 	truncated := 0
 	if capped, changed := truncateBase(payload, s.snapshotMaxBytes(ctx)); changed {
 		payload = capped
 		truncated = 1
 	}
-	deadline := now.Add(s.snapshotDeadline(ctx))
 	if _, err := tx.ExecContext(ctx,
-		`INSERT OR IGNORE INTO incident_snapshots(id, incident_id, status, base, total_bytes, truncated, deadline_at, created_at)
-		 VALUES(?,?,?,?,?,?,?,?)`,
-		"isnap_"+uuid.NewString(), incidentID, status, payload, len(payload), truncated, deadline, now); err != nil {
+		`INSERT OR IGNORE INTO incident_snapshots(id, incident_id, base, truncated, created_at)
+		 VALUES(?,?,?,?,?)`,
+		"isnap_"+uuid.NewString(), incidentID, payload, truncated, now); err != nil {
 		return err
 	}
 	return buildErr
 }
 
-// buildBase assembles the snapshot base and its initial status. status is
-// 'collecting' on a clean build (agent scene collection follows post-commit) and
-// 'failed' when the incident row itself cannot be read.
-func (s *Service) buildBase(ctx context.Context, tx *sql.Tx, incidentID string, now time.Time) (SnapshotBase, string, error) {
+// buildBase assembles the snapshot base. An unreadable incident row or member set
+// yields a partial base and an error: the row is still written, so the incident
+// always has a snapshot, and the caller logs what was missing.
+func (s *Service) buildBase(ctx context.Context, tx *sql.Tx, incidentID string, now time.Time) (SnapshotBase, error) {
 	base := SnapshotBase{IncidentID: incidentID, ReceivedAt: now}
 	var siteID, groupID, groupName, severity, suspected, attribution, attrEv string
 	var openedAt time.Time
@@ -155,7 +154,7 @@ func (s *Service) buildBase(ctx context.Context, tx *sql.Tx, incidentID string, 
 		 FROM incidents WHERE id=?`, incidentID).
 		Scan(&siteID, &groupID, &groupName, &severity, &suspected, &openedAt, &attribution, &attrEv)
 	if err != nil {
-		return base, statusFailed, err
+		return base, err
 	}
 	base.SiteID = siteID
 	base.Group = baseGroup{ID: groupID, Name: groupName}
@@ -169,14 +168,14 @@ func (s *Service) buildBase(ctx context.Context, tx *sql.Tx, incidentID string, 
 
 	members, agentIDs, targetIDs, err := s.baseMembers(ctx, tx, incidentID)
 	if err != nil {
-		// Members unreadable: keep the group/severity base but flag it failed so the
-		// scene is deterministically marked incomplete rather than silently empty.
-		return base, statusFailed, err
+		// Members unreadable: keep the group/severity base rather than storing
+		// nothing, and let the caller log why it is thin.
+		return base, err
 	}
 	base.Members = members
 	base.Agents = s.baseAgents(ctx, agentIDs)
 	base.Targets = s.baseTargets(ctx, tx, targetIDs)
-	return base, statusCollecting, nil
+	return base, nil
 }
 
 // baseMembers reads the incident's member fault signals with their frozen
@@ -376,495 +375,10 @@ func parseParams(params string) pcfg.ProbeParams {
 	return p
 }
 
-// ---- post-commit dispatch (one collecting entry + request per involved Agent) ----
-
-// OnIncidentOpened creates one collecting snapshot entry per distinct involved
-// Agent and dispatches an IncidentSnapshotRequest to each over the WebSocket.
-// It runs post-commit (wired onto TopicIncidentOpened), so it never shares the
-// fault transaction. Idempotent: entries are keyed UNIQUE(snapshot_id, agent_id),
-// and a re-delivered event re-pushes only to still-collecting in-deadline agents.
-func (s *Service) OnIncidentOpened(ctx context.Context, ev eventbus.IncidentEvent) error {
-	snapID, deadline, frozen, err := s.ensureSnapshot(ctx, ev.IncidentID)
-	if err != nil {
-		return err
-	}
-	// Distinct member agents of the incident (at open there is at least one).
-	rows, err := s.db.Read().QueryContext(ctx,
-		`SELECT DISTINCT agent_id FROM fault_signals WHERE incident_id=?`, ev.IncidentID)
-	if err != nil {
-		return err
-	}
-	var agents []string
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			rows.Close()
-			return err
-		}
-		agents = append(agents, id)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return err
-	}
-
-	now := time.Now().UTC()
-	for _, agentID := range agents {
-		reqID := "isnapreq_" + uuid.NewString()
-		// Derive the target refs ONCE, here, and freeze them onto the entry; every
-		// later push (reconnect re-delivery) replays these bytes rather than
-		// re-reading mutable probe_tasks. The values come from the base frozen
-		// inside the incident transaction, so a monitor edit committing between
-		// that transaction and this post-commit handler cannot leak in either.
-		targets := s.snapshotTargets(ctx, ev.IncidentID, agentID, frozen)
-		res, err := s.db.ExecContext(ctx,
-			`INSERT OR IGNORE INTO incident_snapshot_entries(id, snapshot_id, request_id, agent_id, agent_name, status, targets, requested_at)
-			 VALUES(?,?,?,?,?, 'collecting', ?, ?)`,
-			"isne_"+uuid.NewString(), snapID, reqID, agentID, s.agentName(ctx, agentID), mustJSON(targets), now)
-		if err != nil {
-			return err
-		}
-		if n, _ := res.RowsAffected(); n == 0 {
-			continue // entry already exists (idempotent re-delivery)
-		}
-		s.dispatchSnapshot(agentID, ev.IncidentID, reqID, deadline, targets)
-	}
-	// A snapshot with no agent entries (should not happen: an incident always has a
-	// member alert) is finalized immediately so it never hangs collecting.
-	return s.finalizeSnapshot(ctx, snapID, false)
-}
-
-// ensureSnapshot returns the snapshot id, deadline and tx-frozen base targets
-// for an incident, creating a minimal collecting row when WriteIncidentBase did
-// not run (base build failed in the fault tx). Deterministic fallback so scene
-// collection can still proceed — on that path (and when truncation dropped the
-// base's target section) the returned map is empty and snapshotTargets falls
-// back to the live config.
-func (s *Service) ensureSnapshot(ctx context.Context, incidentID string) (string, time.Time, map[string]baseTarget, error) {
-	var id, base string
-	var deadline time.Time
-	err := s.db.Read().QueryRowContext(ctx,
-		`SELECT id, deadline_at, base FROM incident_snapshots WHERE incident_id=?`, incidentID).Scan(&id, &deadline, &base)
-	if err == nil {
-		return id, deadline, frozenBaseTargets(base), nil
-	}
-	if !errors.Is(err, sql.ErrNoRows) {
-		return "", time.Time{}, nil, err
-	}
-	now := time.Now().UTC()
-	deadline = now.Add(s.snapshotDeadline(ctx))
-	id = "isnap_" + uuid.NewString()
-	if _, err := s.db.ExecContext(ctx,
-		`INSERT OR IGNORE INTO incident_snapshots(id, incident_id, status, base, total_bytes, truncated, deadline_at, created_at)
-		 VALUES(?,?, 'collecting', '', 0, 0, ?, ?)`, id, incidentID, deadline, now); err != nil {
-		return "", time.Time{}, nil, err
-	}
-	// Re-read to resolve a race where a concurrent writer inserted first.
-	if err := s.db.Read().QueryRowContext(ctx,
-		`SELECT id, deadline_at, base FROM incident_snapshots WHERE incident_id=?`, incidentID).Scan(&id, &deadline, &base); err != nil {
-		return "", time.Time{}, nil, err
-	}
-	return id, deadline, frozenBaseTargets(base), nil
-}
-
-// frozenBaseTargets indexes a stored snapshot base's target section by monitor
-// id. An empty, truncated-away or (impossible for our own JSON) unparseable
-// base yields an empty map, which downgrades snapshotTargets to its live-config
-// fallback rather than failing the dispatch.
-func frozenBaseTargets(base string) map[string]baseTarget {
-	if base == "" {
-		return nil
-	}
-	var b struct {
-		Targets []baseTarget `json:"targets"`
-	}
-	if json.Unmarshal([]byte(base), &b) != nil {
-		return nil
-	}
-	m := make(map[string]baseTarget, len(b.Targets))
-	for _, t := range b.Targets {
-		m[t.MonitorID] = t
-	}
-	return m
-}
-
-// dispatchSnapshot pushes one agent's IncidentSnapshotRequest. Offline agents
-// simply do not receive it (the entry stays collecting until the deadline or a
-// reconnect re-push).
-//
-// targets are the refs frozen onto the entry at creation, passed in rather than
-// re-derived: see OnIncidentOpened.
-//
-// The collection window travels as the remaining budget at push time, never as
-// this server's absolute deadline: the agent's clock is independent of ours and
-// skew larger than the window would expire the request on arrival, making the
-// agent report timeouts for work it was never given time to attempt. We keep the
-// absolute deadline_at for our own reaping, so the only slack the agent gains is
-// the push latency. An already-spent window is not pushed at all — finalize's
-// deadline sweep terminalizes the entry.
-func (s *Service) dispatchSnapshot(agentID, incidentID, reqID string, deadline time.Time, targets []pcfg.SnapshotTargetRef) {
-	if s.pusher == nil {
-		return
-	}
-	budgetMs := int(time.Until(deadline).Milliseconds())
-	if budgetMs <= 0 {
-		return
-	}
-	s.pusher.PushIncidentSnapshotRequest(agentID, pcfg.IncidentSnapshotRequest{
-		RequestID:  reqID,
-		IncidentID: incidentID,
-		BudgetMs:   budgetMs,
-		Targets:    targets,
-	})
-}
-
-// snapshotTargets derives the monitor targets one agent should resolve for the
-// scene. It is called EXACTLY ONCE per entry — at creation, in OnIncidentOpened.
-// The result is frozen onto the entry and replayed from there on every later
-// push; nothing downstream may call this again.
-//
-// frozen is the base's target section as captured INSIDE the incident-open
-// transaction, and it wins over the live probe_tasks row: this runs post-commit,
-// so a monitor edit landing in the gap would otherwise be frozen onto the entry
-// and the agent would collect evidence for a config that never raised the
-// incident (while the base right next to it shows the one that did). The live
-// row (then the signal's own frozen columns) remains the fallback for targets
-// the base does not carry — a base-less fallback snapshot, or one whose target
-// section was truncated away.
-//
-// Host-anchor monitors are excluded: their target names a metric series ("host",
-// "*", a mount like "C:"), not a network destination, so there is nothing to
-// resolve and asking the agent to try would only produce a bogus lookup failure.
-// The exclusion tests the frozen kind, so a monitor retyped in the gap can
-// neither slip in nor knock its target out. Gateway monitors ARE included, but
-// carry the NIC selection instead of a resolvable host — the agent reads its
-// routing table, not DNS.
-func (s *Service) snapshotTargets(ctx context.Context, incidentID, agentID string, frozen map[string]baseTarget) []pcfg.SnapshotTargetRef {
-	rows, err := s.db.Read().QueryContext(ctx, `
-		SELECT DISTINCT s.target_id, COALESCE(pt.kind, s.probe_kind), COALESCE(pt.target, s.target_addr), COALESCE(pt.params,'')
-		FROM fault_signals s
-		LEFT JOIN probe_tasks pt ON pt.id = s.target_id
-		WHERE s.incident_id=? AND s.agent_id=? AND s.target_id <> ''`, incidentID, agentID)
-	if err != nil {
-		return nil
-	}
-	defer rows.Close()
-	var out []pcfg.SnapshotTargetRef
-	for rows.Next() {
-		var ref pcfg.SnapshotTargetRef
-		var params string
-		if err := rows.Scan(&ref.MonitorID, &ref.Kind, &ref.Target, &params); err != nil {
-			return out
-		}
-		if bt, ok := frozen[ref.MonitorID]; ok {
-			ref.Kind, ref.Target, ref.Port, ref.Iface = bt.Kind, bt.Target, bt.Port, bt.Iface
-		} else {
-			p := parseParams(params)
-			ref.Port = p.Port
-			if ref.Kind == "gateway" {
-				ref.Iface = p.Interface
-			}
-		}
-		if ref.Kind == "host" {
-			continue
-		}
-		out = append(out, ref)
-	}
-	return out
-}
-
-// ---- ingest ----
-
-// snapshotAllowlist is the set of snapshot field-group ids the server accepts. An
-// agent result carrying anything else has that group dropped (validate-only-
-// allowlisted), never persisted.
-var snapshotAllowlist = map[string]bool{
-	telemetry.SnapshotGroupNetwork:   true,
-	telemetry.SnapshotGroupAgent:     true,
-	telemetry.SnapshotGroupResources: true,
-	telemetry.SnapshotGroupTargets:   true,
-}
-
-// entryPayload is the persisted per-Agent scene payload (allowlisted groups only).
-type entryPayload struct {
-	Groups    []telemetry.SnapshotGroupResult  `json:"groups"`
-	Network   *telemetry.SnapshotNetwork       `json:"network,omitempty"`
-	Agent     *telemetry.SnapshotAgentInfo     `json:"agent,omitempty"`
-	Resources *telemetry.SnapshotResources     `json:"resources,omitempty"`
-	Targets   []telemetry.SnapshotTargetResult `json:"targets,omitempty"`
-}
-
-// clockSkewFlagMs is the agent/server receive-time delta beyond which the entry is
-// flagged clock-skewed.
-const clockSkewFlagMs = 5000
-
-// IngestSnapshot persists one agent's incident-scene result. It matches by
-// request id + incident id + authenticated agent id, requires the entry to still
-// be collecting, keeps only allowlisted groups, computes the server receive
-// time/clock skew, and finalizes the snapshot when all entries are terminal.
-// Duplicate, late, wrong-incident and wrong-agent results are idempotent no-ops.
-func (s *Service) IngestSnapshot(ctx context.Context, agentID string, snap telemetry.IncidentSnapshot) error {
-	var snapshotID, entryAgent, entryStatus, incidentID string
-	err := s.db.Read().QueryRowContext(ctx, `
-		SELECT e.snapshot_id, e.agent_id, e.status, sn.incident_id
-		FROM incident_snapshot_entries e
-		JOIN incident_snapshots sn ON sn.id = e.snapshot_id
-		WHERE e.request_id=?`, snap.RequestID).Scan(&snapshotID, &entryAgent, &entryStatus, &incidentID)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil // unknown request id
-	}
-	if err != nil {
-		return err
-	}
-	if entryAgent != agentID || incidentID != snap.IncidentID || entryStatus != statusCollecting {
-		return nil // wrong agent / wrong incident / already terminal (idempotent)
-	}
-
-	payload, status := buildEntryPayload(snap)
-	now := time.Now().UTC()
-	skewMs := now.Sub(snap.CollectedAt).Milliseconds()
-	if skewMs < 0 {
-		skewMs = -skewMs
-	}
-	skewed := skewMs > clockSkewFlagMs
-
-	res, err := s.db.ExecContext(ctx, `
-		UPDATE incident_snapshot_entries
-		SET status=?, reason=?, clock_skew_ms=?, skewed=?, payload=?, received_at=?
-		WHERE request_id=? AND status='collecting'`,
-		status, entryReason(status), skewMs, boolInt(skewed), mustJSON(payload), now, snap.RequestID)
-	if err != nil {
-		return err
-	}
-	if n, _ := res.RowsAffected(); n == 0 {
-		return nil // lost the idempotency race; already terminal
-	}
-	return s.finalizeSnapshot(ctx, snapshotID, false)
-}
-
-// buildEntryPayload filters an agent result to allowlisted groups and derives the
-// entry's terminal status from the collected/denied/unsupported/failed group mix.
-func buildEntryPayload(snap telemetry.IncidentSnapshot) (entryPayload, string) {
-	var p entryPayload
-	collected := map[string]bool{}
-	total := 0
-	ok := 0
-	for _, g := range snap.Groups {
-		if !snapshotAllowlist[g.Group] {
-			continue // drop non-allowlisted group
-		}
-		p.Groups = append(p.Groups, g)
-		total++
-		if g.Status == telemetry.ScopeCollected {
-			ok++
-			collected[g.Group] = true
-		}
-	}
-	if collected[telemetry.SnapshotGroupNetwork] {
-		p.Network = snap.Network
-	}
-	if collected[telemetry.SnapshotGroupAgent] {
-		p.Agent = snap.Agent
-	}
-	if collected[telemetry.SnapshotGroupResources] {
-		p.Resources = snap.Resources
-	}
-	if collected[telemetry.SnapshotGroupTargets] {
-		p.Targets = snap.Targets
-	}
-	switch {
-	case total == 0 || ok == 0:
-		return p, statusFailed
-	case ok == total:
-		return p, statusComplete
-	default:
-		return p, statusPartial
-	}
-}
-
-func entryReason(status string) string {
-	if status == statusFailed {
-		return "no_groups_collected"
-	}
-	return ""
-}
-
-// ---- finalize + truncation ----
-
-// finalizeSnapshot recomputes a snapshot's terminal status once all its entries
-// are terminal (or, when force is set by the deadline sweep, immediately —
-// terminating any still-collecting entries as timed out). It then enforces the
-// serialized-size cap with deterministic truncation. A no-op while entries are
-// still legitimately collecting inside the deadline.
-func (s *Service) finalizeSnapshot(ctx context.Context, snapshotID string, force bool) error {
-	var deadline time.Time
-	var curStatus string
-	if err := s.db.Read().QueryRowContext(ctx,
-		`SELECT status, deadline_at FROM incident_snapshots WHERE id=?`, snapshotID).Scan(&curStatus, &deadline); err != nil {
-		return err
-	}
-	if curStatus != statusCollecting {
-		return nil // already terminal
-	}
-	deadlinePassed := force || !time.Now().UTC().Before(deadline)
-
-	rows, err := s.db.Read().QueryContext(ctx,
-		`SELECT status FROM incident_snapshot_entries WHERE snapshot_id=?`, snapshotID)
-	if err != nil {
-		return err
-	}
-	var total, complete, partial, collecting int
-	for rows.Next() {
-		var st string
-		if err := rows.Scan(&st); err != nil {
-			rows.Close()
-			return err
-		}
-		total++
-		switch st {
-		case statusComplete:
-			complete++
-		case statusPartial:
-			partial++
-		case statusCollecting:
-			collecting++
-		}
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return err
-	}
-	if collecting > 0 && !deadlinePassed {
-		return nil // still collecting inside the deadline
-	}
-	if collecting > 0 {
-		// Deadline passed: terminate the stragglers deterministically as timed out.
-		if _, err := s.db.ExecContext(ctx,
-			`UPDATE incident_snapshot_entries SET status='failed', reason='timeout' WHERE snapshot_id=? AND status='collecting'`,
-			snapshotID); err != nil {
-			return err
-		}
-	}
-
-	final := statusFailed
-	switch {
-	case total == 0 || complete == total:
-		final = statusComplete
-	case complete > 0 || partial > 0:
-		final = statusPartial
-	}
-
-	totalBytes, truncated, err := s.enforceSizeCap(ctx, snapshotID)
-	if err != nil {
-		return err
-	}
-	_, err = s.db.ExecContext(ctx,
-		`UPDATE incident_snapshots SET status=?, total_bytes=?, truncated=? WHERE id=? AND status='collecting'`,
-		final, totalBytes, boolInt(truncated), snapshotID)
-	return err
-}
-
-// enforceSizeCap makes incident_snapshot_max_bytes a hard cap on the whole
-// serialized snapshot (immutable base + entry payloads). When the total exceeds
-// the maximum it truncates deterministically: first optional entry detail (recent
-// target-resolution detail, then network interfaces, then the resources summary),
-// then the base's optional detail (recent samples, then supplementary sections,
-// then trailing members — never the incident identifiers/status), and finally, if
-// entry payloads alone still overflow, it drops entry payloads outright. It returns
-// the post-truncation byte total (always ≤ max) and whether anything was dropped.
-func (s *Service) enforceSizeCap(ctx context.Context, snapshotID string) (int, bool, error) {
-	maxBytes := s.snapshotMaxBytes(ctx)
-	var baseJSON string
-	if err := s.db.Read().QueryRowContext(ctx,
-		`SELECT COALESCE(base,'') FROM incident_snapshots WHERE id=?`, snapshotID).Scan(&baseJSON); err != nil {
-		return 0, false, err
-	}
-	type entRow struct {
-		id      string
-		payload string
-	}
-	rows, err := s.db.Read().QueryContext(ctx,
-		`SELECT id, COALESCE(payload,'') FROM incident_snapshot_entries WHERE snapshot_id=? ORDER BY agent_id`, snapshotID)
-	if err != nil {
-		return 0, false, err
-	}
-	var ents []entRow
-	entriesLen := 0
-	for rows.Next() {
-		var e entRow
-		if err := rows.Scan(&e.id, &e.payload); err != nil {
-			rows.Close()
-			return 0, false, err
-		}
-		entriesLen += len(e.payload)
-		ents = append(ents, e)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return 0, false, err
-	}
-	total := len(baseJSON) + entriesLen
-	if total <= maxBytes {
-		return total, false, nil
-	}
-
-	truncated := false
-	// Phase 1: strip optional entry detail in priority order across entries.
-	for level := 0; level < 3 && total > maxBytes; level++ {
-		for i := range ents {
-			if total <= maxBytes {
-				break
-			}
-			newPayload, changed := stripEntryLevel(ents[i].payload, level)
-			if !changed {
-				continue
-			}
-			delta := len(newPayload) - len(ents[i].payload)
-			total += delta
-			entriesLen += delta
-			ents[i].payload = newPayload
-			truncated = true
-			if _, err := s.db.ExecContext(ctx,
-				`UPDATE incident_snapshot_entries SET payload=? WHERE id=?`, newPayload, ents[i].id); err != nil {
-				return 0, false, err
-			}
-		}
-	}
-
-	// Phase 2: reduce the immutable base to fit within the remaining budget.
-	if total > maxBytes {
-		if newBase, changed := truncateBase(baseJSON, maxBytes-entriesLen); changed {
-			if _, err := s.db.ExecContext(ctx,
-				`UPDATE incident_snapshots SET base=? WHERE id=?`, newBase, snapshotID); err != nil {
-				return 0, false, err
-			}
-			total += len(newBase) - len(baseJSON)
-			baseJSON = newBase
-			truncated = true
-		}
-	}
-
-	// Phase 3 (guarantee): if entry payloads alone still overflow, drop them outright
-	// (deterministically by agent order) until the total fits. The immutable base and
-	// its identifiers survive.
-	for i := 0; i < len(ents) && total > maxBytes; i++ {
-		if ents[i].payload == "" {
-			continue
-		}
-		total -= len(ents[i].payload)
-		ents[i].payload = ""
-		truncated = true
-		if _, err := s.db.ExecContext(ctx,
-			`UPDATE incident_snapshot_entries SET payload='' WHERE id=?`, ents[i].id); err != nil {
-			return 0, false, err
-		}
-	}
-
-	return total, truncated, nil
-}
+// ---- base truncation ----
 
 // truncateBase deterministically reduces a serialized SnapshotBase to at most
-// budget bytes, preserving the incident's core identifiers and status. Optional
+// budget bytes, preserving the incident's core identifiers. Optional
 // detail is dropped in a fixed priority: per-member recent samples first, then
 // the supplementary agent/target sections (their identity survives on the members
 // and their evidence), and finally trailing members as a guaranteed floor. Returns
@@ -908,46 +422,10 @@ func truncateBase(payload string, budget int) (string, bool) {
 		return mustJSON(b), changed
 	}
 	// Tier 3 (floor): drop trailing members until the base fits. An empty member list
-	// still yields a valid, tiny base carrying the incident identifiers/status.
+	// still yields a valid, tiny base carrying the incident identifiers.
 	for len(b.Members) > 0 && !fits() {
 		b.Members = b.Members[:len(b.Members)-1]
 		changed = true
 	}
 	return mustJSON(b), changed
-}
-
-// stripEntryLevel removes one tier of optional detail from an entry payload,
-// preserving group-status metadata and agent identity. level 0 drops target
-// resolution detail, 1 drops network interfaces, 2 drops the resources summary.
-// Returns the re-serialized payload and whether it changed.
-func stripEntryLevel(payload string, level int) (string, bool) {
-	if payload == "" {
-		return payload, false
-	}
-	var p entryPayload
-	if json.Unmarshal([]byte(payload), &p) != nil {
-		return payload, false
-	}
-	changed := false
-	switch level {
-	case 0:
-		if len(p.Targets) > 0 {
-			p.Targets = nil
-			changed = true
-		}
-	case 1:
-		if p.Network != nil && len(p.Network.Interfaces) > 0 {
-			p.Network.Interfaces = nil
-			changed = true
-		}
-	case 2:
-		if p.Resources != nil {
-			p.Resources = nil
-			changed = true
-		}
-	}
-	if !changed {
-		return payload, false
-	}
-	return mustJSON(p), true
 }

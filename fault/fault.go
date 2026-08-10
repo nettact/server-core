@@ -429,6 +429,20 @@ type Signal struct {
 	// so an in-tunnel diagnostic can demand exactly that generation rather than
 	// whatever the proxy has been rotated to since.
 	ProxyConfigSerial int `json:"proxy_config_serial,omitempty"`
+	// TargetConfigSerial is the monitored target's own material generation at
+	// confirmation time. It is the server half of the key an agent-collected
+	// scene is claimed on (INCIDENT-005): the agent stamps every scene trigger
+	// with the generation it held for the monitor, and only a signal frozen at
+	// the same generation may claim it.
+	//
+	// A monitor id alone would not do. A target edited between the agent's
+	// collection and this confirmation is a different destination wearing the
+	// same id, and matching on the id would file a scene of the old target as
+	// evidence for a fault on the new one. Set by the detectors that confirm
+	// against a probe target's own rounds; 0 for agent connectivity, which has no
+	// target at all, and for the host detectors, whose target id names a metric
+	// series rather than a generation an agent could have stamped a scene with.
+	TargetConfigSerial int `json:"target_config_serial,omitempty"`
 
 	ObservedAt        time.Time  `json:"observed_at"`
 	ConfirmedAt       time.Time  `json:"confirmed_at"`

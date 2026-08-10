@@ -202,15 +202,6 @@ func (h *Hub) readLoop(ctx context.Context, s *session) error {
 					log.Printf("agentws: monitor status from %s: %v", s.agentID, err)
 				}
 			}
-		case frame.IncidentSnapshot != nil:
-			// One-shot incident-scene result. Never acked; matched idempotently by
-			// (request id + incident id + authenticated agent id) — a duplicate, late
-			// or wrong-agent result is a no-op inside the orchestration.
-			if h.deps.IncidentOps != nil {
-				if err := h.deps.IncidentOps.IngestSnapshot(ctx, s.agentID, *frame.IncidentSnapshot); err != nil {
-					log.Printf("agentws: incident snapshot from %s: %v", s.agentID, err)
-				}
-			}
 		default:
 			// A second Hello, or a server->agent frame kind (Ack / DesiredState /
 			// SnapshotRequest) coming FROM the agent: both are protocol violations.

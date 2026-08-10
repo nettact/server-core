@@ -300,6 +300,13 @@ func (s *Service) confirmSignal(ctx context.Context, tx *sql.Tx, agentID, siteID
 		StunAddr: r.StunAddr, StunTransport: r.StunTransport,
 		ProxyID: r.Meta.ProxyID, ProxyType: r.Meta.ProxyType, ProxyAddr: r.Meta.ProxyAddr,
 		ProxyConfigSerial: r.Meta.ProxyConfigSerial,
+		// The target's own material generation, taken from the confirming round
+		// rather than re-read from probe_tasks: ingest drops any sample whose serial
+		// does not equal the target's current one, so the round IS the live
+		// generation, and reading the row again would only add a query that can
+		// disagree with the evidence. It is the server half of the key an
+		// agent-collected scene is claimed on (INCIDENT-005).
+		TargetConfigSerial: r.ConfigSerial,
 		// Freeze the cause of every round of the streak, not just the confirming one.
 		// The summary columns above answer "why is this firing"; these answer "what
 		// actually happened" — a target that timed out twice and was then refused
@@ -583,15 +590,15 @@ func insertSignal(ctx context.Context, tx *sql.Tx, sig Signal, port int) error {
 		    state, fail_threshold, recover_threshold, metric_kind, comparator, value, threshold,
 		    reason_code, reason_detail, baseline_p50, baseline_p95,
 		    resolver_addr, resolver_protocol, stun_addr, stun_transport,
-		    proxy_id, proxy_type, proxy_addr, proxy_config_serial,
+		    proxy_id, proxy_type, proxy_addr, proxy_config_serial, target_config_serial,
 		    rounds_json, observed_at, confirmed_at, incident_id)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'firing', ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'firing', ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		sig.ID, sig.SiteID, sig.AgentID, sig.TargetID, sig.DetectorKey, sig.ProbeKind,
 		sig.GroupID, sig.GroupName, sig.TargetName, sig.TargetAddr, port, sig.AgentName, sig.Layer, sig.Severity,
 		sig.FailThreshold, sig.RecoverThreshold, sig.MetricKind, sig.Comparator, sig.Value, sig.Threshold,
 		sig.ReasonCode, sig.ReasonDetail, sig.BaselineP50, sig.BaselineP95,
 		sig.ResolverAddr, sig.ResolverProtocol, sig.StunAddr, sig.StunTransport,
-		sig.ProxyID, sig.ProxyType, sig.ProxyAddr, sig.ProxyConfigSerial,
+		sig.ProxyID, sig.ProxyType, sig.ProxyAddr, sig.ProxyConfigSerial, sig.TargetConfigSerial,
 		roundsJSON, sig.ObservedAt, sig.ConfirmedAt, sig.IncidentID)
 	return err
 }

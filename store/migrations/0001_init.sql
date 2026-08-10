@@ -1047,6 +1047,15 @@ CREATE TABLE fault_signals(
   -- pinned to exactly this generation so a key rotated between fault and
   -- diagnosis can never be re-enabled to carry the probes (0 = no pin).
   proxy_config_serial INTEGER NOT NULL DEFAULT 0,
+  -- The MONITORED target's material generation at confirmation time — the server
+  -- half of the agent scene claim key (scene_report_triggers.config_serial).
+  -- Frozen for the same reason as everything above it: an edit landing between
+  -- the fault and the scene would otherwise re-key evidence onto a definition it
+  -- never described. Ingest drops samples whose serial does not match the
+  -- target's current one, so the confirming round is necessarily the live
+  -- generation and this is that number. 0 for the agent-connectivity detector,
+  -- which has no target at all.
+  target_config_serial INTEGER NOT NULL DEFAULT 0,
   -- Every round of the confirming streak, not just the last one: a JSON array of
   -- {ts, metric_kind, value, reason_code, reason_detail}. The columns above are
   -- the confirming round's summary; a streak that timed out twice and was then
@@ -1157,40 +1166,126 @@ CREATE INDEX idx_opissues_active ON operational_issues(site_id, state, read);
 
 -- ===== incident diagnostics (scene snapshots + traceroute) =====
 
+-- The SERVER's half of an incident's scene, frozen inside the transaction that
+-- opened the incident: stable identifiers, the display facts as they stood at
+-- trigger time, each firing condition's threshold/value and a bounded
+-- recent-sample chart. Written once by WriteIncidentBase and never touched
+-- again, so a later rename, edit or deletion cannot rewrite what it said.
+--
+-- It carries no collection lifecycle — no status, no deadline, no per-agent
+-- entries — because nothing is ever pending on it. The AGENT's half used to be
+-- commanded from here (an incident opened, a request went down the socket, an
+-- entry waited for the answer), which is exactly backwards: the agent most worth
+-- asking is the one that just went unreachable, and a push to an offline agent is
+-- a no-op, so the scene was missing precisely for the network faults it exists to
+-- explain. Agents now collect on their own fault edges and ship the result
+-- through the WAL as a scene_report, which this server claims afterwards.
 CREATE TABLE incident_snapshots(
   id          TEXT PRIMARY KEY,
   incident_id TEXT NOT NULL UNIQUE REFERENCES incidents(id) ON DELETE CASCADE,
-  status      TEXT NOT NULL DEFAULT 'collecting',   -- collecting | complete | partial | failed
   base        TEXT NOT NULL DEFAULT '',             -- immutable base JSON
-  total_bytes INTEGER NOT NULL DEFAULT 0,
-  truncated   INTEGER NOT NULL DEFAULT 0,
-  deadline_at TIMESTAMP NOT NULL,
+  truncated   INTEGER NOT NULL DEFAULT 0,           -- optional base detail was dropped to fit incident_snapshot_max_bytes
   created_at  TIMESTAMP NOT NULL
 );
 
-CREATE TABLE incident_snapshot_entries(
+-- One agent-collected scene: what an agent could see about itself and its
+-- surroundings at the moment IT decided something was broken (INCIDENT-005).
+--
+-- Every row is TERMINAL on arrival, for the same reason trace_reports is: the
+-- agent decided, collected and filed the whole self-describing report through its
+-- outbox, so there is no request id, no pending state and no deadline to keep
+-- here. What a row is waiting for is not collection but a VERDICT — a scene that
+-- matches no confirmed fault yet is stored unattached and claimed later (see
+-- scene_report_refs), because evidence recorded before a verdict is still that
+-- verdict's evidence.
+--
+-- A scene therefore describes what the agent saw when it detected the fault,
+-- which is an earlier and different statement from the frozen target list the
+-- server used to ask for at incident-open time. Nothing server-side can
+-- reconstruct it, so the report carries its own reason for existing in
+-- scene_report_triggers.
+CREATE TABLE scene_reports(
+  -- Agent-minted, and the ingest idempotency key on its own: a replayed packet
+  -- re-presents the same id and the INSERT OR IGNORE makes it a no-op. The key is
+  -- NOT scoped per agent, deliberately — an id an agent invents that collides
+  -- with another agent's stored report is dropped rather than allowed to
+  -- overwrite it, which is the safe direction for a UUID collision.
   id            TEXT PRIMARY KEY,
-  snapshot_id   TEXT NOT NULL REFERENCES incident_snapshots(id) ON DELETE CASCADE,
-  request_id    TEXT NOT NULL,
+  site_id       TEXT NOT NULL,
   agent_id      TEXT NOT NULL,
   agent_name    TEXT NOT NULL DEFAULT '',
-  status        TEXT NOT NULL DEFAULT 'collecting', -- collecting | complete | partial | failed
-  reason        TEXT NOT NULL DEFAULT '',
-  clock_skew_ms INTEGER NOT NULL DEFAULT 0,
-  skewed        INTEGER NOT NULL DEFAULT 0,
-  payload       TEXT NOT NULL DEFAULT '',           -- field-group JSON
-  -- The target refs this agent was asked to resolve, frozen as JSON when the
-  -- entry is created. A reconnect re-push reads them from here instead of
-  -- re-deriving from probe_tasks, which is mutable: an operator who retypes or
-  -- deletes a monitor while the agent is offline would otherwise have the scene
-  -- collected against the NEW config (a gateway monitor's NIC selection above
-  -- all), producing evidence unrelated to the fault that opened the incident.
-  targets       TEXT NOT NULL DEFAULT '',           -- []config.SnapshotTargetRef JSON
-  requested_at  TIMESTAMP NOT NULL,
-  received_at   TIMESTAMP,
-  UNIQUE(snapshot_id, agent_id)
+  collected_at  TIMESTAMP,                          -- agent clock when collection finished
+  received_at   TIMESTAMP NOT NULL,                 -- server clock at ingest; the claim window is measured on it
+  -- How long the scene waited between the two clocks above, signed, reported
+  -- rather than corrected. Positive is the ordinary case and is information, not
+  -- a fault: a scene collected during an outage legitimately arrives minutes or
+  -- hours after it was taken, which is what routing it through the outbox is FOR.
+  -- Only a negative lag says something is wrong — the agent stamped the scene in
+  -- this server's future, which delivery cannot explain and a fast agent clock
+  -- can — and that is what clock_ahead flags. Reading the absolute gap as skew
+  -- instead would put a clock warning on exactly the outage evidence this table
+  -- exists to hold. Neither value is rewritten: an agent's clock is its own, and
+  -- correcting collected_at would destroy the only record of when the agent
+  -- thought it was looking.
+  delivery_lag_ms INTEGER NOT NULL DEFAULT 0,
+  clock_ahead     INTEGER NOT NULL DEFAULT 0,
+  payload       TEXT NOT NULL DEFAULT '',           -- allowlisted field-group JSON
+  truncated     INTEGER NOT NULL DEFAULT 0          -- optional detail was shed to fit incident_snapshot_max_bytes
 );
-CREATE UNIQUE INDEX idx_snap_entry_req ON incident_snapshot_entries(request_id);
+-- Claims are always "this agent, recently": a newly-confirmed fault looking for a
+-- scene that landed first, and retention aging out the scenes that never found a
+-- fault at all.
+CREATE INDEX idx_scene_claim ON scene_reports(agent_id, received_at);
+
+-- The fault edges one scene answers for. A table rather than a column because
+-- collection takes real time and faults arrive in clusters: an edge crossed while
+-- a scene is already being gathered joins that scene instead of queueing a second
+-- copy of the same machine. So one report can be filed as evidence under several
+-- incidents, on several different keys.
+CREATE TABLE scene_report_triggers(
+  report_id       TEXT NOT NULL REFERENCES scene_reports(id) ON DELETE CASCADE,
+  idx             INTEGER NOT NULL,                 -- position in the agent's own list
+  kind            TEXT NOT NULL CHECK(kind IN('probe_fault','server_disconnect')),
+  -- probe_fault: the failing monitor and the material generation the agent held
+  -- for it. Together with agent_id that is the claim key, matched against
+  -- fault_signals(target_id, target_config_serial). The serial is what stops a
+  -- scene collected under a target's old definition surfacing under its new one —
+  -- the same generation that already participates in metric series identity.
+  monitor_id      TEXT NOT NULL DEFAULT '',
+  config_serial   INTEGER NOT NULL DEFAULT 0,
+  trigger_streak  INTEGER NOT NULL DEFAULT 0,
+  first_failed_at TIMESTAMP,
+  -- server_disconnect: there is no probe streak — an agent-connectivity fault is
+  -- detected server-side by a sweeper noticing the agent is gone, and crosses no
+  -- local edge — so the edge is the session ending, the agent's stable
+  -- classification of what ended it, and how many flapping edges this one entry
+  -- stands for (a link that flaps produces edges faster than a scene is worth
+  -- collecting, and the count is what keeps the merge from reading as one clean
+  -- drop).
+  disconnected_at TIMESTAMP,
+  reason          TEXT NOT NULL DEFAULT '',
+  edge_count      INTEGER NOT NULL DEFAULT 1,
+  PRIMARY KEY(report_id, idx)
+) WITHOUT ROWID;
+CREATE INDEX idx_scene_trig ON scene_report_triggers(monitor_id, config_serial);
+
+-- Which incident (through which fault signal) a scene is evidence for.
+--
+-- There is deliberately NO active flag, unlike trace_report_refs. A trace
+-- reference participates in ATTRIBUTION — its reached-point is re-read to answer
+-- "where did this break", so a resolved fault's trace has to stop counting as
+-- live evidence. A scene asserts no reachability verdict and feeds no recompute:
+-- it is a frozen description of one moment, and it reads exactly the same after
+-- the incident resolves as it did while the incident was open. A flag nothing
+-- would ever consult is a flag that goes stale.
+CREATE TABLE scene_report_refs(
+  report_id   TEXT NOT NULL REFERENCES scene_reports(id) ON DELETE CASCADE,
+  incident_id TEXT NOT NULL REFERENCES incidents(id) ON DELETE CASCADE,
+  signal_id   TEXT NOT NULL,
+  created_at  TIMESTAMP NOT NULL,
+  PRIMARY KEY(report_id, incident_id, signal_id)
+);
+CREATE INDEX idx_srr_incident ON scene_report_refs(incident_id);
 
 -- One traceroute an Agent decided to run and reported afterwards.
 --

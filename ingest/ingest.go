@@ -65,29 +65,31 @@ type Baseliner interface {
 	Bands(ctx context.Context, agentID string, reqs map[baseline.BandKey]int) (map[baseline.BandKey]baseline.Band, error)
 }
 
-// Tracer persists the agent-triggered traceroute reports a packet carries, in
-// ingest's own write transaction. Satisfied by *incidentops.Service; kept as a
-// small interface so ingest unit tests can pass nil (reports are then dropped,
-// which no test asserts against).
+// AgentEvidence persists the agent-initiated evidence a packet carries — the
+// traceroutes an agent ran on its own initiative, and the scenes it collected on
+// its own fault edges — in ingest's own write transaction. Satisfied by
+// *incidentops.Service; kept as a small interface so ingest unit tests can pass
+// nil (both payloads are then dropped, which no test asserts against).
 //
-// It shares the transaction for the same reason the fault evaluator does: a
-// report is evidence about the rounds arriving beside it, and committing the two
-// separately would let the console see an incident whose attribution was
-// computed without a trace that was in the same packet. A failure withholds the
-// ack, the agent replays, and the (agent, report id) idempotency makes the replay
-// a no-op.
-type Tracer interface {
+// It shares the transaction for the same reason the fault evaluator does: this
+// evidence describes the rounds arriving beside it, and committing the two
+// separately would let the console see an incident whose evidence was computed
+// without what was in the same packet. A failure withholds the ack, the agent
+// replays, and the agent-minted report id makes the replay a no-op.
+type AgentEvidence interface {
 	IngestTracesTx(ctx context.Context, tx *sql.Tx, agentID, siteID string, results []telemetry.TraceResult) (*incidentops.TraceOutcome, error)
 	PublishTraceOutcome(ctx context.Context, out *incidentops.TraceOutcome)
+	IngestScenesTx(ctx context.Context, tx *sql.Tx, agentID, siteID string, reports []telemetry.SceneReport) (*incidentops.SceneOutcome, error)
+	PublishSceneOutcome(ctx context.Context, out *incidentops.SceneOutcome)
 }
 
 type Service struct {
 	db       *store.DB
 	bus      *eventbus.Bus
 	metrics  *metrics.Store
-	fault    Evaluator // nil-safe: telemetry then commits without inline evaluation
-	baseline Baseliner // nil-safe: degradation detection is then never fed
-	tracer   Tracer    // nil-safe: traceroute reports are then not persisted
+	fault    Evaluator     // nil-safe: telemetry then commits without inline evaluation
+	baseline Baseliner     // nil-safe: degradation detection is then never fed
+	tracer   AgentEvidence // nil-safe: agent-initiated evidence is then not persisted
 
 	// TouchAgentTx, when set, folds the agent's liveness bump into the ingest
 	// transaction (registry.TouchLastSeenTx): called once per packet — replays
@@ -118,7 +120,7 @@ type seqState struct {
 	epoch uint64
 }
 
-func New(db *store.DB, bus *eventbus.Bus, m *metrics.Store, ev Evaluator, bl Baseliner, tr Tracer) *Service {
+func New(db *store.DB, bus *eventbus.Bus, m *metrics.Store, ev Evaluator, bl Baseliner, tr AgentEvidence) *Service {
 	return &Service{db: db, bus: bus, metrics: m, fault: ev, baseline: bl, tracer: tr, seq: make(map[string]*seqState)}
 }
 
@@ -342,6 +344,7 @@ func (s *Service) Ingest(ctx context.Context, agentID, siteID string, pkt teleme
 	var outcome *fault.Outcome
 	var hostOutcome *fault.Outcome
 	var traces *incidentops.TraceOutcome
+	var scenes *incidentops.SceneOutcome
 	if isNew {
 		// Authoritative in-tx re-check: config edits serialize on the single write
 		// connection, so a serial read here has no TOCTOU with the pre-tx filter.
@@ -445,6 +448,14 @@ func (s *Service) Ingest(ctx context.Context, agentID, siteID string, pkt teleme
 				return Ack{}, err
 			}
 		}
+		// Incident scenes the agent collected on its own fault edges, on the same
+		// terms and for the same reason. Ordered after the traces only for
+		// determinism; neither reads the other's rows.
+		if s.tracer != nil && len(pkt.SceneReports) > 0 {
+			if scenes, err = s.tracer.IngestScenesTx(ctx, tx, agentID, siteID, pkt.SceneReports); err != nil {
+				return Ack{}, err
+			}
+		}
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -493,6 +504,9 @@ func (s *Service) Ingest(ctx context.Context, agentID, siteID string, pkt teleme
 		}
 		if s.tracer != nil && traces != nil {
 			s.tracer.PublishTraceOutcome(ctx, traces)
+		}
+		if s.tracer != nil && scenes != nil {
+			s.tracer.PublishSceneOutcome(ctx, scenes)
 		}
 		if s.bus != nil {
 			ids := monitorIDs(acceptedTx)
