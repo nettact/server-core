@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -148,6 +149,26 @@ func readFrame(t *testing.T, conn *websocket.Conn) wire.Frame {
 		t.Fatalf("unmarshal frame: %v", err)
 	}
 	return f
+}
+
+// readFrameUntilAck reads from an in-process session until an Ack arrives,
+// discarding DesiredState pushes. The server may push DesiredState at any
+// moment — a config edit made before the agent connected still fans out on the
+// hub's own goroutine, which can land mid-session — so a test that wants the
+// Ack must not assume it is the next frame on the wire.
+func readFrameUntilAck(ctx context.Context, c wire.Conn) (wire.Frame, error) {
+	for {
+		f, err := c.ReadFrame(ctx)
+		if err != nil {
+			return wire.Frame{}, err
+		}
+		if f.Ack != nil {
+			return f, nil
+		}
+		if f.DesiredState == nil {
+			return wire.Frame{}, fmt.Errorf("waiting for an Ack, got %+v", f)
+		}
+	}
 }
 
 func testHello() wire.Frame {
@@ -538,11 +559,19 @@ func TestDialLocal(t *testing.T) {
 	if err := c.WriteFrame(ctx, testPacket(1)); err != nil {
 		t.Fatalf("write packet: %v", err)
 	}
-	f, err = c.ReadFrame(ctx)
+	// Skip any DesiredState on the way to the Ack. The setTargets above
+	// published TopicConfigChanged before this session existed, and the hub
+	// fans those out on its own goroutine — on a loaded machine that goroutine
+	// can be scheduled after the session registers and deliver a (redundant)
+	// push between the handshake and this Ack. That is legal protocol traffic,
+	// not a defect: the server may push DesiredState at any time and the agent
+	// ignores any version it has already applied. Asserting on "the very next
+	// frame" made this test lose that race on a two-core CI runner.
+	f, err = readFrameUntilAck(ctx, c)
 	if err != nil {
 		t.Fatalf("read ack: %v", err)
 	}
-	if f.Ack == nil || f.Ack.HighestSequence != 1 {
+	if f.Ack.HighestSequence != 1 {
 		t.Fatalf("ack = %+v, want HighestSequence 1", f)
 	}
 
