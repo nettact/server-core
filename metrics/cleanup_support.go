@@ -193,25 +193,36 @@ func (s *Store) repairEdgeBucketLocked(ctx context.Context, tier tsstore.Tier, w
 }
 
 // ClearSeriesHistory hides a live series' entire recorded history without a
-// single tombstone: series.purge_cutoff is raised past everything stored and
-// every read path clamps below it, while the old blocks age out through
+// single tombstone: series.purge_cutoff rises past everything already stored
+// and every read path clamps below it, while the old blocks age out through
 // ordinary retention. This replaces "PurgeRange(0, maxTS)" — a tombstone over
 // the future would mask the very samples the still-live series keeps
 // appending, and compaction-time application would make the breakage permanent.
 //
-// purge_cutoff is the OLDEST SECOND STILL VISIBLE, so every reader can keep
-// using it directly as an inclusive lower bound. It is set past the newest
-// sample the series actually holds, not merely to now: ingest accepts
-// timestamps up to two minutes ahead of the clock, so a cutoff of now would
-// leave those future-stamped samples — and any sample landing exactly on the
-// cutoff second — visible after a clear that claims to hide everything
-// recorded.
+// purge_cutoff is the OLDEST SECOND STILL VISIBLE, so every reader can use it
+// directly as an inclusive lower bound. Normally that is now+1. It goes higher
+// only as far as the series' own stored maximum requires: ingest accepts
+// timestamps up to tsFutureSlack (two minutes) ahead of the clock, and a
+// clock-ahead sample is still recorded history that "clear everything" has to
+// hide.
+//
+// That extension costs a blind window — until the wall clock passes the newest
+// clock-ahead sample, the on-time samples arriving next also fall below the
+// cutoff, so Query, Summarize and Latest report no current data. It is bounded
+// by the ingest slack (≤ ~2 minutes), it self-heals with no operator action,
+// and it only occurs on a series whose agent's clock was already ahead. Both
+// alternatives are worse: leaving the future samples visible breaks the
+// function's only contract, and deleting just that window leaves a tombstone
+// over exactly the timestamps the live series is about to write into — prom
+// clamps the tombstone to what exists, but every post-clear sample landing
+// inside it is masked, which is the same blindness plus a permanent hole for
+// anything later backfilled there.
 func (s *Store) ClearSeriesHistory(ctx context.Context, ids []int64) (PurgeCounts, error) {
 	if len(ids) == 0 {
 		return PurgeCounts{}, nil
 	}
 	// As in PurgeRange: a batch that has committed but not yet appended is part
-	// of "everything recorded", so let it land before reading the extent the
+	// of "everything recorded", so let it land before reading the extents the
 	// cutoff is derived from.
 	s.waitForPendingAppends()
 	s.rollupMu.Lock()

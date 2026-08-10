@@ -7,6 +7,7 @@ import (
 	"strconv"
 
 	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
 )
 
@@ -29,13 +30,25 @@ func sidMatchers(name string, sid int64) []*labels.Matcher {
 
 // iterSeries streams one series' (t, v) pairs in [mint, maxt] ascending
 // through fn; fn returning false stops early.
+//
+// DisableTrimming is not an optimisation here, it is a crash guard. With
+// trimming on, blockBaseSeriesSet.Next appends synthetic tombstone intervals
+// ([MinInt64, mint-1] and [maxt+1, MaxInt64]) to whatever intervals the series
+// already carries, and tombstones.Intervals.Add in v0.313.2 mishandles the
+// second one: the branch computing maxi is skipped when n.Maxt == MaxInt64, so
+// maxi stays len(in) instead of len(in)-mini and the closing
+// in[maxi+mini-1] indexes past the slice. Any series with a single real
+// tombstone, read over a window that trims both ends of a chunk, panics — which
+// is exactly what a purge's edge-bucket repair does. We already clamp every
+// sample to [mint, maxt] below, so trimming was never load-bearing for us.
 func (p *Prom) iterSeries(ctx context.Context, inst int, name string, sid, mint, maxt int64, fn func(t int64, v float64) bool) error {
 	q, err := p.dbs[inst].Querier(mint, maxt)
 	if err != nil {
 		return err
 	}
 	defer q.Close()
-	ss := q.Select(ctx, true, nil, sidMatchers(name, sid)...)
+	hints := &storage.SelectHints{Start: mint, End: maxt, DisableTrimming: true}
+	ss := q.Select(ctx, true, hints, sidMatchers(name, sid)...)
 	for ss.Next() {
 		it := ss.At().Iterator(nil)
 		for it.Next() != chunkenc.ValNone {

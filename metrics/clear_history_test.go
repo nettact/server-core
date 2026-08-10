@@ -10,15 +10,16 @@ import (
 )
 
 // TestClearSeriesHistoryHidesEverythingRecorded pins the contract the function
-// name states: after it returns, nothing that was already stored is readable.
+// name states: after it returns, nothing that was already stored is readable —
+// and, just as importantly, the series keeps recording.
 //
 // Two samples make that non-trivial. One sits exactly on the second the clear
-// runs, and purge_cutoff is an INCLUSIVE lower bound for every reader — a
+// runs, and purge_cutoff is an INCLUSIVE lower bound for every reader, so a
 // cutoff of "now" would leave it visible. The other is stamped ahead of the
 // clock: ingest accepts up to two minutes of future slack, so a series can hold
-// samples above now at the moment of the clear, and a cutoff derived from the
-// clock alone would never cover them. The cutoff is therefore taken from the
-// series' actual extent.
+// samples above now at the moment of the clear. Those are removed by a bounded
+// purge rather than by pushing the cutoff above them — a cutoff in the future
+// would hide the on-time samples that arrive next.
 func TestClearSeriesHistoryHidesEverythingRecorded(t *testing.T) {
 	db, s := openStore(t)
 	ctx := context.Background()
@@ -33,7 +34,7 @@ func TestClearSeriesHistoryHidesEverythingRecorded(t *testing.T) {
 	// Ordinary history, a sample landing on the clear second, and one inside the
 	// future slack ingest allows.
 	ingestBatch(t, db, s, "agent_a", []telemetry.Metric{
-		mk(now.Add(-time.Hour), 1),
+		mk(now.Add(-30*time.Minute), 1),
 		mk(now, 2),
 		mk(now.Add(90*time.Second), 3),
 	})
@@ -48,23 +49,38 @@ func TestClearSeriesHistoryHidesEverythingRecorded(t *testing.T) {
 		t.Fatalf("ClearSeriesHistory: %v", err)
 	}
 
+	// The cutoff must cover everything stored — including the clock-ahead
+	// sample — and must not exceed it. Ingest's future slack bounds how far
+	// ahead that can be, which is what bounds the blind window afterwards.
 	var cutoff int64
 	if err := db.QueryRowContext(ctx, `SELECT purge_cutoff FROM series WHERE id=?`, seriesID).Scan(&cutoff); err != nil {
 		t.Fatalf("read cutoff: %v", err)
 	}
-	if want := now.Add(90*time.Second).Unix() + 1; cutoff != want {
-		t.Fatalf("purge_cutoff=%d, want %d (one past the newest stored sample)", cutoff, want)
+	if want := now.Add(90 * time.Second).Unix(); cutoff <= want {
+		t.Fatalf("purge_cutoff=%d does not cover the clock-ahead sample at %d", cutoff, want)
+	}
+	if max := now.Add(150 * time.Second).Unix(); cutoff > max {
+		t.Fatalf("purge_cutoff=%d reaches beyond the stored maximum (bound %d): the blind window after a "+
+			"clear must stay inside ingest's future slack", cutoff, max)
 	}
 
-	// Every reader that honours the cutoff must now see nothing.
-	pts, err := s.Query(ctx, Query{
-		AgentID: "agent_a", MonitorID: "probe_m1", Kind: string(telemetry.ICMPRTTms),
-		SinceUnix: now.Add(-2 * time.Hour).Unix(), UntilUnix: now.Add(time.Hour).Unix(),
-	})
-	if err != nil {
-		t.Fatalf("Query: %v", err)
+	// A window anchored well inside the raw tier. Query recomputes wall time, so
+	// a span sitting near the 2h raw/1m boundary would flip tiers if the test
+	// takes a second, and the 1m tier is empty until a rollup runs.
+	query := func(from, to time.Time) []Point {
+		t.Helper()
+		pts, err := s.Query(ctx, Query{
+			AgentID: "agent_a", MonitorID: "probe_m1", Kind: string(telemetry.ICMPRTTms),
+			SinceUnix: from.Unix(), UntilUnix: to.Unix(),
+		})
+		if err != nil {
+			t.Fatalf("Query: %v", err)
+		}
+		return pts
 	}
-	if len(pts) != 0 {
+	// Every reader that honours the cutoff must now see nothing — the ordinary
+	// history, the sample on the clear second, and the clock-ahead one alike.
+	if pts := query(now.Add(-40*time.Minute), now.Add(5*time.Minute)); len(pts) != 0 {
 		t.Fatalf("Query returned %d points after a full clear; the first is %+v", len(pts), pts[0])
 	}
 	live, err := s.LatestForSeries(ctx, []string{"agent_a"}, []int64{seriesID})
@@ -75,16 +91,11 @@ func TestClearSeriesHistoryHidesEverythingRecorded(t *testing.T) {
 		t.Fatalf("the latest cache still serves a value the clear was supposed to hide")
 	}
 
-	// A sample recorded AFTER the clear is new history and must appear.
-	after := now.Add(3 * time.Minute)
-	ingestBatch(t, db, s, "agent_a", []telemetry.Metric{mk(after, 42)})
-	pts, err = s.Query(ctx, Query{
-		AgentID: "agent_a", MonitorID: "probe_m1", Kind: string(telemetry.ICMPRTTms),
-		SinceUnix: now.Add(-2 * time.Hour).Unix(), UntilUnix: after.Add(time.Hour).Unix(),
-	})
-	if err != nil {
-		t.Fatalf("Query after: %v", err)
-	}
+	// A sample recorded after the clear, above the cutoff, is new history and
+	// must be served — no tombstone stands over the live series' future.
+	next := time.Unix(cutoff, 0).UTC().Add(time.Second)
+	ingestBatch(t, db, s, "agent_a", []telemetry.Metric{mk(next, 42)})
+	pts := query(now.Add(-40*time.Minute), next.Add(time.Minute))
 	if len(pts) != 1 || pts[0].Value != 42 {
 		t.Fatalf("post-clear sample not served back: %+v", pts)
 	}
