@@ -611,6 +611,49 @@ func TestSlowCadenceSceneIsStillClaimable(t *testing.T) {
 	}
 }
 
+// A scene that arrives before its fault has exactly one later chance: the
+// post-commit confirmation handler. That handler is best-effort — the event is
+// never replayed and the bus swallows its error — so a process exiting in that
+// gap, or one transient failure, used to strand the scene until retention
+// deleted it. Telemetry replay cannot bring it back either: the packet is
+// deduplicated by sequence. The reconcile pass is what makes the claim durable.
+func TestReconcileClaimsASceneWhoseConfirmationWasMissed(t *testing.T) {
+	db, ctx := openIncidentOpsTest(t)
+	now := time.Now().UTC()
+	start := now.Add(-5 * time.Minute)
+	svc := New(db, nil, settings.New(db), eventbus.New())
+
+	// The scene lands before any signal exists, so ingest attaches nothing.
+	ingestScenes(t, svc, ctx, "agent_a",
+		basicScene("scene_missed", start, probeTrigger("probe_z", 9, start)))
+	if n := countRows(t, db, `SELECT COUNT(*) FROM scene_report_refs WHERE report_id='scene_missed'`); n != 0 {
+		t.Fatalf("a scene attached before its signal existed (%d refs)", n)
+	}
+
+	// The signal is now durable, but OnSignalConfirmed never ran for it.
+	seedSceneSignal(t, db, "inc_missed", "sig_missed", "agent_a", "probe_z", 9, start)
+
+	if err := svc.ReconcileSceneClaims(ctx); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if n := countRows(t, db,
+		`SELECT COUNT(*) FROM scene_report_refs WHERE report_id='scene_missed' AND incident_id='inc_missed'`); n != 1 {
+		t.Fatalf("the stranded scene was not recovered (%d refs)", n)
+	}
+	if n := countRows(t, db,
+		`SELECT COUNT(*) FROM incident_timeline WHERE incident_id='inc_missed' AND kind='scene.collected'`); n != 1 {
+		t.Fatalf("timeline rows = %d, want exactly one", n)
+	}
+
+	// Running again must change nothing.
+	if err := svc.ReconcileSceneClaims(ctx); err != nil {
+		t.Fatalf("second reconcile: %v", err)
+	}
+	if n := countRows(t, db, `SELECT COUNT(*) FROM scene_report_refs WHERE report_id='scene_missed'`); n != 1 {
+		t.Fatalf("reconcile is not idempotent (%d refs)", n)
+	}
+}
+
 // The console reads the two halves together: the server's frozen base and every
 // claimed agent scene, each carrying the trigger that explains why it exists.
 func TestSnapshotViewCarriesScenesAndTriggers(t *testing.T) {

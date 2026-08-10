@@ -22,7 +22,16 @@ import (
 // incident-scoped, so it is invisible. A day preserves it for hand debugging;
 // past that it is dead weight. Mirrors unreferencedTraceRetention, for the same
 // reason and on the same clock.
-const unreferencedSceneRetention = 24 * time.Hour
+// It has to cover the widest gap a supported configuration can put between the
+// agent collecting a scene and this server confirming the fault that owns it.
+// That gap is (server threshold - agent threshold) rounds of the target's own
+// interval, and interval_seconds accepts up to 86400 — so a daily monitor on a
+// profile that confirms two rounds later than the agent's own threshold leaves
+// two days. A one-day retention would delete that scene, on the hourly sweep,
+// before the signal it belongs to ever existed. A week covers it with margin and
+// costs little: scenes are individually capped and an agent produces at most one
+// a minute per server, only on real fault edges.
+const unreferencedSceneRetention = 7 * 24 * time.Hour
 
 // sceneClaimWindow is how far back a claim looks for a scene, and how old a
 // signal may be and still own one. It matches unreferencedSceneRetention on
@@ -677,6 +686,122 @@ func (s *Service) claimScenes(ctx context.Context, ev fault.SignalEvent) error {
 	committed = true
 	if s.bus != nil {
 		s.bus.Publish(eventbus.TopicIncidentUpdated, eventbus.IncidentEvent{IncidentID: ev.IncidentID, SiteID: ev.SiteID})
+	}
+	return nil
+}
+
+// ReconcileSceneClaims files any scene that is still referenced by nothing
+// against a signal that now owns it. The server drives it from Recover and from
+// the maintenance tick.
+//
+// It is the durable backstop for a claim that only ever had one chance. A scene
+// arriving before its fault is stored unattached, and the ONLY thing that comes
+// back for it is the post-commit TopicFaultConfirmed handler — which is
+// best-effort by construction: the event is published after the signal's
+// transaction commits, is never replayed, and the bus swallows what the handler
+// returns. A process that exits in that gap, or one transient DB error inside
+// claimScenes, therefore stranded the scene permanently: telemetry replay is
+// deduplicated by high_sequence so the report never arrives again, nothing else
+// scans for it, and retention eventually deleted evidence that was collected,
+// delivered, and correct.
+//
+// Idempotent and cheap: the reference insert is the dedupe, so a pass with
+// nothing to do is one indexed query.
+func (s *Service) ReconcileSceneClaims(ctx context.Context) error {
+	type pending struct {
+		reportID, agentID string
+		trigger           telemetry.SceneTrigger
+	}
+	now := time.Now().UTC()
+	rows, err := s.db.Read().QueryContext(ctx, `
+		SELECT sr.id, sr.agent_id, t.kind, COALESCE(t.monitor_id,''), t.config_serial,
+		       t.first_failed_at, t.disconnected_at
+		FROM scene_reports sr
+		JOIN scene_report_triggers t ON t.report_id = sr.id
+		WHERE sr.received_at >= ?
+		  AND NOT EXISTS(SELECT 1 FROM scene_report_refs r WHERE r.report_id = sr.id)
+		ORDER BY sr.id, t.idx`, now.Add(-sceneClaimWindow))
+	if err != nil {
+		return err
+	}
+	var todo []pending
+	for rows.Next() {
+		var p pending
+		var firstFailed, disconnected sql.NullTime
+		if err := rows.Scan(&p.reportID, &p.agentID, &p.trigger.Kind, &p.trigger.MonitorID,
+			&p.trigger.ConfigSerial, &firstFailed, &disconnected); err != nil {
+			rows.Close()
+			return err
+		}
+		if firstFailed.Valid {
+			p.trigger.FirstFailedAt = firstFailed.Time
+		}
+		if disconnected.Valid {
+			p.trigger.DisconnectedAt = disconnected.Time
+		}
+		todo = append(todo, p)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if len(todo) == 0 {
+		return nil
+	}
+
+	for _, p := range todo {
+		var owner sceneRef
+		var ok bool
+		var err error
+		switch p.trigger.Kind {
+		case telemetry.SceneTriggerProbeFault:
+			if p.trigger.MonitorID == "" {
+				continue
+			}
+			owner, ok, err = ownerOfProbeFault(ctx, s.db.Read(), p.agentID,
+				p.trigger.MonitorID, p.trigger.ConfigSerial, p.trigger.FirstFailedAt, now)
+		case telemetry.SceneTriggerServerDisconnect:
+			owner, ok, err = ownerOfDisconnect(ctx, s.db.Read(), p.agentID, p.trigger.DisconnectedAt, now)
+		default:
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if !ok {
+			continue
+		}
+		if err := s.fileReconciledScene(ctx, p.reportID, owner, now); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// fileReconciledScene attaches one recovered claim in its own short transaction,
+// so a later failure cannot undo the ones already filed.
+func (s *Service) fileReconciledScene(ctx context.Context, reportID string, owner sceneRef, now time.Time) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	inserted, err := insertSceneRef(ctx, tx, reportID, owner, now)
+	if err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	if !inserted {
+		return tx.Rollback()
+	}
+	if err := addSceneTimeline(ctx, tx, owner.incidentID, reportID, now); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	if s.bus != nil {
+		s.bus.Publish(eventbus.TopicIncidentUpdated, eventbus.IncidentEvent{IncidentID: owner.incidentID})
 	}
 	return nil
 }

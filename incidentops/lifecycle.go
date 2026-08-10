@@ -9,20 +9,29 @@ import (
 // references against alert state. It spawns no goroutine — the server calls it
 // once during startup.
 //
-// Nothing else needs recovering any more. Both kinds of agent evidence — the
-// traceroute and the scene — are decided, executed and delivered by the agent
-// through its outbox, so a server that was down while one was produced finds it
-// waiting in the next packet rather than a half-finished lifecycle of its own.
-// The only durable server-side state left is the reference bookkeeping below.
+// Neither kind of agent evidence needs its COLLECTION recovered: the traceroute
+// and the scene are decided, executed and delivered by the agent through its
+// outbox, so a server that was down while one was produced finds it waiting in
+// the next packet rather than a half-finished lifecycle of its own. What does
+// need recovering is the bookkeeping — a reference left active by an alert that
+// resolved unobserved, and a scene whose one post-commit chance to be claimed
+// was missed.
 func (s *Service) Recover(ctx context.Context) error {
-	return s.reconcileTraceRefs(ctx)
+	if err := s.reconcileTraceRefs(ctx); err != nil {
+		return err
+	}
+	return s.ReconcileSceneClaims(ctx)
 }
 
 // Tick is the callable periodic maintenance pass (the server drives it on a
-// timer): reconcile active trace references against alert state. Idempotent and
-// cheap when there is nothing to do.
+// timer): reconcile active trace references against alert state, and file any
+// scene still waiting for the fault that owns it. Idempotent and cheap when
+// there is nothing to do.
 func (s *Service) Tick(ctx context.Context) error {
-	return s.reconcileTraceRefs(ctx)
+	if err := s.reconcileTraceRefs(ctx); err != nil {
+		return err
+	}
+	return s.ReconcileSceneClaims(ctx)
 }
 
 // reconcileTraceRefs durably deactivates any trace reference whose alert is no
