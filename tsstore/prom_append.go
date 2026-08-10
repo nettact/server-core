@@ -68,6 +68,7 @@ func (p *Prom) AppendRaw(ctx context.Context, samples []RawSample) (AppendResult
 	db := p.dbs[instRaw]
 	app := db.Appender(ctx)
 	var res AppendResult
+	var maxSID int64
 	for _, s := range samples {
 		k := refKey{name: 's', sid: s.SID}
 		ref := p.refs[instRaw].get(k)
@@ -83,11 +84,17 @@ func (p *Prom) AppendRaw(ctx context.Context, samples []RawSample) (AppendResult
 		if newRef != ref {
 			p.refs[instRaw].put(k, newRef)
 		}
+		if s.SID > maxSID {
+			maxSID = s.SID
+		}
 		res.Appended++
 	}
 	if err := app.Commit(); err != nil {
 		return AppendResult{}, err
 	}
+	// After the commit, so the recorded mark never claims data that is not
+	// durable. Only an id past the mark writes anything.
+	p.noteSeriesIDs(maxSID)
 	return res, nil
 }
 

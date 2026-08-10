@@ -159,15 +159,33 @@ func TestRewindSurvivesAConcurrentRollupPass(t *testing.T) {
 	}
 
 	// The cascade must have carried past the hour tier too, or the backlog would
-	// be missing from the day tier the moment this day closes.
+	// be missing from the day tier the moment this day closes. Which of the two
+	// legitimate outcomes lands depends on the clock, so accept either and fail
+	// only on the one that means the cascade stopped: the day tier is BOTH still
+	// trusting its re-advanced watermark AND missing the backlog's day.
+	//
+	// (The day tier only ever materializes COMPLETED days — upTo is aligned down
+	// to midnight. A backlog five hours back sits inside today when the test runs
+	// after 05:00 UTC, so the day stays open and the rewound watermark is the
+	// evidence; run it before 05:00 and the same backlog lands on yesterday,
+	// which the pass then legitimately materializes and advances past.)
+	dayStart := alignDown(old.Unix(), 86400)
 	var dayWatermark int64
 	if err := db.QueryRowContext(ctx,
 		`SELECT last_ts FROM rollup_state WHERE resolution='1d' AND series_id=?`, seriesID).Scan(&dayWatermark); err != nil {
 		t.Fatalf("day watermark: %v", err)
 	}
-	if dayStart := alignDown(old.Unix(), 86400); dayWatermark > dayStart {
-		t.Fatalf("day watermark %d is still past the backlog's day %d: the cascade stopped at the hour tier",
-			dayWatermark, dayStart)
+	dayBuckets, err := s.ts.ReadBuckets(ctx, tsstore.TierD1, seriesID, dayStart, dayStart+86400)
+	if err != nil {
+		t.Fatalf("ReadBuckets day: %v", err)
+	}
+	var dayCnt int64
+	for _, b := range dayBuckets {
+		dayCnt += b.Cnt
+	}
+	if dayWatermark > dayStart && dayCnt < 2 {
+		t.Fatalf("day watermark %d is past the backlog's day %d and that day holds %d of the 2 backlog samples: "+
+			"the cascade stopped at the hour tier", dayWatermark, dayStart, dayCnt)
 	}
 }
 

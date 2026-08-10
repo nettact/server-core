@@ -216,6 +216,11 @@ type SeriesStore interface {	// AppendRaw writes a batch in one appender/commit.
 	// recreated) and for edge buckets too old to k-repair.
 	DeleteBucketRange(ctx context.Context, tier Tier, sid, alignedFromSec, alignedToSec int64) error
 
+	// SeriesHighWater is the largest series id this data plane has ever stored
+	// data for, so the caller can refuse a dictionary that was rolled back
+	// behind it (see the manifest's field comment).
+	SeriesHighWater() int64
+
 	Stats(ctx context.Context) (Stats, error)
 	Close() error
 }
