@@ -42,6 +42,9 @@ func statusPageFixture(t *testing.T, dev bool) (http.Handler, *store.DB, *http.C
 		VALUES('agent_a','site_default',x'00','h','secret-hostname','Alpha','online',?,?,?)`, now, now, now)
 	exec(`INSERT INTO probe_tasks(id, site_id, group_id, kind, target, name, enabled)
 		VALUES('probe_1','site_default','mg','http','https://internal.example','Website',1)`)
+	// Pages publish agent GROUPS, so the fixture needs one holding the agent.
+	exec(`INSERT INTO agent_groups(id,site_id,name) VALUES('ag_1','site_default','Rack A')`)
+	exec(`INSERT INTO agent_group_members(group_id,agent_id) VALUES('ag_1','agent_a')`)
 
 	id := identity.New(db)
 	admin, _, err := id.EnsureAdmin(ctx, "admin", "correct-horse-battery")
@@ -81,7 +84,7 @@ func doJSON(t *testing.T, h http.Handler, method, url, body string, cookie *http
 
 const statusPagePayload = `{"slug":"home","title":"Home lab","description":"hi",
 	"enabled":true,"show_target_address":false,"show_agent_view":true,"show_target_view":true,
-	"agent_ids":["agent_a"],"target_ids":["probe_1"]}`
+	"agent_group_ids":["ag_1"],"target_ids":["probe_1"]}`
 
 func createStatusPage(t *testing.T, h http.Handler, cookie *http.Cookie, payload string) statuspage.Page {
 	t.Helper()
@@ -100,7 +103,7 @@ func TestStatusPageAdminCRUDRoundTrip(t *testing.T) {
 	h, _, cookie := statusPageFixture(t, false)
 
 	page := createStatusPage(t, h, cookie, statusPagePayload)
-	if page.ID == "" || page.Slug != "home" || len(page.AgentIDs) != 1 || len(page.TargetIDs) != 1 {
+	if page.ID == "" || page.Slug != "home" || len(page.AgentGroupIDs) != 1 || len(page.TargetIDs) != 1 {
 		t.Fatalf("created page = %+v", page)
 	}
 
@@ -118,7 +121,7 @@ func TestStatusPageAdminCRUDRoundTrip(t *testing.T) {
 
 	updated := doJSON(t, h, http.MethodPut, "/api/v1/status-pages/"+page.ID,
 		`{"slug":"home","title":"Renamed","enabled":true,"show_agent_view":true,"show_target_view":true,
-		  "agent_ids":[],"target_ids":["probe_1"]}`, cookie)
+		  "agent_group_ids":[],"target_ids":["probe_1"]}`, cookie)
 	if updated.Code != http.StatusOK {
 		t.Fatalf("update status=%d body=%s", updated.Code, updated.Body.String())
 	}
@@ -131,7 +134,7 @@ func TestStatusPageAdminCRUDRoundTrip(t *testing.T) {
 	if err := json.Unmarshal(got.Body.Bytes(), &one); err != nil {
 		t.Fatalf("decode get: %v", err)
 	}
-	if one.Title != "Renamed" || len(one.AgentIDs) != 0 {
+	if one.Title != "Renamed" || len(one.AgentGroupIDs) != 0 {
 		t.Fatalf("after update = %+v, want the renamed page with an empty agent selection", one)
 	}
 
@@ -158,7 +161,7 @@ func TestStatusPageAdminRejectsBadRequests(t *testing.T) {
 		{"bad slug", `{"slug":"Not A Slug","title":"x"}`, http.StatusBadRequest},
 		{"empty title", `{"slug":"ok","title":"  "}`, http.StatusBadRequest},
 		{"both views hidden", `{"slug":"ok","title":"x","show_agent_view":false,"show_target_view":false}`, http.StatusBadRequest},
-		{"unknown agent", `{"slug":"ok","title":"x","agent_ids":["agent_nope"]}`, http.StatusBadRequest},
+		{"unknown agent group", `{"slug":"ok","title":"x","agent_group_ids":["ag_nope"]}`, http.StatusBadRequest},
 		{"unknown target", `{"slug":"ok","title":"x","target_ids":["probe_nope"]}`, http.StatusBadRequest},
 		{"duplicate slug", `{"slug":"home","title":"x"}`, http.StatusConflict},
 		{"malformed json", `{"slug":`, http.StatusBadRequest},
@@ -317,7 +320,7 @@ func TestEveryPublicMissIsTheSameResponse(t *testing.T) {
 	createStatusPage(t, h, cookie,
 		`{"slug":"down","title":"Taken down","enabled":false,"target_ids":["probe_1"]}`)
 	createStatusPage(t, h, cookie,
-		`{"slug":"agents-only","title":"Agents","show_target_view":false,"agent_ids":["agent_a"]}`)
+		`{"slug":"agents-only","title":"Agents","show_target_view":false,"agent_group_ids":["ag_1"]}`)
 
 	paths := []string{
 		"/api/v1/public/pages/never-existed",

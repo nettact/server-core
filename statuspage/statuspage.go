@@ -1,6 +1,6 @@
 // Package statuspage owns the public status pages: the admin CRUD over a page
-// and its agent/target selection, and the anonymous, sanitized reads that serve
-// it to the world.
+// and its agent-group/target selection, and the anonymous, sanitized reads that
+// serve it to the world.
 //
 // It is the only place in server-core that answers a request with no session
 // behind it, so its shape is defensive on purpose:
@@ -9,9 +9,14 @@
 //     aggregations the console reads; this package filters and redacts, and never
 //     re-decides whether something is up. Two sources for "is it down" is exactly
 //     the drift a status page must not have.
-//   - Publication is by explicit selection, never by existence. A new agent or
-//     target is invisible until an admin picks it, so the blast radius of adding
-//     monitoring is zero.
+//   - Publication is by selection, never by existence: nothing reaches a page
+//     because it exists, only because an operator chose it. Targets are chosen one
+//     at a time. AGENTS ARE CHOSEN BY GROUP, and that difference is worth stating
+//     plainly — a page publishes each selected group's current membership, so an
+//     agent added to a published group becomes public with it, and one removed
+//     from it disappears. That is the point (the page tracks the fleet the
+//     operator already curates instead of drifting out of date) and it is also the
+//     trade, which is why the console spells it out on the form.
 //   - Redaction happens HERE, in the DTO mapping, not in the frontend. The public
 //     endpoints are directly callable, so anything the UI would hide has to be
 //     absent from the payload rather than merely unrendered.
@@ -49,8 +54,8 @@ var (
 	// ErrSlugTaken means the requested public address is already in use. Slugs are
 	// unique across sites because the public route resolves by slug alone.
 	ErrSlugTaken = errors.New("statuspage: slug already in use")
-	// ErrBadSelection means the selection named an agent or target that this site
-	// cannot publish (unknown, revoked, or belonging to another site). It is a typed
+	// ErrBadSelection means the selection named an agent group or target that this
+	// site cannot publish (unknown, or belonging to another site). It is a typed
 	// sentinel rather than a bare formatted error so the API can answer 400 instead
 	// of 500: the operator picked something invalid, the server is fine.
 	ErrBadSelection = errors.New("statuspage: invalid selection")
@@ -81,19 +86,22 @@ const defaultCacheTTL = 5 * time.Second
 
 // Page is the admin-facing view of a status page, selection included.
 type Page struct {
-	ID                string    `json:"id"`
-	SiteID            string    `json:"site_id"`
-	Slug              string    `json:"slug"`
-	Title             string    `json:"title"`
-	Description       string    `json:"description"`
-	Enabled           bool      `json:"enabled"`
-	ShowTargetAddress bool      `json:"show_target_address"`
-	ShowAgentView     bool      `json:"show_agent_view"`
-	ShowTargetView    bool      `json:"show_target_view"`
-	AgentIDs          []string  `json:"agent_ids"`
-	TargetIDs         []string  `json:"target_ids"`
-	CreatedAt         time.Time `json:"created_at"`
-	UpdatedAt         time.Time `json:"updated_at"`
+	ID                string `json:"id"`
+	SiteID            string `json:"site_id"`
+	Slug              string `json:"slug"`
+	Title             string `json:"title"`
+	Description       string `json:"description"`
+	Enabled           bool   `json:"enabled"`
+	ShowTargetAddress bool   `json:"show_target_address"`
+	ShowAgentView     bool   `json:"show_agent_view"`
+	ShowTargetView    bool   `json:"show_target_view"`
+	// Agents are published by GROUP, so what a page names is the operator's own
+	// curation rather than a list of machines that goes stale the moment one is
+	// enrolled. The published node list is each selected group's CURRENT members.
+	AgentGroupIDs []string  `json:"agent_group_ids"`
+	TargetIDs     []string  `json:"target_ids"`
+	CreatedAt     time.Time `json:"created_at"`
+	UpdatedAt     time.Time `json:"updated_at"`
 }
 
 // Spec is a page's complete editable state. Create and Update both take the whole
@@ -108,7 +116,7 @@ type Spec struct {
 	ShowTargetAddress bool
 	ShowAgentView     bool
 	ShowTargetView    bool
-	AgentIDs          []string
+	AgentGroupIDs     []string
 	TargetIDs         []string
 }
 
@@ -332,7 +340,7 @@ func scanPage(sc rowScanner) (Page, error) {
 	}
 	// Never nil: the console renders these as lists and the API contract says an
 	// empty selection is [], not null.
-	p.AgentIDs = []string{}
+	p.AgentGroupIDs = []string{}
 	p.TargetIDs = []string{}
 	return p, nil
 }
@@ -358,10 +366,10 @@ func (s *Service) loadMembers(ctx context.Context, siteID string, byID map[strin
 		return rows.Err()
 	}
 	if err := load(`
-		SELECT m.page_id, m.agent_id FROM status_page_agents m
+		SELECT m.page_id, m.group_id FROM status_page_agent_groups m
 		  JOIN status_pages p ON p.id = m.page_id
-		 WHERE p.site_id=? ORDER BY m.agent_id`,
-		func(p *Page, id string) { p.AgentIDs = append(p.AgentIDs, id) }); err != nil {
+		 WHERE p.site_id=? ORDER BY m.group_id`,
+		func(p *Page, id string) { p.AgentGroupIDs = append(p.AgentGroupIDs, id) }); err != nil {
 		return err
 	}
 	return load(`
@@ -402,28 +410,27 @@ func ensureSlugFree(ctx context.Context, tx *sql.Tx, slug, exceptID string) erro
 
 // replaceMembers rewrites a page's selection inside the caller's transaction.
 //
-// Each insert is an INSERT..SELECT filtered by site (and, for agents, by
-// revoked=0), so an id this site cannot publish inserts no row and is rejected
-// with ErrBadSelection rather than being silently dropped. Silently dropping is
-// the dangerous half of that choice in the other direction too: an operator who
-// pasted the wrong id would get a page that looks saved and publishes less than
-// they think.
+// Each insert is an INSERT..SELECT filtered by site, so an id this site cannot
+// publish inserts no row and is rejected with ErrBadSelection rather than being
+// silently dropped. Silently dropping is the dangerous half of that choice in the
+// other direction too: an operator who pasted the wrong id would get a page that
+// looks saved and publishes less than they think.
 func replaceMembers(ctx context.Context, tx *sql.Tx, pageID, siteID string, spec Spec) error {
-	if _, err := tx.ExecContext(ctx, `DELETE FROM status_page_agents WHERE page_id=?`, pageID); err != nil {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM status_page_agent_groups WHERE page_id=?`, pageID); err != nil {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM status_page_targets WHERE page_id=?`, pageID); err != nil {
 		return err
 	}
-	for _, agentID := range dedupe(spec.AgentIDs) {
+	for _, groupID := range dedupe(spec.AgentGroupIDs) {
 		res, err := tx.ExecContext(ctx, `
-			INSERT INTO status_page_agents(page_id, agent_id)
-			SELECT ?, id FROM agents WHERE id=? AND site_id=? AND revoked=0`, pageID, agentID, siteID)
+			INSERT INTO status_page_agent_groups(page_id, group_id)
+			SELECT ?, id FROM agent_groups WHERE id=? AND site_id=?`, pageID, groupID, siteID)
 		if err != nil {
 			return err
 		}
 		if n, _ := res.RowsAffected(); n == 0 {
-			return fmt.Errorf("%w: agent %q is not available in site %s", ErrBadSelection, agentID, siteID)
+			return fmt.Errorf("%w: agent group %q is not available in site %s", ErrBadSelection, groupID, siteID)
 		}
 	}
 	for _, targetID := range dedupe(spec.TargetIDs) {

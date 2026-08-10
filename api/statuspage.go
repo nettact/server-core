@@ -38,7 +38,7 @@ type statusPageBody struct {
 	ShowTargetAddress bool     `json:"show_target_address"`
 	ShowAgentView     *bool    `json:"show_agent_view"`
 	ShowTargetView    *bool    `json:"show_target_view"`
-	AgentIDs          []string `json:"agent_ids"`
+	AgentGroupIDs     []string `json:"agent_group_ids"`
 	TargetIDs         []string `json:"target_ids"`
 }
 
@@ -57,7 +57,7 @@ func (b statusPageBody) toSpec() statuspage.Spec {
 		ShowTargetAddress: b.ShowTargetAddress,
 		ShowAgentView:     boolOr(b.ShowAgentView, true),
 		ShowTargetView:    boolOr(b.ShowTargetView, true),
-		AgentIDs:          b.AgentIDs,
+		AgentGroupIDs:     b.AgentGroupIDs,
 		TargetIDs:         b.TargetIDs,
 	}
 }

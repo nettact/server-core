@@ -35,6 +35,12 @@ func newFixture(t *testing.T) (*Service, *store.DB) {
 
 	seedAgent(t, db, "agent_a", "site_default", "Alpha", "online")
 	seedAgent(t, db, "agent_b", "site_default", "", "offline")
+	// Pages publish GROUPS, so the fixture gives each agent its own group plus a
+	// group holding both — enough to tell "the page's selection" apart from "the
+	// group's membership".
+	seedAgentGroup(t, db, "grp_a", "site_default", "Alpha group", "agent_a")
+	seedAgentGroup(t, db, "grp_b", "site_default", "Beta group", "agent_b")
+	seedAgentGroup(t, db, "grp_both", "site_default", "Everything", "agent_a", "agent_b")
 	seedTarget(t, db, "probe_1", "site_default", "mg", "http", "https://example.com", "Website")
 	seedTarget(t, db, "probe_2", "site_default", "mg", "icmp", "10.0.0.1", "")
 
@@ -51,6 +57,14 @@ func seedAgent(t *testing.T, db *store.DB, id, siteID, displayName, status strin
 		id, siteID, "h_"+id, id+"-internal-hostname", displayName, status, now, now, now)
 }
 
+func seedAgentGroup(t *testing.T, db *store.DB, id, siteID, name string, agentIDs ...string) {
+	t.Helper()
+	mustExec(t, db, `INSERT INTO agent_groups(id, site_id, name) VALUES(?,?,?)`, id, siteID, name)
+	for _, agentID := range agentIDs {
+		mustExec(t, db, `INSERT INTO agent_group_members(group_id, agent_id) VALUES(?,?)`, id, agentID)
+	}
+}
+
 func seedTarget(t *testing.T, db *store.DB, id, siteID, groupID, kind, target, name string) {
 	t.Helper()
 	mustExec(t, db, `INSERT INTO probe_tasks(id, site_id, group_id, kind, target, name, enabled)
@@ -61,7 +75,7 @@ func fullSpec() Spec {
 	return Spec{
 		Slug: "home", Title: "Home lab", Description: "public",
 		Enabled: true, ShowAgentView: true, ShowTargetView: true,
-		AgentIDs: []string{"agent_a"}, TargetIDs: []string{"probe_1"},
+		AgentGroupIDs: []string{"grp_a"}, TargetIDs: []string{"probe_1"},
 	}
 }
 
@@ -70,7 +84,7 @@ func TestCreateAndGetRoundTripsTheSelection(t *testing.T) {
 	ctx := context.Background()
 
 	spec := fullSpec()
-	spec.AgentIDs = []string{"agent_a", "agent_b"}
+	spec.AgentGroupIDs = []string{"grp_a", "grp_b"}
 	spec.TargetIDs = []string{"probe_1", "probe_2"}
 	created, err := svc.Create(ctx, "site_default", spec)
 	if err != nil {
@@ -83,8 +97,8 @@ func TestCreateAndGetRoundTripsTheSelection(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
-	if len(got.AgentIDs) != 2 || len(got.TargetIDs) != 2 {
-		t.Fatalf("selection = %v / %v, want both members on each side", got.AgentIDs, got.TargetIDs)
+	if len(got.AgentGroupIDs) != 2 || len(got.TargetIDs) != 2 {
+		t.Fatalf("selection = %v / %v, want both members on each side", got.AgentGroupIDs, got.TargetIDs)
 	}
 	if !got.Enabled || !got.ShowAgentView || !got.ShowTargetView || got.ShowTargetAddress {
 		t.Fatalf("toggles = %+v, want the spec's values (address off by default)", got)
@@ -94,7 +108,7 @@ func TestCreateAndGetRoundTripsTheSelection(t *testing.T) {
 	if err != nil {
 		t.Fatalf("list: %v", err)
 	}
-	if len(list) != 1 || len(list[0].AgentIDs) != 2 {
+	if len(list) != 1 || len(list[0].AgentGroupIDs) != 2 {
 		t.Fatalf("list = %+v, want one page carrying its selection", list)
 	}
 }
@@ -104,14 +118,14 @@ func TestCreateAndGetRoundTripsTheSelection(t *testing.T) {
 func TestEmptySelectionIsAnEmptySliceNotNil(t *testing.T) {
 	svc, _ := newFixture(t)
 	spec := fullSpec()
-	spec.AgentIDs = nil
+	spec.AgentGroupIDs = nil
 	spec.TargetIDs = nil
 	page, err := svc.Create(context.Background(), "site_default", spec)
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	if page.AgentIDs == nil || page.TargetIDs == nil {
-		t.Fatalf("selection = %v / %v, want empty slices", page.AgentIDs, page.TargetIDs)
+	if page.AgentGroupIDs == nil || page.TargetIDs == nil {
+		t.Fatalf("selection = %v / %v, want empty slices", page.AgentGroupIDs, page.TargetIDs)
 	}
 }
 
@@ -119,22 +133,22 @@ func TestUpdateReplacesTheWholeSelection(t *testing.T) {
 	svc, _ := newFixture(t)
 	ctx := context.Background()
 	spec := fullSpec()
-	spec.AgentIDs = []string{"agent_a", "agent_b"}
+	spec.AgentGroupIDs = []string{"grp_a", "grp_b"}
 	page, err := svc.Create(ctx, "site_default", spec)
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
 
 	next := fullSpec()
-	next.AgentIDs = []string{"agent_b"}
+	next.AgentGroupIDs = []string{"grp_b"}
 	next.TargetIDs = []string{"probe_2"}
 	next.Title = "Renamed"
 	updated, err := svc.Update(ctx, page.ID, next)
 	if err != nil {
 		t.Fatalf("update: %v", err)
 	}
-	if len(updated.AgentIDs) != 1 || updated.AgentIDs[0] != "agent_b" {
-		t.Fatalf("agents = %v, want exactly the new set", updated.AgentIDs)
+	if len(updated.AgentGroupIDs) != 1 || updated.AgentGroupIDs[0] != "grp_b" {
+		t.Fatalf("agents = %v, want exactly the new set", updated.AgentGroupIDs)
 	}
 	if len(updated.TargetIDs) != 1 || updated.TargetIDs[0] != "probe_2" {
 		t.Fatalf("targets = %v, want exactly the new set", updated.TargetIDs)
@@ -156,7 +170,7 @@ func TestDeleteRemovesThePageAndItsSelection(t *testing.T) {
 	}
 	var members int
 	if err := db.QueryRow(`SELECT
-		(SELECT COUNT(*) FROM status_page_agents) + (SELECT COUNT(*) FROM status_page_targets)`).
+		(SELECT COUNT(*) FROM status_page_agent_groups) + (SELECT COUNT(*) FROM status_page_targets)`).
 		Scan(&members); err != nil {
 		t.Fatalf("count members: %v", err)
 	}
@@ -201,16 +215,15 @@ func TestSelectionRejectsWhatTheSiteCannotPublish(t *testing.T) {
 	svc, db := newFixture(t)
 	ctx := context.Background()
 	seedAgent(t, db, "agent_elsewhere", "site_other", "Elsewhere", "online")
+	seedAgentGroup(t, db, "grp_elsewhere", "site_other", "Elsewhere group", "agent_elsewhere")
 	seedTarget(t, db, "probe_elsewhere", "site_other", "mg_other", "http", "https://other", "Other")
-	mustExec(t, db, `UPDATE agents SET revoked=1 WHERE id='agent_b'`)
 
 	cases := []struct {
 		name string
 		spec func(Spec) Spec
 	}{
-		{"unknown agent", func(s Spec) Spec { s.AgentIDs = []string{"agent_missing"}; return s }},
-		{"revoked agent", func(s Spec) Spec { s.AgentIDs = []string{"agent_b"}; return s }},
-		{"cross-site agent", func(s Spec) Spec { s.AgentIDs = []string{"agent_elsewhere"}; return s }},
+		{"unknown agent group", func(s Spec) Spec { s.AgentGroupIDs = []string{"grp_missing"}; return s }},
+		{"cross-site agent group", func(s Spec) Spec { s.AgentGroupIDs = []string{"grp_elsewhere"}; return s }},
 		{"unknown target", func(s Spec) Spec { s.TargetIDs = []string{"probe_missing"}; return s }},
 		{"cross-site target", func(s Spec) Spec { s.TargetIDs = []string{"probe_elsewhere"}; return s }},
 	}
@@ -382,7 +395,7 @@ func TestUnnamedRowsFallBackToOrdinalsNeverHostnames(t *testing.T) {
 	svc, _ := newFixture(t)
 	ctx := context.Background()
 	spec := fullSpec()
-	spec.AgentIDs = []string{"agent_a", "agent_b"}
+	spec.AgentGroupIDs = []string{"grp_a", "grp_b"}
 	spec.TargetIDs = []string{"probe_1", "probe_2"}
 	if _, err := svc.Create(ctx, "site_default", spec); err != nil {
 		t.Fatalf("create: %v", err)
@@ -430,7 +443,7 @@ func TestOrdinalsAreStableForSameSecondAgents(t *testing.T) {
 	mustExec(t, db, `UPDATE agents SET display_name='', created_at=? WHERE site_id='site_default'`, same)
 
 	spec := fullSpec()
-	spec.AgentIDs = []string{"agent_a", "agent_b"}
+	spec.AgentGroupIDs = []string{"grp_a", "grp_b"}
 	if _, err := svc.Create(ctx, "site_default", spec); err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -454,18 +467,93 @@ func TestOrdinalsAreStableForSameSecondAgents(t *testing.T) {
 	}
 }
 
-// Deleting an agent must take it off every page that published it, with no
-// cleanup pass and no dangling row.
-func TestDeletedAgentDisappearsFromThePage(t *testing.T) {
+// A page names groups, so what it publishes tracks their CURRENT membership.
+// This is the whole point of selecting by group — and also the trade it makes, so
+// both directions are pinned here: joining a published group publishes you,
+// leaving it takes you off, and neither requires anyone to re-save the page.
+func TestPublishedNodesFollowGroupMembership(t *testing.T) {
 	svc, db := newFixture(t)
 	ctx := context.Background()
 	spec := fullSpec()
-	spec.AgentIDs = []string{"agent_a", "agent_b"}
+	spec.AgentGroupIDs = []string{"grp_a"} // holds agent_a only
 	page, err := svc.Create(ctx, "site_default", spec)
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	mustExec(t, db, `DELETE FROM agents WHERE id='agent_a'`)
+	svc.ttl = 0
+
+	names := func() []string {
+		t.Helper()
+		got, err := svc.PublicAgentStatuses(ctx, "home")
+		if err != nil {
+			t.Fatalf("agent statuses: %v", err)
+		}
+		out := make([]string, 0, len(got.Agents))
+		for _, row := range got.Agents {
+			out = append(out, row.Name)
+		}
+		return out
+	}
+	if got := names(); len(got) != 1 || got[0] != "Alpha" {
+		t.Fatalf("published = %v, want just the group's one member", got)
+	}
+
+	// An agent joining the published group appears without the page changing.
+	mustExec(t, db, `INSERT INTO agent_group_members(group_id, agent_id) VALUES('grp_a','agent_b')`)
+	if got := names(); len(got) != 2 {
+		t.Fatalf("published = %v, want the new group member to appear", got)
+	}
+
+	// And leaving it removes them again.
+	mustExec(t, db, `DELETE FROM agent_group_members WHERE group_id='grp_a' AND agent_id='agent_a'`)
+	if got := names(); len(got) != 1 || got[0] != "" {
+		t.Fatalf("published = %v, want only the remaining member", got)
+	}
+
+	// Through all of it the page's own selection is untouched: it names a group,
+	// not the machines that happen to be in it.
+	stored, err := svc.Get(ctx, page.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if len(stored.AgentGroupIDs) != 1 || stored.AgentGroupIDs[0] != "grp_a" {
+		t.Fatalf("selection = %v, want it unchanged", stored.AgentGroupIDs)
+	}
+}
+
+// An agent in two selected groups is one published node, not two.
+func TestOverlappingGroupsPublishAnAgentOnce(t *testing.T) {
+	svc, _ := newFixture(t)
+	ctx := context.Background()
+	spec := fullSpec()
+	spec.AgentGroupIDs = []string{"grp_a", "grp_both"} // agent_a is in both
+	if _, err := svc.Create(ctx, "site_default", spec); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	got, err := svc.PublicAgentStatuses(ctx, "home")
+	if err != nil {
+		t.Fatalf("agent statuses: %v", err)
+	}
+	if len(got.Agents) != 2 {
+		t.Fatalf("published = %+v, want two distinct agents", got.Agents)
+	}
+}
+
+// Deleting a group takes it off every page that published it, with no cleanup
+// pass and no dangling row.
+func TestDeletedAgentGroupDisappearsFromThePage(t *testing.T) {
+	svc, db := newFixture(t)
+	ctx := context.Background()
+	spec := fullSpec()
+	spec.AgentGroupIDs = []string{"grp_a", "grp_b"}
+	page, err := svc.Create(ctx, "site_default", spec)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	// registry.DeleteGroup clears the membership rows before the group itself; the
+	// page's own reference is what must cascade.
+	mustExec(t, db, `DELETE FROM agent_group_members WHERE group_id='grp_a'`)
+	mustExec(t, db, `DELETE FROM agent_groups WHERE id='grp_a'`)
 	svc.ttl = 0
 
 	agents, err := svc.PublicAgentStatuses(ctx, "home")
@@ -473,14 +561,14 @@ func TestDeletedAgentDisappearsFromThePage(t *testing.T) {
 		t.Fatalf("agent statuses: %v", err)
 	}
 	if len(agents.Agents) != 1 {
-		t.Fatalf("agents = %+v, want only the surviving one", agents.Agents)
+		t.Fatalf("agents = %+v, want only the surviving group's member", agents.Agents)
 	}
 	stored, err := svc.Get(ctx, page.ID)
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
-	if len(stored.AgentIDs) != 1 || stored.AgentIDs[0] != "agent_b" {
-		t.Fatalf("selection = %v, want the cascade to have removed the deleted agent", stored.AgentIDs)
+	if len(stored.AgentGroupIDs) != 1 || stored.AgentGroupIDs[0] != "grp_b" {
+		t.Fatalf("selection = %v, want the cascade to have removed the deleted group", stored.AgentGroupIDs)
 	}
 }
 
@@ -620,7 +708,7 @@ func TestSnapshotCacheIsPerSite(t *testing.T) {
 		t.Fatalf("create default: %v", err)
 	}
 	other := fullSpec()
-	other.Slug, other.TargetIDs, other.AgentIDs = "other", []string{"probe_other"}, nil
+	other.Slug, other.TargetIDs, other.AgentGroupIDs = "other", []string{"probe_other"}, nil
 	if _, err := svc.Create(ctx, "site_other", other); err != nil {
 		t.Fatalf("create other: %v", err)
 	}

@@ -132,8 +132,15 @@ func (s *Service) PublicPage(ctx context.Context, slug string) (PublicPage, erro
 // here rather than by the frontend declining to ask, because this endpoint is
 // directly reachable.
 func (s *Service) PublicAgentStatuses(ctx context.Context, slug string) (PublicAgentStatuses, error) {
-	p, selected, err := s.resolveWithSelection(ctx, slug,
-		`SELECT agent_id FROM status_page_agents WHERE page_id=?`,
+	// The page selects GROUPS; what it publishes is their current membership. So
+	// this resolves through agent_group_members on every read rather than storing
+	// a frozen agent list — an agent added to a published group is meant to appear,
+	// and one removed from it is meant to vanish, without anyone re-saving the page.
+	// Reading it inside the same transaction as the flags keeps that resolution on
+	// the same committed state as the toggles that govern it.
+	p, selected, err := s.resolveWithSelection(ctx, slug, `
+		SELECT m.agent_id FROM agent_group_members m
+		 WHERE m.group_id IN (SELECT group_id FROM status_page_agent_groups WHERE page_id=?)`,
 		func(p pageRow) bool { return p.showAgentView })
 	if err != nil {
 		return PublicAgentStatuses{}, err

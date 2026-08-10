@@ -1485,14 +1485,19 @@ CREATE TABLE cleanup_job_items(
 -- ===== public status pages =====
 
 -- A status page is an anonymous, slug-addressed, read-only view over an
--- admin-chosen subset of a site's agents and monitoring targets — the only
+-- admin-chosen subset of a site's agent groups and monitoring targets — the only
 -- unauthenticated surface in the product that carries monitoring data. Two
 -- consequences are baked into the schema. First, membership is explicit and
 -- per-page: nothing is published because it exists, only because someone picked
--- it, so an agent or target added later is invisible until an admin selects it.
--- Second, the visibility toggles live on the row rather than in the frontend,
--- because the public API enforces them server-side (a viewer who calls the
--- endpoint directly must not see what the page's UI would have hidden).
+-- it. Second, the visibility toggles live on the row rather than in the
+-- frontend, because the public API enforces them server-side (a viewer who calls
+-- the endpoint directly must not see what the page's UI would have hidden).
+--
+-- Agents are selected BY GROUP rather than one at a time. A group is the unit an
+-- operator already curates, so publishing one keeps the page in step with the
+-- fleet instead of drifting the moment a machine is added. The trade is worth
+-- naming: an agent joining a published group becomes public with it, which is
+-- why the console says so on the form.
 --
 -- enabled=0 is a kill switch that reads as "no such page" publicly: the API
 -- answers a disabled slug and an unknown slug identically, so taking a page down
@@ -1517,16 +1522,16 @@ CREATE TABLE status_pages(
 CREATE INDEX idx_status_pages_site ON status_pages(site_id);
 
 -- Membership cascades from both sides: dropping a page takes its selections with
--- it, and deleting an agent/target removes it from every page that published it.
--- That second direction is the important one — a revoked agent must not linger as
--- a published row — and it is why these reference agents(id)/probe_tasks(id)
--- rather than storing loose ids.
-CREATE TABLE status_page_agents(
+-- it, and deleting an agent group or target removes it from every page that
+-- published it. That second direction is the important one — a deleted group
+-- must not linger as a published row — and it is why these reference
+-- agent_groups(id)/probe_tasks(id) rather than storing loose ids.
+CREATE TABLE status_page_agent_groups(
   page_id  TEXT NOT NULL REFERENCES status_pages(id) ON DELETE CASCADE,
-  agent_id TEXT NOT NULL REFERENCES agents(id)       ON DELETE CASCADE,
-  PRIMARY KEY(page_id, agent_id)
+  group_id TEXT NOT NULL REFERENCES agent_groups(id) ON DELETE CASCADE,
+  PRIMARY KEY(page_id, group_id)
 );
-CREATE INDEX idx_spa_agent ON status_page_agents(agent_id);
+CREATE INDEX idx_spag_group ON status_page_agent_groups(group_id);
 
 CREATE TABLE status_page_targets(
   page_id   TEXT NOT NULL REFERENCES status_pages(id) ON DELETE CASCADE,
