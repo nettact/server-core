@@ -654,6 +654,34 @@ func TestReconcileClaimsASceneWhoseConfirmationWasMissed(t *testing.T) {
 	}
 }
 
+// A trigger with no edge cannot be placed against any outage. The permissive
+// reading — "nothing to compare, so anything is compatible" — is worse than
+// leaving it unclaimed: it resolves to the newest candidate, so a scene of
+// unknown vintage becomes evidence for whatever happens to be failing now.
+func TestEdgelessTriggerOwnsNothing(t *testing.T) {
+	db, ctx := openIncidentOpsTest(t)
+	now := time.Now().UTC()
+	svc := New(db, nil, settings.New(db), eventbus.New())
+
+	ingestScenes(t, svc, ctx, "agent_a",
+		basicScene("scene_edgeless", now, probeTrigger("probe_x", 1, time.Time{})))
+	seedSceneSignal(t, db, "inc_now", "sig_now", "agent_a", "probe_x", 1, now)
+
+	if err := svc.OnSignalConfirmed(ctx, fault.SignalEvent{
+		SignalID: "sig_now", IncidentID: "inc_now", AgentID: "agent_a", SiteID: "site_default",
+		TargetID: "probe_x", DetectorKey: fault.DetectorAvailability,
+	}); err != nil {
+		t.Fatalf("on signal confirmed: %v", err)
+	}
+	if err := svc.ReconcileSceneClaims(ctx); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if n := countRows(t, db,
+		`SELECT COUNT(*) FROM scene_report_refs WHERE report_id='scene_edgeless'`); n != 0 {
+		t.Fatalf("an edgeless trigger was attached to an outage it cannot be placed in (%d refs)", n)
+	}
+}
+
 // Retention deliberately outlives the claim horizon so the last pass that can
 // claim a scene precedes the pass that may delete it. That grace is only real if
 // BOTH claim paths reach into it. A receipt cutoff on either one keeps the scene

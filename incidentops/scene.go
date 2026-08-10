@@ -48,22 +48,21 @@ const sceneClaimWindow = 7 * 24 * time.Hour
 // reconciler runs hourly, so with an equal cutoff a scene whose confirmation
 // failed in the last hour of its life would be deleted by the retention call in
 // the very same pass that could still have claimed it — the durable backstop
-// losing evidence exactly at the edge it exists to cover. The grace is
-// comfortably more than one scheduling interval, so at least two reconcile
-// passes follow the last moment an owning signal can appear.
+// losing evidence exactly at the edge it exists to cover.
 //
-// The margin is only real because neither claim path bounds on RECEIPT age: a
-// scene is claimable for exactly as long as it is stored, and sceneClaimWindow
-// bounds which signals may own an edge instead. Reintroducing a receipt cutoff
-// on either path — the reconciler's scan or claimableScenes' — re-opens the hole
-// this constant exists to close, in the quietest possible way: the scene is kept
-// on disk and skipped by every pass during the grace, which deletes it just as
-// surely and two hours later.
+// The margin is real because the two horizons measure different things. An
+// OWNER can only appear while the scene is inside sceneClaimWindow: a signal
+// owns an edge only if its own interval contains it (or starts within
+// attachSlack of it), so the last confirmation that can claim a scene arrives
+// roughly a claim window after it was received. Both claim paths then search a
+// window two hours wider than that, which is at least two reconcile passes after
+// the last owner can show up and before anything is deleted.
 //
-// It also means the ordering inside the hourly worker is not load-bearing. That
-// worker does reconcile before it deletes, but a grace shorter than its interval
-// would make that incidental ordering the only thing standing between a late
-// confirmation and lost evidence.
+// Both paths must use the SAME horizon. A cutoff on only one of them is the
+// quietest possible bug: the hourly backstop files what the confirmation
+// refused, so the evidence survives on a schedule instead of on the event that
+// wanted it, and nothing looks broken. Removing the cutoff instead is not the
+// fix — see claimableScenes for why the bound has to stay indexable.
 const sceneRetentionGrace = 2 * time.Hour
 
 // unreferencedSceneRetention is how long a scene that never found a fault is
@@ -463,7 +462,15 @@ type rowQuerier interface {
 // scene compatible with the next outage as well, and files one drop's evidence
 // under two incidents. The slack absorbs disagreement between two records of one
 // moment; it was never a licence to span two of them.
+// An edge of zero owns nothing. A trigger that carries no timestamp cannot be
+// placed against any outage, and the permissive reading — "nothing to compare,
+// so anything is compatible" — resolves it to the newest candidate instead,
+// which files evidence of unknown vintage under whatever is failing now. Refusing
+// leaves the trigger unclaimed, which is what an unplaceable edge is.
 func pickOwner(rows *sql.Rows, edge time.Time) (sceneRef, bool, error) {
+	if edge.IsZero() {
+		return sceneRef{}, false, rows.Err()
+	}
 	var nearest sceneRef
 	haveNearest := false
 	for rows.Next() {
@@ -517,7 +524,7 @@ func contains(edge, observedAt time.Time, resolvedAt sql.NullTime) bool {
 // hour after a closed outage ended, which is not skew — it is a different event —
 // and that is precisely how a stale outage adopts a fresh scene.
 func nearInterval(edge, observedAt time.Time, resolvedAt sql.NullTime) bool {
-	if edge.IsZero() || observedAt.IsZero() {
+	if observedAt.IsZero() {
 		return true // nothing to compare; not a reason to refuse
 	}
 	if edge.Before(observedAt.Add(-attachSlack)) {
@@ -732,31 +739,35 @@ func (s *Service) ReconcileSceneClaims(ctx context.Context) error {
 		trigger                   telemetry.SceneTrigger
 	}
 	now := time.Now().UTC()
-	// No receipt bound. A scene is reconcilable for exactly as long as it is
-	// stored, and retention alone decides that — pairing a scan cutoff with a
-	// deletion cutoff means keeping two constants in lockstep, and being wrong in
-	// either direction is silent. Too narrow keeps the scene on disk and skips it
-	// on every pass (a slower way of deleting it); too wide scans for rows that no
-	// longer exist. sceneClaimWindow still bounds which SIGNALS may own an edge,
-	// which is the question that decides whether a claim is right; receipt age
-	// never answered it. The set walked here is bounded by retention rather than
-	// by the query: an unclaimed scene lives at most sceneClaimWindow +
-	// sceneRetentionGrace.
+	// Bounded by the RETENTION horizon, which is both wider than the claim horizon
+	// and the same bound claimableScenes uses — the two paths answer one question
+	// and a horizon on only one of them means a scene the backstop files is refused
+	// by the confirmation that could have filed it at once.
+	//
+	// The bound cannot simply be dropped, tempting as it looks once retention is
+	// deleting unreferenced rows anyway: retention only deletes UNREFERENCED
+	// scenes, so claimed ones accumulate for the life of the incident history. An
+	// unbounded scan would walk all of them on every hourly pass and every startup
+	// Recover, with an owner lookup per trigger. It would also make the
+	// over-selection below permanent instead of transient.
 	//
 	// A report is worth revisiting while it holds FEWER references than triggers.
 	// "No references at all" was wrong: a scene carries several independently
 	// claimable triggers, so one trigger attaching would have excluded the report
-	// for good and the others could never be recovered. The comparison
-	// over-selects when two triggers resolve to one signal, which costs a repeated
-	// no-op insert and nothing else.
+	// for good and the others could never be recovered. The comparison over-selects
+	// when two triggers resolve to one signal — that mismatch never closes — which
+	// costs a repeated no-op insert until the receipt bound ages the row out of the
+	// scan. That expiry is what keeps it transient, and is the second reason the
+	// bound stays.
 	rows, err := s.db.Read().QueryContext(ctx, `
 		SELECT sr.id, sr.agent_id, sr.site_id, t.kind, COALESCE(t.monitor_id,''), t.config_serial,
 		       t.first_failed_at, t.disconnected_at
 		FROM scene_reports sr
 		JOIN scene_report_triggers t ON t.report_id = sr.id
-		WHERE (SELECT COUNT(*) FROM scene_report_triggers t2 WHERE t2.report_id = sr.id)
+		WHERE sr.received_at >= ?
+		  AND (SELECT COUNT(*) FROM scene_report_triggers t2 WHERE t2.report_id = sr.id)
 		    > (SELECT COUNT(*) FROM scene_report_refs r WHERE r.report_id = sr.id)
-		ORDER BY sr.id, t.idx`)
+		ORDER BY sr.id, t.idx`, now.Add(-unreferencedSceneRetention))
 	if err != nil {
 		return err
 	}
@@ -861,16 +872,23 @@ func (s *Service) fileReconciledScene(ctx context.Context, reportID, siteID stri
 // the edge is the question that has one answer, and routing both paths through
 // one function is what keeps them from drifting apart.
 //
-// There is no receipt-age filter, for the same reason the reconciler has none:
-// the two paths answer the same question and a cutoff on only one of them means
-// a scene the hourly backstop would file is refused by the confirmation that
-// could have filed it immediately — evidence surviving on a schedule instead of
-// on the event that wanted it. See sceneRetentionGrace.
+// The receipt cutoff is the retention horizon, not the claim window — the same
+// bound the reconciler uses, because the two paths answer the same question and
+// a narrower one here means a scene the hourly backstop would file is refused by
+// the confirmation that could have filed it immediately: evidence surviving on a
+// schedule instead of on the event that wanted it. See sceneRetentionGrace.
+//
+// It is a bound on the SEARCH, not on correctness — ownership decides that — but
+// it has to stay, and stay indexable. Retention deletes only unreferenced
+// scenes, so a long-lived monitor generation accumulates claimed ones without
+// limit; an unbounded query would materialize the whole history and run an owner
+// lookup per row, synchronously, on every confirmation.
 func (s *Service) claimableScenes(ctx context.Context, ev fault.SignalEvent, targetID string, configSerial int) ([]string, error) {
 	now := time.Now().UTC()
+	cutoff := now.Add(-unreferencedSceneRetention)
 
 	if ev.DetectorKey == fault.DetectorAgentConnectivity {
-		return s.claimableDisconnectScenes(ctx, ev, now)
+		return s.claimableDisconnectScenes(ctx, ev, cutoff, now)
 	}
 	if targetID == "" {
 		return nil, nil
@@ -878,9 +896,9 @@ func (s *Service) claimableScenes(ctx context.Context, ev fault.SignalEvent, tar
 	rows, err := s.db.Read().QueryContext(ctx, `
 		SELECT sr.id, t.first_failed_at FROM scene_reports sr
 		JOIN scene_report_triggers t ON t.report_id = sr.id
-		WHERE sr.agent_id=? AND t.kind='probe_fault'
+		WHERE sr.agent_id=? AND sr.received_at >= ? AND t.kind='probe_fault'
 		  AND t.monitor_id=? AND t.config_serial=?
-		ORDER BY sr.id`, ev.AgentID, targetID, configSerial)
+		ORDER BY sr.id`, ev.AgentID, cutoff, targetID, configSerial)
 	if err != nil {
 		return nil, err
 	}
@@ -927,12 +945,12 @@ func scanCandidates(rows *sql.Rows) ([]sceneCandidate, error) {
 
 // claimableDisconnectScenes narrows this agent's recent disconnect scenes to the
 // ones this connectivity signal actually owns.
-func (s *Service) claimableDisconnectScenes(ctx context.Context, ev fault.SignalEvent, now time.Time) ([]string, error) {
+func (s *Service) claimableDisconnectScenes(ctx context.Context, ev fault.SignalEvent, cutoff, now time.Time) ([]string, error) {
 	rows, err := s.db.Read().QueryContext(ctx, `
 		SELECT sr.id, t.disconnected_at FROM scene_reports sr
 		JOIN scene_report_triggers t ON t.report_id = sr.id
-		WHERE sr.agent_id=? AND t.kind='server_disconnect'
-		ORDER BY sr.id`, ev.AgentID)
+		WHERE sr.agent_id=? AND sr.received_at >= ? AND t.kind='server_disconnect'
+		ORDER BY sr.id`, ev.AgentID, cutoff)
 	if err != nil {
 		return nil, err
 	}
