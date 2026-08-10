@@ -135,6 +135,52 @@ func TestCheckStoreInstallUsesCheckerAndCatalogAgent(t *testing.T) {
 	}
 }
 
+// A Checker that reports an update but names a version no newer than the
+// running one has named the wrong thing — the WinRT Store API hands out the
+// *installed* package, which is exactly how this used to reach the console as
+// "latest version: <the one you are on>" beside a live update notice. The
+// availability answer is still the Checker's to give; only the name is dropped.
+func TestCheckStoreVersionNotNewerReportsUnnamed(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		current  string
+		reported string
+		want     string
+	}{
+		{name: "equal to current", current: "v1.0.0", reported: "v1.0.0", want: ""},
+		{name: "older than current", current: "v1.2.0", reported: "v1.1.0", want: ""},
+		{name: "newer than current", current: "v1.0.0", reported: "v1.1.0", want: "v1.1.0"},
+		// An unstamped build compares as older than everything, so the Store's
+		// name is the only version information there is — keep it.
+		{name: "unstamped current", current: "dev", reported: "v1.0.0", want: "v1.0.0"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := catalog(t, map[string]string{"agent": "v1.5.0"})
+			s := New(Config{
+				InstallType:    InstallStore,
+				CurrentVersion: tc.current,
+				BaseURL:        srv.URL,
+				Checker: func(context.Context) (CheckResult, error) {
+					return CheckResult{LatestVersion: tc.reported, Available: true}, nil
+				},
+			})
+			st, err := s.CheckNow(context.Background())
+			if err != nil {
+				t.Fatalf("CheckNow: %v", err)
+			}
+			if st.LatestVersion != tc.want {
+				t.Errorf("LatestVersion = %q, want %q", st.LatestVersion, tc.want)
+			}
+			if !st.UpdateAvailable {
+				t.Error("UpdateAvailable = false; the Checker owns that answer, not the version name")
+			}
+			if !st.ProductChecked {
+				t.Error("ProductChecked = false although the Store answered")
+			}
+		})
+	}
+}
+
 // A Store query that cannot run (sideloaded package, no Store license) must not
 // also cost the console its agent version.
 func TestCheckStoreFailureKeepsAgentVersion(t *testing.T) {

@@ -48,10 +48,17 @@ const (
 	// non-Store install is sent to upgrade.
 	DownloadPageURL = "https://d.nettact.org/"
 
+	// StoreProductID is the Microsoft Store product id for the desktop app. It
+	// identifies the app in three places that must never drift apart: the web
+	// product page below, the ms-windows-store:// protocol URL the desktop opens
+	// instead, and the Store catalog query the desktop uses to name a pending
+	// update.
+	StoreProductID = "9NX7VNLL0QSG"
+
 	// StorePageURL is the Microsoft Store product page for the desktop app. Store
 	// installs are sent here; the desktop host opens the ms-windows-store:// form
 	// instead so the Store app itself comes up.
-	StorePageURL = "https://apps.microsoft.com/store/detail/9NX7VNLL0QSG?cid=DevShareMCLPCS"
+	StorePageURL = "https://apps.microsoft.com/store/detail/" + StoreProductID + "?cid=DevShareMCLPCS"
 
 	defaultBaseURL = "https://d.nettact.org"
 
@@ -360,6 +367,25 @@ func (s *Service) check(ctx context.Context) (Status, error) {
 			break
 		}
 		st.LatestVersion, st.UpdateAvailable = res.LatestVersion, res.Available
+		// A Checker decides whether an update exists — that is the whole reason it
+		// displaces the catalog — so Available is taken verbatim. The name it
+		// attaches gets one sanity check: a version that is not newer than what is
+		// running cannot be the name of a pending update, and publishing it
+		// produces the worst reading available. The console draws "latest version:
+		// <the version you are already on>" directly beside a live update notice,
+		// and the tray announces the release the user has installed. The
+		// unnamed-update path says the same thing honestly, and every consumer
+		// already handles it.
+		//
+		// Not hypothetical tidiness: the Store checker used to read its version
+		// off StorePackageUpdate.Package — the *installed* package, per the WinRT
+		// contract — so it produced exactly this shape on every Store install with
+		// an update pending, and nothing here caught it.
+		if st.UpdateAvailable && st.LatestVersion != "" && !Newer(st.LatestVersion, s.cfg.CurrentVersion) {
+			log.Printf("updatecheck: checker reported an update but named %q, which is not newer than %q; reporting it unnamed",
+				st.LatestVersion, s.cfg.CurrentVersion)
+			st.LatestVersion = ""
+		}
 		progress = true
 	case s.cfg.InstallType == InstallStore:
 		// A Store install with no Store query has no answer to give: the catalog
