@@ -654,6 +654,38 @@ func TestReconcileClaimsASceneWhoseConfirmationWasMissed(t *testing.T) {
 	}
 }
 
+// Retention deliberately outlives the claim horizon so the last pass that can
+// claim a scene precedes the pass that may delete it. That grace is only real if
+// the reconciler scans to the RETENTION horizon: bounding its scan by the claim
+// window instead keeps the scene on disk and skips it on every pass, which
+// deletes it just as surely and two hours later.
+func TestReconcileScansToTheRetentionHorizon(t *testing.T) {
+	db, ctx := openIncidentOpsTest(t)
+	now := time.Now().UTC()
+	edge := now.Add(-sceneClaimWindow - time.Hour)
+	svc := New(db, nil, settings.New(db), eventbus.New())
+
+	ingestScenes(t, svc, ctx, "agent_a",
+		basicScene("scene_edge", edge, probeTrigger("probe_e", 2, edge)))
+	// Age it past the claim horizon but still inside retention — the grace window.
+	if _, err := db.ExecContext(ctx,
+		`UPDATE scene_reports SET received_at=? WHERE id='scene_edge'`, edge); err != nil {
+		t.Fatalf("age receipt: %v", err)
+	}
+	if now.Sub(edge) <= sceneClaimWindow || now.Sub(edge) >= unreferencedSceneRetention {
+		t.Fatalf("test scene is not inside the grace window: aged %s", now.Sub(edge))
+	}
+
+	seedSceneSignal(t, db, "inc_edge", "sig_edge", "agent_a", "probe_e", 2, edge)
+	if err := svc.ReconcileSceneClaims(ctx); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if n := countRows(t, db,
+		`SELECT COUNT(*) FROM scene_report_refs WHERE report_id='scene_edge' AND incident_id='inc_edge'`); n != 1 {
+		t.Fatalf("a scene inside the retention grace was skipped by reconciliation (%d refs)", n)
+	}
+}
+
 // The console reads the two halves together: the server's frozen base and every
 // claimed agent scene, each carrying the trigger that explains why it exists.
 func TestSnapshotViewCarriesScenesAndTriggers(t *testing.T) {

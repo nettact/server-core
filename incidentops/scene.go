@@ -42,16 +42,20 @@ import (
 // contains the edge. The window only bounds the search.
 const sceneClaimWindow = 7 * 24 * time.Hour
 
-// sceneRetentionGrace is how long a scene outlives its own claimability.
+// sceneRetentionGrace is how long a scene outlives its own claim horizon.
 //
-// Retention must not delete on the same boundary the claim query filters on. The
-// reconciler runs hourly and selects on received_at >= now-sceneClaimWindow, so
-// with an equal cutoff a scene whose confirmation failed in the last hour of its
-// life would age out of the query and be deleted by the retention call in that
-// very same pass — the durable backstop losing evidence exactly at the edge it
-// exists to cover. The grace is comfortably more than one scheduling interval,
-// so the last pass that can still claim a scene always precedes the pass that
-// may delete it.
+// Retention must not delete on the same boundary anything else stops at. The
+// reconciler runs hourly, so with an equal cutoff a scene whose confirmation
+// failed in the last hour of its life would be deleted by the retention call in
+// the very same pass that could still have claimed it — the durable backstop
+// losing evidence exactly at the edge it exists to cover. The grace is
+// comfortably more than one scheduling interval, so the last pass that can claim
+// a scene always precedes the pass that may delete it.
+//
+// The grace only works because the reconciler scans to the RETENTION horizon
+// rather than the claim one. Extending retention while leaving the scan bounded
+// by sceneClaimWindow keeps the scene on disk and skips it on every pass, which
+// deletes it just as surely and two hours later.
 const sceneRetentionGrace = 2 * time.Hour
 
 // unreferencedSceneRetention is how long a scene that never found a fault is
@@ -721,6 +725,13 @@ func (s *Service) ReconcileSceneClaims(ctx context.Context) error {
 		trigger                   telemetry.SceneTrigger
 	}
 	now := time.Now().UTC()
+	// Scanned to the RETENTION horizon, not the claim horizon. Bounding this by
+	// sceneClaimWindow is the mistake the grace period exists to prevent: the scene
+	// would be kept for two more hours and skipped by every pass during them, which
+	// is a longer way of deleting it. A scene is reconcilable for exactly as long
+	// as it is stored; sceneClaimWindow still bounds which SIGNALS may own an edge,
+	// which is a different question.
+	//
 	// A report is worth revisiting while it holds FEWER references than triggers.
 	// "No references at all" was wrong: a scene carries several independently
 	// claimable triggers, so one trigger attaching would have excluded the report
@@ -735,7 +746,7 @@ func (s *Service) ReconcileSceneClaims(ctx context.Context) error {
 		WHERE sr.received_at >= ?
 		  AND (SELECT COUNT(*) FROM scene_report_triggers t2 WHERE t2.report_id = sr.id)
 		    > (SELECT COUNT(*) FROM scene_report_refs r WHERE r.report_id = sr.id)
-		ORDER BY sr.id, t.idx`, now.Add(-sceneClaimWindow))
+		ORDER BY sr.id, t.idx`, now.Add(-unreferencedSceneRetention))
 	if err != nil {
 		return err
 	}
