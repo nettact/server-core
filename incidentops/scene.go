@@ -16,21 +16,26 @@ import (
 
 // unreferencedSceneRetention is how long a scene that never found a fault is
 // kept. An agent legitimately collects one without a server-side verdict ever
-// following (its local streak crossed, the rounds recovered before this server's
-// profile confirmed anything; or it lost its session for four seconds), and after
-// claimWindow nothing can ever reference such a report — every read path is
-// incident-scoped, so it is invisible. A day preserves it for hand debugging;
-// past that it is dead weight. Mirrors unreferencedTraceRetention, for the same
-// reason and on the same clock.
-// It has to cover the widest gap a supported configuration can put between the
-// agent collecting a scene and this server confirming the fault that owns it.
-// That gap is (server threshold - agent threshold) rounds of the target's own
-// interval, and interval_seconds accepts up to 86400 — so a daily monitor on a
-// profile that confirms two rounds later than the agent's own threshold leaves
-// two days. A one-day retention would delete that scene, on the hourly sweep,
-// before the signal it belongs to ever existed. A week covers it with margin and
-// costs little: scenes are individually capped and an agent produces at most one
-// a minute per server, only on real fault edges.
+// following — its local streak crossed and the rounds recovered before this
+// server's profile confirmed anything — and once nothing can reference such a
+// report it is invisible, because every read path is incident-scoped.
+//
+// It has to cover the gap a supported configuration can put between the agent
+// collecting a scene and this server confirming the fault that owns it: (server
+// threshold - agent threshold) rounds of the target's own interval. A week
+// covers the ordinary spread, including a daily monitor on a profile confirming
+// two rounds after the agent's own threshold, and costs little — scenes are
+// individually capped and an agent produces at most one a minute per server,
+// only on real fault edges.
+//
+// It does NOT cover the extreme: fail_rounds accepts up to 20, so a daily
+// monitor configured that way would confirm seventeen days after its scene
+// arrived, and the sweep deletes the scene first. Sizing for that would mean
+// three weeks of unclaimed scenes, and a target flapping faster than its own
+// confirmation threshold would then accumulate them at one a minute with nothing
+// ever claiming them — an unbounded store, which is a worse failure than a lost
+// scene on an absurd setting. Sizing the horizon from the site's own settings,
+// with a per-agent cap, is the real fix; see the backlog.
 const unreferencedSceneRetention = 7 * 24 * time.Hour
 
 // sceneClaimWindow is how far back a claim looks for a scene, and how old a
@@ -709,17 +714,24 @@ func (s *Service) claimScenes(ctx context.Context, ev fault.SignalEvent) error {
 // nothing to do is one indexed query.
 func (s *Service) ReconcileSceneClaims(ctx context.Context) error {
 	type pending struct {
-		reportID, agentID string
-		trigger           telemetry.SceneTrigger
+		reportID, agentID, siteID string
+		trigger                   telemetry.SceneTrigger
 	}
 	now := time.Now().UTC()
+	// A report is worth revisiting while it holds FEWER references than triggers.
+	// "No references at all" was wrong: a scene carries several independently
+	// claimable triggers, so one trigger attaching would have excluded the report
+	// for good and the others could never be recovered. The comparison
+	// over-selects when two triggers resolve to one signal, which costs a repeated
+	// no-op insert and nothing else.
 	rows, err := s.db.Read().QueryContext(ctx, `
-		SELECT sr.id, sr.agent_id, t.kind, COALESCE(t.monitor_id,''), t.config_serial,
+		SELECT sr.id, sr.agent_id, sr.site_id, t.kind, COALESCE(t.monitor_id,''), t.config_serial,
 		       t.first_failed_at, t.disconnected_at
 		FROM scene_reports sr
 		JOIN scene_report_triggers t ON t.report_id = sr.id
 		WHERE sr.received_at >= ?
-		  AND NOT EXISTS(SELECT 1 FROM scene_report_refs r WHERE r.report_id = sr.id)
+		  AND (SELECT COUNT(*) FROM scene_report_triggers t2 WHERE t2.report_id = sr.id)
+		    > (SELECT COUNT(*) FROM scene_report_refs r WHERE r.report_id = sr.id)
 		ORDER BY sr.id, t.idx`, now.Add(-sceneClaimWindow))
 	if err != nil {
 		return err
@@ -728,7 +740,7 @@ func (s *Service) ReconcileSceneClaims(ctx context.Context) error {
 	for rows.Next() {
 		var p pending
 		var firstFailed, disconnected sql.NullTime
-		if err := rows.Scan(&p.reportID, &p.agentID, &p.trigger.Kind, &p.trigger.MonitorID,
+		if err := rows.Scan(&p.reportID, &p.agentID, &p.siteID, &p.trigger.Kind, &p.trigger.MonitorID,
 			&p.trigger.ConfigSerial, &firstFailed, &disconnected); err != nil {
 			rows.Close()
 			return err
@@ -771,7 +783,7 @@ func (s *Service) ReconcileSceneClaims(ctx context.Context) error {
 		if !ok {
 			continue
 		}
-		if err := s.fileReconciledScene(ctx, p.reportID, owner, now); err != nil {
+		if err := s.fileReconciledScene(ctx, p.reportID, p.siteID, owner, now); err != nil {
 			return err
 		}
 	}
@@ -780,7 +792,7 @@ func (s *Service) ReconcileSceneClaims(ctx context.Context) error {
 
 // fileReconciledScene attaches one recovered claim in its own short transaction,
 // so a later failure cannot undo the ones already filed.
-func (s *Service) fileReconciledScene(ctx context.Context, reportID string, owner sceneRef, now time.Time) error {
+func (s *Service) fileReconciledScene(ctx context.Context, reportID, siteID string, owner sceneRef, now time.Time) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -801,7 +813,11 @@ func (s *Service) fileReconciledScene(ctx context.Context, reportID string, owne
 		return err
 	}
 	if s.bus != nil {
-		s.bus.Publish(eventbus.TopicIncidentUpdated, eventbus.IncidentEvent{IncidentID: owner.incidentID})
+		// The site id has to travel: the incident bridge notifies by exact site
+		// match, so an empty one reaches no console and the recovered claim would
+		// stay invisible until something else refreshed the page.
+		s.bus.Publish(eventbus.TopicIncidentUpdated,
+			eventbus.IncidentEvent{IncidentID: owner.incidentID, SiteID: siteID})
 	}
 	return nil
 }

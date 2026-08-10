@@ -24,14 +24,17 @@ func (s *Service) Recover(ctx context.Context) error {
 }
 
 // Tick is the callable periodic maintenance pass (the server drives it on a
-// timer): reconcile active trace references against alert state, and file any
-// scene still waiting for the fault that owns it. Idempotent and cheap when
-// there is nothing to do.
+// timer, every few seconds): reconcile active trace references against alert
+// state. Idempotent and cheap when there is nothing to do — one indexed UPDATE.
+//
+// Scene reconciliation is deliberately NOT here. It rescans every scene still
+// short of a reference across the whole claim window, so at this cadence it
+// would re-ask the same question about the same pending scene tens of thousands
+// of times before retention removed it. It rides the hourly retention worker
+// instead, where a claim recovered within the hour is soon enough for evidence
+// whose normal path already succeeded.
 func (s *Service) Tick(ctx context.Context) error {
-	if err := s.reconcileTraceRefs(ctx); err != nil {
-		return err
-	}
-	return s.ReconcileSceneClaims(ctx)
+	return s.reconcileTraceRefs(ctx)
 }
 
 // reconcileTraceRefs durably deactivates any trace reference whose alert is no
