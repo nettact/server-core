@@ -547,7 +547,70 @@ func TestSnapshotCacheServesInsideTheWindowAndExpires(t *testing.T) {
 	}
 }
 
-// The cache is keyed by site, so one site's snapshot must never answer another's.
+// A public read must see ONE committed version of the page. Read separately, the
+// flags and the membership can straddle an admin's save — publishing a newly
+// selected target under the previous version's show_target_address, which is the
+// exact boundary this feature exists to hold. The read transaction is what
+// prevents it; this pins the guarantee by hammering reads against a writer.
+func TestPublicReadNeverMixesFlagsFromOneSaveWithMembersFromAnother(t *testing.T) {
+	svc, _ := newFixture(t)
+	ctx := context.Background()
+	svc.ttl = 0 // never serve a cached aggregation, so every read is a fresh pass
+
+	spec := fullSpec()
+	spec.TargetIDs = []string{"probe_1"}
+	page, err := svc.Create(ctx, "site_default", spec)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	// Two states an admin toggles between. Addresses are shown ONLY in the state
+	// that publishes a single target, so any read that reports two targets with
+	// addresses has combined halves of different versions.
+	withAddress := fullSpec()
+	withAddress.ShowTargetAddress = true
+	withAddress.TargetIDs = []string{"probe_1"}
+	withoutAddress := fullSpec()
+	withoutAddress.ShowTargetAddress = false
+	withoutAddress.TargetIDs = []string{"probe_1", "probe_2"}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 40; i++ {
+			next := withAddress
+			if i%2 == 0 {
+				next = withoutAddress
+			}
+			if _, err := svc.Update(ctx, page.ID, next); err != nil {
+				t.Errorf("update: %v", err)
+				return
+			}
+		}
+	}()
+
+	for i := 0; i < 200; i++ {
+		got, err := svc.PublicTargetStatuses(ctx, "home")
+		if err != nil {
+			t.Fatalf("public read: %v", err)
+		}
+		addressed := 0
+		for _, row := range got.Targets {
+			if row.Address != "" {
+				addressed++
+			}
+		}
+		switch {
+		case len(got.Targets) == 1 && (addressed == 0 || addressed == 1):
+			// Either saved state is fine for a single-target page.
+		case len(got.Targets) == 2 && addressed == 0:
+			// The two-target state hides addresses.
+		default:
+			t.Fatalf("read mixed two saves: %d targets, %d with an address", len(got.Targets), addressed)
+		}
+	}
+	<-done
+}
 func TestSnapshotCacheIsPerSite(t *testing.T) {
 	svc, db := newFixture(t)
 	ctx := context.Background()

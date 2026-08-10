@@ -132,14 +132,9 @@ func (s *Service) PublicPage(ctx context.Context, slug string) (PublicPage, erro
 // here rather than by the frontend declining to ask, because this endpoint is
 // directly reachable.
 func (s *Service) PublicAgentStatuses(ctx context.Context, slug string) (PublicAgentStatuses, error) {
-	p, err := s.resolve(ctx, slug)
-	if err != nil {
-		return PublicAgentStatuses{}, err
-	}
-	if !p.showAgentView {
-		return PublicAgentStatuses{}, ErrPageNotFound
-	}
-	selected, err := s.selection(ctx, `SELECT agent_id FROM status_page_agents WHERE page_id=?`, p.id)
+	p, selected, err := s.resolveWithSelection(ctx, slug,
+		`SELECT agent_id FROM status_page_agents WHERE page_id=?`,
+		func(p pageRow) bool { return p.showAgentView })
 	if err != nil {
 		return PublicAgentStatuses{}, err
 	}
@@ -187,14 +182,9 @@ func (s *Service) PublicAgentStatuses(ctx context.Context, slug string) (PublicA
 // PublicTargetStatuses serves the target view, with the same server-side toggle
 // enforcement as the agent view.
 func (s *Service) PublicTargetStatuses(ctx context.Context, slug string) (PublicTargetStatuses, error) {
-	p, err := s.resolve(ctx, slug)
-	if err != nil {
-		return PublicTargetStatuses{}, err
-	}
-	if !p.showTargetView {
-		return PublicTargetStatuses{}, ErrPageNotFound
-	}
-	selected, err := s.selection(ctx, `SELECT target_id FROM status_page_targets WHERE page_id=?`, p.id)
+	p, selected, err := s.resolveWithSelection(ctx, slug,
+		`SELECT target_id FROM status_page_targets WHERE page_id=?`,
+		func(p pageRow) bool { return p.showTargetView })
 	if err != nil {
 		return PublicTargetStatuses{}, err
 	}
@@ -249,12 +239,17 @@ func (s *Service) PublicTargetStatuses(ctx context.Context, slug string) (Public
 // return the same error on purpose — taking a page down must not confirm that it
 // once existed.
 func (s *Service) resolve(ctx context.Context, slug string) (pageRow, error) {
+	return scanPageRow(s.db.Read().QueryRowContext(ctx, publicPageQuery, slug))
+}
+
+const publicPageQuery = `
+	SELECT id, site_id, slug, title, description, show_target_address, show_agent_view, show_target_view
+	FROM status_pages WHERE slug=? AND enabled=1`
+
+func scanPageRow(row *sql.Row) (pageRow, error) {
 	var p pageRow
-	err := s.db.Read().QueryRowContext(ctx, `
-		SELECT id, site_id, slug, title, description, show_target_address, show_agent_view, show_target_view
-		FROM status_pages WHERE slug=? AND enabled=1`, slug).
-		Scan(&p.id, &p.siteID, &p.slug, &p.title, &p.description,
-			&p.showTargetAddress, &p.showAgentView, &p.showTargetView)
+	err := row.Scan(&p.id, &p.siteID, &p.slug, &p.title, &p.description,
+		&p.showTargetAddress, &p.showAgentView, &p.showTargetView)
 	if errors.Is(err, sql.ErrNoRows) {
 		return pageRow{}, ErrPageNotFound
 	}
@@ -264,21 +259,51 @@ func (s *Service) resolve(ctx context.Context, slug string) (pageRow, error) {
 	return p, nil
 }
 
-func (s *Service) selection(ctx context.Context, query, pageID string) (map[string]bool, error) {
-	rows, err := s.db.Read().QueryContext(ctx, query, pageID)
+// resolveWithSelection reads a page's publication flags AND its membership inside
+// ONE read transaction, then checks the caller's view gate.
+//
+// The transaction is the point, not an optimization. Read separately, the two
+// queries can straddle an admin's save and combine flags from one version of the
+// page with membership from another — publishing a newly selected target under
+// the previous version's show_target_address, which is precisely the boundary
+// this feature exists to hold. WAL isolation makes a single read transaction see
+// one committed state, the same reason targetstatus takes one for its snapshot.
+//
+// The gate is evaluated after the reads rather than short-circuiting before them:
+// it costs one cheap query on a hidden view and keeps both branches returning the
+// same indistinguishable ErrPageNotFound.
+func (s *Service) resolveWithSelection(ctx context.Context, slug, memberQuery string,
+	visible func(pageRow) bool) (pageRow, map[string]bool, error) {
+	tx, err := s.db.Read().BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
-		return nil, err
+		return pageRow{}, nil, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	p, err := scanPageRow(tx.QueryRowContext(ctx, publicPageQuery, slug))
+	if err != nil {
+		return pageRow{}, nil, err
+	}
+	if !visible(p) {
+		return pageRow{}, nil, ErrPageNotFound
+	}
+	rows, err := tx.QueryContext(ctx, memberQuery, p.id)
+	if err != nil {
+		return pageRow{}, nil, err
 	}
 	defer rows.Close()
-	out := map[string]bool{}
+	selected := map[string]bool{}
 	for rows.Next() {
 		var id string
 		if err := rows.Scan(&id); err != nil {
-			return nil, err
+			return pageRow{}, nil, err
 		}
-		out[id] = true
+		selected[id] = true
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return pageRow{}, nil, err
+	}
+	return p, selected, nil
 }
 
 // ---- snapshot cache ----

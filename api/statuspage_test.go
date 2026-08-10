@@ -207,6 +207,29 @@ func TestStatusPageAdminRoutesRequireSession(t *testing.T) {
 	}
 }
 
+// A 404 without cache headers is heuristically cacheable, so a browser or CDN
+// can keep answering "no such page" for a slug the operator has since created or
+// re-enabled — with nothing in the console to explain why.
+func TestPublicStatusPageMissesAreNotCacheable(t *testing.T) {
+	h, _, cookie := statusPageFixture(t, false)
+	createStatusPage(t, h, cookie,
+		`{"slug":"down","title":"Taken down","enabled":false,"target_ids":["probe_1"]}`)
+
+	for _, path := range []string{
+		"/api/v1/public/pages/never-existed",
+		"/api/v1/public/pages/down",
+		"/api/v1/public/pages/down/target-statuses",
+	} {
+		w := doJSON(t, h, http.MethodGet, path, "", nil)
+		if w.Code != http.StatusNotFound {
+			t.Fatalf("%s status=%d, want 404", path, w.Code)
+		}
+		if cc := w.Header().Get("Cache-Control"); cc != "no-store" {
+			t.Errorf("%s Cache-Control = %q on a miss, want no-store", path, cc)
+		}
+	}
+}
+
 // ---- the anonymous surface ----
 
 func TestPublicStatusPageServesWithoutASession(t *testing.T) {

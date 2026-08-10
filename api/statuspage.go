@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log"
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
@@ -199,18 +200,25 @@ func (d Deps) servePublic(w http.ResponseWriter, r *http.Request, load func(slug
 		writeError(w, http.StatusServiceUnavailable, "status pages unavailable")
 		return
 	}
+	// Set before the read, so a MISS carries it too. A 404 without cache headers
+	// is heuristically cacheable, and a browser or CDN that retains one keeps
+	// answering 404 for a slug the operator has since created or re-enabled —
+	// with nothing in the console to explain why the page is still "missing".
+	w.Header().Set("Cache-Control", "no-store")
+
 	out, err := load(chi.URLParam(r, "slug"))
 	if err != nil {
 		if errors.Is(err, statuspage.ErrPageNotFound) {
 			writeError(w, http.StatusNotFound, "page not found")
 			return
 		}
-		writeError(w, http.StatusInternalServerError, err.Error())
+		// Anonymous caller: the error text stays server-side. A driver error names
+		// tables, columns and file paths, and this is the one endpoint in the router
+		// where the reader is a stranger.
+		log.Printf("statuspage: public read %q: %v", chi.URLParam(r, "slug"), err)
+		writeError(w, http.StatusInternalServerError, "status page unavailable")
 		return
 	}
-	// Anonymous readers poll; a cache that outlives the page's own refresh would
-	// show a stale board with no way to force a reload.
-	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, http.StatusOK, out)
 }
 
