@@ -14,35 +14,8 @@ import (
 	"github.com/nettact/server-core/fault"
 )
 
-// unreferencedSceneRetention is how long a scene that never found a fault is
-// kept. An agent legitimately collects one without a server-side verdict ever
-// following — its local streak crossed and the rounds recovered before this
-// server's profile confirmed anything — and once nothing can reference such a
-// report it is invisible, because every read path is incident-scoped.
-//
-// It has to cover the gap a supported configuration can put between the agent
-// collecting a scene and this server confirming the fault that owns it: (server
-// threshold - agent threshold) rounds of the target's own interval. A week
-// covers the ordinary spread, including a daily monitor on a profile confirming
-// two rounds after the agent's own threshold, and costs little — scenes are
-// individually capped and an agent produces at most one a minute per server,
-// only on real fault edges.
-//
-// It does NOT cover the extreme: fail_rounds accepts up to 20, so a daily
-// monitor configured that way would confirm seventeen days after its scene
-// arrived, and the sweep deletes the scene first. Sizing for that would mean
-// three weeks of unclaimed scenes, and a target flapping faster than its own
-// confirmation threshold would then accumulate them at one a minute with nothing
-// ever claiming them — an unbounded store, which is a worse failure than a lost
-// scene on an absurd setting. Sizing the horizon from the site's own settings,
-// with a per-agent cap, is the real fix; see the backlog.
-const unreferencedSceneRetention = 7 * 24 * time.Hour
-
 // sceneClaimWindow is how far back a claim looks for a scene, and how old a
-// signal may be and still own one. It matches unreferencedSceneRetention on
-// purpose: a scene is claimable for exactly as long as it is kept, and a rule
-// that expired the claim earlier would keep evidence it had already decided
-// nothing may ever look at.
+// signal may be and still own one.
 //
 // It is deliberately much wider than the traceroute claimWindow. A trace is
 // claimed against a fault confirmed on the same rounds that triggered it, so
@@ -52,12 +25,41 @@ const unreferencedSceneRetention = 7 * 24 * time.Hour
 // a supported, default configuration — that is an hour between the scene
 // arriving and the signal that owns it existing. Under a fifteen-minute cutoff
 // the exact agent/monitor/generation match would be rejected on age alone and
-// the scene could never be claimed at all.
+// the scene could never be claimed at all. A week covers the ordinary spread,
+// including a daily monitor confirming two rounds after the agent's threshold.
+//
+// It does NOT cover the extreme: fail_rounds accepts up to 20, so a daily
+// monitor configured that way would confirm seventeen days after its scene
+// arrived. Sizing for that would mean three weeks of unclaimed scenes, and a
+// target flapping faster than its own confirmation threshold would then
+// accumulate them at one a minute with nothing ever claiming them — an unbounded
+// store, which is a worse failure than a lost scene on an absurd setting. Sizing
+// the horizon from the site's own settings, with a per-agent cap, is the real
+// fix; see the backlog.
 //
 // Widening it costs nothing in precision, because precision does not come from
 // the window: it comes from the owner rules below, which pick the outage that
 // contains the edge. The window only bounds the search.
-const sceneClaimWindow = unreferencedSceneRetention
+const sceneClaimWindow = 7 * 24 * time.Hour
+
+// sceneRetentionGrace is how long a scene outlives its own claimability.
+//
+// Retention must not delete on the same boundary the claim query filters on. The
+// reconciler runs hourly and selects on received_at >= now-sceneClaimWindow, so
+// with an equal cutoff a scene whose confirmation failed in the last hour of its
+// life would age out of the query and be deleted by the retention call in that
+// very same pass — the durable backstop losing evidence exactly at the edge it
+// exists to cover. The grace is comfortably more than one scheduling interval,
+// so the last pass that can still claim a scene always precedes the pass that
+// may delete it.
+const sceneRetentionGrace = 2 * time.Hour
+
+// unreferencedSceneRetention is how long a scene that never found a fault is
+// kept. An agent legitimately collects one without a server-side verdict ever
+// following — its local streak crossed and the rounds recovered before this
+// server's profile confirmed anything — and once nothing can reference such a
+// report it is invisible, because every read path is incident-scoped.
+const unreferencedSceneRetention = sceneClaimWindow + sceneRetentionGrace
 
 // clockAheadFlagMs is how far an agent's collection time may run PAST this
 // server's receipt before the scene is flagged as clock-skewed.
@@ -695,9 +697,10 @@ func (s *Service) claimScenes(ctx context.Context, ev fault.SignalEvent) error {
 	return nil
 }
 
-// ReconcileSceneClaims files any scene that is still referenced by nothing
-// against a signal that now owns it. The server drives it from Recover and from
-// the maintenance tick.
+// ReconcileSceneClaims files any scene still holding fewer references than it has
+// triggers against whatever signal now owns each unclaimed one. The server drives
+// it from Recover at startup and from the hourly worker, immediately before
+// retention deletes what nothing referenced.
 //
 // It is the durable backstop for a claim that only ever had one chance. A scene
 // arriving before its fault is stored unattached, and the ONLY thing that comes
