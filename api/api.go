@@ -337,9 +337,11 @@ func Router(d Deps) http.Handler {
 		})
 	})
 
-	// Embedded SPA (served for any non-/api path) when provided.
+	// Embedded SPA (served for any non-/api path) when provided. homeGate wraps it
+	// so that an anonymous GET / can be diverted to the operator's nominated
+	// status page; every other path passes straight through (see statuspage.go).
 	if d.SPA != nil {
-		r.Handle("/*", d.SPA)
+		r.Handle("/*", d.homeGate(d.SPA))
 	}
 	return r
 }

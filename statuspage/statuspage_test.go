@@ -730,3 +730,142 @@ func TestSnapshotCacheIsPerSite(t *testing.T) {
 		t.Fatalf("cross-site bleed: %q / %q", first.Targets[0].Name, second.Targets[0].Name)
 	}
 }
+
+// The home flag is the server's single root URL, so the interesting behaviour is
+// not that it can be set but that setting it somewhere else MOVES it.
+
+func TestSettingHomeTakesItFromThePageThatHadIt(t *testing.T) {
+	svc, _ := newFixture(t)
+	ctx := context.Background()
+
+	first := fullSpec()
+	first.IsHome = true
+	a, err := svc.Create(ctx, "site_default", first)
+	if err != nil {
+		t.Fatalf("create a: %v", err)
+	}
+	if !a.IsHome {
+		t.Fatal("first page did not keep the home flag it was created with")
+	}
+
+	second := fullSpec()
+	second.Slug, second.IsHome = "office", true
+	b, err := svc.Create(ctx, "site_default", second)
+	if err != nil {
+		t.Fatalf("create b: %v", err)
+	}
+	if !b.IsHome {
+		t.Fatal("second page did not take the home flag")
+	}
+
+	// The point of the whole exercise: a is demoted rather than the write failing
+	// on the partial unique index.
+	reread, err := svc.Get(ctx, a.ID)
+	if err != nil {
+		t.Fatalf("re-get a: %v", err)
+	}
+	if reread.IsHome {
+		t.Error("both pages claim to be the home page")
+	}
+
+	slug, ok, err := svc.HomeSlug(ctx)
+	if err != nil || !ok || slug != "office" {
+		t.Fatalf("HomeSlug = %q,%v,%v; want \"office\",true,nil", slug, ok, err)
+	}
+}
+
+// Re-saving the page that already holds the flag must not demote it — clearHome's
+// exceptID is the only thing standing between "save with no changes" and "the
+// server has no home page any more".
+func TestUpdatingTheHomePageKeepsItHome(t *testing.T) {
+	svc, _ := newFixture(t)
+	ctx := context.Background()
+
+	spec := fullSpec()
+	spec.IsHome = true
+	page, err := svc.Create(ctx, "site_default", spec)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	spec.Title = "Home lab (renamed)"
+	updated, err := svc.Update(ctx, page.ID, spec)
+	if err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if !updated.IsHome {
+		t.Fatal("re-saving the home page cleared its own flag")
+	}
+	if slug, ok, _ := svc.HomeSlug(ctx); !ok || slug != "home" {
+		t.Fatalf("HomeSlug = %q,%v; want \"home\",true", slug, ok)
+	}
+}
+
+func TestHomeSlugIgnoresUnpublishedAndAbsentHomePages(t *testing.T) {
+	svc, _ := newFixture(t)
+	ctx := context.Background()
+
+	if _, ok, err := svc.HomeSlug(ctx); ok || err != nil {
+		t.Fatalf("HomeSlug on an empty server = %v,%v; want false,nil", ok, err)
+	}
+
+	spec := fullSpec()
+	spec.IsHome = true
+	page, err := svc.Create(ctx, "site_default", spec)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, ok, _ := svc.HomeSlug(ctx); !ok {
+		t.Fatal("published home page did not resolve")
+	}
+
+	// Taking the page down reads as "no such page" everywhere else in this
+	// package; the root URL must not be the exception that keeps publishing it.
+	spec.Enabled = false
+	if _, err := svc.Update(ctx, page.ID, spec); err != nil {
+		t.Fatalf("unpublish: %v", err)
+	}
+	if _, ok, err := svc.HomeSlug(ctx); ok || err != nil {
+		t.Fatalf("HomeSlug for an unpublished home page = %v,%v; want false,nil", ok, err)
+	}
+
+	// ...and re-publishing brings it back, rather than the flag having been eaten.
+	spec.Enabled = true
+	if _, err := svc.Update(ctx, page.ID, spec); err != nil {
+		t.Fatalf("republish: %v", err)
+	}
+	if slug, ok, _ := svc.HomeSlug(ctx); !ok || slug != "home" {
+		t.Fatalf("HomeSlug after republish = %q,%v; want \"home\",true", slug, ok)
+	}
+}
+
+// The public DTO carries is_home because the status app shows a console link
+// only on the page that is the front door.
+func TestPublicPageReportsHome(t *testing.T) {
+	svc, _ := newFixture(t)
+	ctx := context.Background()
+
+	plain := fullSpec()
+	if _, err := svc.Create(ctx, "site_default", plain); err != nil {
+		t.Fatalf("create plain: %v", err)
+	}
+	pub, err := svc.PublicPage(ctx, "home")
+	if err != nil {
+		t.Fatalf("public page: %v", err)
+	}
+	if pub.IsHome {
+		t.Error("an ordinary page reported itself as the home page")
+	}
+
+	home := fullSpec()
+	home.Slug, home.IsHome = "office", true
+	if _, err := svc.Create(ctx, "site_default", home); err != nil {
+		t.Fatalf("create home: %v", err)
+	}
+	pub, err = svc.PublicPage(ctx, "office")
+	if err != nil {
+		t.Fatalf("public home page: %v", err)
+	}
+	if !pub.IsHome {
+		t.Error("the home page did not report itself as such")
+	}
+}

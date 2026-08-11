@@ -379,3 +379,131 @@ func TestPublicStatusPageOverridesDevCORS(t *testing.T) {
 		t.Errorf("Allow-Credentials = %q, want publicCORS to have removed devCORS's", got)
 	}
 }
+
+// ---- the root URL ----
+
+// stubSPA stands in for the console shell. The real one is a built dist supplied
+// by the host binary; all this test needs is something distinguishable from a
+// redirect.
+const stubSPABody = "console shell"
+
+// rootFixture is statusPageFixture plus an SPA, because homeGate only exists when
+// one is mounted. Kept separate rather than adding a parameter to the shared
+// helper: every other status-page test asserts on the API surface, and giving
+// them a root handler they never call would only invite confusion about which
+// handler answered.
+func rootFixture(t *testing.T) (http.Handler, *http.Cookie) {
+	t.Helper()
+	db := storetest.Open(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	exec := func(q string, args ...any) {
+		t.Helper()
+		if _, err := db.ExecContext(ctx, q, args...); err != nil {
+			t.Fatalf("exec %q: %v", q, err)
+		}
+	}
+	exec(`INSERT INTO sites(id,name,created_at) VALUES('site_default','def',?)`, now)
+	exec(`INSERT INTO monitor_groups(id,site_id,name,is_default) VALUES('mg','site_default','Default',1)`)
+	exec(`INSERT INTO probe_tasks(id, site_id, group_id, kind, target, name, enabled)
+		VALUES('probe_1','site_default','mg','http','https://internal.example','Website',1)`)
+
+	id := identity.New(db)
+	admin, _, err := id.EnsureAdmin(ctx, "admin", "correct-horse-battery")
+	if err != nil {
+		t.Fatalf("EnsureAdmin: %v", err)
+	}
+	session, _, err := id.CreateSession(ctx, admin.ID)
+	if err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	d := Deps{
+		Identity:   id,
+		Audit:      audit.New(db),
+		StatusPage: statuspage.New(db, targetstatus.New(db, nil), agentstatus.New(db, nil, settings.New(db)), nil),
+		SPA: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = w.Write([]byte(stubSPABody))
+		}),
+	}
+	return Router(d), &http.Cookie{Name: sessionCookie, Value: session}
+}
+
+const homePagePayload = `{"slug":"home","title":"Home lab","enabled":true,
+	"show_agent_view":false,"show_target_view":true,"is_home":true,
+	"agent_group_ids":[],"target_ids":["probe_1"]}`
+
+func TestRootRedirectsToHomeStatusPage(t *testing.T) {
+	h, cookie := rootFixture(t)
+
+	// No home page yet: the root is the console, exactly as before this feature.
+	if w := doJSON(t, h, http.MethodGet, "/", "", nil); w.Code != http.StatusOK ||
+		w.Body.String() != stubSPABody {
+		t.Fatalf("root with no home page: status=%d body=%q; want 200 + the SPA", w.Code, w.Body.String())
+	}
+
+	page := createStatusPage(t, h, cookie, homePagePayload)
+	if !page.IsHome {
+		t.Fatalf("created page did not take the home flag: %+v", page)
+	}
+
+	// GET and HEAD must behave identically. HEAD is the reason homeGate wraps the
+	// SPA instead of registering its own "/" route: a static route would match the
+	// path, miss the method, and answer 405.
+	for _, method := range []string{http.MethodGet, http.MethodHead} {
+		w := doJSON(t, h, method, "/", "", nil)
+		if w.Code != http.StatusFound {
+			t.Errorf("anonymous %s /: status=%d; want 302", method, w.Code)
+			continue
+		}
+		if got, want := w.Header().Get("Location"), "/status/#/home"; got != want {
+			t.Errorf("anonymous %s / Location=%q; want %q", method, got, want)
+		}
+		// Without no-store a cached redirect outlives the setting that caused it,
+		// and even signing in would not get the admin back to the console.
+		if got := w.Header().Get("Cache-Control"); got != "no-store" {
+			t.Errorf("anonymous %s / Cache-Control=%q; want no-store", method, got)
+		}
+	}
+
+	// A signed-in admin asked for the console and gets the console.
+	if w := doJSON(t, h, http.MethodGet, "/", "", cookie); w.Code != http.StatusOK ||
+		w.Body.String() != stubSPABody {
+		t.Errorf("authenticated GET /: status=%d body=%q; want 200 + the SPA", w.Code, w.Body.String())
+	}
+
+	// Only the root is diverted. A bookmarked console deep link must still reach
+	// the SPA, whose own guard sends it to /login.
+	if w := doJSON(t, h, http.MethodGet, "/monitoring", "", nil); w.Code != http.StatusOK ||
+		w.Body.String() != stubSPABody {
+		t.Errorf("anonymous GET /monitoring: status=%d body=%q; want 200 + the SPA", w.Code, w.Body.String())
+	}
+
+	// Unpublishing the home page reads as "no such page" here too.
+	unpublished := strings.Replace(homePagePayload, `"enabled":true`, `"enabled":false`, 1)
+	if w := doJSON(t, h, http.MethodPut, "/api/v1/status-pages/"+page.ID, unpublished, cookie); w.Code != http.StatusOK {
+		t.Fatalf("unpublish: status=%d body=%s", w.Code, w.Body.String())
+	}
+	if w := doJSON(t, h, http.MethodGet, "/", "", nil); w.Code != http.StatusOK ||
+		w.Body.String() != stubSPABody {
+		t.Errorf("root with an unpublished home page: status=%d; want 200 + the SPA", w.Code)
+	}
+}
+
+// The anonymous DTO carries is_home so the board can decide whether to offer a
+// way back to the console.
+func TestPublicPageWireCarriesIsHome(t *testing.T) {
+	h, cookie := rootFixture(t)
+	createStatusPage(t, h, cookie, homePagePayload)
+
+	w := doJSON(t, h, http.MethodGet, "/api/v1/public/pages/home", "", nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("public page: status=%d body=%s", w.Code, w.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got, ok := body["is_home"]; !ok || got != true {
+		t.Errorf("public page is_home = %v (present=%v); want true", got, ok)
+	}
+}

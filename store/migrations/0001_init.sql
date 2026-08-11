@@ -1530,10 +1530,35 @@ CREATE TABLE status_pages(
   -- byte totals and mount paths describe the MACHINE rather than its service and
   -- stay opt-in, the same call show_target_address makes above.
   agent_metrics       TEXT NOT NULL DEFAULT 'basic',
+  -- This server's front door. When set, a GET / carrying no session redirects to
+  -- /status/#/<slug> instead of serving the console shell; an admin with a
+  -- session still gets the console, because they asked for the console.
+  --
+  -- Uniqueness is GLOBAL rather than per site, for the same reason slug is:
+  -- there is exactly one root URL, and it resolves without a site in it. Setting
+  -- the flag clears it everywhere else inside the same write transaction (see
+  -- statuspage.clearHome), and the partial index below is the real guarantee
+  -- behind that.
+  --
+  -- Deliberately independent of `enabled`: a page taken down reads as "no such
+  -- page" everywhere else in this feature, and the home lookup requires
+  -- enabled=1, so an unpublished home page simply has no effect until it is
+  -- published again. That is less surprising than forcing the operator to clear
+  -- one flag before they may set the other.
+  --
+  -- Not to be confused with the DEPLOYMENT-layer default page (`page` in the
+  -- status app's config.js, see docs/*/status-page-domain.md). That one serves
+  -- the "status page on its own domain" topology and only applies when the URL
+  -- carries no #/<slug>; the redirect this column produces always carries an
+  -- explicit slug, so the two can never overwrite each other.
+  is_home             INTEGER NOT NULL DEFAULT 0,
   created_at          TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at          TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX idx_status_pages_site ON status_pages(site_id);
+-- At most one home page, server-wide. Partial so that the unlimited number of
+-- is_home=0 rows stays unconstrained.
+CREATE UNIQUE INDEX idx_status_pages_home ON status_pages(is_home) WHERE is_home=1;
 
 -- Membership cascades from both sides: dropping a page takes its selections with
 -- it, and deleting an agent group or target removes it from every page that

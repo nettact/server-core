@@ -31,7 +31,12 @@ type PublicPage struct {
 	ShowTargetView    bool      `json:"show_target_view"`
 	ShowIncidents     bool      `json:"show_incidents"`
 	ShowTargetAddress bool      `json:"show_target_address"`
-	GeneratedAt       time.Time `json:"generated_at"`
+	// IsHome tells the page it is this server's front door, which is the ONLY
+	// condition under which it offers a link back to the console. It discloses
+	// nothing a stranger could not already observe: visiting the root and being
+	// redirected here says the same thing.
+	IsHome      bool      `json:"is_home"`
+	GeneratedAt time.Time `json:"generated_at"`
 }
 
 // PublicAgentRow is one published agent. Name is the operator-set display name
@@ -220,6 +225,7 @@ type pageRow struct {
 	showTargetView    bool
 	showIncidents     bool
 	agentMetrics      string
+	isHome            bool
 }
 
 // PublicPage resolves a slug to its public description.
@@ -236,6 +242,7 @@ func (s *Service) PublicPage(ctx context.Context, slug string) (PublicPage, erro
 		ShowTargetView:    p.showTargetView,
 		ShowIncidents:     p.showIncidents,
 		ShowTargetAddress: p.showTargetAddress,
+		IsHome:            p.isHome,
 		GeneratedAt:       s.now().UTC(),
 	}, nil
 }
@@ -765,14 +772,14 @@ func (s *Service) resolve(ctx context.Context, slug string) (pageRow, error) {
 
 const publicPageQuery = `
 	SELECT id, site_id, slug, title, description, show_target_address, show_agent_view,
-	       show_target_view, show_incidents, agent_metrics
+	       show_target_view, show_incidents, agent_metrics, is_home
 	FROM status_pages WHERE slug=? AND enabled=1`
 
 func scanPageRow(row *sql.Row) (pageRow, error) {
 	var p pageRow
 	err := row.Scan(&p.id, &p.siteID, &p.slug, &p.title, &p.description,
 		&p.showTargetAddress, &p.showAgentView, &p.showTargetView, &p.showIncidents,
-		&p.agentMetrics)
+		&p.agentMetrics, &p.isHome)
 	if errors.Is(err, sql.ErrNoRows) {
 		return pageRow{}, ErrPageNotFound
 	}

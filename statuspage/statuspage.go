@@ -148,6 +148,10 @@ type Page struct {
 	// AgentMetrics is off|basic|full — how much resource detail published nodes
 	// disclose. It only means anything when ShowAgentView is on.
 	AgentMetrics string `json:"agent_metrics"`
+	// IsHome marks this page as the server's front door: an anonymous GET / is
+	// redirected to it instead of the console shell. At most one page carries it,
+	// and setting it on a page clears it from whichever page held it before.
+	IsHome bool `json:"is_home"`
 	// Agents are published by GROUP, so what a page names is the operator's own
 	// curation rather than a list of machines that goes stale the moment one is
 	// enrolled. The published node list is each selected group's CURRENT members.
@@ -171,6 +175,7 @@ type Spec struct {
 	ShowTargetView    bool
 	ShowIncidents     bool
 	AgentMetrics      string
+	IsHome            bool
 	AgentGroupIDs     []string
 	TargetIDs         []string
 }
@@ -289,7 +294,7 @@ func (s *Service) List(ctx context.Context, siteID string) ([]Page, error) {
 	rows, err := s.db.Read().QueryContext(ctx, `
 		SELECT id, site_id, slug, title, description, enabled,
 		       show_target_address, show_agent_view, show_target_view, show_incidents,
-		       agent_metrics,
+		       agent_metrics, is_home,
 		       created_at, updated_at
 		FROM status_pages WHERE site_id=? ORDER BY created_at, id`, siteID)
 	if err != nil {
@@ -327,7 +332,7 @@ func (s *Service) Get(ctx context.Context, id string) (Page, error) {
 	row := s.db.Read().QueryRowContext(ctx, `
 		SELECT id, site_id, slug, title, description, enabled,
 		       show_target_address, show_agent_view, show_target_view, show_incidents,
-		       agent_metrics,
+		       agent_metrics, is_home,
 		       created_at, updated_at
 		FROM status_pages WHERE id=?`, id)
 	p, err := scanPage(row)
@@ -355,14 +360,17 @@ func (s *Service) Create(ctx context.Context, siteID string, spec Spec) (Page, e
 		if err := ensureSlugFree(ctx, tx, spec.Slug, ""); err != nil {
 			return err
 		}
+		if err := clearHome(ctx, tx, spec, "", now); err != nil {
+			return err
+		}
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO status_pages(id, site_id, slug, title, description, enabled,
 			                         show_target_address, show_agent_view, show_target_view,
-			                         show_incidents, agent_metrics, created_at, updated_at)
-			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+			                         show_incidents, agent_metrics, is_home, created_at, updated_at)
+			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 			id, siteID, spec.Slug, strings.TrimSpace(spec.Title), spec.Description, spec.Enabled,
 			spec.ShowTargetAddress, spec.ShowAgentView, spec.ShowTargetView, spec.ShowIncidents,
-			spec.AgentMetrics,
+			spec.AgentMetrics, spec.IsHome,
 			now, now); err != nil {
 			return err
 		}
@@ -391,16 +399,20 @@ func (s *Service) Update(ctx context.Context, id string, spec Spec) (Page, error
 		if err := ensureSlugFree(ctx, tx, spec.Slug, id); err != nil {
 			return err
 		}
+		now := s.now().UTC()
+		if err := clearHome(ctx, tx, spec, id, now); err != nil {
+			return err
+		}
 		if _, err := tx.ExecContext(ctx, `
 			UPDATE status_pages
 			   SET slug=?, title=?, description=?, enabled=?,
 			       show_target_address=?, show_agent_view=?, show_target_view=?,
-			       show_incidents=?, agent_metrics=?, updated_at=?
+			       show_incidents=?, agent_metrics=?, is_home=?, updated_at=?
 			 WHERE id=?`,
 			spec.Slug, strings.TrimSpace(spec.Title), spec.Description, spec.Enabled,
 			spec.ShowTargetAddress, spec.ShowAgentView, spec.ShowTargetView, spec.ShowIncidents,
-			spec.AgentMetrics,
-			s.now().UTC(), id); err != nil {
+			spec.AgentMetrics, spec.IsHome,
+			now, id); err != nil {
 			return err
 		}
 		return replaceMembers(ctx, tx, id, siteID, spec)
@@ -443,7 +455,7 @@ func scanPage(sc rowScanner) (Page, error) {
 	var p Page
 	err := sc.Scan(&p.ID, &p.SiteID, &p.Slug, &p.Title, &p.Description, &p.Enabled,
 		&p.ShowTargetAddress, &p.ShowAgentView, &p.ShowTargetView, &p.ShowIncidents,
-		&p.AgentMetrics,
+		&p.AgentMetrics, &p.IsHome,
 		&p.CreatedAt, &p.UpdatedAt)
 	if err != nil {
 		return Page{}, err
@@ -487,6 +499,59 @@ func (s *Service) loadMembers(ctx context.Context, siteID string, byID map[strin
 		  JOIN status_pages p ON p.id = m.page_id
 		 WHERE p.site_id=? ORDER BY m.target_id`,
 		func(p *Page, id string) { p.TargetIDs = append(p.TargetIDs, id) })
+}
+
+// clearHome demotes whatever page currently holds the home flag, so the caller
+// can claim it. A no-op unless the spec is actually claiming it.
+//
+// Setting a home page TAKES it rather than being refused, and that is a UX
+// decision worth writing down. The alternative — answer 409 and make the
+// operator go clear the other page first — is more explicit but describes a
+// state nobody wants to be in: two pages cannot both be the front door, so the
+// second save is unambiguous about intent. The console says which page is about
+// to lose the flag before the save, which is where that information is useful;
+// discovering it as an error afterwards is not.
+//
+// It must run BEFORE the caller writes its own row. The partial unique index
+// admits exactly one is_home=1 row, so claiming first and demoting second would
+// trip the constraint inside the same statement pair. Both live in the caller's
+// transaction, which is what makes the swap atomic — a reader can see the old
+// home or the new one, never two and never none.
+//
+// exceptID keeps an update of the page that ALREADY holds the flag from
+// demoting itself (Create passes "", which matches no id).
+func clearHome(ctx context.Context, tx *sql.Tx, spec Spec, exceptID string, now time.Time) error {
+	if !spec.IsHome {
+		return nil
+	}
+	_, err := tx.ExecContext(ctx,
+		`UPDATE status_pages SET is_home=0, updated_at=? WHERE is_home=1 AND id<>?`, now, exceptID)
+	return err
+}
+
+// HomeSlug returns the slug of the published page nominated as this server's
+// home page, and whether there is one.
+//
+// enabled=1 is part of the query rather than a caller's check: a page taken down
+// reads as "no such page" everywhere else in this package, and the root URL is
+// not the place to start making an exception. An unpublished home page simply
+// means the root serves the console again, and republishing brings it back.
+//
+// Uncached on purpose. It hits a partial unique index and returns at most one
+// row, and it only runs for document-level GET / — the status board's 30s poll
+// talks to /api/v1/public/*, which never reaches here. That is cheaper than the
+// file I/O the SPA fallback was about to do anyway.
+func (s *Service) HomeSlug(ctx context.Context) (string, bool, error) {
+	var slug string
+	err := s.db.Read().QueryRowContext(ctx,
+		`SELECT slug FROM status_pages WHERE is_home=1 AND enabled=1`).Scan(&slug)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return slug, true, nil
 }
 
 func (s *Service) inTx(ctx context.Context, fn func(tx *sql.Tx) error) error {
