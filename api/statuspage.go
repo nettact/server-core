@@ -26,10 +26,12 @@ import (
 
 const maxStatusPageBodyBytes = 1 << 20
 
-// statusPageBody is the create/update payload. Enabled and the two view toggles
+// statusPageBody is the create/update payload. Enabled and the two primary view toggles
 // are pointers so an omitted field takes the sensible default (published, both
 // views shown) instead of silently creating an invisible page; show_target_address
 // defaults to false, which is the safe direction and so needs no pointer.
+// agent_metrics is a string whose empty value means "unset" for the same reason a
+// pointer would, so it takes the package default rather than the zero enum.
 type statusPageBody struct {
 	Slug              string   `json:"slug"`
 	Title             string   `json:"title"`
@@ -38,6 +40,8 @@ type statusPageBody struct {
 	ShowTargetAddress bool     `json:"show_target_address"`
 	ShowAgentView     *bool    `json:"show_agent_view"`
 	ShowTargetView    *bool    `json:"show_target_view"`
+	ShowIncidents     bool     `json:"show_incidents"`
+	AgentMetrics      string   `json:"agent_metrics"`
 	AgentGroupIDs     []string `json:"agent_group_ids"`
 	TargetIDs         []string `json:"target_ids"`
 }
@@ -49,6 +53,10 @@ func (b statusPageBody) toSpec() statuspage.Spec {
 		}
 		return def
 	}
+	agentMetrics := b.AgentMetrics
+	if agentMetrics == "" {
+		agentMetrics = statuspage.DefaultAgentMetrics
+	}
 	return statuspage.Spec{
 		Slug:              b.Slug,
 		Title:             b.Title,
@@ -57,6 +65,8 @@ func (b statusPageBody) toSpec() statuspage.Spec {
 		ShowTargetAddress: b.ShowTargetAddress,
 		ShowAgentView:     boolOr(b.ShowAgentView, true),
 		ShowTargetView:    boolOr(b.ShowTargetView, true),
+		ShowIncidents:     b.ShowIncidents,
+		AgentMetrics:      agentMetrics,
 		AgentGroupIDs:     b.AgentGroupIDs,
 		TargetIDs:         b.TargetIDs,
 	}
@@ -237,5 +247,11 @@ func (d Deps) handlePublicStatusPageAgents(w http.ResponseWriter, r *http.Reques
 func (d Deps) handlePublicStatusPageTargets(w http.ResponseWriter, r *http.Request) {
 	d.servePublic(w, r, func(slug string) (any, error) {
 		return d.StatusPage.PublicTargetStatuses(r.Context(), slug)
+	})
+}
+
+func (d Deps) handlePublicStatusPageIncidents(w http.ResponseWriter, r *http.Request) {
+	d.servePublic(w, r, func(slug string) (any, error) {
+		return d.StatusPage.PublicIncidentHistory(r.Context(), slug)
 	})
 }

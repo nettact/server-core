@@ -59,7 +59,7 @@ func statusPageFixture(t *testing.T, dev bool) (http.Handler, *store.DB, *http.C
 	d := Deps{
 		Identity:   id,
 		Audit:      audit.New(db),
-		StatusPage: statuspage.New(db, targetstatus.New(db, nil), agentstatus.New(db, nil, settings.New(db))),
+		StatusPage: statuspage.New(db, targetstatus.New(db, nil), agentstatus.New(db, nil, settings.New(db)), nil),
 		Dev:        dev,
 	}
 	return Router(d), db, &http.Cookie{Name: sessionCookie, Value: session}
@@ -83,7 +83,7 @@ func doJSON(t *testing.T, h http.Handler, method, url, body string, cookie *http
 }
 
 const statusPagePayload = `{"slug":"home","title":"Home lab","description":"hi",
-	"enabled":true,"show_target_address":false,"show_agent_view":true,"show_target_view":true,
+	"enabled":true,"show_target_address":false,"show_agent_view":true,"show_target_view":true,"show_incidents":true,
 	"agent_group_ids":["ag_1"],"target_ids":["probe_1"]}`
 
 func createStatusPage(t *testing.T, h http.Handler, cookie *http.Cookie, payload string) statuspage.Page {
@@ -103,7 +103,7 @@ func TestStatusPageAdminCRUDRoundTrip(t *testing.T) {
 	h, _, cookie := statusPageFixture(t, false)
 
 	page := createStatusPage(t, h, cookie, statusPagePayload)
-	if page.ID == "" || page.Slug != "home" || len(page.AgentGroupIDs) != 1 || len(page.TargetIDs) != 1 {
+	if page.ID == "" || page.Slug != "home" || !page.ShowIncidents || len(page.AgentGroupIDs) != 1 || len(page.TargetIDs) != 1 {
 		t.Fatalf("created page = %+v", page)
 	}
 
@@ -160,7 +160,7 @@ func TestStatusPageAdminRejectsBadRequests(t *testing.T) {
 	}{
 		{"bad slug", `{"slug":"Not A Slug","title":"x"}`, http.StatusBadRequest},
 		{"empty title", `{"slug":"ok","title":"  "}`, http.StatusBadRequest},
-		{"both views hidden", `{"slug":"ok","title":"x","show_agent_view":false,"show_target_view":false}`, http.StatusBadRequest},
+		{"all views hidden", `{"slug":"ok","title":"x","show_agent_view":false,"show_target_view":false,"show_incidents":false}`, http.StatusBadRequest},
 		{"unknown agent group", `{"slug":"ok","title":"x","agent_group_ids":["ag_nope"]}`, http.StatusBadRequest},
 		{"unknown target", `{"slug":"ok","title":"x","target_ids":["probe_nope"]}`, http.StatusBadRequest},
 		{"duplicate slug", `{"slug":"home","title":"x"}`, http.StatusConflict},
@@ -243,6 +243,7 @@ func TestPublicStatusPageServesWithoutASession(t *testing.T) {
 		"/api/v1/public/pages/home",
 		"/api/v1/public/pages/home/agent-statuses",
 		"/api/v1/public/pages/home/target-statuses",
+		"/api/v1/public/pages/home/incidents",
 	} {
 		w := doJSON(t, h, http.MethodGet, path, "", nil)
 		if w.Code != http.StatusOK {
@@ -287,13 +288,18 @@ func TestPublicStatusPageWithholdsInternalDetail(t *testing.T) {
 	for _, path := range []string{
 		"/api/v1/public/pages/home/agent-statuses",
 		"/api/v1/public/pages/home/target-statuses",
+		"/api/v1/public/pages/home/incidents",
 	} {
 		body := doJSON(t, h, http.MethodGet, path, "", nil).Body.String()
 		for _, leak := range []string{
 			"secret-hostname",                    // the agent's hostname
 			"https://internal.example",           // the target address, not opted into
 			"agent_a", "probe_1", "site_default", // internal ids
-			"resources", "params", "proxy", "incident", "signal_ids",
+			"params", "proxy", "incident_id", "signal_ids",
+			// Node resources publish at the DEFAULT level here, so the figures
+			// that describe the machine rather than its health must still be
+			// absent: those need agent_metrics=full, which nobody asked for.
+			"mem_used", "mem_total", "disk_used", "disk_total", "disk_mount",
 		} {
 			if strings.Contains(body, leak) {
 				t.Errorf("%s leaked %q: %s", path, leak, body)
@@ -321,12 +327,15 @@ func TestEveryPublicMissIsTheSameResponse(t *testing.T) {
 		`{"slug":"down","title":"Taken down","enabled":false,"target_ids":["probe_1"]}`)
 	createStatusPage(t, h, cookie,
 		`{"slug":"agents-only","title":"Agents","show_target_view":false,"agent_group_ids":["ag_1"]}`)
+	createStatusPage(t, h, cookie,
+		`{"slug":"no-history","title":"No history","show_incidents":false,"target_ids":["probe_1"]}`)
 
 	paths := []string{
 		"/api/v1/public/pages/never-existed",
 		"/api/v1/public/pages/down",
 		"/api/v1/public/pages/down/target-statuses",
 		"/api/v1/public/pages/agents-only/target-statuses",
+		"/api/v1/public/pages/no-history/incidents",
 	}
 	var first string
 	for i, path := range paths {

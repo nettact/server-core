@@ -21,11 +21,11 @@
 //     endpoints are directly callable, so anything the UI would hide has to be
 //     absent from the payload rather than merely unrendered.
 //
-// The visibility toggles (enabled, show_agent_view, show_target_view) are read as
-// route existence rather than as flags: when one is off, the public read returns
-// ErrPageNotFound and the API answers exactly as it would for a slug that was
-// never created. Nothing distinguishes "taken down", "view disabled" and "never
-// existed" from outside.
+// The visibility toggles (enabled, show_agent_view, show_target_view,
+// show_incidents) are read as route existence rather than as flags: when one is
+// off, the public read returns ErrPageNotFound and the API answers exactly as it
+// would for a slug that was never created. Nothing distinguishes "taken down",
+// "view disabled" and "never existed" from outside.
 package statuspage
 
 import (
@@ -41,6 +41,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/nettact/server-core/agentstatus"
+	"github.com/nettact/server-core/metrics"
 	"github.com/nettact/server-core/store"
 	"github.com/nettact/server-core/targetstatus"
 )
@@ -84,6 +85,54 @@ const (
 // an edit land almost immediately.
 const defaultCacheTTL = 5 * time.Second
 
+// defaultAvailabilityTTL bounds the reliability breakdown separately, and much
+// more loosely, because it is a different kind of read: five nested windows and
+// ninety day cells scanned from the rollup tiers, against a snapshot that is one
+// SQLite transaction. A 90-day ratio does not move in a minute — it cannot, by
+// construction — so refreshing it at the live board's cadence would buy nothing
+// and cost the most expensive query on the anonymous surface.
+const defaultAvailabilityTTL = 60 * time.Second
+
+// How much a published node discloses about itself. Off is up/down only; basic is
+// percentages and rates; full adds the byte totals and the busiest mount's name.
+// See the agent_metrics column comment in the schema for why this is an enum.
+const (
+	AgentMetricsOff   = "off"
+	AgentMetricsBasic = "basic"
+	AgentMetricsFull  = "full"
+)
+
+// DefaultAgentMetrics is what a page publishes when the field is omitted.
+const DefaultAgentMetrics = AgentMetricsBasic
+
+// validAgentMetrics is the whitelist. An unrecognised value is rejected rather
+// than coerced: silently downgrading a typo to "off" would hide nodes the
+// operator meant to publish, and silently upgrading it would disclose more than
+// they asked for. Neither is a guess worth making on their behalf.
+func validAgentMetrics(v string) bool {
+	switch v {
+	case AgentMetricsOff, AgentMetricsBasic, AgentMetricsFull:
+		return true
+	}
+	return false
+}
+
+// PublicAvailabilityWindows are the reliability windows every public page
+// publishes, narrowest first. The list is fixed server-side rather than taken
+// from the query string: an anonymous caller choosing arbitrary windows would
+// make the cache useless and the scan unbounded, and a status page's job is to
+// answer one well-known question, not to be a query API.
+var PublicAvailabilityWindows = []struct {
+	Token string
+	Dur   time.Duration
+}{
+	{"24h", 24 * time.Hour},
+	{"7d", 7 * 24 * time.Hour},
+	{"30d", 30 * 24 * time.Hour},
+	{"90d", 90 * 24 * time.Hour},
+	{"1y", 365 * 24 * time.Hour},
+}
+
 // Page is the admin-facing view of a status page, selection included.
 type Page struct {
 	ID                string `json:"id"`
@@ -95,6 +144,10 @@ type Page struct {
 	ShowTargetAddress bool   `json:"show_target_address"`
 	ShowAgentView     bool   `json:"show_agent_view"`
 	ShowTargetView    bool   `json:"show_target_view"`
+	ShowIncidents     bool   `json:"show_incidents"`
+	// AgentMetrics is off|basic|full — how much resource detail published nodes
+	// disclose. It only means anything when ShowAgentView is on.
+	AgentMetrics string `json:"agent_metrics"`
 	// Agents are published by GROUP, so what a page names is the operator's own
 	// curation rather than a list of machines that goes stale the moment one is
 	// enrolled. The published node list is each selected group's CURRENT members.
@@ -116,6 +169,8 @@ type Spec struct {
 	ShowTargetAddress bool
 	ShowAgentView     bool
 	ShowTargetView    bool
+	ShowIncidents     bool
+	AgentMetrics      string
 	AgentGroupIDs     []string
 	TargetIDs         []string
 }
@@ -137,8 +192,12 @@ func (s Spec) Validate() error {
 	if len([]rune(s.Description)) > MaxDescriptionLen {
 		return fmt.Errorf("%w: description must be at most %d characters", ErrBadSpec, MaxDescriptionLen)
 	}
-	if !s.ShowAgentView && !s.ShowTargetView {
-		return fmt.Errorf("%w: at least one of the agent and target views must be shown", ErrBadSpec)
+	if !s.ShowAgentView && !s.ShowTargetView && !s.ShowIncidents {
+		return fmt.Errorf("%w: at least one public view must be shown", ErrBadSpec)
+	}
+	if !validAgentMetrics(s.AgentMetrics) {
+		return fmt.Errorf("%w: agent_metrics must be one of %q, %q or %q",
+			ErrBadSpec, AgentMetricsOff, AgentMetricsBasic, AgentMetricsFull)
 	}
 	return nil
 }
@@ -154,9 +213,11 @@ type Service struct {
 	db      *store.DB
 	targets *targetstatus.Service
 	agents  *agentstatus.Service
+	metrics *metrics.Store
 
-	ttl time.Duration
-	now func() time.Time
+	ttl      time.Duration
+	availTTL time.Duration
+	now      func() time.Time
 
 	// mu guards the snapshot cache AND is held across the aggregation call, which
 	// makes concurrent public readers single-flight into one query instead of a
@@ -165,6 +226,21 @@ type Service struct {
 	mu          sync.Mutex
 	targetCache map[string]targetSnapshot
 	agentCache  map[string]agentSnapshot
+
+	// availMu is deliberately NOT mu. The reliability breakdown is the slowest
+	// read here by an order of magnitude and the only one refreshed by the minute;
+	// sharing a lock with the five-second board would make every live poll queue
+	// behind a ninety-day scan that it does not even need.
+	availMu    sync.Mutex
+	availCache map[string]availSnapshot
+
+	// incidentMu is separate for the same reason: the incident CTE is an
+	// anonymous, multi-table history read and must neither block live status
+	// snapshots nor execute once per viewer. Page visibility and the selected
+	// subjects are still read before this cache, so a configuration edit cannot
+	// reuse data published under a different selection.
+	incidentMu    sync.Mutex
+	incidentCache map[string]incidentSnapshot
 }
 
 type targetSnapshot struct {
@@ -177,17 +253,32 @@ type agentSnapshot struct {
 	data agentstatus.SiteAgentStatuses
 }
 
+type availSnapshot struct {
+	at   time.Time
+	data metrics.SiteAvailabilityBreakdown
+}
+
+type incidentSnapshot struct {
+	at        time.Time
+	selection string
+	data      PublicIncidentHistory
+}
+
 // New constructs the service over the shared store and the two status
 // aggregations it republishes.
-func New(db *store.DB, ts *targetstatus.Service, as *agentstatus.Service) *Service {
+func New(db *store.DB, ts *targetstatus.Service, as *agentstatus.Service, m *metrics.Store) *Service {
 	return &Service{
-		db:          db,
-		targets:     ts,
-		agents:      as,
-		ttl:         defaultCacheTTL,
-		now:         time.Now,
-		targetCache: map[string]targetSnapshot{},
-		agentCache:  map[string]agentSnapshot{},
+		db:            db,
+		targets:       ts,
+		agents:        as,
+		metrics:       m,
+		ttl:           defaultCacheTTL,
+		availTTL:      defaultAvailabilityTTL,
+		now:           time.Now,
+		targetCache:   map[string]targetSnapshot{},
+		agentCache:    map[string]agentSnapshot{},
+		availCache:    map[string]availSnapshot{},
+		incidentCache: map[string]incidentSnapshot{},
 	}
 }
 
@@ -197,7 +288,9 @@ func New(db *store.DB, ts *targetstatus.Service, as *agentstatus.Service) *Servi
 func (s *Service) List(ctx context.Context, siteID string) ([]Page, error) {
 	rows, err := s.db.Read().QueryContext(ctx, `
 		SELECT id, site_id, slug, title, description, enabled,
-		       show_target_address, show_agent_view, show_target_view, created_at, updated_at
+		       show_target_address, show_agent_view, show_target_view, show_incidents,
+		       agent_metrics,
+		       created_at, updated_at
 		FROM status_pages WHERE site_id=? ORDER BY created_at, id`, siteID)
 	if err != nil {
 		return nil, err
@@ -233,7 +326,9 @@ func (s *Service) List(ctx context.Context, siteID string) ([]Page, error) {
 func (s *Service) Get(ctx context.Context, id string) (Page, error) {
 	row := s.db.Read().QueryRowContext(ctx, `
 		SELECT id, site_id, slug, title, description, enabled,
-		       show_target_address, show_agent_view, show_target_view, created_at, updated_at
+		       show_target_address, show_agent_view, show_target_view, show_incidents,
+		       agent_metrics,
+		       created_at, updated_at
 		FROM status_pages WHERE id=?`, id)
 	p, err := scanPage(row)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -263,10 +358,12 @@ func (s *Service) Create(ctx context.Context, siteID string, spec Spec) (Page, e
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO status_pages(id, site_id, slug, title, description, enabled,
 			                         show_target_address, show_agent_view, show_target_view,
-			                         created_at, updated_at)
-			VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
+			                         show_incidents, agent_metrics, created_at, updated_at)
+			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 			id, siteID, spec.Slug, strings.TrimSpace(spec.Title), spec.Description, spec.Enabled,
-			spec.ShowTargetAddress, spec.ShowAgentView, spec.ShowTargetView, now, now); err != nil {
+			spec.ShowTargetAddress, spec.ShowAgentView, spec.ShowTargetView, spec.ShowIncidents,
+			spec.AgentMetrics,
+			now, now); err != nil {
 			return err
 		}
 		return replaceMembers(ctx, tx, id, siteID, spec)
@@ -297,10 +394,13 @@ func (s *Service) Update(ctx context.Context, id string, spec Spec) (Page, error
 		if _, err := tx.ExecContext(ctx, `
 			UPDATE status_pages
 			   SET slug=?, title=?, description=?, enabled=?,
-			       show_target_address=?, show_agent_view=?, show_target_view=?, updated_at=?
+			       show_target_address=?, show_agent_view=?, show_target_view=?,
+			       show_incidents=?, agent_metrics=?, updated_at=?
 			 WHERE id=?`,
 			spec.Slug, strings.TrimSpace(spec.Title), spec.Description, spec.Enabled,
-			spec.ShowTargetAddress, spec.ShowAgentView, spec.ShowTargetView, s.now().UTC(), id); err != nil {
+			spec.ShowTargetAddress, spec.ShowAgentView, spec.ShowTargetView, spec.ShowIncidents,
+			spec.AgentMetrics,
+			s.now().UTC(), id); err != nil {
 			return err
 		}
 		return replaceMembers(ctx, tx, id, siteID, spec)
@@ -308,6 +408,7 @@ func (s *Service) Update(ctx context.Context, id string, spec Spec) (Page, error
 	if err != nil {
 		return Page{}, err
 	}
+	s.invalidateIncidentCache(id)
 	return s.Get(ctx, id)
 }
 
@@ -320,7 +421,14 @@ func (s *Service) Delete(ctx context.Context, id string) error {
 	if n, _ := res.RowsAffected(); n == 0 {
 		return ErrNotFound
 	}
+	s.invalidateIncidentCache(id)
 	return nil
+}
+
+func (s *Service) invalidateIncidentCache(pageID string) {
+	s.incidentMu.Lock()
+	delete(s.incidentCache, pageID)
+	s.incidentMu.Unlock()
 }
 
 // ---- internals ----
@@ -334,7 +442,9 @@ type rowScanner interface {
 func scanPage(sc rowScanner) (Page, error) {
 	var p Page
 	err := sc.Scan(&p.ID, &p.SiteID, &p.Slug, &p.Title, &p.Description, &p.Enabled,
-		&p.ShowTargetAddress, &p.ShowAgentView, &p.ShowTargetView, &p.CreatedAt, &p.UpdatedAt)
+		&p.ShowTargetAddress, &p.ShowAgentView, &p.ShowTargetView, &p.ShowIncidents,
+		&p.AgentMetrics,
+		&p.CreatedAt, &p.UpdatedAt)
 	if err != nil {
 		return Page{}, err
 	}

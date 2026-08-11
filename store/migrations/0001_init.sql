@@ -1516,6 +1516,20 @@ CREATE TABLE status_pages(
   show_target_address INTEGER NOT NULL DEFAULT 0,
   show_agent_view     INTEGER NOT NULL DEFAULT 1,
   show_target_view    INTEGER NOT NULL DEFAULT 1,
+  -- Opt-in publication of the selected resources' recent incident history.
+  -- Default off because this is a separate disclosure decision from publishing
+  -- current health; the anonymous endpoint enforces the flag server-side.
+  show_incidents      INTEGER NOT NULL DEFAULT 0,
+  -- How much a published node says about itself: 'off' (up/down only), 'basic'
+  -- (CPU, load, memory, disk, network and uptime as percentages and rates) or
+  -- 'full' (adds used/total bytes and the busiest mount's name).
+  --
+  -- An enum rather than two booleans because the third combination — detail
+  -- without publication — is not a state that should be representable. 'basic' is
+  -- the default: node health is the point of publishing nodes at all, while the
+  -- byte totals and mount paths describe the MACHINE rather than its service and
+  -- stay opt-in, the same call show_target_address makes above.
+  agent_metrics       TEXT NOT NULL DEFAULT 'basic',
   created_at          TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at          TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );

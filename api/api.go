@@ -141,6 +141,17 @@ func Router(d Deps) http.Handler {
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
 	r.Use(middleware.Recoverer)
+	// Nothing else in the stack compresses, so without this every response ships
+	// raw: the console's bundle, the status app's, and the largest JSON here — the
+	// public status payload, which carries ninety daily cells per target. All of
+	// them are text and all of them shrink by roughly two thirds.
+	//
+	// It is safe above the SSE route precisely because it is content-type driven:
+	// chi's allowlist covers html/css/javascript/json and NOT text/event-stream, so
+	// the console's event feed passes through untouched. Widening that allowlist
+	// would buffer live events behind a compressor — compress_test.go holds both
+	// halves of that line.
+	r.Use(middleware.Compress(5))
 	if d.Dev {
 		r.Use(devCORS)
 	}
@@ -161,6 +172,7 @@ func Router(d Deps) http.Handler {
 			r.Get("/pages/{slug}", d.handlePublicStatusPage)
 			r.Get("/pages/{slug}/agent-statuses", d.handlePublicStatusPageAgents)
 			r.Get("/pages/{slug}/target-statuses", d.handlePublicStatusPageTargets)
+			r.Get("/pages/{slug}/incidents", d.handlePublicStatusPageIncidents)
 		})
 
 		// session-protected UI

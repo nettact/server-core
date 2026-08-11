@@ -44,7 +44,7 @@ func newFixture(t *testing.T) (*Service, *store.DB) {
 	seedTarget(t, db, "probe_1", "site_default", "mg", "http", "https://example.com", "Website")
 	seedTarget(t, db, "probe_2", "site_default", "mg", "icmp", "10.0.0.1", "")
 
-	svc := New(db, targetstatus.New(db, nil), agentstatus.New(db, nil, settings.New(db)))
+	svc := New(db, targetstatus.New(db, nil), agentstatus.New(db, nil, settings.New(db)), nil)
 	return svc, db
 }
 
@@ -75,6 +75,7 @@ func fullSpec() Spec {
 	return Spec{
 		Slug: "home", Title: "Home lab", Description: "public",
 		Enabled: true, ShowAgentView: true, ShowTargetView: true,
+		AgentMetrics:  AgentMetricsBasic,
 		AgentGroupIDs: []string{"grp_a"}, TargetIDs: []string{"probe_1"},
 	}
 }
@@ -84,6 +85,7 @@ func TestCreateAndGetRoundTripsTheSelection(t *testing.T) {
 	ctx := context.Background()
 
 	spec := fullSpec()
+	spec.ShowIncidents = true
 	spec.AgentGroupIDs = []string{"grp_a", "grp_b"}
 	spec.TargetIDs = []string{"probe_1", "probe_2"}
 	created, err := svc.Create(ctx, "site_default", spec)
@@ -100,7 +102,7 @@ func TestCreateAndGetRoundTripsTheSelection(t *testing.T) {
 	if len(got.AgentGroupIDs) != 2 || len(got.TargetIDs) != 2 {
 		t.Fatalf("selection = %v / %v, want both members on each side", got.AgentGroupIDs, got.TargetIDs)
 	}
-	if !got.Enabled || !got.ShowAgentView || !got.ShowTargetView || got.ShowTargetAddress {
+	if !got.Enabled || !got.ShowAgentView || !got.ShowTargetView || !got.ShowIncidents || got.ShowTargetAddress {
 		t.Fatalf("toggles = %+v, want the spec's values (address off by default)", got)
 	}
 
@@ -257,7 +259,10 @@ func TestValidateRejectsMalformedSpecs(t *testing.T) {
 		{"slug with trailing dash", func(s Spec) Spec { s.Slug = "home-"; return s }},
 		{"blank title", func(s Spec) Spec { s.Title = "   "; return s }},
 		{"overlong title", func(s Spec) Spec { s.Title = string(make([]rune, MaxTitleLen+1)); return s }},
-		{"both views hidden", func(s Spec) Spec { s.ShowAgentView, s.ShowTargetView = false, false; return s }},
+		{"all views hidden", func(s Spec) Spec {
+			s.ShowAgentView, s.ShowTargetView, s.ShowIncidents = false, false, false
+			return s
+		}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -381,7 +386,7 @@ func TestPublicPageCarriesOnlyItsOwnDescription(t *testing.T) {
 	if page.Slug != "home" || page.Title != "Home lab" || page.Description != "public" {
 		t.Fatalf("page = %+v", page)
 	}
-	if !page.ShowAgentView || !page.ShowTargetView || page.ShowTargetAddress {
+	if !page.ShowAgentView || !page.ShowTargetView || page.ShowIncidents || page.ShowTargetAddress {
 		t.Fatalf("toggles = %+v, want them mirrored for the frontend", page)
 	}
 	if page.GeneratedAt.IsZero() {
