@@ -53,10 +53,11 @@ type PublicAgentRow struct {
 // must render as a gap. A zero would be a lie — "0% CPU" and "not allowed to say"
 // are not the same claim.
 //
-// The byte totals and the mount name are populated only under agent_metrics=full.
-// They are separated from the percentages because they describe the MACHINE (how
-// much RAM it has, how its disks are laid out) rather than how the service it
-// hosts is doing, and only the latter is inherent to publishing a status page.
+// The byte totals are populated only under agent_metrics=full. They are
+// separated from the percentages because they describe the MACHINE (how much
+// RAM and disk capacity it has) rather than how the service it hosts is doing,
+// and only the latter is inherent to publishing a status page. Filesystem mount
+// names and counts never enter this public DTO.
 type PublicResources struct {
 	CPUPct *float64 `json:"cpu_pct,omitempty"`
 	// Load is the 1/5/15-minute load average, in that order — the order every
@@ -67,15 +68,12 @@ type PublicResources struct {
 	MemUsed  *float64 `json:"mem_used,omitempty"`  // bytes; full only
 	MemTotal *float64 `json:"mem_total,omitempty"` // bytes; full only
 
-	// Disk is the BUSIEST mount, matching what the console's agent list shows: a
-	// public page has one line per node, and the mount closest to full is the one
-	// worth that line. DiskMounts says how many there were so a single figure
-	// cannot be mistaken for the whole story.
-	DiskPct    *float64 `json:"disk_pct,omitempty"`
-	DiskUsed   *float64 `json:"disk_used,omitempty"`  // bytes; full only
-	DiskTotal  *float64 `json:"disk_total,omitempty"` // bytes; full only
-	DiskMount  string   `json:"disk_mount,omitempty"` // full only
-	DiskMounts int      `json:"disk_mounts,omitempty"`
+	// Disk is the busiest filesystem, matching what the console's agent list
+	// shows. The anonymous contract publishes its usage but never its mount
+	// identity or the machine's filesystem count.
+	DiskPct   *float64 `json:"disk_pct,omitempty"`
+	DiskUsed  *float64 `json:"disk_used,omitempty"`  // bytes; full only
+	DiskTotal *float64 `json:"disk_total,omitempty"` // bytes; full only
 
 	RxBps *float64 `json:"rx_bps,omitempty"`
 	TxBps *float64 `json:"tx_bps,omitempty"`
@@ -340,13 +338,9 @@ func publicResources(r agentstatus.Resources, mode string) *PublicResources {
 	if r.Disk != nil {
 		v := r.Disk.Pct
 		out.DiskPct = &v
-		out.DiskMounts = r.Disk.Mounts
 		if full {
 			used, total := r.Disk.Used, r.Disk.Total
 			out.DiskUsed, out.DiskTotal = &used, &total
-			// The mount NAME is a filesystem path — "/mnt/backup-nas" says
-			// something about the machine that "61% full" does not.
-			out.DiskMount = r.Disk.Mount
 		}
 		out.Stale = out.Stale || r.Disk.Stale
 	}

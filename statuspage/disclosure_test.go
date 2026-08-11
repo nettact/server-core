@@ -2,7 +2,9 @@ package statuspage
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/nettact/server-core/agentstatus"
@@ -62,15 +64,6 @@ func TestPublicResourcesDisclosureGate(t *testing.T) {
 	if basic.MemUsed != nil || basic.MemTotal != nil || basic.DiskUsed != nil || basic.DiskTotal != nil {
 		t.Errorf("basic leaked byte totals: %+v", basic)
 	}
-	if basic.DiskMount != "" {
-		t.Errorf("basic leaked the mount path %q", basic.DiskMount)
-	}
-	// The mount COUNT is not a path and stays: it is what stops one percentage
-	// from reading as the whole disk story.
-	if basic.DiskMounts != 3 {
-		t.Errorf("basic disk_mounts = %d, want 3", basic.DiskMounts)
-	}
-
 	full := publicResources(r, AgentMetricsFull)
 	if full == nil {
 		t.Fatal("agent_metrics=full published nothing")
@@ -78,8 +71,23 @@ func TestPublicResourcesDisclosureGate(t *testing.T) {
 	if full.MemUsed == nil || *full.MemUsed != 8_160_000_000 || full.MemTotal == nil {
 		t.Errorf("full omitted the memory totals: %+v", full)
 	}
-	if full.DiskUsed == nil || full.DiskTotal == nil || full.DiskMount != "/mnt/backup-nas" {
+	if full.DiskUsed == nil || full.DiskTotal == nil {
 		t.Errorf("full omitted the disk detail: %+v", full)
+	}
+}
+
+// Filesystem names and counts are internal topology. Even full resource
+// disclosure publishes capacity figures only; it never identifies a volume.
+func TestPublicResourcesNeverExposeFilesystemLayout(t *testing.T) {
+	got := publicResources(fullResources(), AgentMetricsFull)
+	body, err := json.Marshal(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{"disk_mount", "disk_mounts"} {
+		if strings.Contains(string(body), field) {
+			t.Errorf("full resources leaked %q: %s", field, body)
+		}
 	}
 }
 
@@ -96,10 +104,6 @@ func TestPublicResourcesKeepsDeniedFamiliesAbsent(t *testing.T) {
 	if got.MemPct != nil || got.DiskPct != nil || got.RxBps != nil || got.Load != nil || got.UptimeSec != nil {
 		t.Fatalf("a denied family was published as a value: %+v", got)
 	}
-	if got.DiskMounts != 0 {
-		t.Fatalf("disk_mounts = %d with no disk reading", got.DiskMounts)
-	}
-
 	// Nothing reported at all: the object itself goes away, so a renderer is not
 	// handed an empty shell to draw six blank gauges from.
 	if got := publicResources(agentstatus.Resources{}, AgentMetricsFull); got != nil {
