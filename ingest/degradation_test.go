@@ -102,7 +102,7 @@ func (h *degHarness) push(n int, rttMs float64) {
 		)
 	}
 	h.seq++
-	if _, err := h.svc.Ingest(h.ctx, "agent_a", "site_default", telemetry.Packet{
+	if _, err := h.svc.Ingest(h.ctx, "agent_a", "site_default", 1, telemetry.Packet{
 		SchemaVersion: protocol.SchemaVersion, AgentID: "agent_a", SiteID: "site_default",
 		Sequence: h.seq, SentAt: time.Now().UTC(), Metrics: ms,
 	}); err != nil {

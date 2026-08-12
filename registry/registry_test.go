@@ -499,6 +499,9 @@ func TestReinstallTokenRejoinsSameAgent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Enroll: %v", err)
 	}
+	if resp1.EnrollmentEpoch != 1 {
+		t.Fatalf("fresh enrollment epoch = %d, want 1", resp1.EnrollmentEpoch)
+	}
 	if resetCalls != 0 {
 		t.Fatalf("first enrollment reset the watermark %d times, want 0", resetCalls)
 	}
@@ -542,11 +545,31 @@ func TestReinstallTokenRejoinsSameAgent(t *testing.T) {
 	if resp2.AgentID != agentID {
 		t.Fatalf("reinstall agent_id = %q, want %q", resp2.AgentID, agentID)
 	}
+	if resp2.EnrollmentEpoch != 2 {
+		t.Fatalf("reinstall epoch = %d, want 2 — a reinstall replaces an install and must never reuse a generation", resp2.EnrollmentEpoch)
+	}
 	if resetCalls != 1 {
 		t.Errorf("reinstall reset the watermark %d times, want 1", resetCalls)
 	}
 	if disconnectCalls != 1 {
 		t.Errorf("reinstall disconnected %d sessions, want 1", disconnectCalls)
+	}
+	// The row itself carries the advanced generation, and the rotation pending
+	// window is closed outright (a reinstall is not the controlled rotation
+	// flow — its old token died at once).
+	var storedEpoch uint64
+	var pendingHash string
+	var pendingUntil int64
+	if err := db.QueryRowContext(ctx,
+		`SELECT enrollment_epoch, pending_prev_token_hash, pending_prev_token_until FROM agents WHERE id=?`,
+		agentID).Scan(&storedEpoch, &pendingHash, &pendingUntil); err != nil {
+		t.Fatalf("read epoch columns: %v", err)
+	}
+	if storedEpoch != 2 {
+		t.Errorf("stored enrollment_epoch = %d, want 2", storedEpoch)
+	}
+	if pendingHash != "" || pendingUntil != 0 {
+		t.Errorf("pending window after reinstall = %q/%d, want closed", pendingHash, pendingUntil)
 	}
 
 	// Still exactly one agent row: the reinstall re-bound it, it did not add one.
@@ -580,10 +603,10 @@ func TestReinstallTokenRejoinsSameAgent(t *testing.T) {
 	}
 
 	// The freshly issued bearer token authenticates; the old one no longer does.
-	if _, _, err := reg.AuthenticateAgent(ctx, resp2.AgentToken); err != nil {
+	if _, err := reg.AuthenticateAgent(ctx, resp2.AgentToken); err != nil {
 		t.Errorf("new bearer token rejected: %v", err)
 	}
-	if _, _, err := reg.AuthenticateAgent(ctx, resp1.AgentToken); err == nil {
+	if _, err := reg.AuthenticateAgent(ctx, resp1.AgentToken); err == nil {
 		t.Errorf("old bearer token still authenticates after reinstall")
 	}
 

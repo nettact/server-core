@@ -2,6 +2,7 @@ package agentws
 
 import (
 	"context"
+	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -14,6 +15,7 @@ import (
 	"github.com/coder/websocket"
 
 	"github.com/nettact/protocol"
+	"github.com/nettact/protocol/enroll"
 	"github.com/nettact/protocol/permission"
 	"github.com/nettact/protocol/telemetry"
 	"github.com/nettact/protocol/wire"
@@ -173,10 +175,12 @@ func readFrameUntilAck(ctx context.Context, c wire.Conn) (wire.Frame, error) {
 
 func testHello() wire.Frame {
 	return wire.Frame{Hello: &wire.Hello{
-		SchemaVersion: protocol.SchemaVersion,
-		Hostname:      "ws-host",
-		Platform:      "linux",
-		AgentVersion:  "test",
+		SchemaVersion:   protocol.SchemaVersion,
+		Hostname:        "ws-host",
+		Platform:        "linux",
+		AgentVersion:    "test",
+		Capabilities:    []string{wire.CapSequenceFloorV1},
+		EnrollmentEpoch: 1,
 		Permissions: permission.PermissionReport{
 			Supported:  []string{"probe.icmp"},
 			Granted:    []string{"probe.icmp"},
@@ -185,6 +189,44 @@ func testHello() wire.Frame {
 			PolicyHash: "h1",
 		},
 	}}
+}
+
+// handshake walks the schema-8 connect pushes on an already-dialed connection:
+// Hello up, DesiredState down, then the SequenceFloor, then the applied reply.
+// It returns the pushed floor so tests can assert on it. A redundant
+// DesiredState may land between the initial push and the floor — a config
+// change made before the session existed fans out on the hub's own goroutine
+// and can race the connect pushes — so those are skipped, never mistaken for
+// the floor.
+func handshake(t *testing.T, conn *websocket.Conn, epoch uint64) wire.SequenceFloor {
+	t.Helper()
+	sendFrame(t, conn, testHello())
+	f := readFrame(t, conn)
+	if f.DesiredState == nil {
+		t.Fatalf("first push = %+v, want DesiredState", f)
+	}
+	var floor wire.SequenceFloor
+	for {
+		f = readFrame(t, conn)
+		if f.SequenceFloor != nil {
+			floor = *f.SequenceFloor
+			break
+		}
+		if f.DesiredState == nil {
+			t.Fatalf("waiting for the SequenceFloor, got %+v", f)
+		}
+	}
+	if floor.EnrollmentEpoch != epoch {
+		t.Fatalf("floor epoch = %d, want %d", floor.EnrollmentEpoch, epoch)
+	}
+	if floor.SessionID == "" {
+		t.Fatalf("floor carries no session id: %+v", floor)
+	}
+	sendFrame(t, conn, wire.Frame{SequenceFloorApplied: &wire.SequenceFloorApplied{
+		EnrollmentEpoch: floor.EnrollmentEpoch,
+		SequenceFloor:   floor.SequenceFloor,
+	}})
+	return floor
 }
 
 func testPacket(seq uint64) wire.Frame {
@@ -215,22 +257,17 @@ func expectClose(t *testing.T, conn *websocket.Conn, want wire.CloseCode) {
 
 // TestConnectHelloOnline covers the connect path: hello marks the agent online
 // immediately (with its reported info refreshed), the current DesiredState is
-// pushed unconditionally, and the hub tracks the session.
+// pushed unconditionally, the schema-8 sequence floor follows it, and the hub
+// tracks the session.
 func TestConnectHelloOnline(t *testing.T) {
 	e := newTestEnv(t)
 	e.seedAgent(t, "agent_a", "tok_a")
 	e.setTargets(t, "1.1.1.1") // config_version 0 -> 1
 
 	conn := e.dial(t, "tok_a", wire.SubprotocolJSON)
-	sendFrame(t, conn, testHello())
-
-	f := readFrame(t, conn)
-	if f.DesiredState == nil {
-		t.Fatalf("first push = %+v, want DesiredState", f)
-	}
-	if f.DesiredState.ConfigVersion != 1 || len(f.DesiredState.ProbeTargets) != 1 {
-		t.Errorf("DesiredState = version %d with %d targets, want version 1 with 1",
-			f.DesiredState.ConfigVersion, len(f.DesiredState.ProbeTargets))
+	floor := handshake(t, conn, 1)
+	if floor.SequenceFloor != 0 {
+		t.Errorf("floor = %d for a fresh agent, want 0", floor.SequenceFloor)
 	}
 
 	a, err := e.reg.Get(context.Background(), "agent_a")
@@ -262,10 +299,7 @@ func TestDisconnectEvicts(t *testing.T) {
 	e.seedAgent(t, "agent_a", "tok_a")
 
 	conn := e.dial(t, "tok_a", wire.SubprotocolJSON)
-	sendFrame(t, conn, testHello())
-	if f := readFrame(t, conn); f.DesiredState == nil {
-		t.Fatalf("first push = %+v, want DesiredState", f)
-	}
+	handshake(t, conn, 1)
 
 	e.hub.Disconnect("agent_a", wire.CloseRevoked, "agent deleted")
 	expectClose(t, conn, wire.CloseRevoked)
@@ -292,10 +326,7 @@ func TestPacketAckRoundTrip(t *testing.T) {
 	if got := conn.Subprotocol(); got != wire.SubprotocolProtobuf {
 		t.Fatalf("negotiated subprotocol = %q, want %q", got, wire.SubprotocolProtobuf)
 	}
-	sendFrame(t, conn, testHello())
-	if f := readFrame(t, conn); f.DesiredState == nil {
-		t.Fatalf("first push = %+v, want DesiredState", f)
-	}
+	handshake(t, conn, 1)
 
 	// Send a burst, then read the acks: the single reader + ordered write queue
 	// must return them FIFO with a monotonic watermark.
@@ -315,7 +346,9 @@ func TestPacketAckRoundTrip(t *testing.T) {
 		}
 	}
 
-	// A replayed sequence still acks the watermark (idempotent dedup).
+	// A replayed sequence still acks the watermark (idempotent dedup). The
+	// fingerprint excludes per-sample timestamps, so the re-served copy's fresh
+	// clock stamp does not read as different content.
 	sendFrame(t, conn, testPacket(2))
 	if f := readFrame(t, conn); f.Ack == nil || f.Ack.HighestSequence != 3 {
 		t.Errorf("replay ack = %+v, want watermark 3", f.Ack)
@@ -330,10 +363,7 @@ func TestConfigChangePush(t *testing.T) {
 	e.setTargets(t, "1.1.1.1") // config_version 0 -> 1
 
 	conn := e.dial(t, "tok_a", wire.SubprotocolJSON)
-	sendFrame(t, conn, testHello())
-	if f := readFrame(t, conn); f.DesiredState == nil {
-		t.Fatalf("first push = %+v, want DesiredState", f)
-	}
+	handshake(t, conn, 1)
 
 	e.setTargets(t, "1.1.1.1", "8.8.8.8") // config_version 1 -> 2
 
@@ -355,16 +385,10 @@ func TestKickSuperseded(t *testing.T) {
 	e.seedAgent(t, "agent_a", "tok_a")
 
 	conn1 := e.dial(t, "tok_a", wire.SubprotocolJSON)
-	sendFrame(t, conn1, testHello())
-	if f := readFrame(t, conn1); f.DesiredState == nil {
-		t.Fatalf("conn1 first push = %+v, want DesiredState", f)
-	}
+	handshake(t, conn1, 1)
 
 	conn2 := e.dial(t, "tok_a", wire.SubprotocolJSON)
-	sendFrame(t, conn2, testHello())
-	if f := readFrame(t, conn2); f.DesiredState == nil {
-		t.Fatalf("conn2 first push = %+v, want DesiredState", f)
-	}
+	handshake(t, conn2, 1)
 
 	expectClose(t, conn1, wire.CloseSuperseded)
 
@@ -401,11 +425,21 @@ func TestSnapshotRequestPush(t *testing.T) {
 		t.Fatalf("first push = %+v, want DesiredState", f)
 	}
 	// The request registered before the connect is still pending, so the hub
-	// re-pushed it right after DesiredState (the reconnect-blip path).
+	// re-pushed it right after DesiredState (the reconnect-blip path), before
+	// the sequence floor.
 	f := readFrame(t, conn)
 	if f.SnapshotRequest == nil {
 		t.Fatalf("second push = %+v, want re-pushed SnapshotRequest", f)
 	}
+	// The floor follows, and the barrier opens.
+	f = readFrame(t, conn)
+	if f.SequenceFloor == nil {
+		t.Fatalf("third push = %+v, want SequenceFloor", f)
+	}
+	sendFrame(t, conn, wire.Frame{SequenceFloorApplied: &wire.SequenceFloorApplied{
+		EnrollmentEpoch: f.SequenceFloor.EnrollmentEpoch,
+		SequenceFloor:   f.SequenceFloor.SequenceFloor,
+	}})
 
 	// A fresh request while connected pushes directly. It asks for a scope the
 	// still-pending request above does not cover — a subset of it would (rightly)
@@ -464,10 +498,7 @@ func TestServerToAgentFrameRejected(t *testing.T) {
 	e.seedAgent(t, "agent_a", "tok_a")
 
 	conn := e.dial(t, "tok_a", wire.SubprotocolJSON)
-	sendFrame(t, conn, testHello())
-	if f := readFrame(t, conn); f.DesiredState == nil {
-		t.Fatalf("first push = %+v, want DesiredState", f)
-	}
+	handshake(t, conn, 1)
 	sendFrame(t, conn, wire.Frame{Ack: &wire.Ack{HighestSequence: 1}})
 	expectClose(t, conn, wire.CloseProtocolError)
 }
@@ -493,6 +524,9 @@ func TestMalformedFrameAfterHello(t *testing.T) {
 	sendFrame(t, conn, testHello())
 	if f := readFrame(t, conn); f.DesiredState == nil {
 		t.Fatalf("first push = %+v, want DesiredState", f)
+	}
+	if f := readFrame(t, conn); f.SequenceFloor == nil {
+		t.Fatalf("second push = %+v, want SequenceFloor", f)
 	}
 	// Garbage that is neither valid JSON nor a valid Frame.
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -543,7 +577,7 @@ func TestDialLocal(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DialLocal: %v", err)
 	}
-	// Hello up, DesiredState down.
+	// Hello up, DesiredState down, then the schema-8 floor barrier.
 	if err := c.WriteFrame(ctx, testHello()); err != nil {
 		t.Fatalf("write hello: %v", err)
 	}
@@ -553,6 +587,19 @@ func TestDialLocal(t *testing.T) {
 	}
 	if f.DesiredState == nil || f.DesiredState.ConfigVersion != 1 || len(f.DesiredState.ProbeTargets) != 1 {
 		t.Fatalf("first push = %+v, want DesiredState v1 with 1 target", f)
+	}
+	f, err = c.ReadFrame(ctx)
+	if err != nil || f.SequenceFloor == nil {
+		t.Fatalf("second push = %+v err=%v, want SequenceFloor", f, err)
+	}
+	if f.SequenceFloor.EnrollmentEpoch != 1 {
+		t.Fatalf("floor epoch = %d, want 1", f.SequenceFloor.EnrollmentEpoch)
+	}
+	if err := c.WriteFrame(ctx, wire.Frame{SequenceFloorApplied: &wire.SequenceFloorApplied{
+		EnrollmentEpoch: f.SequenceFloor.EnrollmentEpoch,
+		SequenceFloor:   f.SequenceFloor.SequenceFloor,
+	}}); err != nil {
+		t.Fatalf("write floor applied: %v", err)
 	}
 
 	// Packet up, Ack down.
@@ -594,6 +641,11 @@ func TestDialLocal(t *testing.T) {
 	}
 	if _, err := c2.ReadFrame(ctx); err != nil {
 		t.Fatalf("read desired state 2: %v", err)
+	}
+	// Drain the floor too: CloseAll's writer drains queued frames before the
+	// close, and the test must read them or they mask the close error.
+	if _, err := c2.ReadFrame(ctx); err != nil {
+		t.Fatalf("read floor 2: %v", err)
 	}
 	rctx, rcancel := context.WithTimeout(ctx, 5*time.Second)
 	defer rcancel()
@@ -727,12 +779,10 @@ func TestSupersededDoesNotOverwriteProvenance(t *testing.T) {
 	e.seedAgent(t, "agent_a", "tok_a")
 
 	conn1 := e.dial(t, "tok_a", wire.SubprotocolJSON)
-	sendFrame(t, conn1, testHello())
-	_ = readFrame(t, conn1)
+	handshake(t, conn1, 1)
 
 	conn2 := e.dial(t, "tok_a", wire.SubprotocolJSON)
-	sendFrame(t, conn2, testHello())
-	_ = readFrame(t, conn2)
+	handshake(t, conn2, 1)
 
 	// Let the kicked session's close handshake complete so its teardown runs.
 	expectClose(t, conn1, wire.CloseSuperseded)
@@ -758,5 +808,279 @@ func TestBadSchemaRecordsVersionIncompatible(t *testing.T) {
 	e.waitDisconnectKind(t, "agent_a", "unsupported_schema")
 	if a, _ := e.reg.Get(context.Background(), "agent_a"); a.FirstConnectedAt != nil {
 		t.Fatal("first_connected_at set despite an unsupported-schema Hello")
+	}
+}
+
+// TestHelloFloorGateRejects: a Hello without the sequence_floor_v1 capability,
+// or with a zero enrollment epoch, is refused before registration — the floor
+// barrier keys on the epoch, and a peer that cannot speak the barrier must not
+// get a session whose packets could be renumbered in place.
+func TestHelloFloorGateRejects(t *testing.T) {
+	e := newTestEnv(t)
+	e.seedAgent(t, "agent_a", "tok_a")
+
+	conn := e.dial(t, "tok_a", wire.SubprotocolJSON)
+	hello := testHello()
+	hello.Hello.Capabilities = nil
+	sendFrame(t, conn, hello)
+	expectClose(t, conn, wire.CloseProtocolError)
+
+	conn2 := e.dial(t, "tok_a", wire.SubprotocolJSON)
+	hello2 := testHello()
+	hello2.Hello.EnrollmentEpoch = 0
+	sendFrame(t, conn2, hello2)
+	expectClose(t, conn2, wire.CloseProtocolError)
+}
+
+// TestPacketBeforeFloorAppliedCloses pins the barrier fail-closed: a packet
+// sent before the SequenceFloorApplied reply is a protocol error, even though
+// the floor was pushed and the session is otherwise healthy.
+func TestPacketBeforeFloorAppliedCloses(t *testing.T) {
+	e := newTestEnv(t)
+	e.seedAgent(t, "agent_a", "tok_a")
+
+	conn := e.dial(t, "tok_a", wire.SubprotocolJSON)
+	sendFrame(t, conn, testHello())
+	if f := readFrame(t, conn); f.DesiredState == nil {
+		t.Fatalf("first push = %+v, want DesiredState", f)
+	}
+	if f := readFrame(t, conn); f.SequenceFloor == nil {
+		t.Fatalf("second push = %+v, want SequenceFloor", f)
+	}
+	// The barrier is still closed: no applied reply was sent.
+	sendFrame(t, conn, testPacket(1))
+	expectClose(t, conn, wire.CloseProtocolError)
+}
+
+// TestFloorAppliedMismatchCloses: the applied reply must restate exactly this
+// session's pushed floor — epoch included. A wrong floor value or a wrong
+// epoch is a protocol error.
+func TestFloorAppliedMismatchCloses(t *testing.T) {
+	e := newTestEnv(t)
+	e.seedAgent(t, "agent_a", "tok_a")
+
+	// Wrong floor value.
+	conn := e.dial(t, "tok_a", wire.SubprotocolJSON)
+	sendFrame(t, conn, testHello())
+	_ = readFrame(t, conn) // DesiredState
+	floor := readFrame(t, conn)
+	if floor.SequenceFloor == nil {
+		t.Fatalf("push = %+v, want SequenceFloor", floor)
+	}
+	sendFrame(t, conn, wire.Frame{SequenceFloorApplied: &wire.SequenceFloorApplied{
+		EnrollmentEpoch: floor.SequenceFloor.EnrollmentEpoch,
+		SequenceFloor:   floor.SequenceFloor.SequenceFloor + 12345,
+	}})
+	expectClose(t, conn, wire.CloseProtocolError)
+
+	// Wrong epoch.
+	conn2 := e.dial(t, "tok_a", wire.SubprotocolJSON)
+	sendFrame(t, conn2, testHello())
+	_ = readFrame(t, conn2) // DesiredState
+	floor2 := readFrame(t, conn2)
+	if floor2.SequenceFloor == nil {
+		t.Fatalf("push = %+v, want SequenceFloor", floor2)
+	}
+	sendFrame(t, conn2, wire.Frame{SequenceFloorApplied: &wire.SequenceFloorApplied{
+		EnrollmentEpoch: floor2.SequenceFloor.EnrollmentEpoch + 1,
+		SequenceFloor:   floor2.SequenceFloor.SequenceFloor,
+	}})
+	expectClose(t, conn2, wire.CloseProtocolError)
+}
+
+// TestStaleHelloEpochChallenges: a Hello presenting a stale credential
+// generation gets an epoch_mismatch rotation challenge instead of a floor, and
+// the session is held for the rotation flow — no floor was pushed, so a packet
+// is still refused (the barrier stays closed until the rotation lands and the
+// agent reconnects).
+func TestStaleHelloEpochChallenges(t *testing.T) {
+	e := newTestEnv(t)
+	e.seedAgent(t, "agent_a", "tok_a")
+
+	conn := e.dial(t, "tok_a", wire.SubprotocolJSON)
+	hello := testHello()
+	hello.Hello.EnrollmentEpoch = 5 // the row is at generation 1
+	sendFrame(t, conn, hello)
+	if f := readFrame(t, conn); f.DesiredState == nil {
+		t.Fatalf("first push = %+v, want DesiredState", f)
+	}
+	f := readFrame(t, conn)
+	if f.EpochRotationChallenge == nil {
+		t.Fatalf("second push = %+v, want EpochRotationChallenge", f)
+	}
+	if f.EpochRotationChallenge.Reason != "epoch_mismatch" || f.EpochRotationChallenge.Challenge == "" {
+		t.Errorf("challenge = %+v, want reason epoch_mismatch with a non-empty challenge", f.EpochRotationChallenge)
+	}
+	// The barrier is still closed: no floor was pushed for this session.
+	sendFrame(t, conn, testPacket(1))
+	expectClose(t, conn, wire.CloseProtocolError)
+}
+
+// TestSequenceConflictChallengesRotation: a replayed sequence carrying
+// different content is refused with a sequence_conflict rotation challenge
+// (no ack), and the session stays alive — the agent drives the rotation from
+// here, and unrelated fresh sequences keep flowing.
+func TestSequenceConflictChallengesRotation(t *testing.T) {
+	e := newTestEnv(t)
+	e.seedAgent(t, "agent_a", "tok_a")
+
+	conn := e.dial(t, "tok_a", wire.SubprotocolJSON)
+	handshake(t, conn, 1)
+
+	sendFrame(t, conn, testPacket(1))
+	if f := readFrame(t, conn); f.Ack == nil || f.Ack.HighestSequence != 1 {
+		t.Fatalf("ack = %+v, want watermark 1", f.Ack)
+	}
+
+	// Same sequence, different content: a conflict, not a duplicate.
+	alt := testPacket(1)
+	alt.Packet.Metrics[0].Value = 99.0
+	sendFrame(t, conn, alt)
+	f := readFrame(t, conn)
+	if f.EpochRotationChallenge == nil {
+		t.Fatalf("conflict reply = %+v, want EpochRotationChallenge (no ack)", f)
+	}
+	if f.EpochRotationChallenge.Reason != "sequence_conflict" {
+		t.Errorf("challenge reason = %q, want sequence_conflict", f.EpochRotationChallenge.Reason)
+	}
+
+	// The session is still live: a fresh sequence flows normally.
+	sendFrame(t, conn, testPacket(2))
+	if f := readFrame(t, conn); f.Ack == nil || f.Ack.HighestSequence != 2 {
+		t.Fatalf("post-conflict ack = %+v, want watermark 2", f.Ack)
+	}
+}
+
+// TestRotationOverHub drives the complete controlled rotation over an
+// in-process pipe session: the agent asks to be challenged, signs the
+// challenge with its enrolled key, receives the new credential and the close
+// 1001; a reconnect with the OLD token gets the committed result re-issued
+// idempotently (the pending window); and the NEW token authenticates at the
+// advanced generation — closing the old-token window for good.
+func TestRotationOverHub(t *testing.T) {
+	e := newTestEnv(t)
+	ctx := context.Background()
+
+	// Enroll a real agent: the rotation must verify an ed25519 possession
+	// proof, so the seeded row needs a real key.
+	tok, err := e.reg.CreateEnrollmentToken(ctx, site.DefaultSiteID, "rotation", time.Hour)
+	if err != nil {
+		t.Fatalf("CreateEnrollmentToken: %v", err)
+	}
+	pub, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("keygen: %v", err)
+	}
+	const nonce = "nonce-rotation"
+	resp, err := e.reg.Enroll(ctx, enroll.EnrollRequest{
+		SchemaVersion:   protocol.SchemaVersion,
+		PublicKey:       pub,
+		Nonce:           nonce,
+		Signature:       ed25519.Sign(priv, []byte(nonce)),
+		EnrollmentToken: tok,
+		Hostname:        "rot-host",
+		Platform:        "windows",
+		AgentVersion:    "test",
+		Permissions:     permission.PermissionReport{},
+	})
+	if err != nil {
+		t.Fatalf("Enroll: %v", err)
+	}
+	agentID := resp.AgentID
+	if resp.EnrollmentEpoch != 1 {
+		t.Fatalf("enrollment epoch = %d, want 1", resp.EnrollmentEpoch)
+	}
+	oldToken := resp.AgentToken
+
+	// The floor barrier first: epoch 1, floor 0, applied.
+	c, err := e.hub.DialLocal(ctx, oldToken)
+	if err != nil {
+		t.Fatalf("DialLocal: %v", err)
+	}
+	if err := c.WriteFrame(ctx, testHello()); err != nil {
+		t.Fatalf("write hello: %v", err)
+	}
+	if f, err := c.ReadFrame(ctx); err != nil || f.DesiredState == nil {
+		t.Fatalf("first push = %+v err=%v, want DesiredState", f, err)
+	}
+	f, err := c.ReadFrame(ctx)
+	if err != nil || f.SequenceFloor == nil || f.SequenceFloor.EnrollmentEpoch != 1 {
+		t.Fatalf("second push = %+v err=%v, want SequenceFloor for epoch 1", f, err)
+	}
+	if err := c.WriteFrame(ctx, wire.Frame{SequenceFloorApplied: &wire.SequenceFloorApplied{
+		EnrollmentEpoch: f.SequenceFloor.EnrollmentEpoch,
+		SequenceFloor:   f.SequenceFloor.SequenceFloor,
+	}}); err != nil {
+		t.Fatalf("write applied: %v", err)
+	}
+
+	// The agent asks to be rotated (its in-flight claim is at/below the floor).
+	if err := c.WriteFrame(ctx, wire.Frame{EpochRotationChallengeRequest: &wire.EpochRotationChallengeRequest{Reason: "claim_below_floor"}}); err != nil {
+		t.Fatalf("write challenge request: %v", err)
+	}
+	f, err = c.ReadFrame(ctx)
+	if err != nil || f.EpochRotationChallenge == nil {
+		t.Fatalf("challenge = %+v err=%v", f, err)
+	}
+	if f.EpochRotationChallenge.Reason != "claim_below_floor" {
+		t.Errorf("challenge reason = %q, want claim_below_floor", f.EpochRotationChallenge.Reason)
+	}
+
+	// The possession proof, then the verdict.
+	challenge := f.EpochRotationChallenge.Challenge
+	if err := c.WriteFrame(ctx, wire.Frame{EpochRotationRequest: &wire.EpochRotationRequest{
+		Challenge: challenge,
+		OldEpoch:  1,
+		Signature: ed25519.Sign(priv, []byte(challenge)),
+	}}); err != nil {
+		t.Fatalf("write rotation request: %v", err)
+	}
+	f, err = c.ReadFrame(ctx)
+	if err != nil || f.EpochRotationResult == nil {
+		t.Fatalf("rotation result = %+v err=%v", f, err)
+	}
+	res := f.EpochRotationResult
+	if res.Status != wire.RotationOK || res.NewEpoch != 2 || res.AgentToken == "" {
+		t.Fatalf("result = %+v, want RotationOK epoch 2 with a token", res)
+	}
+	// The session ends with 1001 after the result: the agent persists and
+	// reconnects under the new identity.
+	rctx, rcancel := context.WithTimeout(ctx, 5*time.Second)
+	defer rcancel()
+	if _, err := c.ReadFrame(rctx); wire.CloseStatus(err) != wire.CloseGoingAway {
+		t.Fatalf("post-rotation close = %v, want CloseGoingAway (1001)", err)
+	}
+
+	// The old token is inside its pending window: a reconnect with it re-issues
+	// the committed result idempotently instead of a floor.
+	cOld, err := e.hub.DialLocal(ctx, oldToken)
+	if err != nil {
+		t.Fatalf("DialLocal(old token): %v", err)
+	}
+	if err := cOld.WriteFrame(ctx, testHello()); err != nil {
+		t.Fatalf("write hello: %v", err)
+	}
+	if f, err := cOld.ReadFrame(ctx); err != nil || f.DesiredState == nil {
+		t.Fatalf("old-token first push = %+v err=%v, want DesiredState", f, err)
+	}
+	f, err = cOld.ReadFrame(ctx)
+	if err != nil || f.EpochRotationResult == nil {
+		t.Fatalf("old-token second push = %+v err=%v, want the re-issued EpochRotationResult", f, err)
+	}
+	if got := f.EpochRotationResult; got.Status != wire.RotationOK || got.NewEpoch != 2 || got.AgentToken != res.AgentToken {
+		t.Fatalf("re-issued result = %+v, want the committed result %+v", got, res)
+	}
+	if _, err := cOld.ReadFrame(rctx); wire.CloseStatus(err) != wire.CloseGoingAway {
+		t.Fatalf("old-token close = %v, want CloseGoingAway (1001)", err)
+	}
+
+	// The new credential authenticates at the advanced generation, and its
+	// first use closed the old-token window.
+	auth, err := e.reg.AuthenticateAgent(ctx, res.AgentToken)
+	if err != nil || auth.AgentID != agentID || auth.Epoch != 2 {
+		t.Fatalf("new token auth = %+v, %v; want %q at epoch 2", auth, err, agentID)
+	}
+	if _, err := e.reg.AuthenticateAgent(ctx, oldToken); err == nil {
+		t.Fatal("old token still authenticates after the new credential was first used")
 	}
 }

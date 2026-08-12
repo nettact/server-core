@@ -77,7 +77,7 @@ func TestIngestConfirmsHostFaultInTheSampleTransaction(t *testing.T) {
 
 	// The default is 90% for 5 minutes, which is ten readings at the 30s cadence.
 	for i := 0; i < 9; i++ {
-		if _, err := svc.Ingest(ctx, "agent_h", "site_default",
+		if _, err := svc.Ingest(ctx, "agent_h", "site_default", 1,
 			hostPacket(uint64(i+1), base.Add(time.Duration(i)*30*time.Second), 95)); err != nil {
 			t.Fatalf("ingest %d: %v", i, err)
 		}
@@ -85,7 +85,7 @@ func TestIngestConfirmsHostFaultInTheSampleTransaction(t *testing.T) {
 	if n := firingHostSignals(t, db); n != 0 {
 		t.Fatalf("confirmed after 9 of 10 readings (%d signals)", n)
 	}
-	if _, err := svc.Ingest(ctx, "agent_h", "site_default",
+	if _, err := svc.Ingest(ctx, "agent_h", "site_default", 1,
 		hostPacket(10, base.Add(9*30*time.Second), 95)); err != nil {
 		t.Fatalf("ingest 10: %v", err)
 	}
@@ -117,7 +117,7 @@ func TestIngestSkipsHostAnchorsOutOfScope(t *testing.T) {
 	base := time.Now().UTC().Truncate(time.Second).Add(-30 * time.Minute)
 
 	for i := 0; i < 12; i++ {
-		if _, err := svc.Ingest(ctx, "agent_h", "site_default",
+		if _, err := svc.Ingest(ctx, "agent_h", "site_default", 1,
 			hostPacket(uint64(i+1), base.Add(time.Duration(i)*30*time.Second), 99)); err != nil {
 			t.Fatalf("ingest %d: %v", i, err)
 		}
@@ -144,7 +144,7 @@ func TestIngestDisabledHostAnchorIsInert(t *testing.T) {
 	}
 	base := time.Now().UTC().Truncate(time.Second).Add(-30 * time.Minute)
 	for i := 0; i < 12; i++ {
-		if _, err := svc.Ingest(ctx, "agent_h", "site_default",
+		if _, err := svc.Ingest(ctx, "agent_h", "site_default", 1,
 			hostPacket(uint64(i+1), base.Add(time.Duration(i)*30*time.Second), 99)); err != nil {
 			t.Fatalf("ingest %d: %v", i, err)
 		}
@@ -171,7 +171,7 @@ func TestIngestReadsCoresFromTheCacheAcrossPackets(t *testing.T) {
 			hostSample(base, telemetry.HostLoad1, "host", 16, telemetry.UnitLoad),
 		},
 	}
-	if _, err := svc.Ingest(ctx, "agent_h", "site_default", first); err != nil {
+	if _, err := svc.Ingest(ctx, "agent_h", "site_default", 1, first); err != nil {
 		t.Fatalf("ingest first: %v", err)
 	}
 	for i := 1; i < 10; i++ {
@@ -181,7 +181,7 @@ func TestIngestReadsCoresFromTheCacheAcrossPackets(t *testing.T) {
 			Sequence: uint64(i + 1), SentAt: ts,
 			Metrics:  []telemetry.Metric{hostSample(ts, telemetry.HostLoad1, "host", 16, telemetry.UnitLoad)},
 		}
-		if _, err := svc.Ingest(ctx, "agent_h", "site_default", pkt); err != nil {
+		if _, err := svc.Ingest(ctx, "agent_h", "site_default", 1, pkt); err != nil {
 			t.Fatalf("ingest %d: %v", i, err)
 		}
 	}
@@ -204,7 +204,7 @@ func TestIngestReplayDoesNotDoubleFoldHostReadings(t *testing.T) {
 
 	pkt := hostPacket(1, base, 95)
 	for i := 0; i < 15; i++ {
-		if _, err := svc.Ingest(ctx, "agent_h", "site_default", pkt); err != nil {
+		if _, err := svc.Ingest(ctx, "agent_h", "site_default", 1, pkt); err != nil {
 			t.Fatalf("ingest replay %d: %v", i, err)
 		}
 	}
@@ -234,7 +234,7 @@ func TestIngestProbeOnlyBatchTouchesNoHostState(t *testing.T) {
 			hostSample(ts, telemetry.HostUptime, "host", 1234, telemetry.UnitSec),
 		},
 	}
-	if _, err := svc.Ingest(ctx, "agent_h", "site_default", pkt); err != nil {
+	if _, err := svc.Ingest(ctx, "agent_h", "site_default", 1, pkt); err != nil {
 		t.Fatalf("ingest: %v", err)
 	}
 	var states int

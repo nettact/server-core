@@ -80,7 +80,8 @@ type Service struct {
 	// sequence watermark. Reenrollment (AGENT-006) reuses an agent id whose WAL was
 	// wiped and restarted at sequence 1; without this the next ack would report the
 	// previous installation's high watermark and the agent would fast-forward past
-	// un-uploaded batches. A function, not an ingest reference, so registry stays
+	// un-uploaded batches. The schema-8 epoch rotation calls it too (see
+	// rotate.go). A function, not an ingest reference, so registry stays
 	// free of an ingest import. Wired at composition (server.Start); nil is a no-op.
 	ResetSeqWatermark func(ctx context.Context, agentID string)
 	// DisconnectSession, when set, forcibly ends a live agent session. Called at
@@ -89,6 +90,12 @@ type Service struct {
 	// ingest after the reset and re-create a high watermark. Wired at composition;
 	// nil is a no-op (no live session to fence).
 	DisconnectSession func(ctx context.Context, agentID string)
+	// Schema-8 rotation state, in memory by design: the live challenge bindings
+	// and the re-issuable results of committed rotations (see rotate.go). Guarded
+	// by rotMu, never by the DB.
+	rotMu      sync.Mutex
+	challenges map[string]*rotationChallenge
+	pending    map[string]*pendingRotationResult
 }
 
 // New constructs the registry. maxAgents caps enrollment (0 = unlimited). bus may
@@ -96,7 +103,12 @@ type Service struct {
 // quota is a product requirement (default 50); note architecture §7/§15 advise
 // against hard-limiting Lite — it is intentionally configurable.
 func New(db *store.DB, maxAgents int, bus *eventbus.Bus) *Service {
-	return &Service{db: db, maxAgents: maxAgents, bus: bus, lastTouch: map[string]time.Time{}}
+	return &Service{
+		db: db, maxAgents: maxAgents, bus: bus,
+		lastTouch:  map[string]time.Time{},
+		challenges: map[string]*rotationChallenge{},
+		pending:    map[string]*pendingRotationResult{},
+	}
 }
 
 // publishLiveness emits a TopicAgentLivenessChanged so a bridge can fan an

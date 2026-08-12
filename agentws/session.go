@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/nettact/protocol/wire"
+	"github.com/nettact/server-core/ingest"
 	"github.com/nettact/server-core/registry"
 )
 
@@ -38,6 +39,18 @@ type session struct {
 	agentID string
 	siteID  string
 
+	// Schema-8 (CLOUD-013C) session state. epoch/floorSent/floorPushed are set
+	// by serve before readLoop starts; floorApplied is read and written only by
+	// readLoop; rotated is set by the rotation paths before their close so the
+	// teardown classifies the disconnect for what it was.
+	epoch           uint64
+	floorSent       bool
+	floorPushed     uint64
+	floorApplied    bool
+	sessionID       string
+	pendingRotation *wire.EpochRotationResult
+	rotated         bool
+
 	sendCh chan wire.Frame
 	done   chan struct{} // closed exactly once on shutdown
 	once   sync.Once
@@ -51,23 +64,26 @@ type session struct {
 	// closeMu guards the close code captured by the first shutdown. serve()'s
 	// teardown reads it to classify why the session ended (server-initiated
 	// supersede/revoke/shutdown/error vs a peer-initiated close it must instead
-	// read off the read error).
-	closeMu   sync.Mutex
-	closeCode wire.CloseCode
-	closeSet  bool
+	// read off the read error). closeReason rides along for the connection
+	// close the writer performs after draining its queue.
+	closeMu     sync.Mutex
+	closeCode   wire.CloseCode
+	closeReason string
+	closeSet    bool
 }
 
-// shutdown closes the connection with the given code and stops the writer
-// and ping goroutines. Safe to call from any goroutine, any number of times;
-// only the first code/reason wins — and only that first code is captured for
-// disconnect classification.
+// shutdown records the close code and signals the session to end. The writer
+// goroutine observes the signal, drains the frames already enqueued (so a
+// final frame — the epoch-rotation result — precedes the close on the wire),
+// and performs the connection close with the recorded code and reason. Safe to
+// call from any goroutine, any number of times; only the first code/reason
+// wins — and only that first code is captured for disconnect classification.
 func (s *session) shutdown(code wire.CloseCode, reason string) {
 	s.once.Do(func() {
 		s.closeMu.Lock()
-		s.closeCode, s.closeSet = code, true
+		s.closeCode, s.closeReason, s.closeSet = code, reason, true
 		s.closeMu.Unlock()
 		close(s.done)
-		_ = s.conn.Close(code, reason)
 	})
 }
 
@@ -79,6 +95,14 @@ func (s *session) closeInfo() (wire.CloseCode, bool) {
 	s.closeMu.Lock()
 	defer s.closeMu.Unlock()
 	return s.closeCode, s.closeSet
+}
+
+// closeInfoReason is closeInfo plus the reason, for the connection close the
+// writer performs after draining its queue.
+func (s *session) closeInfoReason() (wire.CloseCode, string, bool) {
+	s.closeMu.Lock()
+	defer s.closeMu.Unlock()
+	return s.closeCode, s.closeReason, s.closeSet
 }
 
 // enqueue hands a frame to the writer goroutine. It blocks briefly on a full
@@ -100,8 +124,12 @@ func (s *session) enqueue(f wire.Frame) bool {
 }
 
 // writeLoop is the session's single writer: it serializes and sends every
-// outbound frame in enqueue order. Encoding (protobuf vs JSON) lives in the
-// transport adapter.
+// outbound frame in enqueue order, then performs the connection close with the
+// code shutdown recorded. Encoding (protobuf vs JSON) lives in the transport
+// adapter. On shutdown it drains the frames already queued first: a final
+// frame enqueued just before the shutdown (the epoch-rotation result) must
+// precede the close on the wire, the same ordering the pipe transport's reader
+// already implements on the receiving side.
 func (s *session) writeLoop() {
 	for {
 		select {
@@ -114,10 +142,35 @@ func (s *session) writeLoop() {
 				// writer) or, far more rarely, a server-built frame failed to marshal.
 				// Either way the session cannot continue; the reader's teardown handles
 				// the rest. Kept quiet because peer-gone is the normal disconnect path.
+				// Record the classification and close here directly — this IS the
+				// goroutine shutdown would ask to drain and close.
 				s.shutdown(wire.CloseInternalError, "write failed")
+				_ = s.conn.Close(wire.CloseInternalError, "write failed")
 				return
 			}
 		case <-s.done:
+			// Drain-before-close: everything already enqueued goes out, then the
+			// close frame with the recorded code. A frame that cannot be written
+			// (the peer is gone) ends the drain; the close attempt follows with
+			// the recorded code, which still carries the classification.
+		drain:
+			for {
+				select {
+				case f := <-s.sendCh:
+					ctx, cancel := context.WithTimeout(context.Background(), writeTimeout)
+					err := s.conn.WriteFrame(ctx, f)
+					cancel()
+					if err != nil {
+						break drain
+					}
+				default:
+					code, reason, _ := s.closeInfoReason()
+					_ = s.conn.Close(code, reason)
+					return
+				}
+			}
+			code, reason, _ := s.closeInfoReason()
+			_ = s.conn.Close(code, reason)
 			return
 		}
 	}
@@ -174,8 +227,32 @@ func (h *Hub) readLoop(ctx context.Context, s *session) error {
 		}
 		switch {
 		case frame.Packet != nil:
-			ack, err := h.deps.Ingest.Ingest(ctx, s.agentID, s.siteID, *frame.Packet)
+			// Fail closed: until the agent echoes the pushed floor back, no packet
+			// may be claimed — a packet admitted before the barrier would be
+			// renumberable in place, which is exactly what the epoch exists to
+			// forbid.
+			if !s.floorApplied {
+				s.shutdown(wire.CloseProtocolError, "packet before floor applied")
+				return nil
+			}
+			ack, err := h.deps.Ingest.Ingest(ctx, s.agentID, s.siteID, s.epoch, *frame.Packet)
 			if err != nil {
+				if errors.Is(err, ingest.ErrSequenceConflict) {
+					// The batch collides with the durable receipt ledger under its
+					// (epoch, sequence): it was either never admitted at this
+					// watermark or admitted with different content. Renumbering in
+					// place is forbidden, so the agent must rotate its epoch. No
+					// ack, and the session STAYS — the agent drives the rotation
+					// from here (challenge request or a direct request against the
+					// challenge just issued).
+					log.Printf("agentws: sequence conflict from %s (epoch %d, seq %d): offering an epoch rotation",
+						s.agentID, s.epoch, frame.Packet.Sequence)
+					ch := h.deps.Registry.IssueRotationChallenge(s.agentID, s.epoch, "sequence_conflict")
+					if !s.enqueue(wire.Frame{EpochRotationChallenge: &ch}) {
+						return nil
+					}
+					continue
+				}
 				// No ack means the agent keeps the batch in its WAL; closing makes
 				// it reconnect and retry rather than stream into a failing server.
 				log.Printf("agentws: ingest from %s: %v", s.agentID, err)
@@ -188,6 +265,60 @@ func (h *Hub) readLoop(ctx context.Context, s *session) error {
 			if !s.enqueue(wire.Frame{Ack: &wack}) {
 				return nil
 			}
+		case frame.SequenceFloorApplied != nil:
+			// The barrier's echo: it must restate exactly the floor this session
+			// pushed, epoch included. Anything else is either a protocol error or
+			// an echo of some other session's floor.
+			applied := frame.SequenceFloorApplied
+			if !s.floorSent || applied.EnrollmentEpoch != s.epoch || applied.SequenceFloor != s.floorPushed {
+				s.shutdown(wire.CloseProtocolError, "sequence floor mismatch")
+				return nil
+			}
+			s.floorApplied = true
+		case frame.EpochRotationChallengeRequest != nil:
+			// The agent asks to be rotated (its in-flight claim sits at or below
+			// the floor, or some other local reason): mint a challenge and let the
+			// normal challenge→request→result exchange follow.
+			ch := h.deps.Registry.IssueRotationChallenge(s.agentID, s.epoch, frame.EpochRotationChallengeRequest.Reason)
+			if !s.enqueue(wire.Frame{EpochRotationChallenge: &ch}) {
+				return nil
+			}
+		case frame.EpochRotationRequest != nil:
+			newEpoch, newToken, err := h.deps.Registry.RotateEpoch(ctx, s.agentID, *frame.EpochRotationRequest)
+			if err != nil {
+				// Never log token plaintexts; the error carries epoch/reason only.
+				status, reason := wire.RotationDenied, err.Error()
+				switch {
+				case errors.Is(err, registry.ErrRotationChallenge),
+					errors.Is(err, registry.ErrRotationEpoch),
+					errors.Is(err, registry.ErrAuth),
+					errors.Is(err, registry.ErrSignature):
+					status = wire.RotationDenied
+				default:
+					// Transient (a DB error mid-rotation): the agent may retry with
+					// a fresh challenge.
+					status = wire.RotationRetry
+				}
+				log.Printf("agentws: epoch rotation for %s: %v", s.agentID, err)
+				if !s.enqueue(wire.Frame{EpochRotationResult: &wire.EpochRotationResult{Status: status, Reason: reason}}) {
+					return nil
+				}
+				continue // keep the session: the old credential stays in force
+			}
+			// Success: deliver the new credential exactly once (a lost delivery
+			// is recovered through the registry's old-token pending window), then
+			// end the session — the agent persists the credential and reconnects
+			// under the new identity.
+			if !s.enqueue(wire.Frame{EpochRotationResult: &wire.EpochRotationResult{
+				Status:     wire.RotationOK,
+				NewEpoch:   newEpoch,
+				AgentToken: newToken,
+			}}) {
+				return nil
+			}
+			s.rotated = true
+			s.shutdown(wire.CloseGoingAway, "epoch rotated; reconnect")
+			return nil
 		case frame.HostSnapshot != nil:
 			// Stored in memory only, latest-wins and idempotent; never acked.
 			if h.deps.HostLive != nil {

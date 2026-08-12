@@ -65,10 +65,10 @@ func TestGameDataIngestIsIdempotent(t *testing.T) {
 	ctx := context.Background()
 	start := time.Now().UTC().Add(-time.Hour).Truncate(time.Second)
 
-	if _, err := svc.Ingest(ctx, "agent_game", "site_default", gamePacket(1, start)); err != nil {
+	if _, err := svc.Ingest(ctx, "agent_game", "site_default", 1, gamePacket(1, start)); err != nil {
 		t.Fatalf("ingest: %v", err)
 	}
-	if _, err := svc.Ingest(ctx, "agent_game", "site_default", gamePacket(2, start)); err != nil {
+	if _, err := svc.Ingest(ctx, "agent_game", "site_default", 1, gamePacket(2, start)); err != nil {
 		t.Fatalf("re-ingest under a new sequence: %v", err)
 	}
 
@@ -108,7 +108,7 @@ func TestGameDataDroppedWithoutPermission(t *testing.T) {
 	pkt := gamePacket(1, start)
 	pkt.AgentID = "agent_plain"
 
-	ack, err := svc.Ingest(ctx, "agent_plain", "site_default", pkt)
+	ack, err := svc.Ingest(ctx, "agent_plain", "site_default", 1, pkt)
 	if err != nil {
 		t.Fatalf("ingest: %v", err)
 	}

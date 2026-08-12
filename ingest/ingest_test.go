@@ -2,6 +2,7 @@ package ingest
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -69,7 +70,7 @@ func TestInterfaceSnapshotUsesSequenceAndExactRoundNumerics(t *testing.T) {
 	// not run the rollup worker and is specifically exercising raw ingest.
 	t1 := time.Now().UTC().Add(-15 * time.Minute).Truncate(time.Second)
 
-	if _, err := svc.Ingest(ctx, "agent_wifi", "site_default", wifiPacket(10, t1, telemetry.WiFiConnected, "home", true)); err != nil {
+	if _, err := svc.Ingest(ctx, "agent_wifi", "site_default", 1, wifiPacket(10, t1, telemetry.WiFiConnected, "home", true)); err != nil {
 		t.Fatalf("ingest connected: %v", err)
 	}
 	col, ifaces, err := inv.ListInterfaces(ctx, "agent_wifi")
@@ -86,11 +87,13 @@ func TestInterfaceSnapshotUsesSequenceAndExactRoundNumerics(t *testing.T) {
 
 	// A below-watermark sequence is a replay by the agent WAL's FIFO contract
 	// (single in-flight packet, resent under its original sequence until acked):
-	// the whole packet is skipped — snapshot, metrics and all — so neither the
+	// the slot has no receipt (it was never admitted), so the schema-8 ledger
+	// refuses it as a sequence conflict — no ack, nothing stored — so neither the
 	// authoritative Wi-Fi state nor the history may change, even though its
-	// wall-clock sample is later.
-	if _, err := svc.Ingest(ctx, "agent_wifi", "site_default", wifiPacket(9, t1.Add(time.Hour), telemetry.WiFiConnected, "wrong", true)); err != nil {
-		t.Fatalf("ingest lower sequence: %v", err)
+	// wall-clock sample is later. The hub turns the conflict into a rotation
+	// challenge; the state itself is never replaced in place.
+	if _, err := svc.Ingest(ctx, "agent_wifi", "site_default", 1, wifiPacket(9, t1.Add(time.Hour), telemetry.WiFiConnected, "wrong", true)); !errors.Is(err, ErrSequenceConflict) {
+		t.Fatalf("ingest lower sequence = %v, want ErrSequenceConflict", err)
 	}
 	_, ifaces, _ = inv.ListInterfaces(ctx, "agent_wifi")
 	if got := ifaces[0].WiFi.SSID; got != "home" {
@@ -99,7 +102,7 @@ func TestInterfaceSnapshotUsesSequenceAndExactRoundNumerics(t *testing.T) {
 
 	// A higher sequence wins despite device-clock rollback and clears all stale
 	// categorical/numeric fields on disconnect.
-	if _, err := svc.Ingest(ctx, "agent_wifi", "site_default", wifiPacket(11, t1.Add(-time.Hour), telemetry.WiFiDisconnected, "stale", true)); err != nil {
+	if _, err := svc.Ingest(ctx, "agent_wifi", "site_default", 1, wifiPacket(11, t1.Add(-time.Hour), telemetry.WiFiDisconnected, "stale", true)); err != nil {
 		t.Fatalf("ingest clock rollback disconnect: %v", err)
 	}
 	_, ifaces, _ = inv.ListInterfaces(ctx, "agent_wifi")
@@ -127,7 +130,7 @@ func TestInterfaceSnapshotUsesSequenceAndExactRoundNumerics(t *testing.T) {
 	}
 
 	// An explicit zero-interface snapshot is authoritative and clears rows.
-	if _, err := svc.Ingest(ctx, "agent_wifi", "site_default", wifiPacket(12, t1.Add(-30*time.Minute), "", "", false)); err != nil {
+	if _, err := svc.Ingest(ctx, "agent_wifi", "site_default", 1, wifiPacket(12, t1.Add(-30*time.Minute), "", "", false)); err != nil {
 		t.Fatalf("ingest empty snapshot: %v", err)
 	}
 	col, ifaces, err = inv.ListInterfaces(ctx, "agent_wifi")

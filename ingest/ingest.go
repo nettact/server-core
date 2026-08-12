@@ -39,6 +39,16 @@ type Ack struct {
 	ServerTime      time.Time `json:"server_time"`
 }
 
+// ErrSequenceConflict reports a replayed packet whose (epoch, sequence) slot
+// does not carry the content being presented: the receipt is missing (the
+// watermark advanced past a sequence that was never committed under this
+// epoch) or its stored fingerprint differs (the sequence was reused for
+// different content). Either way the batch must never be renumbered in place
+// — the hub answers with an epoch rotation challenge and withholds the ack.
+// The transaction is rolled back, so nothing about the conflicting batch is
+// stored.
+var ErrSequenceConflict = errors.New("ingest: sequence conflict")
+
 // Evaluator is the fault-engine surface ingest drives inside its own sample
 // transaction so telemetry samples and their fault evaluation reach one committed
 // state atomically. Satisfied by *fault.Service; kept as a small interface so
@@ -162,11 +172,23 @@ func filterTimestamps(ms []telemetry.Metric, now time.Time) (kept []telemetry.Me
 }
 
 // Ingest stores one telemetry packet idempotently and returns the ack watermark.
-func (s *Service) Ingest(ctx context.Context, agentID, siteID string, pkt telemetry.Packet) (Ack, error) {
+//
+// epoch is the credential generation the sending session authenticated under
+// (registry.AuthResult.Epoch). It keys the receipt ledger: admission compares
+// the packet's sequence against the CURRENT epoch's high_sequence — a packet
+// served under a stale epoch never reaches the receipt table through the
+// replay path (it would be admitted against the reset watermark instead), and
+// stale-epoch packets surface as a Hello-epoch mismatch at the hub, not here.
+func (s *Service) Ingest(ctx context.Context, agentID, siteID string, epoch uint64, pkt telemetry.Packet) (Ack, error) {
 	if err := protocol.ValidateSchema(pkt.SchemaVersion); err != nil {
 		return Ack{}, err
 	}
 	now := time.Now().UTC()
+	// The semantic fingerprint is computed on the PRISTINE packet, before the
+	// timestamp filter below mutates it: the same WAL batch re-served after a
+	// clock correction must hash identically to its admission, or the filter's
+	// per-serve view of "future/ancient" would fabricate conflicts.
+	fingerprint := PacketFingerprint(pkt)
 
 	// Timestamp policy, enforced before ANYTHING sees the metrics. The data
 	// plane's out-of-order floor is relative to its GLOBAL head time: one agent
@@ -246,7 +268,7 @@ func (s *Service) Ingest(ctx context.Context, agentID, siteID string, pkt teleme
 	// DB, and the single write connection is already checked out once WriteTx
 	// opens its transaction — a pool query here would deadlock against our own
 	// transaction.
-	high, epoch, err := s.currentHigh(ctx, agentID)
+	high, cacheEpoch, err := s.currentHigh(ctx, agentID)
 	if err != nil {
 		return Ack{}, err
 	}
@@ -346,8 +368,55 @@ func (s *Service) Ingest(ctx context.Context, agentID, siteID string, pkt teleme
 					!errors.Is(err, sql.ErrNoRows) {
 					return nil, err
 				}
+				// The receipt ledger settles what the refusal means. A receipt for
+				// THIS slot carrying the same content: the concurrent session
+				// admitted the same batch — a duplicate, ack the adopted watermark.
+				// A different fingerprint, or no receipt at all (the watermark
+				// advanced past a sequence that was never committed): a conflict —
+				// fail the batch, roll back, and let the hub drive a rotation.
+				stored, serr := s.receiptFingerprint(ctx, wtx, agentID, epoch, pkt.Sequence)
+				switch {
+				case errors.Is(serr, sql.ErrNoRows):
+					return nil, ErrSequenceConflict
+				case serr != nil:
+					return nil, serr
+				case stored != fingerprint:
+					return nil, ErrSequenceConflict
+				}
+				isNew = false
+			} else {
+				// The admission admits the receipt: one durable row per committed
+				// (agent, epoch, sequence), carrying the fingerprint that makes a
+				// later replay of the slot verifiable. The OR IGNORE tolerates the
+				// one corner where the slot already exists after a watermark reset
+				// within the same epoch — the row then necessarily carries this
+				// content or the admission itself would not have passed the
+				// monotone guard's epoch-pinned history.
+				if _, err := wtx.ExecContext(ctx, `
+					INSERT OR IGNORE INTO packet_receipts(agent_id, enrollment_epoch, sequence, fingerprint, received_at)
+					VALUES(?,?,?,?,?)`,
+					agentID, epoch, pkt.Sequence, fingerprint, now.Unix()); err != nil {
+					return nil, err
+				}
 			}
-			isNew = admitted > 0
+		} else {
+			// Replay (sequence at or below the watermark): the receipt for this
+			// (epoch, sequence) slot must exist and carry this exact content. A
+			// missing slot or a different fingerprint is a conflict — the WAL's
+			// FIFO single-in-flight contract makes a legitimate below-watermark
+			// gap impossible, so a slot without a receipt is a sequence that was
+			// skipped by whoever moved the watermark, and renumbering it in place
+			// is forbidden (see ErrSequenceConflict). Same fingerprint = the same
+			// batch served again: duplicate as today, ack restates the watermark.
+			stored, serr := s.receiptFingerprint(ctx, wtx, agentID, epoch, pkt.Sequence)
+			switch {
+			case errors.Is(serr, sql.ErrNoRows):
+				return nil, ErrSequenceConflict
+			case serr != nil:
+				return nil, serr
+			case stored != fingerprint:
+				return nil, ErrSequenceConflict
+			}
 		}
 
 		var acceptedTx []telemetry.Metric
@@ -550,9 +619,32 @@ func (s *Service) Ingest(ctx context.Context, agentID, siteID string, pkt teleme
 	}
 
 	return Ack{
-		HighestSequence: s.ackSequence(agentID, pkt.Sequence, epoch, isNew, adoptHigh),
+		HighestSequence: s.ackSequence(agentID, pkt.Sequence, cacheEpoch, isNew, adoptHigh),
 		ServerTime:      now,
 	}, nil
+}
+
+// receiptFingerprint returns the stored content fingerprint for one (agent,
+// epoch, sequence) receipt slot, or sql.ErrNoRows when no receipt exists for
+// the slot.
+func (s *Service) receiptFingerprint(ctx context.Context, wtx store.WriteTx, agentID string, epoch, seq uint64) (string, error) {
+	var fp string
+	err := wtx.QueryRowContext(ctx,
+		`SELECT fingerprint FROM packet_receipts WHERE agent_id=? AND enrollment_epoch=? AND sequence=?`,
+		agentID, epoch, seq).Scan(&fp)
+	return fp, err
+}
+
+// AcceptedFloor returns the current epoch's committed sequence high-watermark
+// (agents.high_sequence) — the durable value the hub pushes as the schema-8
+// SequenceFloor on connect. Mirrors currentHigh, but a straight DB read: the
+// floor must be the committed truth, not whatever the in-memory cache of this
+// process happens to hold.
+func (s *Service) AcceptedFloor(ctx context.Context, agentID string) (uint64, error) {
+	var high uint64
+	err := s.db.QueryRowContext(ctx,
+		`SELECT high_sequence FROM agents WHERE id=?`, agentID).Scan(&high)
+	return high, err
 }
 
 // monitorIDs returns the distinct non-empty MonitorIDs referenced by a batch.

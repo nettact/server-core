@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
+	"github.com/google/uuid"
 
 	"github.com/nettact/protocol"
 	pcfg "github.com/nettact/protocol/config"
@@ -105,7 +106,7 @@ func (h *Hub) HandleUpgrade(w http.ResponseWriter, r *http.Request) {
 	// Authenticate BEFORE upgrading so a bad token gets a plain 401 the agent
 	// can distinguish from transport trouble (and we never hold sockets for
 	// unauthenticated callers).
-	agentID, siteID, err := h.deps.Registry.AuthenticateAgent(r.Context(), bearer(r))
+	auth, err := h.deps.Registry.AuthenticateAgent(r.Context(), bearer(r))
 	if err != nil {
 		http.Error(w, "invalid agent token", http.StatusUnauthorized)
 		return
@@ -129,17 +130,18 @@ func (h *Hub) HandleUpgrade(w http.ResponseWriter, r *http.Request) {
 	conn.SetReadLimit(maxFrameBytes)
 
 	sc := &wsConn{c: conn, contentType: wire.SubprotocolContentType(conn.Subprotocol())}
-	h.serve(r.Context(), agentID, siteID, sc, bearer(r))
+	h.serve(r.Context(), auth, sc, bearer(r))
 }
 
 // serve runs one authenticated session over an established frame link: it
 // requires a valid Hello as the first frame, refreshes registry state, registers
 // the session (kicking any prior one for the same agent), pushes current
-// DesiredState, and loops until the link dies. It blocks for the session's life.
-// Transport-agnostic: HandleUpgrade wraps a WebSocket, DialLocal wraps a pipe.
-// token is the bearer this connection authenticated with; it is re-validated at
-// registration (see below).
-func (h *Hub) serve(ctx context.Context, agentID, siteID string, c wire.Conn, token string) {
+// DesiredState and the schema-8 sequence floor, and loops until the link dies.
+// It blocks for the session's life. Transport-agnostic: HandleUpgrade wraps a
+// WebSocket, DialLocal wraps a pipe. token is the bearer this connection
+// authenticated with; it is re-validated at registration (see below).
+func (h *Hub) serve(ctx context.Context, auth registry.AuthResult, c wire.Conn, token string) {
+	agentID, siteID := auth.AgentID, auth.SiteID
 	// Admission: a hub CloseAll has swept accepts no further connections, and one
 	// it HAS admitted must be awaited — the Hello side effects below write through
 	// the registry, so CloseAll must not return (its caller closes the DB) while a
@@ -188,6 +190,23 @@ func (h *Hub) serve(ctx context.Context, agentID, siteID string, c wire.Conn, to
 		_ = c.Close(wire.CloseUnsupportedSchema, "unsupported schema")
 		return
 	}
+	// Schema-8 gates, evaluated BEFORE registration and before any Hello side
+	// effect: a peer that cannot speak the floor barrier must not get a session
+	// at all — without the barrier its packets would be renumbered in place the
+	// first time its WAL restarts, which the receipt ledger exists to forbid.
+	if !wire.HasCapability(hello.Capabilities, wire.CapSequenceFloorV1) {
+		_ = h.deps.Registry.RecordDisconnect(ctx, agentID, "unsupported_schema")
+		_ = c.Close(wire.CloseProtocolError, "missing sequence_floor_v1 capability")
+		return
+	}
+	// A zero epoch means the agent does not know its credential generation. The
+	// floor barrier keys on the epoch, so admitting the session without one
+	// would make the barrier meaningless.
+	if hello.EnrollmentEpoch == 0 {
+		_ = h.deps.Registry.RecordDisconnect(ctx, agentID, "unsupported_schema")
+		_ = c.Close(wire.CloseProtocolError, "missing enrollment epoch")
+		return
+	}
 
 	// The Hello replaces the per-request X-Agent-* headers of the old POST
 	// transport: refresh the agent-owned fields it carries, then mark the agent
@@ -213,12 +232,13 @@ func (h *Hub) serve(ctx context.Context, agentID, siteID string, c wire.Conn, to
 	}
 
 	s := &session{
-		conn:    c,
-		agentID: agentID,
-		siteID:  siteID,
-		sendCh:  make(chan wire.Frame, sendQueueCap),
-		done:    make(chan struct{}),
-		closed:  make(chan struct{}),
+		conn:      c,
+		agentID:   agentID,
+		siteID:    siteID,
+		sendCh:    make(chan wire.Frame, sendQueueCap),
+		done:      make(chan struct{}),
+		closed:    make(chan struct{}),
+		sessionID: uuid.NewString(),
 	}
 	// Registered first so it runs LAST (after the teardown defer below): closing
 	// `closed` signals Disconnect/CloseAll that the reader has returned and the
@@ -250,7 +270,13 @@ func (h *Hub) serve(ctx context.Context, agentID, siteID string, c wire.Conn, to
 	// the new install's uploads. The rotation commits before the fence returns,
 	// so a dead token is always visible here; a rotation that lands after this
 	// check finds the session registered, where the fence waits for teardown.
-	if revID, _, err := h.deps.Registry.AuthenticateAgent(ctx, token); err != nil || revID != agentID {
+	//
+	// The re-check result (newest) is also the authority for the schema-8 flow
+	// below: a rotation committed between the upgrade auth and here shows up as
+	// either a dead token (close 4004) or a pending rotation (re-issue the
+	// result), and a stale Hello epoch is measured against THIS epoch.
+	revAuth, err := h.deps.Registry.AuthenticateAgent(ctx, token)
+	if err != nil || revAuth.AgentID != agentID {
 		_ = h.deps.Registry.RecordDisconnect(ctx, agentID, "revoked")
 		_ = c.Close(wire.CloseRevoked, "credential rotated")
 		return
@@ -328,6 +354,55 @@ func (h *Hub) serve(ctx context.Context, agentID, siteID string, c wire.Conn, to
 		}
 	}
 
+	// Schema 8: the credential-generation gate and the sequence-floor barrier.
+	// The session serves exactly one epoch — the one its bearer authenticated
+	// to at registration above.
+	s.epoch = revAuth.Epoch
+	switch {
+	case revAuth.PendingRotation != nil:
+		// The presented token is the OLD token of a rotation that already
+		// committed server-side (the result was lost in transit). Re-issue the
+		// result idempotently instead of the floor, then end the session: the
+		// agent persists the new credential and reconnects under it.
+		s.pendingRotation = revAuth.PendingRotation
+		if !s.enqueue(wire.Frame{EpochRotationResult: s.pendingRotation}) {
+			return
+		}
+		s.rotated = true
+		s.shutdown(wire.CloseGoingAway, "epoch rotated; reconnect")
+		return
+	case hello.EnrollmentEpoch != revAuth.Epoch:
+		// The Hello presents a stale credential generation. Challenge the agent
+		// to rotate out of it and HOLD the session for the rotation flow — the
+		// agent answers with EpochRotationRequest, and the read loop completes
+		// the exchange. No floor is pushed: without a floor there is nothing to
+		// apply, so the barrier stays closed and no packet is admitted until the
+		// rotation lands and the agent reconnects.
+		ch := h.deps.Registry.IssueRotationChallenge(agentID, revAuth.Epoch, "epoch_mismatch")
+		if !s.enqueue(wire.Frame{EpochRotationChallenge: &ch}) {
+			return
+		}
+	default:
+		// The barrier: push the current epoch's committed sequence floor before
+		// any packet may be claimed. Until the agent's SequenceFloorApplied
+		// echoes both values back, readLoop refuses packets outright.
+		floor, err := h.deps.Ingest.AcceptedFloor(ctx, agentID)
+		if err != nil {
+			log.Printf("agentws: accepted floor for %s: %v", agentID, err)
+			s.shutdown(wire.CloseInternalError, "floor lookup failed")
+			return
+		}
+		s.floorSent = true
+		s.floorPushed = floor
+		if !s.enqueue(wire.Frame{SequenceFloor: &wire.SequenceFloor{
+			EnrollmentEpoch: revAuth.Epoch,
+			SequenceFloor:   floor,
+			SessionID:       s.sessionID,
+		}}) {
+			return
+		}
+	}
+
 	readErr = h.readLoop(ctx, s)
 }
 
@@ -337,7 +412,13 @@ func (h *Hub) serve(ctx context.Context, agentID, siteID string, c wire.Conn, to
 // close leaves the local code unset and carries its RFC 6455 code in the read
 // error. Both WebSocket and the in-process pipe surface peer codes through
 // wire.CloseStatus, so the desktop's bundled agent classifies identically.
+// A session closed by the schema-8 rotation paths (close 1001 after delivering
+// a new credential) is classified "clean": it is a planned, successful handoff,
+// not a server shutdown or an error.
 func classifyDisconnect(readErr error, s *session) string {
+	if s.rotated {
+		return "clean"
+	}
 	if code, set := s.closeInfo(); set {
 		switch code {
 		case wire.CloseSuperseded:
@@ -378,7 +459,7 @@ func (h *Hub) DialLocal(ctx context.Context, token string) (wire.Conn, error) {
 		return nil, ErrClosed
 	}
 
-	agentID, siteID, err := h.deps.Registry.AuthenticateAgent(ctx, token)
+	auth, err := h.deps.Registry.AuthenticateAgent(ctx, token)
 	if err != nil {
 		return nil, fmt.Errorf("authenticate agent: %w", err)
 	}
@@ -386,7 +467,7 @@ func (h *Hub) DialLocal(ctx context.Context, token string) (wire.Conn, error) {
 	// context.Background(): the session's lifetime is governed by the link itself
 	// plus CloseAll on shutdown, exactly like a hijacked WebSocket that outlives
 	// the request context in practice.
-	go h.serve(context.Background(), agentID, siteID, serverEnd, token)
+	go h.serve(context.Background(), auth, serverEnd, token)
 	return agentEnd, nil
 }
 

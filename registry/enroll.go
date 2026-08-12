@@ -219,6 +219,7 @@ func (s *Service) Enroll(ctx context.Context, req enroll.EnrollRequest) (enroll.
 	now := time.Now().UTC()
 	var agentID, agentToken string
 	var siteSerial int
+	var enrollmentEpoch uint64 = 1 // fresh enrollments are generation 1
 	reclaimed := false
 	if tokenAgentID.Valid && tokenAgentID.String != "" {
 		// A reinstall token (AGENT-006) rejoins the bound agent's row under the
@@ -227,7 +228,7 @@ func (s *Service) Enroll(ctx context.Context, req enroll.EnrollRequest) (enroll.
 		// The quota is irrelevant because no row is added. The bound agent must
 		// still be live (not hard-deleted) — reenrollAgent reports ErrReinstallAgent.
 		// (The old session was already fenced pre-transaction; see above.)
-		siteID, siteSerial, agentToken, err = s.reenrollAgent(ctx, tx, tokenAgentID.String, req)
+		siteID, siteSerial, agentToken, enrollmentEpoch, err = s.reenrollAgent(ctx, tx, tokenAgentID.String, req)
 		if err != nil {
 			return enroll.EnrollResponse{}, err
 		}
@@ -320,10 +321,18 @@ func (s *Service) Enroll(ctx context.Context, req enroll.EnrollRequest) (enroll.
 	if reclaimed && s.ResetSeqWatermark != nil {
 		s.ResetSeqWatermark(ctx, agentID)
 	}
+	// A reinstall ends any prior rotation's pending window outright (the old
+	// token died with the credential swap above): clear the in-memory pending
+	// entry, so the previous generation's token can never be re-issued a
+	// rotation result that belongs to a different credential lineage.
+	if reclaimed {
+		s.clearPendingRotation(agentID)
+	}
 
 	return enroll.EnrollResponse{
 		AgentID: agentID, SiteID: siteID, AgentToken: agentToken,
 		ServerTime: now, ConfigVersion: siteSerial,
+		EnrollmentEpoch: enrollmentEpoch,
 	}, nil
 }
 
@@ -366,20 +375,29 @@ func (s *Service) reinstallTarget(ctx context.Context, token string) string {
 // at sequence 1, so without resetting it every batch the new install sends
 // would be misread as a replay and silently dropped.
 //
+// Schema 8: a reinstall replaces an install, so it advances the enrollment
+// epoch like the controlled wire rotation does — the (agent, epoch, sequence)
+// receipt identity must never reuse a generation, or the fresh WAL could
+// collide with durable receipts the previous installation left behind. The
+// rotation pending window is closed outright (a reinstall is not the
+// controlled rotation flow, and its OLD token must die at once): the columns
+// and the in-memory pending entry are cleared here, the latter after commit
+// in Enroll.
+//
 // Runs inside Enroll's transaction (the caller commits), so a failure rolls the
 // token consumption back together with the row update. Returns ErrReinstallAgent
-// if the bound agent row is gone.
+// if the bound agent row is gone, and the agent's new enrollment epoch.
 func (s *Service) reenrollAgent(ctx context.Context, tx *sql.Tx, agentID string,
-	req enroll.EnrollRequest) (siteID string, siteSerial int, agentToken string, err error) {
+	req enroll.EnrollRequest) (siteID string, siteSerial int, agentToken string, enrollmentEpoch uint64, err error) {
 
 	// The authoritative site comes from the existing row, never from the token's
 	// site_id, so a reinstall can't move an agent across sites.
 	if err := tx.QueryRowContext(ctx,
 		`SELECT site_id FROM agents WHERE id=? AND revoked=0`, agentID).Scan(&siteID); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return "", 0, "", ErrReinstallAgent
+			return "", 0, "", 0, ErrReinstallAgent
 		}
-		return "", 0, "", err
+		return "", 0, "", 0, err
 	}
 
 	agentToken = randToken()
@@ -397,7 +415,9 @@ func (s *Service) reenrollAgent(ctx context.Context, tx *sql.Tx, agentID string,
 			policy_source=?, policy_hash=?,
 			status='offline', high_sequence=0, last_status_config_version=-1,
 			upload_interval_seconds=0,
-			last_disconnect_kind=''
+			last_disconnect_kind='',
+			enrollment_epoch=enrollment_epoch+1,
+			pending_prev_token_hash='', pending_prev_token_until=0
 		WHERE id=?`,
 		[]byte(req.PublicKey), sha256hex(agentToken),
 		req.Hostname, req.Platform, req.AgentVersion,
@@ -406,7 +426,13 @@ func (s *Service) reenrollAgent(ctx context.Context, tx *sql.Tx, agentID string,
 		marshalReasons(req.Permissions.UnsupportedReasons, req.Permissions.Supported),
 		req.Permissions.Source, req.Permissions.PolicyHash,
 		agentID); err != nil {
-		return "", 0, "", err
+		return "", 0, "", 0, err
+	}
+	// The new generation this reinstall just minted, for the EnrollResponse (the
+	// agent persists it with the new credential and presents it in every Hello).
+	if err := tx.QueryRowContext(ctx,
+		`SELECT enrollment_epoch FROM agents WHERE id=?`, agentID).Scan(&enrollmentEpoch); err != nil {
+		return "", 0, "", 0, err
 	}
 	// The old session was fenced (DisconnectSession) before this transaction and
 	// the new one has not connected yet, so no ingest can race this reset.
@@ -415,7 +441,7 @@ func (s *Service) reenrollAgent(ctx context.Context, tx *sql.Tx, agentID string,
 	// reject the fresh WAL's low-sequence snapshots, leaving the interfaces/Wi-Fi
 	// state stale until the new machine out-paces the old one.
 	if _, err := tx.ExecContext(ctx, `DELETE FROM agent_wifi WHERE agent_id=?`, agentID); err != nil {
-		return "", 0, "", err
+		return "", 0, "", 0, err
 	}
 	// Throttle hygiene: the entry describes the previous installation. Clearing
 	// it early (pre-commit) is safe — a cleared throttle only means the next
@@ -423,26 +449,16 @@ func (s *Service) reenrollAgent(ctx context.Context, tx *sql.Tx, agentID string,
 	s.forgetTouch(agentID)
 	if err := tx.QueryRowContext(ctx,
 		`SELECT config_serial FROM sites WHERE id=?`, siteID).Scan(&siteSerial); err != nil {
-		return "", 0, "", err
+		return "", 0, "", 0, err
 	}
-	return siteID, siteSerial, agentToken, nil
+	return siteID, siteSerial, agentToken, enrollmentEpoch, nil
 }
 
 // --- agent bearer auth ---
 
-// AuthenticateAgent maps a bearer token to its agent id + site, or ErrAuth.
-func (s *Service) AuthenticateAgent(ctx context.Context, token string) (agentID, siteID string, err error) {
-	if token == "" {
-		return "", "", ErrAuth
-	}
-	err = s.db.QueryRowContext(ctx,
-		`SELECT id, site_id FROM agents WHERE token_hash=? AND revoked=0`, sha256hex(token)).
-		Scan(&agentID, &siteID)
-	if errors.Is(err, sql.ErrNoRows) {
-		return "", "", ErrAuth
-	}
-	return agentID, siteID, err
-}
+// AuthenticateAgent maps a bearer token to its agent identity (see
+// registry/rotate.go for the schema-8 AuthResult, epoch and rotation-pending
+// semantics).
 
 // --- config version (agents table) ---
 
