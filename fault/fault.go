@@ -443,6 +443,17 @@ type Signal struct {
 	// target at all, and for the host detectors, whose target id names a metric
 	// series rather than a generation an agent could have stamped a scene with.
 	TargetConfigSerial int `json:"target_config_serial,omitempty"`
+	// SizeSweep is the confirming round's probe.icmp.size_sweep classification,
+	// frozen when a loss degradation confirmed with size-correlated loss
+	// (SizeSweep.Code == 1). It is the evidence for the physical-layer claim the
+	// signal carries. Nil when no such sample backed the confirmation, and never
+	// set by a latency degradation.
+	SizeSweep *SizeSweepFacts `json:"size_sweep,omitempty"`
+	// FlowFanout is the confirming round's probe.tcp.flow_fanout classification,
+	// frozen when an availability fault opened with member-level flow loss
+	// (FlowFanout.Code == 2). It is the evidence for the ECMP/LAG member-level
+	// claim the signal carries. Nil when the fault opened without it.
+	FlowFanout *FlowFanoutFacts `json:"flow_fanout,omitempty"`
 
 	ObservedAt        time.Time  `json:"observed_at"`
 	ConfirmedAt       time.Time  `json:"confirmed_at"`

@@ -319,9 +319,16 @@ func TestBandIsAMedianAcrossDaysNotAPool(t *testing.T) {
 	// samples at 500ms. A count-weighted pool would let that single day define
 	// "normal" for the next fortnight, which is exactly the failure this design
 	// exists to avoid.
+	//
+	// The writes are ASCENDING in time on purpose: the tsstore's OOO window
+	// (75h) silently drops a sample appended more than that far behind the head's
+	// newest in-order timestamp, and weekdayNoons can legitimately span a weekend
+	// gap (a 5-weekday window that crosses Sat/Sun). Writing descending would
+	// make the test's outcome depend on which weekday it runs — dropping whole
+	// days from the fold and failing the Days assertion on those calendar days.
 	noons := weekdayNoons(5)
-	for _, noon := range noons[1:] {
-		h.samples(sid, noon.Unix(), 100, 20)
+	for i := len(noons) - 1; i >= 1; i-- {
+		h.samples(sid, noons[i].Unix(), 100, 20)
 	}
 	h.samples(sid, noons[0].Unix(), 1000, 500)
 	if err := h.svc.Fold(h.ctx); err != nil {

@@ -127,6 +127,15 @@ const (
 	maxBodyLen         = 64 << 10 // request body
 	maxRedirectHops    = 20       // follow limit; <0 means "never follow"
 	maxResponseReadCap = 10 << 20 // body bytes the agent may buffer for a keyword match
+	// maxSweepSizes bounds a size_sweep payload list. The sweep compares the
+	// smallest against the largest size actually sent, so two entries are the
+	// minimum meaningful comparison; beyond eight the round-robin sample per size
+	// thins out below statistical usefulness.
+	maxSweepSizes = 8
+	// maxFlowFanout bounds the TCP source-port fan-out count. Each pinned port is
+	// a separate connect, so an unbounded fan-out would let one target monopolize
+	// the agent's probe budget; 32 is already an aggressive ECMP spread.
+	maxFlowFanout = 32
 )
 
 var (
@@ -150,6 +159,23 @@ func validateProbeParams(kind string, p *pcfg.ProbeParams) error {
 		}
 		if p.GlobalTimeoutMs < 0 || p.GlobalTimeoutMs > maxTimeoutMs {
 			return errors.New("global_timeout_ms out of range (0-" + strconv.Itoa(maxTimeoutMs) + ")")
+		}
+		// The sweep compares smallest against largest payload, so a one-entry list
+		// would be a comparison with itself; and the agent dials every entry every
+		// cycle, so the list is bounded the way packet_count is.
+		if len(p.PayloadSizes) > 0 {
+			if len(p.PayloadSizes) < 2 || len(p.PayloadSizes) > maxSweepSizes {
+				return errors.New("payload_sizes must list 2-" + strconv.Itoa(maxSweepSizes) + " sizes (empty = default sweep)")
+			}
+			for _, sz := range p.PayloadSizes {
+				if sz < 1 || sz > maxPacketSize {
+					return errors.New("payload_sizes entry out of range (1-" + strconv.Itoa(maxPacketSize) + ")")
+				}
+			}
+		}
+	case "tcp":
+		if p.FlowFanout < 0 || p.FlowFanout > maxFlowFanout {
+			return errors.New("flow_fanout out of range (0-" + strconv.Itoa(maxFlowFanout) + ")")
 		}
 	case "nat":
 		if p.GlobalTimeoutMs < 0 || p.GlobalTimeoutMs > maxTimeoutMs {

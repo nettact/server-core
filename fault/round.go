@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"math"
 	"sort"
+	"strconv"
 	"time"
 
 	pcfg "github.com/nettact/protocol/config"
@@ -279,6 +280,36 @@ const (
 	RoundFail
 )
 
+// SizeSweepFacts is the per-cycle classification and supporting evidence of a
+// probe.icmp.size_sweep sample: does loss rise with ICMP payload size
+// (physical-layer fingerprint) or not. Code semantics: 0 flat, 1 size-correlated,
+// 2 insufficient evidence. The compared sizes and per-size loss/counts ride as
+// labels on the sample (telemetry.SizeSmallLabel … CountLargeLabel) and are
+// frozen here so a signal can render the evidence without re-deriving it.
+type SizeSweepFacts struct {
+	Code        int     `json:"code"`
+	SizeSmall   int     `json:"size_small"`
+	SizeLarge   int     `json:"size_large"`
+	LossSmall   float64 `json:"loss_small"`
+	LossLarge   float64 `json:"loss_large"`
+	CountSmall  int     `json:"count_small"`
+	CountLarge  int     `json:"count_large"`
+}
+
+// FlowFanoutFacts is the per-cycle classification and supporting evidence of a
+// probe.tcp.flow_fanout sample: do a deterministic subset of pinned source-port
+// flows fail (ECMP/LAG member-level fault) or is loss uniform. Code semantics:
+// 0 single flow, 1 uniform, 2 member-level, 3 all flows failed, 4 insufficient.
+// The flow counts ride as labels (telemetry.FlowFanoutFlowsLabel … OKLabel) and
+// are frozen here so a signal can render the evidence without re-deriving it.
+type FlowFanoutFacts struct {
+	Code      int `json:"code"`
+	Flows     int `json:"flows"`
+	BadStable int `json:"bad_stable"`
+	BadNew    int `json:"bad_new"`
+	OK        int `json:"ok"`
+}
+
 // Round is one probe cycle's availability verdict for one target, plus the
 // evidence to freeze if it turns out to confirm a fault.
 //
@@ -331,6 +362,16 @@ type Round struct {
 	// a WAL replay of yesterday evening's rounds is measured against yesterday
 	// evening's normal.
 	Baselines map[string]baseline.Band
+	// SizeSweep is the round's probe.icmp.size_sweep classification, set when the
+	// round carried one. A loss degradation that confirms on this round freezes it
+	// as the physical-layer evidence. These are dedicated round facts, NOT baseline
+	// kinds — they are never folded into Latencies or judged by a detector.
+	SizeSweep *SizeSweepFacts
+	// FlowFanout is the round's probe.tcp.flow_fanout classification, set when the
+	// round carried one. An availability fault that confirms on this round freezes
+	// it as the ECMP/LAG member-level evidence. A dedicated round fact, not a
+	// baseline kind.
+	FlowFanout *FlowFanoutFacts
 }
 
 // DegradationDetectorKey names the detector that judges a metric kind against a
@@ -564,6 +605,11 @@ func BuildRounds(ms []telemetry.Metric, meta map[string]TargetMeta) []Round {
 		// alongside the verdict rather than in a second pass so both detectors provably
 		// judge the same round.
 		latencies map[string]float64
+		// sizeSweep and flowFanout are this cycle's dedicated classification samples
+		// (probe.icmp.size_sweep / probe.tcp.flow_fanout). They are NOT baseline kinds
+		// — never folded into latencies — they are frozen as round evidence only.
+		sizeSweep  *SizeSweepFacts
+		flowFanout *FlowFanoutFacts
 	}
 	acc := map[roundKey]*roundAcc{}
 	for i := range ms {
@@ -585,7 +631,9 @@ func BuildRounds(ms []telemetry.Metric, meta map[string]TargetMeta) []Round {
 		isReason := hasReason && kind == reason
 		isQuality := baselineKinds[kind]
 		isSent := kind == string(telemetry.ICMPSent) && (tm.Kind == "icmp" || tm.Kind == "gateway")
-		if !isPrimary && !isReason && !isQuality && !isSent {
+		isSizeSweep := kind == string(telemetry.ICMPSizeSweep) && (tm.Kind == "icmp" || tm.Kind == "gateway")
+		isFlowFanout := kind == string(telemetry.TCPFlowFanout) && tm.Kind == "tcp"
+		if !isPrimary && !isReason && !isQuality && !isSent && !isSizeSweep && !isFlowFanout {
 			continue
 		}
 		k := roundKey{targetID: m.MonitorID, ts: m.TS.Unix()}
@@ -596,6 +644,14 @@ func BuildRounds(ms []telemetry.Metric, meta map[string]TargetMeta) []Round {
 		}
 		if isSent {
 			a.sent = int(m.Value)
+			continue
+		}
+		if isSizeSweep {
+			a.sizeSweep = sizeSweepFactsFrom(m)
+			continue
+		}
+		if isFlowFanout {
+			a.flowFanout = flowFanoutFactsFrom(m)
 			continue
 		}
 		// A quality metric can also BE the primary one (ICMP loss is both), so this
@@ -644,7 +700,9 @@ func BuildRounds(ms []telemetry.Metric, meta map[string]TargetMeta) []Round {
 			Value: a.value, Threshold: thresholdFor(tm.Kind, tm.Det),
 			ConfigSerial: a.configSerial, Layer: a.layer, Det: tm.Det, Meta: tm,
 			StunAddr: a.stunAddr, StunTransport: a.stunTransport,
-			Latencies: a.latencies,
+			Latencies:  a.latencies,
+			SizeSweep:  a.sizeSweep,
+			FlowFanout: a.flowFanout,
 		}
 		if r.Layer == "" {
 			r.Layer = builtinLayer(tm.Kind)
@@ -664,6 +722,44 @@ func BuildRounds(ms []telemetry.Metric, meta map[string]TargetMeta) []Round {
 		return out[i].TS < out[j].TS
 	})
 	return out
+}
+
+// sizeSweepFactsFrom reads one probe.icmp.size_sweep sample's classification code
+// (Metric.Value) and its label evidence. A missing or unparsable label yields its
+// zero value — the sample still carries Code, which is what the hooks branch on.
+func sizeSweepFactsFrom(m *telemetry.Metric) *SizeSweepFacts {
+	return &SizeSweepFacts{
+		Code:        int(m.Value),
+		SizeSmall:   atoiLabel(m, telemetry.SizeSmallLabel),
+		SizeLarge:   atoiLabel(m, telemetry.SizeLargeLabel),
+		LossSmall:   parseFloatLabel(m, telemetry.LossSmallLabel),
+		LossLarge:   parseFloatLabel(m, telemetry.LossLargeLabel),
+		CountSmall:  atoiLabel(m, telemetry.CountSmallLabel),
+		CountLarge:  atoiLabel(m, telemetry.CountLargeLabel),
+	}
+}
+
+// flowFanoutFactsFrom reads one probe.tcp.flow_fanout sample's classification
+// code (Metric.Value) and its flow-count labels. Same leniency as
+// sizeSweepFactsFrom.
+func flowFanoutFactsFrom(m *telemetry.Metric) *FlowFanoutFacts {
+	return &FlowFanoutFacts{
+		Code:      int(m.Value),
+		Flows:     atoiLabel(m, telemetry.FlowFanoutFlowsLabel),
+		BadStable: atoiLabel(m, telemetry.FlowFanoutBadStableLabel),
+		BadNew:    atoiLabel(m, telemetry.FlowFanoutBadNewLabel),
+		OK:        atoiLabel(m, telemetry.FlowFanoutOKLabel),
+	}
+}
+
+func atoiLabel(m *telemetry.Metric, key string) int {
+	v, _ := strconv.Atoi(m.Labels[key])
+	return v
+}
+
+func parseFloatLabel(m *telemetry.Metric, key string) float64 {
+	v, _ := strconv.ParseFloat(m.Labels[key], 64)
+	return v
 }
 
 // AvailabilitySamples projects rounds onto the derived probe.round.ok series

@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/nettact/protocol/telemetry"
 	"github.com/nettact/server-core/baseline"
 )
 
@@ -256,6 +257,15 @@ func (s *Service) confirmDegradation(ctx context.Context, tx *sql.Tx, agentID, s
 		BaselineP50: band.P50, BaselineP95: band.P95,
 		Rounds:     c.st.pendingFails,
 		ObservedAt: observed, ConfirmedAt: timeFromUnix(r.TS),
+	}
+
+	// The size-sweep classification is frozen only for a LOSS degradation — loss is
+	// what size-correlation claims to explain, and "latency rises with packet size"
+	// is not a fingerprint anybody should act on. A swept round with size-correlated
+	// loss (Code 1) is exactly the physical-layer evidence the signal is about to
+	// claim, so it rides along; nil or any other code leaves the field nil.
+	if c.metricKind == string(telemetry.ICMPLoss) && r.SizeSweep != nil && r.SizeSweep.Code == 1 {
+		sig.SizeSweep = r.SizeSweep
 	}
 
 	// A degradation never joins an availability incident, even inside a merging

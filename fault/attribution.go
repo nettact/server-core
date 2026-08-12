@@ -76,6 +76,10 @@ type memberFact struct {
 	reasonCode  int
 	severity    string
 	layer       string
+	// sizeSweep / flowFanout are the signal's frozen classification facts,
+	// loaded for the attribution rules to emit as evidence clues (DEGRADE-001/002).
+	sizeSweep  *SizeSweepFacts
+	flowFanout *FlowFanoutFacts
 }
 
 // traceFact is a terminal traceroute report's reaching evidence for one subject.
@@ -109,17 +113,33 @@ type refState struct {
 // memberFactCols projects a fault signal's frozen facts in the shape the
 // attribution rules consume, joined to the proxies table for the display name.
 const memberFactCols = `fs.agent_id, fs.site_id, fs.detector_key, fs.probe_kind, fs.target_id, fs.target_name,
-	fs.target_addr, fs.proxy_id, fs.proxy_type, fs.proxy_addr, fs.reason_code, COALESCE(px.name,''), fs.severity, COALESCE(fs.layer,'')`
+	fs.target_addr, fs.proxy_id, fs.proxy_type, fs.proxy_addr, fs.reason_code, COALESCE(px.name,''), fs.severity, COALESCE(fs.layer,''),
+	fs.size_sweep_json, fs.flow_fanout_json`
 
 func scanMemberFacts(rows *sql.Rows) ([]memberFact, error) {
 	defer rows.Close()
 	var out []memberFact
 	for rows.Next() {
 		var m memberFact
+		var sizeSweepJSON, flowFanoutJSON sql.NullString
 		if err := rows.Scan(&m.agentID, &m.siteID, &m.detectorKey, &m.probeKind, &m.targetID,
 			&m.targetName, &m.targetAddr, &m.proxyID, &m.proxyType, &m.proxyAddr, &m.reasonCode,
-			&m.proxyName, &m.severity, &m.layer); err != nil {
+			&m.proxyName, &m.severity, &m.layer, &sizeSweepJSON, &flowFanoutJSON); err != nil {
 			return nil, err
+		}
+		if sizeSweepJSON.Valid {
+			var f SizeSweepFacts
+			if err := json.Unmarshal([]byte(sizeSweepJSON.String), &f); err != nil {
+				return nil, err
+			}
+			m.sizeSweep = &f
+		}
+		if flowFanoutJSON.Valid {
+			var f FlowFanoutFacts
+			if err := json.Unmarshal([]byte(flowFanoutJSON.String), &f); err != nil {
+				return nil, err
+			}
+			m.flowFanout = &f
 		}
 		out = append(out, m)
 	}
@@ -332,6 +352,38 @@ func traceForTarget(traces []traceFact, subject, targetID string) *traceFact {
 	return nil
 }
 
+// factClues turns a member's frozen classification facts into evidence clues
+// (DEGRADE-001/002): a size-correlated loss signal (SizeSweep.Code == 1) argues
+// physical-layer degradation, a member-level flow signal (FlowFanout.Code == 2)
+// argues an ECMP/LAG member fault. Produced once from the incident's own members
+// and appended to EVERY rule's clue list, so the facts ship as evidence even
+// when the rule that concluded the attribution does not rest on them — and the
+// console can render them whether or not the conclusion named the cause.
+func factClues(members []memberFact) []notification.AttributionClue {
+	var out []notification.AttributionClue
+	for _, m := range members {
+		if m.sizeSweep != nil && m.sizeSweep.Code == 1 {
+			out = append(out, notification.AttributionClue{
+				Kind:      notification.ClueSizeCorrelated,
+				SizeSmall: m.sizeSweep.SizeSmall,
+				SizeLarge: m.sizeSweep.SizeLarge,
+				LossSmall: m.sizeSweep.LossSmall,
+				LossLarge: m.sizeSweep.LossLarge,
+			})
+		}
+		if m.flowFanout != nil && m.flowFanout.Code == 2 {
+			out = append(out, notification.AttributionClue{
+				Kind:      notification.ClueEcmpMember,
+				Flows:     m.flowFanout.Flows,
+				BadStable: m.flowFanout.BadStable,
+				BadNew:    m.flowFanout.BadNew,
+				OK:        m.flowFanout.OK,
+			})
+		}
+	}
+	return out
+}
+
 // computeAttribution runs the rule set. members are the incident's firing
 // members; traces are the incident's terminal reports. Returns (empty, nil) when
 // the evidence is insufficient — the renderers then fall back to layer wording.
@@ -366,6 +418,10 @@ func computeAttribution(ctx context.Context, tx *sql.Tx, members []memberFact, t
 		return "", nil, err
 	}
 
+	// Frozen classification facts ride alongside whichever rule concludes — see
+	// factClues.
+	facts := factClues(members)
+
 	g := gatewayState(firing, refs)
 	firingTargets := map[string]bool{}
 	for _, m := range firing {
@@ -390,7 +446,7 @@ func computeAttribution(ctx context.Context, tx *sql.Tx, members []memberFact, t
 				clues = append(clues, notification.AttributionClue{Kind: notification.ClueTraceDiedInLAN})
 			}
 		}
-		return LocationRouter, clues, nil
+		return LocationRouter, append(clues, facts...), nil
 	}
 
 	// R2 — every member pinned to the same proxy and at least one failed on the
@@ -426,7 +482,7 @@ func computeAttribution(ctx context.Context, tx *sql.Tx, members []memberFact, t
 					clues = append(clues, notification.AttributionClue{Kind: notification.ClueTraceProxyUnreach})
 				}
 			}
-			return LocationProxy, clues, nil
+			return LocationProxy, append(clues, facts...), nil
 		}
 	}
 
@@ -447,7 +503,7 @@ func computeAttribution(ctx context.Context, tx *sql.Tx, members []memberFact, t
 		if hasProxied(members) {
 			clues = append(clues, notification.AttributionClue{Kind: notification.ClueViaProxy})
 		}
-		return LocationService, clues, nil
+		return LocationService, append(clues, facts...), nil
 	}
 
 	// R4 — gateway healthy + several distinct public targets unreachable → ISP
@@ -469,7 +525,7 @@ func computeAttribution(ctx context.Context, tx *sql.Tx, members []memberFact, t
 			if traceLostInLAN {
 				clues = append(clues, notification.AttributionClue{Kind: notification.ClueTraceDiedInLAN})
 			}
-			return LocationISP, clues, nil
+			return LocationISP, append(clues, facts...), nil
 		}
 	}
 
@@ -486,7 +542,7 @@ func computeAttribution(ctx context.Context, tx *sql.Tx, members []memberFact, t
 		if g == "healthy" {
 			clues = append(clues, notification.AttributionClue{Kind: notification.ClueGatewayOK})
 		}
-		return LocationDNS, clues, nil
+		return LocationDNS, append(clues, facts...), nil
 	}
 
 	// R6 — exactly one distinct failing host agent-wide, and either a healthy
@@ -516,7 +572,7 @@ func computeAttribution(ctx context.Context, tx *sql.Tx, members []memberFact, t
 				clues = append(clues, notification.AttributionClue{Kind: notification.ClueTracePublicLost, Name: tf.lastPublicHop})
 			}
 		}
-		return LocationService, clues, nil
+		return LocationService, append(clues, facts...), nil
 	}
 
 	// R7 — insufficient evidence: no conclusion, but ship the advisory clues so
@@ -530,7 +586,7 @@ func computeAttribution(ctx context.Context, tx *sql.Tx, members []memberFact, t
 			clues = append(clues, notification.AttributionClue{Kind: notification.ClueNoReference})
 		}
 	}
-	return "", clues, nil
+	return "", append(clues, facts...), nil
 }
 
 // RecomputeAttributionTx recomputes an incident's attribution from its firing

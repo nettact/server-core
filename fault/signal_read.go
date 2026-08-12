@@ -3,6 +3,7 @@ package fault
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"strings"
 )
 
@@ -22,7 +23,7 @@ const signalCols = `s.id, s.site_id, s.agent_id, s.agent_name, s.target_id, s.ta
 	s.target_port, s.detector_key, s.probe_kind, s.group_id, s.group_name, s.layer, s.severity, s.state,
 	s.resolve_reason, s.fail_threshold, s.recover_threshold, s.metric_kind, s.comparator, s.value, s.threshold,
 	s.reason_code, s.reason_detail, s.baseline_p50, s.baseline_p95,
-	s.rounds_json, s.observed_at, s.confirmed_at, s.resolved_at, s.incident_id,
+	s.rounds_json, s.size_sweep_json, s.flow_fanout_json, s.observed_at, s.confirmed_at, s.resolved_at, s.incident_id,
 	CASE WHEN s.state='firing'
 	          AND (s.detector_key = '` + DetectorAgentConnectivity + `' OR COALESCE(ds.fail_rounds,0) > 0)
 	     THEN 1 ELSE 0 END`
@@ -127,17 +128,32 @@ func (s *Service) query(ctx context.Context, q string, args ...any) ([]Signal, e
 		var sig Signal
 		var resolved sql.NullTime
 		var roundsJSON string
+		var sizeSweepJSON, flowFanoutJSON sql.NullString
 		var abnormal int
 		if err := rows.Scan(&sig.ID, &sig.SiteID, &sig.AgentID, &sig.AgentName, &sig.TargetID,
 			&sig.TargetName, &sig.TargetAddr, &sig.Port, &sig.DetectorKey, &sig.ProbeKind,
 			&sig.GroupID, &sig.GroupName, &sig.Layer, &sig.Severity, &sig.State, &sig.ResolveReason,
 			&sig.FailThreshold, &sig.RecoverThreshold, &sig.MetricKind, &sig.Comparator, &sig.Value,
 			&sig.Threshold, &sig.ReasonCode, &sig.ReasonDetail, &sig.BaselineP50, &sig.BaselineP95,
-			&roundsJSON, &sig.ObservedAt, &sig.ConfirmedAt,
+			&roundsJSON, &sizeSweepJSON, &flowFanoutJSON, &sig.ObservedAt, &sig.ConfirmedAt,
 			&resolved, &sig.IncidentID, &abnormal); err != nil {
 			return nil, err
 		}
 		sig.Rounds = decodeRounds(roundsJSON)
+		if sizeSweepJSON.Valid {
+			var f SizeSweepFacts
+			if err := json.Unmarshal([]byte(sizeSweepJSON.String), &f); err != nil {
+				return nil, err
+			}
+			sig.SizeSweep = &f
+		}
+		if flowFanoutJSON.Valid {
+			var f FlowFanoutFacts
+			if err := json.Unmarshal([]byte(flowFanoutJSON.String), &f); err != nil {
+				return nil, err
+			}
+			sig.FlowFanout = &f
+		}
 		if resolved.Valid {
 			t := resolved.Time.UTC()
 			sig.ResolvedAt = &t

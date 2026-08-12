@@ -106,6 +106,25 @@ func TestValidateProbeParams(t *testing.T) {
 		{name: "icmp packet_size too big", kind: "icmp", params: pcfg.ProbeParams{PacketSize: 70000}, wantErr: "packet_size"},
 		{name: "icmp global timeout too long", kind: "icmp", params: pcfg.ProbeParams{GlobalTimeoutMs: 999999}, wantErr: "global_timeout_ms"},
 
+		// DEGRADE-001: the size sweep compares smallest against largest payload, so a
+		// one-entry list is a comparison with itself; an empty list is the default
+		// sweep and stays valid.
+		{name: "icmp size sweep ok", kind: "icmp", params: pcfg.ProbeParams{SizeSweep: true, PayloadSizes: []int{64, 1400}}},
+		{name: "icmp size sweep default", kind: "icmp", params: pcfg.ProbeParams{SizeSweep: true}},
+		{name: "icmp single size rejected", kind: "icmp", params: pcfg.ProbeParams{SizeSweep: true, PayloadSizes: []int{1400}}, wantErr: "payload_sizes must list 2-8"},
+		{name: "icmp too many sizes", kind: "icmp", params: pcfg.ProbeParams{SizeSweep: true, PayloadSizes: []int{64, 128, 256, 512, 1024, 1400, 2000, 3000, 4000}}, wantErr: "payload_sizes must list 2-8"},
+		{name: "icmp size zero rejected", kind: "icmp", params: pcfg.ProbeParams{SizeSweep: true, PayloadSizes: []int{0, 1400}}, wantErr: "payload_sizes entry out of range"},
+		{name: "icmp size too big rejected", kind: "icmp", params: pcfg.ProbeParams{SizeSweep: true, PayloadSizes: []int{64, 70000}}, wantErr: "payload_sizes entry out of range"},
+		{name: "gateway size sweep ok", kind: "gateway", params: pcfg.ProbeParams{SizeSweep: true, PayloadSizes: []int{64, 1400}}},
+
+		// DEGRADE-002: the source-port fan-out is a per-cycle connect budget, so it
+		// is bounded; 0 = off.
+		{name: "tcp fanout off", kind: "tcp"},
+		{name: "tcp fanout ok", kind: "tcp", params: pcfg.ProbeParams{FlowFanout: 6}},
+		{name: "tcp fanout at bound", kind: "tcp", params: pcfg.ProbeParams{FlowFanout: 32}},
+		{name: "tcp fanout too high", kind: "tcp", params: pcfg.ProbeParams{FlowFanout: 33}, wantErr: "flow_fanout out of range (0-32)"},
+		{name: "tcp fanout negative", kind: "tcp", params: pcfg.ProbeParams{FlowFanout: -1}, wantErr: "flow_fanout out of range (0-32)"},
+
 		// DNS record type + resolver endpoint.
 		{name: "dns default record", kind: "dns"},
 		{name: "dns valid record", kind: "dns", params: pcfg.ProbeParams{RecordType: "MX"}},

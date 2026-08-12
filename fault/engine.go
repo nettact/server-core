@@ -3,6 +3,7 @@ package fault
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"log"
 	"time"
@@ -316,6 +317,15 @@ func (s *Service) confirmSignal(ctx context.Context, tx *sql.Tx, agentID, siteID
 		Rounds:     st.pendingFails,
 		ObservedAt: observed, ConfirmedAt: confirmed,
 	}
+	// The flow-fanout classification is frozen only when the confirming round was
+	// a member-level failure (Code 2) — that is the claim this signal is about to
+	// make, a deterministic bad subset of source-port flows while some stay clean,
+	// and the frozen counts are its evidence. Nil, or a code that says anything
+	// else (uniform loss, all-flows-failed, insufficient), leaves the field nil:
+	// an availability fault is not automatically an ECMP member fault.
+	if r.FlowFanout != nil && r.FlowFanout.Code == 2 {
+		sig.FlowFanout = r.FlowFanout
+	}
 	openKey := "sig:" + signalID
 	if mergeEnabled && r.GroupID != "" {
 		openKey = "grp:" + r.GroupID
@@ -582,6 +592,14 @@ func insertSignal(ctx context.Context, tx *sql.Tx, sig Signal, port int) error {
 	if err != nil {
 		return err
 	}
+	sizeSweepJSON, err := factsJSON(sig.SizeSweep)
+	if err != nil {
+		return err
+	}
+	flowFanoutJSON, err := factsJSON(sig.FlowFanout)
+	if err != nil {
+		return err
+	}
 	// The diagnosis-subject columns are empty for every detector that has no probe
 	// behind it (agent connectivity), which the zero-valued Signal supplies.
 	_, err = tx.ExecContext(ctx, `
@@ -591,16 +609,42 @@ func insertSignal(ctx context.Context, tx *sql.Tx, sig Signal, port int) error {
 		    reason_code, reason_detail, baseline_p50, baseline_p95,
 		    resolver_addr, resolver_protocol, stun_addr, stun_transport,
 		    proxy_id, proxy_type, proxy_addr, proxy_config_serial, target_config_serial,
-		    rounds_json, observed_at, confirmed_at, incident_id)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'firing', ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		    rounds_json, size_sweep_json, flow_fanout_json, observed_at, confirmed_at, incident_id)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'firing', ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		sig.ID, sig.SiteID, sig.AgentID, sig.TargetID, sig.DetectorKey, sig.ProbeKind,
 		sig.GroupID, sig.GroupName, sig.TargetName, sig.TargetAddr, port, sig.AgentName, sig.Layer, sig.Severity,
 		sig.FailThreshold, sig.RecoverThreshold, sig.MetricKind, sig.Comparator, sig.Value, sig.Threshold,
 		sig.ReasonCode, sig.ReasonDetail, sig.BaselineP50, sig.BaselineP95,
 		sig.ResolverAddr, sig.ResolverProtocol, sig.StunAddr, sig.StunTransport,
 		sig.ProxyID, sig.ProxyType, sig.ProxyAddr, sig.ProxyConfigSerial, sig.TargetConfigSerial,
-		roundsJSON, sig.ObservedAt, sig.ConfirmedAt, sig.IncidentID)
+		roundsJSON, sizeSweepJSON, flowFanoutJSON, sig.ObservedAt, sig.ConfirmedAt, sig.IncidentID)
 	return err
+}
+
+// factsJSON serializes a frozen facts block, or SQL NULL for a column when the
+// signal carries no such evidence. The nil-pointer arms are load-bearing: a typed
+// nil (*SizeSweepFacts)(nil) boxed into an any is NOT == nil, and json.Marshal of
+// it produces the four-byte string "null" rather than NULL — which a reader would
+// then faithfully unmarshal into an all-zero facts block, inventing evidence a
+// plain NULL correctly reads as absent.
+func factsJSON(v any) (any, error) {
+	switch p := v.(type) {
+	case *SizeSweepFacts:
+		if p == nil {
+			return nil, nil
+		}
+	case *FlowFanoutFacts:
+		if p == nil {
+			return nil, nil
+		}
+	case nil:
+		return nil, nil
+	}
+	b, err := json.Marshal(v)
+	if err != nil {
+		return nil, err
+	}
+	return string(b), nil
 }
 
 // findOrCreateIncident returns the open incident for an open_key, creating one

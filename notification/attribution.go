@@ -29,6 +29,21 @@ type AttributionClue struct {
 	// ReasonCode is telemetry.ProbeReason* for kind=="reason" clues; the label
 	// comes from the existing probeReasonZh/En translations.
 	ReasonCode int `json:"reason_code,omitempty"`
+	// SizeCorrelated evidence for a size_correlated clue: the two payload sizes
+	// the sweep compared and the loss percent at each. Rendered as the
+	// "(64B 0.0% → 1400B 67.0%)" fragment; zero when the clue is not a
+	// size_correlated one.
+	SizeSmall int     `json:"size_small,omitempty"`
+	SizeLarge int     `json:"size_large,omitempty"`
+	LossSmall float64 `json:"loss_small,omitempty"`
+	LossLarge float64 `json:"loss_large,omitempty"`
+	// Flow counts for an ecmp_member clue: flows actually attempted and how the
+	// deterministic bad subset split across cycles (bad_stable/bad_new/ok).
+	// Zero when the clue is not an ecmp_member one.
+	Flows     int `json:"flows,omitempty"`
+	BadStable int `json:"bad_stable,omitempty"`
+	BadNew    int `json:"bad_new,omitempty"`
+	OK        int `json:"ok,omitempty"`
 }
 
 const (
@@ -51,6 +66,15 @@ const (
 	ClueTraceReached       = "trace_reached"
 	ClueTraceProxyUnreach  = "trace_proxy_unreachable"
 	ClueTraceProxyReached  = "trace_proxy_reachable"
+	// ClueSizeCorrelated fires on a loss degradation whose confirming round
+	// classified size-correlated (SizeSweepFacts.Code == 1): loss rises with
+	// packet size, the fingerprint of physical-layer degradation.
+	ClueSizeCorrelated = "size_correlated"
+	// ClueEcmpMember fires on an availability fault whose confirming round
+	// classified member-level (FlowFanoutFacts.Code == 2): a deterministic bad
+	// subset of pinned source-port flows, the fingerprint of an ECMP/LAG member
+	// fault.
+	ClueEcmpMember = "ecmp_member"
 )
 
 // CluePolarity classifies a clue as "ok" (a ✓), "fail" (a ✗) or "info" (no
@@ -306,6 +330,10 @@ func renderClue(c AttributionClue, lang string) string {
 		return mark + clueStr("trace_proxy_unreachable", en)
 	case ClueTraceProxyReached:
 		return mark + clueStr("trace_proxy_reachable", en)
+	case ClueSizeCorrelated:
+		return mark + fmt.Sprintf(clueStr("size_correlated", en), c.SizeSmall, c.LossSmall, c.SizeLarge, c.LossLarge)
+	case ClueEcmpMember:
+		return mark + clueStr("ecmp_member", en)
 	}
 	return ""
 }
@@ -351,6 +379,10 @@ func clueStr(key string, en bool) string {
 			return "proxy address unreachable"
 		case "trace_proxy_reachable":
 			return "proxy address reachable"
+		case "size_correlated":
+			return "Packet loss rises with packet size (%dB %.1f%% → %dB %.1f%%); suggests physical-layer degradation (optics/CRC/FEC)"
+		case "ecmp_member":
+			return "A fixed subset of source-port flows fails while others stay clean; suggests an ECMP/LAG member-level fault"
 		}
 		return ""
 	}
@@ -393,6 +425,10 @@ func clueStr(key string, en bool) string {
 		return "代理地址不可达"
 	case "trace_proxy_reachable":
 		return "代理地址可达"
+	case "size_correlated":
+		return "丢包随包长上升（%dB %.1f%% → %dB %.1f%%），疑似物理层劣化（光模块/CRC/FEC）"
+	case "ecmp_member":
+		return "固定的一组源端口流确定性失败、其余正常，疑似 ECMP/LAG 成员级故障"
 	}
 	return ""
 }

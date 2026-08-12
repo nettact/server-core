@@ -962,3 +962,61 @@ func TestTerminationClearsReferenceAttribution(t *testing.T) {
 		t.Fatalf("a cleared reference must not keep the service conclusion, got %q", loc)
 	}
 }
+
+// ---- DEGRADE-001/002 fact clues ----
+
+// TestAttributionFactClues is the attribution production hook: a frozen
+// size-correlated sweep or member-level fan-out on a firing member ships as
+// evidence on the incident regardless of which rule concluded the attribution.
+func TestAttributionFactClues(t *testing.T) {
+	h := newHarness(t)
+	h.seedIncident("inc_1")
+	h.seedFiringSignal("inc_1", "t_icmp", "Router", "192.168.1.1", "icmp", telemetry.ProbeReasonTimeout, noProxy())
+	h.exec(`UPDATE fault_signals SET size_sweep_json=? WHERE id='t_icmp_sig'`,
+		`{"code":1,"size_small":64,"size_large":1400,"loss_small":0,"loss_large":67.4,"count_small":5,"count_large":5}`)
+	h.seedFiringSignal("inc_1", "t_tcp", "Svc", "1.2.3.4:443", "tcp", telemetry.ProbeReasonTimeout, noProxy())
+	h.exec(`UPDATE fault_signals SET flow_fanout_json=? WHERE id='t_tcp_sig'`,
+		`{"code":2,"flows":6,"bad_stable":4,"bad_new":1,"ok":1}`)
+
+	_, clues := attributionFor(t, h.db, "inc_1", nil)
+	if !hasClueKinds(clues, notification.ClueSizeCorrelated, notification.ClueEcmpMember) {
+		t.Fatalf("clues=%v want size_correlated + ecmp_member", clueKinds(clues))
+	}
+	var sc, ecmp notification.AttributionClue
+	for _, c := range clues {
+		switch c.Kind {
+		case notification.ClueSizeCorrelated:
+			sc = c
+		case notification.ClueEcmpMember:
+			ecmp = c
+		}
+	}
+	if sc.SizeSmall != 64 || sc.SizeLarge != 1400 || sc.LossSmall != 0 || sc.LossLarge != 67.4 {
+		t.Fatalf("size_correlated clue = %+v", sc)
+	}
+	if ecmp.Flows != 6 || ecmp.BadStable != 4 || ecmp.BadNew != 1 || ecmp.OK != 1 {
+		t.Fatalf("ecmp_member clue = %+v", ecmp)
+	}
+}
+
+// TestAttributionSkipsNonFingerprintFacts: only the fingerprint codes produce a
+// clue. A flat sweep (code 0) and a uniform fan-out (code 1) are the congestion
+// signatures that argue AGAINST those claims, so they must stay out.
+func TestAttributionSkipsNonFingerprintFacts(t *testing.T) {
+	h := newHarness(t)
+	h.seedIncident("inc_1")
+	h.seedFiringSignal("inc_1", "t_icmp", "Router", "192.168.1.1", "icmp", telemetry.ProbeReasonTimeout, noProxy())
+	h.exec(`UPDATE fault_signals SET size_sweep_json=? WHERE id='t_icmp_sig'`,
+		`{"code":0,"size_small":64,"size_large":1400,"loss_small":0,"loss_large":5,"count_small":5,"count_large":5}`)
+	h.seedFiringSignal("inc_1", "t_tcp", "Svc", "1.2.3.4:443", "tcp", telemetry.ProbeReasonTimeout, noProxy())
+	h.exec(`UPDATE fault_signals SET flow_fanout_json=? WHERE id='t_tcp_sig'`,
+		`{"code":1,"flows":6,"bad_stable":0,"bad_new":6,"ok":0}`)
+
+	_, clues := attributionFor(t, h.db, "inc_1", nil)
+	for _, c := range clues {
+		if c.Kind == notification.ClueSizeCorrelated || c.Kind == notification.ClueEcmpMember {
+			t.Fatalf("non-fingerprint facts produced a clue: %+v", c)
+		}
+	}
+}
+

@@ -1063,6 +1063,16 @@ CREATE TABLE fault_signals(
   -- both. Same shape as fluctuations.rounds_json. Empty for detectors that have
   -- no rounds (agent connectivity).
   rounds_json       TEXT NOT NULL DEFAULT '[]',
+  -- DEGRADE-001/002: the confirming round's dedicated classification facts,
+  -- frozen as JSON when the confirming round carried them, NULL otherwise. The
+  -- size_sweep block carries {code, size_small, size_large, loss_small,
+  -- loss_large, count_small, count_large} and only a loss degradation sets it;
+  -- the flow_fanout block carries {code, flows, bad_stable, bad_new, ok} and
+  -- only an availability fault sets it. Same freeze-everything rule as the
+  -- columns above: an agent that stops sweeping must not rewrite what a past
+  -- fault claimed.
+  size_sweep_json   TEXT,                                 -- JSON SizeSweepFacts (NULL = not the evidence)
+  flow_fanout_json  TEXT,                                 -- JSON FlowFanoutFacts (NULL = not the evidence)
   observed_at       TIMESTAMP NOT NULL,                 -- first round of the failing streak
   confirmed_at      TIMESTAMP NOT NULL,                 -- round that reached the threshold
   resolved_at       TIMESTAMP,
