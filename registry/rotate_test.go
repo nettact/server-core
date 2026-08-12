@@ -502,3 +502,59 @@ func TestReinstallClosesRotationPendingWindow(t *testing.T) {
 		t.Errorf("reinstall token auth = epoch %d, %v; want 2", res.Epoch, err)
 	}
 }
+
+// TestPhase2CompletesAfterWindowExpiry: the window limits how long the OLD
+// token can fetch the re-issued result, NOT when the new credential may first
+// be used. An agent that persisted the rotated token and reconnects late (an
+// outage, an offline upgrade) must still complete the switch — otherwise the
+// only credential it holds would be permanently rejected and recovery would
+// mean reinstalling.
+func TestPhase2CompletesAfterWindowExpiry(t *testing.T) {
+	db := storetest.Open(t)
+	ctx := context.Background()
+	mustExec(t, db, `INSERT INTO sites(id,name,created_at) VALUES('site_default','def',?)`, time.Now().UTC())
+	reg := New(db, 0, nil)
+
+	priv, token, agentID := enrollTestAgent(t, reg, "site_default")
+	ch := reg.IssueRotationChallenge(agentID, 1, "sequence_conflict")
+	newEpoch, newToken, err := reg.RotateEpoch(ctx, agentID, wire.EpochRotationRequest{
+		Challenge: ch.Challenge,
+		OldEpoch:  1,
+		Signature: ed25519.Sign(priv, []byte(ch.Challenge)),
+	})
+	if err != nil {
+		t.Fatalf("RotateEpoch: %v", err)
+	}
+	if newEpoch != 2 {
+		t.Fatalf("staged epoch = %d, want 2", newEpoch)
+	}
+	// The re-issue window has closed: force the column into the past. The old
+	// token must no longer fetch the result...
+	mustExec(t, db, `UPDATE agents SET pending_next_until=? WHERE id=?`, 1, agentID)
+	res, err := reg.AuthenticateAgent(ctx, token)
+	if err != nil {
+		t.Fatalf("old token after window: %v", err)
+	}
+	if res.PendingRotation != nil {
+		t.Fatalf("expired window still re-issues: %+v", res.PendingRotation)
+	}
+	// ...but the issued credential itself completes phase 2 regardless.
+	res, err = reg.AuthenticateAgent(ctx, newToken)
+	if err != nil {
+		t.Fatalf("staged token after window: %v", err)
+	}
+	if res.AgentID != agentID || res.Epoch != 2 || res.PendingRotation != nil {
+		t.Fatalf("phase 2 auth = %+v, want %q at epoch 2 with no pending", res, agentID)
+	}
+	var nextEpoch int64
+	if err := db.QueryRowContext(ctx, `SELECT pending_next_epoch FROM agents WHERE id=?`, agentID).Scan(&nextEpoch); err != nil {
+		t.Fatalf("read pending column: %v", err)
+	}
+	if nextEpoch != 0 {
+		t.Errorf("pending_next_epoch after phase 2 = %d, want 0", nextEpoch)
+	}
+	// The old token is now revoked by the swap.
+	if _, err := reg.AuthenticateAgent(ctx, token); !errors.Is(err, ErrAuth) {
+		t.Errorf("old token after phase 2 = %v, want ErrAuth", err)
+	}
+}

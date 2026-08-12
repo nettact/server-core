@@ -352,6 +352,7 @@ func (h *Hub) serve(ctx context.Context, auth registry.AuthResult, c wire.Conn, 
 	// The session serves exactly one epoch — the one its bearer authenticated
 	// to at registration above.
 	s.epoch = revAuth.Epoch
+	s.helloEpoch = hello.EnrollmentEpoch
 	switch {
 	case revAuth.PendingRotation != nil:
 		// The presented token is the current (old) token while a phase-1

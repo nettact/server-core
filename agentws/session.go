@@ -43,7 +43,13 @@ type session struct {
 	// by serve before readLoop starts; floorApplied is read and written only by
 	// readLoop; rotated is set by the rotation paths before their close so the
 	// teardown classifies the disconnect for what it was.
-	epoch           uint64
+	epoch uint64
+	// helloEpoch is the credential generation the agent stated in its Hello —
+	// the epoch its signatures and OldEpoch values will name. It differs from
+	// epoch when the credential is pre-schema-8 (Hello states 0) or stale
+	// (a rotation the agent missed). Challenges are bound to helloEpoch, not
+	// to the row's epoch, so the agent's answers always validate.
+	helloEpoch      uint64
 	floorSent       bool
 	floorPushed     uint64
 	floorApplied    bool
@@ -247,7 +253,7 @@ func (h *Hub) readLoop(ctx context.Context, s *session) error {
 					// challenge just issued).
 					log.Printf("agentws: sequence conflict from %s (epoch %d, seq %d): offering an epoch rotation",
 						s.agentID, s.epoch, frame.Packet.Sequence)
-					ch := h.deps.Registry.IssueRotationChallenge(s.agentID, s.epoch, "sequence_conflict")
+					ch := h.deps.Registry.IssueRotationChallenge(s.agentID, s.helloEpoch, "sequence_conflict")
 					if !s.enqueue(wire.Frame{EpochRotationChallenge: &ch}) {
 						return nil
 					}
@@ -279,7 +285,7 @@ func (h *Hub) readLoop(ctx context.Context, s *session) error {
 			// The agent asks to be rotated (its in-flight claim sits at or below
 			// the floor, or some other local reason): mint a challenge and let the
 			// normal challenge→request→result exchange follow.
-			ch := h.deps.Registry.IssueRotationChallenge(s.agentID, s.epoch, frame.EpochRotationChallengeRequest.Reason)
+			ch := h.deps.Registry.IssueRotationChallenge(s.agentID, s.helloEpoch, frame.EpochRotationChallengeRequest.Reason)
 			if !s.enqueue(wire.Frame{EpochRotationChallenge: &ch}) {
 				return nil
 			}

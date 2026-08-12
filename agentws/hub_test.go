@@ -1206,3 +1206,97 @@ func TestZeroEpochHelloAccepted(t *testing.T) {
 		t.Fatalf("ack = %+v, want HighestSequence 1 (a zero-epoch packet admits without a barrier)", f.Ack)
 	}
 }
+
+// TestZeroEpochConflictRotationRecovers: an upgraded (zero-epoch) agent whose
+// sequence conflicts must still be able to rotate. The challenge is bound to
+// the HELLO epoch (0 — the generation the agent will sign), not to the row's,
+// so the rotation succeeds and the agent converges at row+1.
+func TestZeroEpochConflictRotationRecovers(t *testing.T) {
+	e := newTestEnv(t)
+	ctx := context.Background()
+
+	tok, err := e.reg.CreateEnrollmentToken(ctx, site.DefaultSiteID, "zero-epoch", time.Hour)
+	if err != nil {
+		t.Fatalf("CreateEnrollmentToken: %v", err)
+	}
+	pub, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("keygen: %v", err)
+	}
+	const nonce = "nonce-zero"
+	resp, err := e.reg.Enroll(ctx, enroll.EnrollRequest{
+		SchemaVersion:   protocol.SchemaVersion,
+		PublicKey:       pub,
+		Nonce:           nonce,
+		Signature:       ed25519.Sign(priv, []byte(nonce)),
+		EnrollmentToken: tok,
+		Hostname:        "zero-host",
+		Platform:        "windows",
+		AgentVersion:    "test",
+		Permissions:     permission.PermissionReport{},
+	})
+	if err != nil {
+		t.Fatalf("Enroll: %v", err)
+	}
+	agentID := resp.AgentID
+
+	// A sequence that was already admitted with DIFFERENT content: the row's
+	// watermark covers seq 1 and the receipt disagrees, so the session's
+	// packet replays into a conflict.
+	if _, err := e.db.ExecContext(context.Background(), `UPDATE agents SET high_sequence=1 WHERE id=?`, agentID); err != nil {
+		t.Fatalf("set watermark: %v", err)
+	}
+	if _, err := e.db.ExecContext(context.Background(),
+		`INSERT INTO packet_receipts(agent_id, enrollment_epoch, sequence, fingerprint, received_at) VALUES(?, 1, 1, 'different-content', ?)`,
+		agentID, time.Now().UTC().Unix()); err != nil {
+		t.Fatalf("seed receipt: %v", err)
+	}
+
+	zeroHello := func() wire.Frame {
+		h := testHello()
+		h.Hello.EnrollmentEpoch = 0
+		return h
+	}
+
+	// Zero-epoch session: no floor, drain open; the conflicting packet draws
+	// the challenge. The challenge must be bound to the epoch the agent will
+	// sign — 0, its Hello generation — or every rotation attempt would be
+	// denied.
+	conn := e.dial(t, resp.AgentToken, wire.SubprotocolJSON)
+	sendFrame(t, conn, zeroHello())
+	if f := readFrame(t, conn); f.DesiredState == nil {
+		t.Fatalf("first push = %+v, want DesiredState", f)
+	}
+	sendFrame(t, conn, testPacket(1))
+	f := readFrame(t, conn)
+	if f.EpochRotationChallenge == nil {
+		t.Fatalf("frame after the conflict = %+v, want EpochRotationChallenge", f)
+	}
+	challenge := f.EpochRotationChallenge.Challenge
+	sendFrame(t, conn, wire.Frame{EpochRotationRequest: &wire.EpochRotationRequest{
+		Challenge: challenge,
+		OldEpoch:  0,
+		Signature: ed25519.Sign(priv, []byte(challenge)),
+	}})
+	f = readFrame(t, conn)
+	if f.EpochRotationResult == nil || f.EpochRotationResult.Status != wire.RotationOK ||
+		f.EpochRotationResult.NewEpoch != 2 || f.EpochRotationResult.AgentToken == "" {
+		t.Fatalf("result = %+v, want RotationOK epoch 2 with a token", f.EpochRotationResult)
+	}
+	rotatedToken := f.EpochRotationResult.AgentToken
+	expectClose(t, conn, wire.CloseGoingAway)
+
+	// Reconnect under the rotated credential: phase 2 completes and the floor
+	// serves at the converged generation.
+	conn2 := e.dial(t, rotatedToken, wire.SubprotocolJSON)
+	hello2 := testHello()
+	hello2.Hello.EnrollmentEpoch = 2
+	sendFrame(t, conn2, hello2)
+	if f := readFrame(t, conn2); f.DesiredState == nil {
+		t.Fatalf("push = %+v, want DesiredState", f)
+	}
+	f = readFrame(t, conn2)
+	if f.SequenceFloor == nil || f.SequenceFloor.EnrollmentEpoch != 2 || f.SequenceFloor.SequenceFloor != 0 {
+		t.Fatalf("push = %+v, want SequenceFloor epoch 2 floor 0 (the switch zeroed the watermark)", f)
+	}
+}

@@ -157,10 +157,15 @@ func (s *Service) AuthenticateAgent(ctx context.Context, token string) (AuthResu
 
 // authPhase2 resolves a token that does not match the row's current hash
 // against the staged rotations: the token must be the deterministic NEXT
-// credential of an agent whose pending window is live. The candidate scan runs
-// on the read pool (a failed auth must not take the write lock); the
-// authoritative re-check and the swap run in one write transaction. No
-// matching candidate fails closed with ErrAuth — never with an empty result.
+// credential of an agent with a staged rotation. Completion is NOT
+// window-gated — the token is the secret the agent was issued, and the agent
+// may reconnect after the re-issue window lapsed (an offline upgrade, a long
+// outage); the window only limits how long the OLD token can fetch the
+// re-issued result, not when the new credential may first be used. The
+// candidate scan runs on the read pool (a failed auth must not take the write
+// lock); the authoritative re-check and the swap run in one write transaction.
+// No matching candidate fails closed with ErrAuth — never with an empty
+// result.
 func (s *Service) authPhase2(ctx context.Context, hash string) (AuthResult, error) {
 	key, err := s.readRotationKey(ctx)
 	if err != nil {
@@ -169,10 +174,9 @@ func (s *Service) authPhase2(ctx context.Context, hash string) (AuthResult, erro
 		}
 		return AuthResult{}, err
 	}
-	now := time.Now().UTC().Unix()
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, site_id, enrollment_epoch, pending_next_epoch
-		FROM agents WHERE revoked=0 AND pending_next_epoch>0 AND pending_next_until>?`, now)
+		FROM agents WHERE revoked=0 AND pending_next_epoch>0`)
 	if err != nil {
 		return AuthResult{}, err
 	}
@@ -203,17 +207,21 @@ func (s *Service) authPhase2(ctx context.Context, hash string) (AuthResult, erro
 func (s *Service) completeRotation(ctx context.Context, agentID, siteID string, curEpoch, nextEpoch uint64, hash string) (AuthResult, error) {
 	err := s.db.WriteTx(ctx, store.Standalone(), func(wtx store.WriteTx) (func(), error) {
 		var dbCur, dbNext uint64
-		var until int64
 		if err := wtx.QueryRowContext(ctx, `
-			SELECT enrollment_epoch, pending_next_epoch, pending_next_until
-			FROM agents WHERE id=? AND revoked=0`, agentID).Scan(&dbCur, &dbNext, &until); err != nil {
+			SELECT enrollment_epoch, pending_next_epoch
+			FROM agents WHERE id=? AND revoked=0`, agentID).Scan(&dbCur, &dbNext); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				return nil, ErrAuth
 			}
 			return nil, err
 		}
-		if dbCur != curEpoch || dbNext != nextEpoch || until <= 0 || time.Now().UTC().Unix() > until {
-			return nil, ErrAuth // window closed or the row moved on
+		// Deliberately NO window check here: the window limits how long the
+		// OLD token can fetch the re-issued result, not when the issued
+		// credential may first be used. The deterministic token IS the secret
+		// the agent was handed; a late reconnect (outage, offline upgrade)
+		// must still complete the switch or the agent is locked out forever.
+		if dbCur != curEpoch || dbNext != nextEpoch {
+			return nil, ErrAuth // the row moved on
 		}
 		res, err := wtx.ExecContext(ctx, `
 			UPDATE agents SET
