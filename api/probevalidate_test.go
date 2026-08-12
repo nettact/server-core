@@ -134,16 +134,16 @@ func TestValidateProbeParams(t *testing.T) {
 		// one-entry list is a comparison with itself; an empty list is the default
 		// sweep and stays valid. Sizes are capped at the shared MTU-safe ceiling
 		// (config.MaxSweepPayloadSize) and must be distinct.
-		{name: "icmp size sweep ok", kind: "icmp", params: pcfg.ProbeParams{SizeSweep: true, PayloadSizes: []int{64, 1372}}},
+		{name: "icmp size sweep ok", kind: "icmp", params: pcfg.ProbeParams{SizeSweep: true, PayloadSizes: []int{64, 1232}}},
 		{name: "icmp size sweep default", kind: "icmp", params: pcfg.ProbeParams{SizeSweep: true}},
-		{name: "icmp single size rejected", kind: "icmp", params: pcfg.ProbeParams{SizeSweep: true, PayloadSizes: []int{1372}}, wantErr: "payload_sizes must list 2-8"},
+		{name: "icmp single size rejected", kind: "icmp", params: pcfg.ProbeParams{SizeSweep: true, PayloadSizes: []int{1232}}, wantErr: "payload_sizes must list 2-8"},
 		{name: "icmp too many sizes", kind: "icmp", params: pcfg.ProbeParams{SizeSweep: true, PayloadSizes: []int{64, 128, 256, 384, 512, 640, 768, 896, 1024}}, wantErr: "payload_sizes must list 2-8"},
-		{name: "icmp size zero rejected", kind: "icmp", params: pcfg.ProbeParams{SizeSweep: true, PayloadSizes: []int{0, 1372}}, wantErr: "payload_sizes entry out of range"},
+		{name: "icmp size zero rejected", kind: "icmp", params: pcfg.ProbeParams{SizeSweep: true, PayloadSizes: []int{0, 1232}}, wantErr: "payload_sizes entry out of range"},
 		{name: "icmp size above MTU ceiling rejected", kind: "icmp", params: pcfg.ProbeParams{SizeSweep: true, PayloadSizes: []int{64, 1400}}, wantErr: "payload_sizes entry out of range"},
 		{name: "icmp duplicate sizes rejected", kind: "icmp", params: pcfg.ProbeParams{SizeSweep: true, PayloadSizes: []int{64, 64}}, wantErr: "payload_sizes must be distinct"},
 		{name: "icmp one-echo sweep rejected", kind: "icmp", params: pcfg.ProbeParams{SizeSweep: true, PacketCount: 1}, wantErr: "packet_count must be at least 2"},
 		{name: "icmp swept cycle over echo cap rejected", kind: "icmp", params: pcfg.ProbeParams{SizeSweep: true, PacketCount: 100, PayloadSizes: []int{64, 128, 256, 384, 512, 640, 768, 896}}, wantErr: "echo cap"},
-		{name: "gateway size sweep ok", kind: "gateway", params: pcfg.ProbeParams{SizeSweep: true, PayloadSizes: []int{64, 1372}}},
+		{name: "gateway size sweep ok", kind: "gateway", params: pcfg.ProbeParams{SizeSweep: true, PayloadSizes: []int{64, 1232}}},
 
 		// DEGRADE-002: the source-port fan-out is a per-cycle connect budget, so it
 		// is bounded; 0 = off.
