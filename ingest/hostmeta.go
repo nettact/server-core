@@ -7,6 +7,7 @@ import (
 	"github.com/nettact/protocol/telemetry"
 	"github.com/nettact/server-core/config"
 	"github.com/nettact/server-core/fault"
+	"github.com/nettact/server-core/store"
 )
 
 // hasHostMetrics reports whether a batch carries anything the system-status
@@ -34,7 +35,7 @@ func hasHostMetrics(ms []telemetry.Metric) bool {
 // has exactly one answer in the codebase. An anchor with no
 // host_detection_settings row COALESCEs to the defaults, which is what makes a
 // freshly created anchor watch the machine without anyone opening a form.
-func hostMeta(ctx context.Context, q rowQuerier, agentID, siteID string, cores float64, intervalSeconds, uploadSeconds int) ([]fault.HostTargetMeta, error) {
+func hostMeta(ctx context.Context, q store.Executor, agentID, siteID string, cores float64, intervalSeconds, uploadSeconds int) ([]fault.HostTargetMeta, error) {
 	def := fault.DefaultHostSettings()
 	defCPU, defMem, defLoad, defNet, defDisk := 0, 0, 0, 0, 0
 	if def.CPUEnabled {
@@ -130,7 +131,7 @@ func (s *Service) latestCores(ctx context.Context, agentID string) float64 {
 // install on a deliberately slow upload interval would have every live host
 // fault judged a replay and delayed accordingly. Zero (an agent that has not
 // reported yet) leaves the protocol default standing.
-func reportedUploadSeconds(ctx context.Context, q rowQuerier, agentID string) int {
+func reportedUploadSeconds(ctx context.Context, q store.Executor, agentID string) int {
 	rows, err := q.QueryContext(ctx,
 		`SELECT upload_interval_seconds FROM agents WHERE id=?`, agentID)
 	if err != nil {

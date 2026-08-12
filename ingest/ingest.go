@@ -243,8 +243,9 @@ func (s *Service) Ingest(ctx context.Context, agentID, siteID string, pkt teleme
 	}
 
 	// Replay gate. Read BEFORE the transaction: currentHigh may seed from the
-	// DB, and the single write connection is already checked out once BeginTx
-	// runs — a pool query here would deadlock against our own transaction.
+	// DB, and the single write connection is already checked out once WriteTx
+	// opens its transaction — a pool query here would deadlock against our own
+	// transaction.
 	high, epoch, err := s.currentHigh(ctx, agentID)
 	if err != nil {
 		return Ack{}, err
@@ -273,269 +274,285 @@ func (s *Service) Ingest(ctx context.Context, agentID, siteID string, pkt teleme
 		}()
 	}
 
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return Ack{}, err
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			_ = tx.Rollback()
+	// The transaction: everything relational for this packet runs inside one
+	// WriteTx on the single writer handle. The contract commits first, then
+	// runs the closure fn returns — preserving the exact ordering the old
+	// BeginTx path had (commit → touchPost → AppendRawSamples/UpdateLatest/
+	// PublishOutcome) and discarding that closure on any fn or commit error,
+	// which is what the old `committed` flag did. An append failure still acks
+	// (see the post closure); nothing about that contract changed.
+	//
+	// fault/gamedata/incidentops/metrics.RewindForBatch and the registry's
+	// TouchAgentTx still take *sql.Tx; they are reached through the SQLiteTx
+	// migration seam (store.MIGRATION.md) until CLOUD-015 migrates them. The
+	// migrated helpers (probeMeta, hostMeta, the admission gate, events,
+	// inventory, interface snapshots) use the WriteTx directly.
+	err = s.db.WriteTx(ctx, store.Standalone(), func(wtx store.WriteTx) (func(), error) {
+		tx, ok := s.db.SQLiteTx(wtx)
+		if !ok {
+			return nil, errors.New("ingest: write transaction is not the SQLite adapter")
 		}
-	}()
 
-	// Liveness rides the packet transaction (a replay proves liveness too). The
-	// post closure — throttle advance and the offline→online publish — runs only
-	// after commit; a rollback discards it and the next packet retries.
-	var touchPost func()
-	if s.TouchAgentTx != nil {
-		if touchPost, err = s.TouchAgentTx(ctx, tx, agentID); err != nil {
-			return Ack{}, err
+		// Liveness rides the packet transaction (a replay proves liveness too). The
+		// post closure — throttle advance and the offline→online publish — runs only
+		// after commit; a rollback discards it and the next packet retries.
+		var touchPost func()
+		if s.TouchAgentTx != nil {
+			tp, terr := s.TouchAgentTx(ctx, tx, agentID)
+			if terr != nil {
+				return nil, terr
+			}
+			touchPost = tp
 		}
-	}
 
-	if isNew {
-		// Persist the dedup watermark with the batch it admits — and let this
-		// UPDATE, not the pre-tx read, be the admission gate.
-		//
-		// Reading currentHigh outside the transaction is a check-then-act: two
-		// overlapping sessions for one agent (hub supersession closes the old
-		// socket asynchronously, so they coexist briefly) can read the same
-		// watermark and both conclude the packet is new. Only one of them can
-		// raise the column; the loser must NOT go on to evaluate faults and
-		// store the batch a second time, or equal sequences double-advance
-		// detector state and a lower sequence can land after a higher one. The
-		// removed agent_packets UNIQUE insert was exactly this atomic
-		// test-and-set — the monotone guard restores it only if its result is
-		// what admits the work.
-		//
-		// affected==0 also covers a deleted agent (no row left to raise) and a
-		// session that lost a reenrollment race. Dropping the batch is right in
-		// both: the watermark it would advance no longer belongs to it. The ack
-		// still goes out, so nothing replays forever.
-		res, err := tx.ExecContext(ctx,
-			`UPDATE agents SET high_sequence=? WHERE id=? AND high_sequence<?`,
-			pkt.Sequence, agentID, pkt.Sequence)
-		if err != nil {
-			return Ack{}, err
-		}
-		admitted, err := res.RowsAffected()
-		if err != nil {
-			return Ack{}, err
-		}
-		if admitted == 0 {
-			// The column has already moved past this read. Adopt its value so
-			// the ack tells the agent where the watermark actually stands
-			// instead of restating our stale one — otherwise it would prune to
-			// a lower point and resend batches that can only be refused again.
-			// No row (deleted agent) leaves it at zero and the ack falls back to
-			// the ordinary replay answer.
-			if err := tx.QueryRowContext(ctx,
-				`SELECT high_sequence FROM agents WHERE id=?`, agentID).Scan(&adoptHigh); err != nil &&
-				!errors.Is(err, sql.ErrNoRows) {
-				return Ack{}, err
+		if isNew {
+			// Persist the dedup watermark with the batch it admits — and let this
+			// UPDATE, not the pre-tx read, be the admission gate.
+			//
+			// Reading currentHigh outside the transaction is a check-then-act: two
+			// overlapping sessions for one agent (hub supersession closes the old
+			// socket asynchronously, so they coexist briefly) can read the same
+			// watermark and both conclude the packet is new. Only one of them can
+			// raise the column; the loser must NOT go on to evaluate faults and
+			// store the batch a second time, or equal sequences double-advance
+			// detector state and a lower sequence can land after a higher one. The
+			// removed agent_packets UNIQUE insert was exactly this atomic
+			// test-and-set — the monotone guard restores it only if its result is
+			// what admits the work.
+			//
+			// affected==0 also covers a deleted agent (no row left to raise) and a
+			// session that lost a reenrollment race. Dropping the batch is right in
+			// both: the watermark it would advance no longer belongs to it. The ack
+			// still goes out, so nothing replays forever.
+			res, err := wtx.ExecContext(ctx,
+				`UPDATE agents SET high_sequence=? WHERE id=? AND high_sequence<?`,
+				pkt.Sequence, agentID, pkt.Sequence)
+			if err != nil {
+				return nil, err
 			}
+			admitted, err := res.RowsAffected()
+			if err != nil {
+				return nil, err
+			}
+			if admitted == 0 {
+				// The column has already moved past this read. Adopt its value so
+				// the ack tells the agent where the watermark actually stands
+				// instead of restating our stale one — otherwise it would prune to
+				// a lower point and resend batches that can only be refused again.
+				// No row (deleted agent) leaves it at zero and the ack falls back to
+				// the ordinary replay answer.
+				if err := wtx.QueryRowContext(ctx,
+					`SELECT high_sequence FROM agents WHERE id=?`, agentID).Scan(&adoptHigh); err != nil &&
+					!errors.Is(err, sql.ErrNoRows) {
+					return nil, err
+				}
+			}
+			isNew = admitted > 0
 		}
-		isNew = admitted > 0
-	}
 
-	var acceptedTx []telemetry.Metric
-	var storedTx []telemetry.Metric
-	var outcome *fault.Outcome
-	var hostOutcome *fault.Outcome
-	var traces *incidentops.TraceOutcome
-	var scenes *incidentops.SceneOutcome
-	if isNew {
-		// Authoritative in-tx re-check: config edits serialize on the single write
-		// connection, so a serial read here has no TOCTOU with the pre-tx filter.
-		acceptedTx = accepted
-		var rounds []fault.Round
-		storedTx = stored
-		if len(accepted) > 0 {
-			meta, err := s.probeMeta(ctx, tx, agentID, siteID, monitorIDs(accepted))
-			if err != nil {
-				return Ack{}, err
-			}
-			acceptedTx, _ = filterByGeneration(accepted, meta)
-			rounds = fault.BuildRounds(acceptedTx, meta)
-			attachBaselines(rounds, bands)
-			storedTx = append(acceptedTx, fault.AvailabilitySamples(rounds)...)
-		}
-		// Raw samples reach the data plane AFTER this transaction commits (see
-		// the post-commit block); what rides HERE is the durable intent their
-		// backfill needs — the 1m rollup watermark rewind, computed from the
-		// same authoritative storedTx the append will use, so an
-		// obsolete-generation sample the re-check dropped can neither rewind a
-		// watermark nor reach storage.
-		if err := s.metrics.RewindForBatch(ctx, tx, agentID, seriesIDs, storedTx); err != nil {
-			return Ack{}, err
-		}
-		for _, e := range pkt.Events {
-			if _, err := tx.ExecContext(ctx,
-				`INSERT OR IGNORE INTO events(id, agent_id, site_id, ts, type, layer, severity, message, attrs)
-				 VALUES(?,?,?,?,?,?,?,?,?)`,
-				e.ID, agentID, siteID, e.TS.UTC(), string(e.Type), string(e.Layer), string(e.Severity), e.Message, encodeMap(e.Attrs)); err != nil {
-				return Ack{}, err
-			}
-		}
-		for _, it := range pkt.InventoryDelta {
-			if err := applyInventory(ctx, tx, agentID, siteID, it, now); err != nil {
-				return Ack{}, err
-			}
-		}
-		// Apply only the packet's LAST interface snapshot: the WAL drains in
-		// collection order, so within one packet the last snapshot is the newest
-		// round. This gives each (agent, sequence) a single, unambiguous
-		// last-wins current state, ordered by the monotonic packet sequence. The
-		// packet's metrics are passed so the same round's wifi.* numerics are
-		// projected onto the interface rows (matched by exact Metric.TS). wifi.*
-		// are system metrics (MonitorID==""), unaffected by the provenance gate.
-		if n := len(pkt.InterfaceSnapshots); n > 0 {
-			if err := applyInterfaceSnapshot(ctx, tx, agentID, pkt.InterfaceSnapshots[n-1], pkt.Metrics, pkt.Sequence, now); err != nil {
-				return Ack{}, err
-			}
-		}
-		// Game presentation data rides beside the metrics rather than as metrics,
-		// because a second of frames is a distribution and not a value. It is written
-		// in the same transaction so a committed packet never leaves a run without the
-		// seconds that arrived with it. Its own permission gate lives in gamedata.Apply.
-		if _, err := gamedata.Apply(ctx, tx, agentID, siteID,
-			pkt.GameRuns, pkt.GameBuckets, pkt.GameGaps, pkt.GameHostSeconds); err != nil {
-			return Ack{}, err
-		}
-		// Fault evaluation runs INSIDE this transaction so detector state, fault
-		// signals, incidents, notification plans and the sequence watermark
-		// commit atomically: the next status read can never observe an updated
-		// signal alongside stale detector counters or vice versa. An evaluation
-		// error rolls the whole batch back and the agent's ack is withheld (it
-		// retries the sequence). Evaluation consumes the batch's own rounds
-		// directly — it has never read stored samples — which is precisely what
-		// lets the RAW samples commit elsewhere: their durability is deferred to
-		// the data plane append after this commit, and a crash in that gap loses
-		// chart points only (an accepted contract), never a detection.
-		if s.fault != nil && len(rounds) > 0 {
-			outcome, err = s.fault.EvaluateAgentTx(ctx, tx, agentID, siteID, rounds)
-			if err != nil {
-				return Ack{}, err
-			}
-		}
-		// The system-status detectors run in the same transaction, over the same
-		// batch, under the same contract: a machine that has been pegged for the
-		// configured duration opens a fault, plans its notification and commits with
-		// the samples that prove it. Its anchors are resolved here rather than pre-tx
-		// because a threshold edit serializes on this same write connection, so what
-		// is read here is what the evaluation is judged against.
-		if s.fault != nil && hostBatch {
-			metas, err := hostMeta(ctx, tx, agentID, siteID, cores, config.DefaultRegularSeconds,
-				reportedUploadSeconds(ctx, tx, agentID))
-			if err != nil {
-				return Ack{}, err
-			}
-			if len(metas) > 0 {
-				hostRounds, mounts := fault.BuildHostRounds(acceptedTx, metas)
-				hostOutcome, err = s.fault.EvaluateHostTx(ctx, tx, agentID, siteID, hostRounds, mounts)
+		var acceptedTx []telemetry.Metric
+		var storedTx []telemetry.Metric
+		var outcome *fault.Outcome
+		var hostOutcome *fault.Outcome
+		var traces *incidentops.TraceOutcome
+		var scenes *incidentops.SceneOutcome
+		if isNew {
+			// Authoritative in-tx re-check: config edits serialize on the single write
+			// connection, so a serial read here has no TOCTOU with the pre-tx filter.
+			acceptedTx = accepted
+			var rounds []fault.Round
+			storedTx = stored
+			if len(accepted) > 0 {
+				meta, err := s.probeMeta(ctx, wtx, agentID, siteID, monitorIDs(accepted))
 				if err != nil {
-					return Ack{}, err
+					return nil, err
+				}
+				acceptedTx, _ = filterByGeneration(accepted, meta)
+				rounds = fault.BuildRounds(acceptedTx, meta)
+				attachBaselines(rounds, bands)
+				storedTx = append(acceptedTx, fault.AvailabilitySamples(rounds)...)
+			}
+			// Raw samples reach the data plane AFTER this transaction commits (see
+			// the post-commit block); what rides HERE is the durable intent their
+			// backfill needs — the 1m rollup watermark rewind, computed from the
+			// same authoritative storedTx the append will use, so an
+			// obsolete-generation sample the re-check dropped can neither rewind a
+			// watermark nor reach storage.
+			if err := s.metrics.RewindForBatch(ctx, tx, agentID, seriesIDs, storedTx); err != nil {
+				return nil, err
+			}
+			for _, e := range pkt.Events {
+				if _, err := wtx.ExecContext(ctx,
+					`INSERT OR IGNORE INTO events(id, agent_id, site_id, ts, type, layer, severity, message, attrs)
+					 VALUES(?,?,?,?,?,?,?,?,?)`,
+					e.ID, agentID, siteID, e.TS.UTC(), string(e.Type), string(e.Layer), string(e.Severity), e.Message, encodeMap(e.Attrs)); err != nil {
+					return nil, err
+				}
+			}
+			for _, it := range pkt.InventoryDelta {
+				if err := applyInventory(ctx, wtx, agentID, siteID, it, now); err != nil {
+					return nil, err
+				}
+			}
+			// Apply only the packet's LAST interface snapshot: the WAL drains in
+			// collection order, so within one packet the last snapshot is the newest
+			// round. This gives each (agent, sequence) a single, unambiguous
+			// last-wins current state, ordered by the monotonic packet sequence. The
+			// packet's metrics are passed so the same round's wifi.* numerics are
+			// projected onto the interface rows (matched by exact Metric.TS). wifi.*
+			// are system metrics (MonitorID==""), unaffected by the provenance gate.
+			if n := len(pkt.InterfaceSnapshots); n > 0 {
+				if err := applyInterfaceSnapshot(ctx, wtx, agentID, pkt.InterfaceSnapshots[n-1], pkt.Metrics, pkt.Sequence, now); err != nil {
+					return nil, err
+				}
+			}
+			// Game presentation data rides beside the metrics rather than as metrics,
+			// because a second of frames is a distribution and not a value. It is written
+			// in the same transaction so a committed packet never leaves a run without the
+			// seconds that arrived with it. Its own permission gate lives in gamedata.Apply.
+			if _, err := gamedata.Apply(ctx, tx, agentID, siteID,
+				pkt.GameRuns, pkt.GameBuckets, pkt.GameGaps, pkt.GameHostSeconds); err != nil {
+				return nil, err
+			}
+			// Fault evaluation runs INSIDE this transaction so detector state, fault
+			// signals, incidents, notification plans and the sequence watermark
+			// commit atomically: the next status read can never observe an updated
+			// signal alongside stale detector counters or vice versa. An evaluation
+			// error rolls the whole batch back and the agent's ack is withheld (it
+			// retries the sequence). Evaluation consumes the batch's own rounds
+			// directly — it has never read stored samples — which is precisely what
+			// lets the RAW samples commit elsewhere: their durability is deferred to
+			// the data plane append after this commit, and a crash in that gap loses
+			// chart points only (an accepted contract), never a detection.
+			if s.fault != nil && len(rounds) > 0 {
+				if out, ferr := s.fault.EvaluateAgentTx(ctx, tx, agentID, siteID, rounds); ferr != nil {
+					return nil, ferr
+				} else {
+					outcome = out
+				}
+			}
+			// The system-status detectors run in the same transaction, over the same
+			// batch, under the same contract: a machine that has been pegged for the
+			// configured duration opens a fault, plans its notification and commits with
+			// the samples that prove it. Its anchors are resolved here rather than pre-tx
+			// because a threshold edit serializes on this same write connection, so what
+			// is read here is what the evaluation is judged against.
+			if s.fault != nil && hostBatch {
+				metas, err := hostMeta(ctx, wtx, agentID, siteID, cores, config.DefaultRegularSeconds,
+					reportedUploadSeconds(ctx, wtx, agentID))
+				if err != nil {
+					return nil, err
+				}
+				if len(metas) > 0 {
+					hostRounds, mounts := fault.BuildHostRounds(acceptedTx, metas)
+					if out, ferr := s.fault.EvaluateHostTx(ctx, tx, agentID, siteID, hostRounds, mounts); ferr != nil {
+						return nil, ferr
+					} else {
+						hostOutcome = out
+					}
+				}
+			}
+			// Traceroute reports the agent ran on its own initiative. They land in this
+			// same transaction, after the fault evaluation, so a report and the rounds
+			// that explain it commit together and a report can attach to a fault the
+			// very batch it arrived in has just confirmed.
+			if s.tracer != nil && len(pkt.TraceResults) > 0 {
+				if tr, terr := s.tracer.IngestTracesTx(ctx, tx, agentID, siteID, pkt.TraceResults); terr != nil {
+					return nil, terr
+				} else {
+					traces = tr
+				}
+			}
+			// Incident scenes the agent collected on its own fault edges, on the same
+			// terms and for the same reason. Ordered after the traces only for
+			// determinism; neither reads the other's rows.
+			if s.tracer != nil && len(pkt.SceneReports) > 0 {
+				if sc, serr := s.tracer.IngestScenesTx(ctx, tx, agentID, siteID, pkt.SceneReports); serr != nil {
+					return nil, serr
+				} else {
+					scenes = sc
 				}
 			}
 		}
-		// Traceroute reports the agent ran on its own initiative. They land in this
-		// same transaction, after the fault evaluation, so a report and the rounds
-		// that explain it commit together and a report can attach to a fault the
-		// very batch it arrived in has just confirmed.
-		if s.tracer != nil && len(pkt.TraceResults) > 0 {
-			if traces, err = s.tracer.IngestTracesTx(ctx, tx, agentID, siteID, pkt.TraceResults); err != nil {
-				return Ack{}, err
-			}
-		}
-		// Incident scenes the agent collected on its own fault edges, on the same
-		// terms and for the same reason. Ordered after the traces only for
-		// determinism; neither reads the other's rows.
-		if s.tracer != nil && len(pkt.SceneReports) > 0 {
-			if scenes, err = s.tracer.IngestScenesTx(ctx, tx, agentID, siteID, pkt.SceneReports); err != nil {
-				return Ack{}, err
-			}
-		}
-	}
 
-	if err := tx.Commit(); err != nil {
+		// The post-commit closure: WriteTx runs it exactly once, only after the
+		// commit succeeded, and discards it with the rollback otherwise — the
+		// ordering the old BeginTx path enforced by hand (commit → touchPost →
+		// AppendRawSamples/UpdateLatest/PublishOutcome), now structural.
+		post := func() {
+			if touchPost != nil {
+				touchPost()
+			}
+			if isNew {
+				// Raw samples land in the data plane now, after the commit that admitted
+				// the packet: what the in-tx re-check dropped can never be stored, and a
+				// crash before this append loses ≤ one packet of chart points while the
+				// committed watermark makes the replay a no-op (accepted contract). An
+				// append failure deliberately still ACKS: the SQLite state is committed,
+				// a replay would be deduplicated anyway, and alerting must not be
+				// hostage to data-plane trouble — the gap is charts, loudly logged.
+				if len(storedTx) > 0 {
+					res, err := s.metrics.AppendRawSamples(ctx, agentID, seriesIDs, storedTx)
+					switch {
+					case err != nil:
+						log.Printf("ingest: DATA-PLANE APPEND FAILED for agent %s seq %d (%d samples lost to charts): %v",
+							agentID, pkt.Sequence, len(storedTx), err)
+					case res.Dropped > 0:
+						log.Printf("ingest: data plane dropped %d/%d samples from agent %s (post-filter — investigate)",
+							res.Dropped, len(storedTx), agentID)
+					}
+					pendingDone()
+					pendingDone = nil
+				}
+				// Post-commit, in order: refresh the in-memory latest cache (only after
+				// commit — a rolled-back batch must not surface as "current"), publish the
+				// fault outcome's lifecycle events, then one precise target-status event over
+				// the accepted probe monitors ∪ the outcome's changed targets. Only reported
+				// metrics enter the latest cache: the derived availability series is
+				// bookkeeping for the rollups, never a "current value" any view reads.
+				if len(acceptedTx) > 0 {
+					s.metrics.UpdateLatest(agentID, seriesIDs, acceptedTx)
+				}
+				if s.fault != nil && outcome != nil {
+					s.fault.PublishOutcome(ctx, outcome)
+				}
+				if s.fault != nil && hostOutcome != nil {
+					s.fault.PublishOutcome(ctx, hostOutcome)
+				}
+				if s.tracer != nil && traces != nil {
+					s.tracer.PublishTraceOutcome(ctx, traces)
+				}
+				if s.tracer != nil && scenes != nil {
+					s.tracer.PublishSceneOutcome(ctx, scenes)
+				}
+				if s.bus != nil {
+					ids := monitorIDs(acceptedTx)
+					if outcome != nil {
+						ids = append(ids, outcome.ChangedTargetIDs...)
+					}
+					// Host samples carry no monitor id, so a host anchor whose fault state just
+					// moved would never reach monitorIDs. Its own outcome is the only thing that
+					// refreshes the anchor's row in the console.
+					if hostOutcome != nil {
+						ids = append(ids, hostOutcome.ChangedTargetIDs...)
+					}
+					if len(ids) > 0 {
+						s.bus.Publish(eventbus.TopicTargetStatusChanged,
+							eventbus.TargetStatusChanged{SiteID: siteID, TargetIDs: dedupeStrings(ids)})
+					}
+				}
+			}
+		}
+		return post, nil
+	})
+	if err != nil {
 		return Ack{}, err
-	}
-	committed = true
-	if touchPost != nil {
-		touchPost()
-	}
-
-	if isNew {
-		// Raw samples land in the data plane now, after the commit that admitted
-		// the packet: what the in-tx re-check dropped can never be stored, and a
-		// crash before this append loses ≤ one packet of chart points while the
-		// committed watermark makes the replay a no-op (accepted contract). An
-		// append failure deliberately still ACKS: the SQLite state is committed,
-		// a replay would be deduplicated anyway, and alerting must not be
-		// hostage to data-plane trouble — the gap is charts, loudly logged.
-		if len(storedTx) > 0 {
-			res, err := s.metrics.AppendRawSamples(ctx, agentID, seriesIDs, storedTx)
-			switch {
-			case err != nil:
-				log.Printf("ingest: DATA-PLANE APPEND FAILED for agent %s seq %d (%d samples lost to charts): %v",
-					agentID, pkt.Sequence, len(storedTx), err)
-			case res.Dropped > 0:
-				log.Printf("ingest: data plane dropped %d/%d samples from agent %s (post-filter — investigate)",
-					res.Dropped, len(storedTx), agentID)
-			}
-			pendingDone()
-			pendingDone = nil
-		}
-		// Post-commit, in order: refresh the in-memory latest cache (only after
-		// commit — a rolled-back batch must not surface as "current"), publish the
-		// fault outcome's lifecycle events, then one precise target-status event over
-		// the accepted probe monitors ∪ the outcome's changed targets. Only reported
-		// metrics enter the latest cache: the derived availability series is
-		// bookkeeping for the rollups, never a "current value" any view reads.
-		if len(acceptedTx) > 0 {
-			s.metrics.UpdateLatest(agentID, seriesIDs, acceptedTx)
-		}
-		if s.fault != nil && outcome != nil {
-			s.fault.PublishOutcome(ctx, outcome)
-		}
-		if s.fault != nil && hostOutcome != nil {
-			s.fault.PublishOutcome(ctx, hostOutcome)
-		}
-		if s.tracer != nil && traces != nil {
-			s.tracer.PublishTraceOutcome(ctx, traces)
-		}
-		if s.tracer != nil && scenes != nil {
-			s.tracer.PublishSceneOutcome(ctx, scenes)
-		}
-		if s.bus != nil {
-			ids := monitorIDs(acceptedTx)
-			if outcome != nil {
-				ids = append(ids, outcome.ChangedTargetIDs...)
-			}
-			// Host samples carry no monitor id, so a host anchor whose fault state just
-			// moved would never reach monitorIDs. Its own outcome is the only thing that
-			// refreshes the anchor's row in the console.
-			if hostOutcome != nil {
-				ids = append(ids, hostOutcome.ChangedTargetIDs...)
-			}
-			if len(ids) > 0 {
-				s.bus.Publish(eventbus.TopicTargetStatusChanged,
-					eventbus.TargetStatusChanged{SiteID: siteID, TargetIDs: dedupeStrings(ids)})
-			}
-		}
 	}
 
 	return Ack{
 		HighestSequence: s.ackSequence(agentID, pkt.Sequence, epoch, isNew, adoptHigh),
 		ServerTime:      now,
 	}, nil
-}
-
-// rowQuerier is the read subset shared by the read pool (*store.DB / *sql.DB) and
-// an open *sql.Tx, so the provenance serial lookup runs both pre-tx and in-tx.
-type rowQuerier interface {
-	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
 }
 
 // monitorIDs returns the distinct non-empty MonitorIDs referenced by a batch.
@@ -572,7 +589,7 @@ func dedupeStrings(ss []string) []string {
 // the map, which is what makes a deleted monitor's backlog drop out. A target with
 // no probe_detection_settings row uses the balanced defaults, so the zero-config
 // path costs no rows and no extra query.
-func (s *Service) probeMeta(ctx context.Context, q rowQuerier, agentID, siteID string, ids []string) (map[string]fault.TargetMeta, error) {
+func (s *Service) probeMeta(ctx context.Context, q store.Executor, agentID, siteID string, ids []string) (map[string]fault.TargetMeta, error) {
 	out := make(map[string]fault.TargetMeta, len(ids))
 	if len(ids) == 0 {
 		return out, nil
@@ -865,7 +882,7 @@ func encodeMap(m map[string]string) string {
 	return string(b)
 }
 
-func applyInventory(ctx context.Context, tx *sql.Tx, agentID, siteID string, it telemetry.InventoryItem, now time.Time) error {
+func applyInventory(ctx context.Context, tx store.WriteTx, agentID, siteID string, it telemetry.InventoryItem, now time.Time) error {
 	switch it.Kind {
 	case telemetry.InventoryDevice:
 		if it.Op == telemetry.OpRemove {
@@ -898,7 +915,7 @@ func applyInventory(ctx context.Context, tx *sql.Tx, agentID, siteID string, it 
 // round (or a disconnected/unreadable adapter) has no such metric and stores
 // NULL, never an earlier round's value. With several snapshots in one packet
 // only the last snapshot is applied, and only its exact-timestamp metrics match.
-func applyInterfaceSnapshot(ctx context.Context, tx *sql.Tx, agentID string, snap telemetry.InterfaceSnapshot, metrics []telemetry.Metric, seq uint64, now time.Time) error {
+func applyInterfaceSnapshot(ctx context.Context, tx store.WriteTx, agentID string, snap telemetry.InterfaceSnapshot, metrics []telemetry.Metric, seq uint64, now time.Time) error {
 	var storedSeq, storedHash sql.NullInt64
 	err := tx.QueryRowContext(ctx, `SELECT last_sequence, iface_hash FROM agent_wifi WHERE agent_id=?`, agentID).Scan(&storedSeq, &storedHash)
 	if err != nil && err != sql.ErrNoRows {
