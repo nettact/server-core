@@ -67,17 +67,16 @@ const (
 	// New then returns nil and nothing ever leaves the machine.
 	EnvBaseURL = "NETTACT_UPDATE_BASE_URL"
 
-	// EnvAutoUpdate and EnvUpdateCron tell the server whether a Watchtower
-	// sidecar manages it, and on what cron. The Docker compose file injects them
+	// EnvAutoUpdate and EnvUpdateCron tell the server whether a host systemd
+	// timer manages it, and on what cron. The Docker compose file injects them
 	// from .env (NETTACT_AUTO_UPDATE / NETTACT_UPDATE_CRON). Only meaningful for
 	// the standalone server; the desktop never sets them.
 	EnvAutoUpdate = "NETTACT_AUTO_UPDATE"
 	EnvUpdateCron = "NETTACT_UPDATE_CRON"
 
-	// DefaultUpdateCron is the schedule Watchtower falls back to when the compose
-	// file's NETTACT_UPDATE_CRON interpolation is empty (a manual compose setup
-	// that enabled the profile without baking a cron). Reported so the console's
-	// update panel never reads "no schedule" while the sidecar actually runs.
+	// DefaultUpdateCron is the schedule reported when an auto-updating install did
+	// not bake NETTACT_UPDATE_CRON. The installer normally always writes it, but a
+	// useful default keeps manually assembled deployments from showing no time.
 	DefaultUpdateCron = "0 0 3 * * *"
 )
 
@@ -156,14 +155,14 @@ type Status struct {
 	// outdated agents. Empty when the catalog has not been read successfully.
 	LatestAgentVersion string `json:"latest_agent_version,omitempty"`
 
-	// AutoUpdate reports whether a Watchtower sidecar manages this install, so
+	// AutoUpdate reports whether a host timer manages this install, so
 	// the console can say "will update itself" instead of offering a manual
 	// download. Set from the NETTACT_AUTO_UPDATE environment variable, which the
 	// Docker compose file injects from .env. Only the server image sets it; the
 	// desktop never does, so this stays false there.
 	AutoUpdate bool `json:"auto_update"`
 
-	// UpdateSchedule is the 6-field cron (host-local time) the sidecar runs on,
+	// UpdateSchedule is the 6-field cron (host-local time) the timer runs on,
 	// e.g. "0 30 3 * * *". Empty when auto-update is off. From
 	// NETTACT_UPDATE_CRON.
 	UpdateSchedule string `json:"update_schedule,omitempty"`
@@ -239,17 +238,16 @@ func New(cfg Config) *Service {
 		CurrentVersion: s.cfg.CurrentVersion,
 		DownloadURL:    s.downloadURL,
 	}
-	// A Watchtower sidecar (Docker standalone-server deployments only) declares
+	// A host update timer (Docker standalone-server deployments only) declares
 	// itself through these environment variables, which the compose file injects
 	// from .env. They ride along in the baseline status so the console's update
 	// panel can pick the right wording even before the first catalog check lands.
-	// Desktop/Store installs can never have a sidecar, so they are gated out even
+	// Desktop/Store installs can never have this timer, so they are gated out even
 	// if an inherited environment happens to set the variable.
 	if s.cfg.InstallType == InstallServer {
 		autoUpdate := envBool(os.Getenv(EnvAutoUpdate))
 		// Only a real auto-update reports a schedule, and it must not read as
-		// "off" just because the cron is unset — the compose file runs Watchtower's
-		// own 03:00 default then, so report that.
+		// "off" just because the cron is unset; report the documented default.
 		var schedule string
 		if autoUpdate {
 			schedule = strings.TrimSpace(os.Getenv(EnvUpdateCron))

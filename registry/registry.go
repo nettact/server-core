@@ -61,7 +61,7 @@ type StatusEvent struct {
 	Reason    string    `json:"reason,omitempty"`
 }
 
-const statusHistoryLimit = 20
+const statusHistoryLimit = 500
 
 type Service struct {
 	db        *store.DB
@@ -382,11 +382,19 @@ func (s *Service) recordStatus(ctx context.Context, agentID, status, reason stri
 		"ash_"+uuid.NewString(), agentID, status, reason, at)
 }
 
-// StatusHistory returns at most 20 online/offline transitions, newest first.
-func (s *Service) StatusHistory(ctx context.Context, agentID string) ([]StatusEvent, error) {
-	rows, err := s.db.QueryContext(ctx,
-		`SELECT status, COALESCE(reason,''), changed_at FROM agent_status_history WHERE agent_id=? ORDER BY changed_at DESC LIMIT ?`,
-		agentID, statusHistoryLimit)
+// StatusHistory returns online/offline transitions within the requested range,
+// newest first. A zero since value is unbounded; the hard cap keeps a pathological
+// reconnect loop from producing an unbounded response even for a 90-day range.
+func (s *Service) StatusHistory(ctx context.Context, agentID string, since time.Time) ([]StatusEvent, error) {
+	query := `SELECT status, COALESCE(reason,''), changed_at FROM agent_status_history WHERE agent_id=?`
+	args := []any{agentID}
+	if !since.IsZero() {
+		query += ` AND changed_at >= ?`
+		args = append(args, since)
+	}
+	query += ` ORDER BY changed_at DESC LIMIT ?`
+	args = append(args, statusHistoryLimit)
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}

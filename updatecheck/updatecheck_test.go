@@ -394,7 +394,7 @@ func TestNewReadsEnvBaseURL(t *testing.T) {
 	}
 }
 
-// A Docker deployment declares its Watchtower sidecar through these env vars,
+// A Docker deployment declares its host update timer through these env vars,
 // which the compose file injects from .env. They must reach the console from the
 // moment the service exists — the update panel reads the baseline status before
 // the first catalog check lands.
@@ -414,8 +414,8 @@ func TestNewReadsAutoUpdateEnv(t *testing.T) {
 	}
 }
 
-// An enabled sidecar with no cron baked still runs — on Watchtower's own 03:00
-// default — so the console must not read "no schedule" for it.
+// An enabled timer with no cron baked still reports the documented 03:00
+// default, so the console must not read "no schedule" for it.
 func TestNewAutoUpdateWithoutCronReportsDefault(t *testing.T) {
 	t.Setenv(EnvAutoUpdate, "true")
 	t.Setenv(EnvUpdateCron, "")
@@ -429,7 +429,7 @@ func TestNewAutoUpdateWithoutCronReportsDefault(t *testing.T) {
 	}
 }
 
-// A disabled sidecar must not report a schedule left over in .env from when it
+// A disabled timer must not report a schedule left over in .env from when it
 // was enabled — the schedule field belongs to an actually-running updater.
 func TestNewDisabledAutoUpdateSuppressesSchedule(t *testing.T) {
 	t.Setenv(EnvAutoUpdate, "false")
@@ -444,7 +444,7 @@ func TestNewDisabledAutoUpdateSuppressesSchedule(t *testing.T) {
 	}
 }
 
-// The sidecar can only exist in Docker standalone-server installs, so a desktop
+// The timer can only exist in Docker standalone-server installs, so a desktop
 // or Store process that happens to inherit the env vars must not report one.
 func TestNewDesktopIgnoresAutoUpdateEnv(t *testing.T) {
 	t.Setenv(EnvAutoUpdate, "1")

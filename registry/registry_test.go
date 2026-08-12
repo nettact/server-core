@@ -363,7 +363,7 @@ func TestConnectivityProvenance(t *testing.T) {
 	if _, err := reg.SweepStale(ctx, 10*time.Second, nil); err != nil {
 		t.Fatalf("SweepStale: %v", err)
 	}
-	hist, _ := reg.StatusHistory(ctx, "agent_c")
+	hist, _ := reg.StatusHistory(ctx, "agent_c", time.Time{})
 	if len(hist) == 0 || hist[0].Status != "offline" || hist[0].Reason != "clean" {
 		t.Fatalf("expected offline/clean history, got %+v", hist)
 	}
@@ -414,15 +414,15 @@ func TestSweepStaleExcludesConnected(t *testing.T) {
 		}
 	}
 	// Only the flipped agent gets an offline history row.
-	if hist, _ := reg.StatusHistory(ctx, "agent_gone"); len(hist) != 1 || hist[0].Status != "offline" {
+	if hist, _ := reg.StatusHistory(ctx, "agent_gone", time.Time{}); len(hist) != 1 || hist[0].Status != "offline" {
 		t.Errorf("agent_gone history = %+v, want one offline event", hist)
 	}
-	if hist, _ := reg.StatusHistory(ctx, "agent_connected"); len(hist) != 0 {
+	if hist, _ := reg.StatusHistory(ctx, "agent_connected", time.Time{}); len(hist) != 0 {
 		t.Errorf("agent_connected history = %+v, want none", hist)
 	}
 }
 
-func TestStatusHistoryReturnsOnlyNewestTwentyEvents(t *testing.T) {
+func TestStatusHistoryFiltersBySince(t *testing.T) {
 	db := storetest.Open(t)
 	ctx := context.Background()
 	base := time.Now().UTC().Truncate(time.Second).Add(-time.Hour)
@@ -436,17 +436,18 @@ func TestStatusHistoryReturnsOnlyNewestTwentyEvents(t *testing.T) {
 			fmt.Sprintf("ash_%02d", i), []string{"offline", "online"}[i%2], base.Add(time.Duration(i)*time.Minute))
 	}
 
-	history, err := New(db, 0, nil).StatusHistory(ctx, "agent_history")
+	since := base.Add(20 * time.Minute)
+	history, err := New(db, 0, nil).StatusHistory(ctx, "agent_history", since)
 	if err != nil {
 		t.Fatalf("StatusHistory: %v", err)
 	}
-	if len(history) != statusHistoryLimit {
-		t.Fatalf("history length = %d, want %d", len(history), statusHistoryLimit)
+	if len(history) != 5 {
+		t.Fatalf("history length = %d, want 5", len(history))
 	}
 	if want := base.Add(24 * time.Minute); !history[0].ChangedAt.Equal(want) {
 		t.Errorf("newest event = %v, want %v", history[0].ChangedAt, want)
 	}
-	if want := base.Add(5 * time.Minute); !history[len(history)-1].ChangedAt.Equal(want) {
+	if want := since; !history[len(history)-1].ChangedAt.Equal(want) {
 		t.Errorf("oldest returned event = %v, want %v", history[len(history)-1].ChangedAt, want)
 	}
 }

@@ -14,14 +14,20 @@ import (
 )
 
 // handleTargetStatuses returns the whole site's authoritative current target
-// status in one deterministic batch. An unknown site is a 404; any dependency /
-// query failure is a truthful 500 (never a partial or empty 200).
+// status in one deterministic batch. Availability and fluctuation evidence use
+// the page-wide time range. An unknown site is a 404; any dependency or query
+// failure is a truthful 500 (never a partial or empty 200).
 func (d Deps) handleTargetStatuses(w http.ResponseWriter, r *http.Request) {
 	if d.TargetStatus == nil {
 		writeError(w, http.StatusServiceUnavailable, "target status not available")
 		return
 	}
-	res, err := d.TargetStatus.SiteStatuses(r.Context(), chi.URLParam(r, "id"))
+	win, ok := timeRange(r)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "window must be 3h, 24h, 7d, 30d or 90d")
+		return
+	}
+	res, err := d.TargetStatus.SiteStatuses(r.Context(), chi.URLParam(r, "id"), win)
 	if errors.Is(err, targetstatus.ErrSiteNotFound) {
 		writeError(w, http.StatusNotFound, "site not found")
 		return

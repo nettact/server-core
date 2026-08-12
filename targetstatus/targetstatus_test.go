@@ -160,8 +160,11 @@ func TestAssembleTargetIncludesPerAgentAvailability(t *testing.T) {
 		metrics.AvailabilityRatio{}, map[string]metrics.AvailabilityRatio{
 			"agent": {AgentID: "agent", Rounds: 4, OKRounds: 3, Ratio: 0.75},
 		}, nil)
-	if len(got.Agents) != 1 || got.Agents[0].Availability24h == nil || *got.Agents[0].Availability24h != 0.75 {
+	if len(got.Agents) != 1 || got.Agents[0].Availability == nil || *got.Agents[0].Availability != 0.75 {
 		t.Fatalf("agent availability = %+v, want 0.75", got.Agents)
+	}
+	if got.Agents[0].AvailabilityRounds != 4 || got.Agents[0].AvailabilityOKRounds != 3 {
+		t.Fatalf("agent availability rounds = %+v, want 3/4", got.Agents[0])
 	}
 }
 
@@ -178,12 +181,12 @@ func TestAssembleTargetSumsFluctuationsAcrossAgents(t *testing.T) {
 
 	got := svc.assembleTarget(target, pairs, time.Now().UTC(), nil, nil, nil, nil,
 		metrics.AvailabilityRatio{}, nil, map[string]int{"agent_a": 2, "agent_b": 3})
-	if got.Fluctuations24h != 5 {
-		t.Fatalf("target fluctuations = %d, want 5 (2 + 3)", got.Fluctuations24h)
+	if got.Fluctuations != 5 {
+		t.Fatalf("target fluctuations = %d, want 5 (2 + 3)", got.Fluctuations)
 	}
 	byAgent := map[string]int{}
 	for _, a := range got.Agents {
-		byAgent[a.AgentID] = a.Fluctuations24h
+		byAgent[a.AgentID] = a.Fluctuations
 	}
 	if byAgent["agent_a"] != 2 || byAgent["agent_b"] != 3 {
 		t.Fatalf("per-agent fluctuations = %v, want a=2 b=3", byAgent)
@@ -210,9 +213,9 @@ func TestFluctuationTotalTracksTheAvailabilityPopulation(t *testing.T) {
 			"agent_outscope": {AgentID: "agent_outscope", Rounds: 40, OKRounds: 38, Ratio: 0.95},
 		},
 		map[string]int{"agent_live": 1, "agent_outscope": 2})
-	if got.Fluctuations24h != 3 {
+	if got.Fluctuations != 3 {
 		t.Fatalf("total = %d, want 3: the out-of-scope agent still moves the ratio, so its dips explain it",
-			got.Fluctuations24h)
+			got.Fluctuations)
 	}
 
 	// A DELETED agent is the mirror case: metrics.Store.PurgeAgent drops its series so
@@ -224,8 +227,8 @@ func TestFluctuationTotalTracksTheAvailabilityPopulation(t *testing.T) {
 			"agent_live": {AgentID: "agent_live", Rounds: 60, OKRounds: 59, Ratio: 0.983},
 		},
 		map[string]int{"agent_live": 1, "agent_deleted": 7})
-	if got.Fluctuations24h != 1 {
+	if got.Fluctuations != 1 {
 		t.Fatalf("total = %d, want 1: a purged agent no longer moves the ratio, so its history must not explain it",
-			got.Fluctuations24h)
+			got.Fluctuations)
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"strings"
+	"time"
 )
 
 // signalCols is the full projection of a fault signal, with the read-time
@@ -39,6 +40,7 @@ type SignalFilter struct {
 	TargetID string
 	Detector string
 	State    string // firing | resolved | "" (both)
+	Since    int64  // confirmed_at lower bound, Unix seconds; 0 = unbounded
 	Limit    int
 }
 
@@ -65,6 +67,10 @@ func (s *Service) ListSignals(ctx context.Context, f SignalFilter) ([]Signal, er
 	if f.Detector != "" {
 		where = append(where, "s.detector_key=?")
 		args = append(args, f.Detector)
+	}
+	if f.Since > 0 {
+		where = append(where, "s.confirmed_at >= ?")
+		args = append(args, time.Unix(f.Since, 0).UTC())
 	}
 	switch f.State {
 	case "firing", "resolved":

@@ -849,7 +849,7 @@ func (s *Service) targetSnapshot(ctx context.Context, siteID string) (targetstat
 	if e, ok := s.targetCache[siteID]; ok && s.now().Sub(e.at) < s.ttl {
 		return e.data, nil
 	}
-	data, err := s.targets.SiteStatuses(ctx, siteID)
+	data, err := s.targets.SiteStatuses(ctx, siteID, 24*time.Hour)
 	if err != nil {
 		return targetstatus.SiteStatuses{}, err
 	}

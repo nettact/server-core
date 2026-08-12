@@ -101,6 +101,23 @@ const (
 // target's worst current severity.
 var severityRank = map[string]int{"info": 0, "warn": 1, "error": 2, "critical": 3}
 
+// timeRangeToken keeps the response self-describing. Callers validate the
+// duration against the API's fixed range set before reaching the service.
+func timeRangeToken(window time.Duration) string {
+	switch window {
+	case 3 * time.Hour:
+		return "3h"
+	case 7 * 24 * time.Hour:
+		return "7d"
+	case 30 * 24 * time.Hour:
+		return "30d"
+	case 90 * 24 * time.Hour:
+		return "90d"
+	default:
+		return "24h"
+	}
+}
+
 // ---- API DTOs (frozen contract shared with the web-console types) ----
 
 // SiteStatuses is one deterministic batch of every target's current status for a
@@ -108,6 +125,7 @@ var severityRank = map[string]int{"info": 0, "warn": 1, "error": 2, "critical": 
 type SiteStatuses struct {
 	GeneratedAt time.Time      `json:"generated_at"`
 	SiteID      string         `json:"site_id"`
+	TimeRange   string         `json:"time_range"`
 	Targets     []TargetStatus `json:"targets"`
 }
 
@@ -126,18 +144,23 @@ type TargetStatus struct {
 	AffectedAgents   int        `json:"affected_agents"`
 	WorstSeverity    string     `json:"worst_severity,omitempty"`
 	LastObservedAt   *time.Time `json:"last_observed_at,omitempty"`
-	// Availability24h is the share of verdict-reaching probe rounds in the last 24
-	// hours that succeeded, across every Agent. Nil when the window holds no
+	// Availability is the share of verdict-reaching probe rounds in the requested
+	// window that succeeded, across every Agent. Nil when the window holds no
 	// verdict at all — "unknown" and "0%" are different answers and must look it.
-	Availability24h *float64 `json:"availability_24h,omitempty"`
-	// Fluctuations24h counts the failing streaks that recovered before confirming a
-	// fault over the same 24 hours, across every Agent. It travels with the
+	Availability *float64 `json:"availability,omitempty"`
+	// AvailabilityRounds and AvailabilityOKRounds expose the exact denominator and
+	// numerator behind Availability. Besides making the percentage auditable, the
+	// counts make nested windows visibly distinct even when all of them are 100%.
+	AvailabilityRounds   int64 `json:"availability_rounds"`
+	AvailabilityOKRounds int64 `json:"availability_ok_rounds"`
+	// Fluctuations counts the failing streaks that recovered before confirming a
+	// fault over the same requested window, across every Agent. It travels with the
 	// availability figure because it is the answer to the question that figure
 	// raises: a ratio under 100% with no fault to show for it used to be a dead end.
-	Fluctuations24h int           `json:"fluctuations_24h"`
-	SignalIDs       []string      `json:"signal_ids"`
-	IncidentIDs     []string      `json:"incident_ids"`
-	Agents          []AgentStatus `json:"agents"`
+	Fluctuations int           `json:"fluctuations"`
+	SignalIDs    []string      `json:"signal_ids"`
+	IncidentIDs  []string      `json:"incident_ids"`
+	Agents       []AgentStatus `json:"agents"`
 }
 
 // AgentStatus is one target's status as seen from one applicable Agent. The three
@@ -167,11 +190,13 @@ type AgentStatus struct {
 	Confirm *ConfirmProgress `json:"confirm,omitempty"`
 	// Fault links to the confirmed fault when fault_state is faulted.
 	Fault *FaultRef `json:"fault,omitempty"`
-	// Availability24h is this pair's 24-hour probe-round success ratio.
-	Availability24h *float64 `json:"availability_24h,omitempty"`
-	// Fluctuations24h is this pair's count of recovered sub-threshold streaks over
+	// Availability is this pair's probe-round success ratio over the requested window.
+	Availability         *float64 `json:"availability,omitempty"`
+	AvailabilityRounds   int64    `json:"availability_rounds"`
+	AvailabilityOKRounds int64    `json:"availability_ok_rounds"`
+	// Fluctuations is this pair's count of recovered sub-threshold streaks over
 	// the same window — what explains the ratio beside it.
-	Fluctuations24h int `json:"fluctuations_24h"`
+	Fluctuations int `json:"fluctuations"`
 }
 
 // ConfirmProgress is a detector's live confirmation streak: how many consecutive
@@ -274,10 +299,11 @@ type agentAgg struct {
 }
 
 // SiteStatuses computes the whole site's current target status in one read-pool
-// snapshot transaction. It returns ErrSiteNotFound for an unknown site; any
-// dependency/query failure returns an error (the API answers a truthful 500 and
-// never a partial/empty 200).
-func (s *Service) SiteStatuses(ctx context.Context, siteID string) (SiteStatuses, error) {
+// snapshot transaction, with availability and fluctuation evidence over the
+// requested window. It returns ErrSiteNotFound for an unknown site; any dependency
+// or query failure returns an error (the API answers a truthful 500 and never a
+// partial/empty 200).
+func (s *Service) SiteStatuses(ctx context.Context, siteID string, timeRange time.Duration) (SiteStatuses, error) {
 	now := time.Now().UTC()
 	// One read snapshot: WAL isolation holds for the life of a single read
 	// transaction, so fault signals and detector counters (committed together by
@@ -324,12 +350,12 @@ func (s *Service) SiteStatuses(ctx context.Context, siteID string) (SiteStatuses
 	}
 	// Availability is read outside the snapshot: it aggregates rollup buckets that
 	// no other dimension depends on, so an extra query on the read pool is cheaper
-	// than widening the snapshot, and a one-round skew in a 24-hour ratio is not
+	// than widening the snapshot, and a one-round skew in the ratio is not
 	// observable.
 	avail := map[string]metrics.AvailabilityRatio{}
 	availByAgent := map[string]map[string]metrics.AvailabilityRatio{}
 	if s.metrics != nil {
-		avail, availByAgent, err = s.metrics.AvailabilityForSiteWithAgents(ctx, siteID, now.Add(-24*time.Hour).Unix(), now.Unix())
+		avail, availByAgent, err = s.metrics.AvailabilityForSiteWithAgents(ctx, siteID, now.Add(-timeRange).Unix(), now.Unix())
 		if err != nil {
 			return SiteStatuses{}, err
 		}
@@ -337,12 +363,15 @@ func (s *Service) SiteStatuses(ctx context.Context, siteID string) (SiteStatuses
 	// Fluctuation counts ride along for the same reason and on the same read pool:
 	// the console shows them next to the availability ratio, and one grouped query
 	// keeps that from costing a request per row.
-	flux, err := s.loadFluctuationCounts(ctx, siteID, now.Add(-24*time.Hour), now)
+	flux, err := s.loadFluctuationCounts(ctx, siteID, now.Add(-timeRange), now)
 	if err != nil {
 		return SiteStatuses{}, err
 	}
 
-	out := SiteStatuses{GeneratedAt: now, SiteID: siteID, Targets: make([]TargetStatus, 0, len(targets))}
+	out := SiteStatuses{
+		GeneratedAt: now, SiteID: siteID, TimeRange: timeRangeToken(timeRange),
+		Targets: make([]TargetStatus, 0, len(targets)),
+	}
 	for i := range targets {
 		t := &targets[i]
 		out.Targets = append(out.Targets, s.assembleTarget(t, pairs[t.id], now,
@@ -369,7 +398,9 @@ func (s *Service) assembleTarget(t *targetRow, pairs []applicablePair, now time.
 	}
 	if avail.Rounds > 0 {
 		r := avail.Ratio
-		ts.Availability24h = &r
+		ts.Availability = &r
+		ts.AvailabilityRounds = avail.Rounds
+		ts.AvailabilityOKRounds = avail.OKRounds
 	}
 	// Counted over the SAME agents whose rounds produced the availability figure
 	// above, because this number exists to explain that figure and the two are read
@@ -395,7 +426,7 @@ func (s *Service) assembleTarget(t *targetRow, pairs []applicablePair, now time.
 		counted[p.agentID] = true
 	}
 	for agentID := range counted {
-		ts.Fluctuations24h += fluxByAgent[agentID]
+		ts.Fluctuations += fluxByAgent[agentID]
 	}
 
 	// Deterministic per-agent order: agent_name, agent_id.
@@ -416,9 +447,11 @@ func (s *Service) assembleTarget(t *targetRow, pairs []applicablePair, now time.
 		as, agg := s.deriveAgent(t, p, now, msByKey, samples, detectors, signals)
 		if agentAvail := availByAgent[p.agentID]; agentAvail.Rounds > 0 {
 			ratio := agentAvail.Ratio
-			as.Availability24h = &ratio
+			as.Availability = &ratio
+			as.AvailabilityRounds = agentAvail.Rounds
+			as.AvailabilityOKRounds = agentAvail.OKRounds
 		}
-		as.Fluctuations24h = fluxByAgent[p.agentID]
+		as.Fluctuations = fluxByAgent[p.agentID]
 		ts.Agents = append(ts.Agents, as)
 		aggs = append(aggs, agg)
 

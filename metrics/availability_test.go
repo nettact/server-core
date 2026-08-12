@@ -152,6 +152,58 @@ func TestAvailabilityCascadeCountsEachRoundOnce(t *testing.T) {
 	}
 }
 
+// TestAvailabilityRequestedWindowsDiffer proves the three console windows use
+// genuinely different lower bounds. The recent day is perfect, days 2-7 have a
+// small deficit, and the older part of the month is worse again. A regression
+// that reuses the 24h lower bound for every request makes both the ratios and the
+// round counts collapse to the same values and fails this test.
+func TestAvailabilityRequestedWindowsDiffer(t *testing.T) {
+	f := newAvailFixture(t, "probe_m1")
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Hour)
+	until := now.Unix()
+	since30d := until - 30*86400
+	since7d := until - 7*86400
+	since24h := until - 24*3600
+
+	f.putBucketsVar(t, tsstore.TierH1, since30d, 30*24, func(ts int64) (int64, float64) {
+		switch {
+		case ts >= since24h:
+			return 60, 60
+		case ts >= since7d:
+			return 60, 54
+		default:
+			return 60, 48
+		}
+	})
+	// The 24h query selects the minute tier; mirror the last day's perfect
+	// history there, as a live rollup cascade would.
+	f.putBuckets(t, tsstore.TierM1, since24h, 24*60, 1, 1)
+	f.setWatermark(t, "1h", until)
+	f.setWatermark(t, "1m", until)
+
+	result := make(map[time.Duration]AvailabilityRatio)
+	for _, window := range []time.Duration{24 * time.Hour, 7 * 24 * time.Hour, 30 * 24 * time.Hour} {
+		total, _, err := f.s.AvailabilityForTarget(ctx, "probe_m1", until-int64(window/time.Second), until)
+		if err != nil {
+			t.Fatalf("AvailabilityForTarget(%s): %v", window, err)
+		}
+		result[window] = total
+	}
+
+	d1 := result[24*time.Hour]
+	d7 := result[7*24*time.Hour]
+	d30 := result[30*24*time.Hour]
+	if !(d1.Rounds < d7.Rounds && d7.Rounds < d30.Rounds) {
+		t.Fatalf("round counts did not grow with the window: 24h=%d 7d=%d 30d=%d",
+			d1.Rounds, d7.Rounds, d30.Rounds)
+	}
+	if !(d1.Ratio > d7.Ratio && d7.Ratio > d30.Ratio) {
+		t.Fatalf("ratios did not reflect the distinct history: 24h=%v 7d=%v 30d=%v",
+			d1.Ratio, d7.Ratio, d30.Ratio)
+	}
+}
+
 // TestAvailabilityRewoundFenceCannotDoubleCount pins the clamp. Ingest and the
 // rollup's parent-rewind protocol both move fences BACKWARDS, so a coarse fence
 // ahead of a finer one is a state the reader must survive. The clamp is allowed to

@@ -1866,6 +1866,9 @@ func (d Deps) handleListFaultSignals(w http.ResponseWriter, r *http.Request) {
 	if n, err := strconv.Atoi(q.Get("limit")); err == nil && n > 0 {
 		f.Limit = n
 	}
+	if n, err := strconv.ParseInt(q.Get("since"), 10, 64); err == nil && n > 0 {
+		f.Since = n
+	}
 	sigs, err := d.Fault.ListSignals(r.Context(), f)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -2401,18 +2404,21 @@ func (d Deps) handleGetTargetBaseline(w http.ResponseWriter, r *http.Request) {
 
 // ---- availability ----
 
-// availabilityWindow parses ?window= (24h | 7d | 30d), defaulting to 24h. The
-// window set is fixed rather than free-form: availability is summed from minute
-// rollup buckets, which are retained for 30 days, so a longer window would
-// silently answer from an incomplete range.
-func availabilityWindow(r *http.Request) (time.Duration, bool) {
+// timeRange parses the page-wide ?window= selection, defaulting to 24h. The
+// fixed tokens keep all status-page data sources on one bounded contract while
+// still allowing the metrics store to select the appropriate retention tier.
+func timeRange(r *http.Request) (time.Duration, bool) {
 	switch r.URL.Query().Get("window") {
+	case "3h":
+		return 3 * time.Hour, true
 	case "", "24h":
 		return 24 * time.Hour, true
 	case "7d":
 		return 7 * 24 * time.Hour, true
 	case "30d":
 		return 30 * 24 * time.Hour, true
+	case "90d":
+		return 90 * 24 * time.Hour, true
 	}
 	return 0, false
 }
@@ -2420,9 +2426,9 @@ func availabilityWindow(r *http.Request) (time.Duration, bool) {
 // handleSiteAvailability returns every target's availability over one window,
 // batched for the target-status page.
 func (d Deps) handleSiteAvailability(w http.ResponseWriter, r *http.Request) {
-	win, ok := availabilityWindow(r)
+	win, ok := timeRange(r)
 	if !ok {
-		writeError(w, http.StatusBadRequest, "window must be 24h, 7d or 30d")
+		writeError(w, http.StatusBadRequest, "window must be 3h, 24h, 7d, 30d or 90d")
 		return
 	}
 	now := time.Now().UTC()
@@ -2441,21 +2447,25 @@ func (d Deps) handleTargetAvailability(w http.ResponseWriter, r *http.Request) {
 	targetID := chi.URLParam(r, "id")
 	windows := strings.Split(r.URL.Query().Get("windows"), ",")
 	if len(windows) == 1 && windows[0] == "" {
-		windows = []string{"24h", "7d", "30d"}
+		windows = []string{"3h", "24h", "7d", "30d", "90d"}
 	}
 	now := time.Now().UTC()
 	out := make([]map[string]any, 0, len(windows))
 	for _, wname := range windows {
 		var win time.Duration
 		switch strings.TrimSpace(wname) {
+		case "3h":
+			win = 3 * time.Hour
 		case "24h":
 			win = 24 * time.Hour
 		case "7d":
 			win = 7 * 24 * time.Hour
 		case "30d":
 			win = 30 * 24 * time.Hour
+		case "90d":
+			win = 90 * 24 * time.Hour
 		default:
-			writeError(w, http.StatusBadRequest, "windows must be a comma-separated subset of 24h,7d,30d")
+			writeError(w, http.StatusBadRequest, "windows must be a comma-separated subset of 3h,24h,7d,30d,90d")
 			return
 		}
 		total, perAgent, err := d.Metrics.AvailabilityForTarget(r.Context(), targetID, now.Add(-win).Unix(), now.Unix())
@@ -2960,7 +2970,11 @@ func (d Deps) handleDeleteChannel(w http.ResponseWriter, r *http.Request) {
 }
 
 func (d Deps) handleAgentStatusHistory(w http.ResponseWriter, r *http.Request) {
-	hist, err := d.Registry.StatusHistory(r.Context(), chi.URLParam(r, "id"))
+	var since time.Time
+	if n, err := strconv.ParseInt(r.URL.Query().Get("since"), 10, 64); err == nil && n > 0 {
+		since = time.Unix(n, 0).UTC()
+	}
+	hist, err := d.Registry.StatusHistory(r.Context(), chi.URLParam(r, "id"), since)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return

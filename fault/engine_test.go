@@ -544,6 +544,15 @@ func TestConnectivitySignalReadsAsAbnormalWhileOffline(t *testing.T) {
 	if !sigs[0].CurrentlyAbnormal {
 		t.Fatal("a firing connectivity fault means the Agent is offline right now")
 	}
+	filtered, err := h.svc.ListSignals(h.ctx, SignalFilter{
+		SiteID: "site_default", Detector: DetectorAgentConnectivity, Since: now.Add(time.Second).Unix(),
+	})
+	if err != nil {
+		t.Fatalf("list with since: %v", err)
+	}
+	if len(filtered) != 0 {
+		t.Fatalf("since after confirmation returned %d signals, want none", len(filtered))
+	}
 }
 
 // TestSignalTitleIsLiteralInBothLanguages: the product may not upgrade "one probe
