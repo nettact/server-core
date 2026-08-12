@@ -194,17 +194,11 @@ func (h *Hub) serve(ctx context.Context, auth registry.AuthResult, c wire.Conn, 
 	// effect: a peer that cannot speak the floor barrier must not get a session
 	// at all — without the barrier its packets would be renumbered in place the
 	// first time its WAL restarts, which the receipt ledger exists to forbid.
+	// A schema-8 agent always declares the capability regardless of epoch, so
+	// the zero-epoch bootstrap path (below) is still gated here.
 	if !wire.HasCapability(hello.Capabilities, wire.CapSequenceFloorV1) {
 		_ = h.deps.Registry.RecordDisconnect(ctx, agentID, "unsupported_schema")
 		_ = c.Close(wire.CloseProtocolError, "missing sequence_floor_v1 capability")
-		return
-	}
-	// A zero epoch means the agent does not know its credential generation. The
-	// floor barrier keys on the epoch, so admitting the session without one
-	// would make the barrier meaningless.
-	if hello.EnrollmentEpoch == 0 {
-		_ = h.deps.Registry.RecordDisconnect(ctx, agentID, "unsupported_schema")
-		_ = c.Close(wire.CloseProtocolError, "missing enrollment epoch")
 		return
 	}
 
@@ -360,10 +354,10 @@ func (h *Hub) serve(ctx context.Context, auth registry.AuthResult, c wire.Conn, 
 	s.epoch = revAuth.Epoch
 	switch {
 	case revAuth.PendingRotation != nil:
-		// The presented token is the OLD token of a rotation that already
-		// committed server-side (the result was lost in transit). Re-issue the
-		// result idempotently instead of the floor, then end the session: the
-		// agent persists the new credential and reconnects under it.
+		// The presented token is the current (old) token while a phase-1
+		// rotation is staged: re-issue the result idempotently instead of the
+		// floor, then end the session — the agent persists the new credential
+		// and reconnects with it (which completes phase 2).
 		s.pendingRotation = revAuth.PendingRotation
 		if !s.enqueue(wire.Frame{EpochRotationResult: s.pendingRotation}) {
 			return
@@ -371,14 +365,23 @@ func (h *Hub) serve(ctx context.Context, auth registry.AuthResult, c wire.Conn, 
 		s.rotated = true
 		s.shutdown(wire.CloseGoingAway, "epoch rotated; reconnect")
 		return
+	case hello.EnrollmentEpoch == 0:
+		// A pre-schema-8 credential: the agent knows no generation and skips
+		// the floor barrier on its side too (zero means "unknown"). No floor is
+		// pushed and the barrier is opened immediately — gating a zero-epoch
+		// session would stall every install upgraded from before schema 8.
+		s.floorApplied = true
 	case hello.EnrollmentEpoch != revAuth.Epoch:
 		// The Hello presents a stale credential generation. Challenge the agent
 		// to rotate out of it and HOLD the session for the rotation flow — the
 		// agent answers with EpochRotationRequest, and the read loop completes
-		// the exchange. No floor is pushed: without a floor there is nothing to
-		// apply, so the barrier stays closed and no packet is admitted until the
-		// rotation lands and the agent reconnects.
-		ch := h.deps.Registry.IssueRotationChallenge(agentID, revAuth.Epoch, "epoch_mismatch")
+		// the exchange. The challenge is bound to the HELLO epoch (the
+		// generation the agent will state as OldEpoch and sign with); the new
+		// generation is derived from the row, so a stale agent jumps forward to
+		// row+1 rather than being refused. No floor is pushed: without a floor
+		// there is nothing to apply, so the barrier stays closed and no packet
+		// is admitted until the rotation lands and the agent reconnects.
+		ch := h.deps.Registry.IssueRotationChallenge(agentID, hello.EnrollmentEpoch, "epoch_mismatch")
 		if !s.enqueue(wire.Frame{EpochRotationChallenge: &ch}) {
 			return
 		}

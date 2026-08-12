@@ -13,7 +13,7 @@ import (
 // recorded, plus the data a released installation has — then opens it through
 // the normal path so the migrator applies 0002, and asserts the upgrade: the
 // new columns and the receipt table exist, pre-existing rows keep their data
-// and land on generation 1, and the rotation pending window starts empty.
+// and land on generation 1, and no rotation is staged.
 //
 // The runner applies every unrecorded migration, so "a database at the
 // previous release" cannot be produced by the runner itself; the 0001 SQL is
@@ -67,11 +67,10 @@ func TestSchema8UpgradeFromV1(t *testing.T) {
 	defer db.Close()
 
 	var hostname string
-	var epoch uint64
-	var pendingHash string
+	var epoch, pendingEpoch uint64
 	var pendingUntil, high int64
-	if err := db.QueryRow(`SELECT hostname, enrollment_epoch, pending_prev_token_hash, pending_prev_token_until, high_sequence
-		FROM agents WHERE id='agent_old'`).Scan(&hostname, &epoch, &pendingHash, &pendingUntil, &high); err != nil {
+	if err := db.QueryRow(`SELECT hostname, enrollment_epoch, pending_next_epoch, pending_next_until, high_sequence
+		FROM agents WHERE id='agent_old'`).Scan(&hostname, &epoch, &pendingEpoch, &pendingUntil, &high); err != nil {
 		t.Fatalf("read upgraded agent: %v", err)
 	}
 	if hostname != "box-1" || high != 42 {
@@ -80,8 +79,8 @@ func TestSchema8UpgradeFromV1(t *testing.T) {
 	if epoch != 1 {
 		t.Errorf("enrollment_epoch = %d, want the 1 default for pre-schema-8 rows", epoch)
 	}
-	if pendingHash != "" || pendingUntil != 0 {
-		t.Errorf("pending window = %q/%d, want empty on upgrade", pendingHash, pendingUntil)
+	if pendingEpoch != 0 || pendingUntil != 0 {
+		t.Errorf("pending rotation = %d/%d, want none staged on upgrade", pendingEpoch, pendingUntil)
 	}
 
 	// The new table exists and is empty.

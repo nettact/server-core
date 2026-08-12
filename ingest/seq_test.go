@@ -323,6 +323,38 @@ func TestRotationLetsFreshSequenceReAdmit(t *testing.T) {
 	}
 }
 
+// TestStaleSessionCannotAdvanceNewEpochFloor pins the epoch-pinned admission:
+// a session carrying the PRE-rotation epoch must not advance the new
+// generation's watermark — the guarded UPDATE refuses on the epoch mismatch
+// and the batch reads as a conflict, with the column untouched.
+func TestStaleSessionCannotAdvanceNewEpochFloor(t *testing.T) {
+	db, svc := openSeqIngest(t)
+	ctx := context.Background()
+	t0 := time.Now().UTC().Add(-time.Minute)
+
+	if _, err := svc.Ingest(ctx, "agent_seq", "site_default", 1, seqPacket(1, t0)); err != nil {
+		t.Fatalf("seq 1: %v", err)
+	}
+
+	// A rotation (or reinstall) commits under the session: generation 2, a
+	// zeroed watermark. The stale session still carries epoch 1.
+	mustSeqExec(t, db, `UPDATE agents SET enrollment_epoch=2, high_sequence=0 WHERE id='agent_seq'`)
+
+	if _, err := svc.Ingest(ctx, "agent_seq", "site_default", 1, seqPacket(2, t0)); !errors.Is(err, ErrSequenceConflict) {
+		t.Fatalf("stale-epoch ingest = %v, want ErrSequenceConflict", err)
+	}
+	var high int
+	if err := db.QueryRowContext(ctx, `SELECT high_sequence FROM agents WHERE id='agent_seq'`).Scan(&high); err != nil {
+		t.Fatalf("high_sequence: %v", err)
+	}
+	if high != 0 {
+		t.Fatalf("high_sequence = %d, want 0 — a stale session must not advance the new epoch's floor", high)
+	}
+	if countEvents(t, db) != 1 {
+		t.Fatalf("stale-epoch batch wrote events")
+	}
+}
+
 // TestAcceptedFloor: the floor is a straight DB read of the current epoch's
 // committed high — the cache reset does not move it.
 func TestAcceptedFloor(t *testing.T) {

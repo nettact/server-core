@@ -554,22 +554,21 @@ func TestReinstallTokenRejoinsSameAgent(t *testing.T) {
 	if disconnectCalls != 1 {
 		t.Errorf("reinstall disconnected %d sessions, want 1", disconnectCalls)
 	}
-	// The row itself carries the advanced generation, and the rotation pending
-	// window is closed outright (a reinstall is not the controlled rotation
-	// flow — its old token died at once).
+	// The row itself carries the advanced generation, and no rotation is staged
+	// (a reinstall invalidates any outstanding rotation of the dead lineage).
 	var storedEpoch uint64
-	var pendingHash string
+	var pendingEpoch uint64
 	var pendingUntil int64
 	if err := db.QueryRowContext(ctx,
-		`SELECT enrollment_epoch, pending_prev_token_hash, pending_prev_token_until FROM agents WHERE id=?`,
-		agentID).Scan(&storedEpoch, &pendingHash, &pendingUntil); err != nil {
+		`SELECT enrollment_epoch, pending_next_epoch, pending_next_until FROM agents WHERE id=?`,
+		agentID).Scan(&storedEpoch, &pendingEpoch, &pendingUntil); err != nil {
 		t.Fatalf("read epoch columns: %v", err)
 	}
 	if storedEpoch != 2 {
 		t.Errorf("stored enrollment_epoch = %d, want 2", storedEpoch)
 	}
-	if pendingHash != "" || pendingUntil != 0 {
-		t.Errorf("pending window after reinstall = %q/%d, want closed", pendingHash, pendingUntil)
+	if pendingEpoch != 0 || pendingUntil != 0 {
+		t.Errorf("pending rotation after reinstall = %d/%d, want none staged", pendingEpoch, pendingUntil)
 	}
 
 	// Still exactly one agent row: the reinstall re-bound it, it did not add one.

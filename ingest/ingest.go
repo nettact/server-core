@@ -342,13 +342,23 @@ func (s *Service) Ingest(ctx context.Context, agentID, siteID string, epoch uint
 			// test-and-set — the monotone guard restores it only if its result is
 			// what admits the work.
 			//
-			// affected==0 also covers a deleted agent (no row left to raise) and a
-			// session that lost a reenrollment race. Dropping the batch is right in
-			// both: the watermark it would advance no longer belongs to it. The ack
-			// still goes out, so nothing replays forever.
+			// The guard is PINNED TO THE EPOCH (schema 8): a rotation or reinstall
+			// zeroes the column under a NEW generation, so a session that still
+			// carries the old epoch would otherwise sail past the guard and
+			// advance the new epoch's floor with stale-epoch sequences. With the
+			// pin, the guarded UPDATE refuses it and the epoch re-check below
+			// turns the refusal into a conflict. The replay path needs no extra
+			// guard: a sequence <= high is only "a replay" within the same epoch
+			// precisely because admission cannot cross the epoch boundary.
+			//
+			// affected==0 also covers a deleted agent (no row left to raise). The
+			// receipt check below decides: a deleted agent's ledger rows cascade
+			// away with it, so the batch reads as a conflict and the hub drives a
+			// rotation whose reconnect fails authentication outright — the agent's
+			// terminal outcome for a deleted identity.
 			res, err := wtx.ExecContext(ctx,
-				`UPDATE agents SET high_sequence=? WHERE id=? AND high_sequence<?`,
-				pkt.Sequence, agentID, pkt.Sequence)
+				`UPDATE agents SET high_sequence=? WHERE id=? AND high_sequence<? AND enrollment_epoch=?`,
+				pkt.Sequence, agentID, pkt.Sequence, epoch)
 			if err != nil {
 				return nil, err
 			}
@@ -357,16 +367,26 @@ func (s *Service) Ingest(ctx context.Context, agentID, siteID string, epoch uint
 				return nil, err
 			}
 			if admitted == 0 {
-				// The column has already moved past this read. Adopt its value so
-				// the ack tells the agent where the watermark actually stands
-				// instead of restating our stale one — otherwise it would prune to
-				// a lower point and resend batches that can only be refused again.
-				// No row (deleted agent) leaves it at zero and the ack falls back to
-				// the ordinary replay answer.
-				if err := wtx.QueryRowContext(ctx,
-					`SELECT high_sequence FROM agents WHERE id=?`, agentID).Scan(&adoptHigh); err != nil &&
-					!errors.Is(err, sql.ErrNoRows) {
-					return nil, err
+				// The column has already moved past this read — or the row's
+				// generation has. Adopt the committed value so the ack tells the
+				// agent where the watermark actually stands instead of restating
+				// our stale one; but FIRST check whose watermark this is: an epoch
+				// that no longer matches the session's means a rotation/reinstall
+				// committed under it, and this batch must not silently advance the
+				// new generation's floor. That is a conflict (the hub challenges),
+				// not a restated ack.
+				var rowEpoch uint64
+				rerr := wtx.QueryRowContext(ctx,
+					`SELECT high_sequence, enrollment_epoch FROM agents WHERE id=?`, agentID).
+					Scan(&adoptHigh, &rowEpoch)
+				switch {
+				case errors.Is(rerr, sql.ErrNoRows):
+					// Deleted agent: no row to adopt from; the receipt lookup
+					// below (ledger cascade-emptied) decides.
+				case rerr != nil:
+					return nil, rerr
+				case rowEpoch != epoch:
+					return nil, ErrSequenceConflict
 				}
 				// The receipt ledger settles what the refusal means. A receipt for
 				// THIS slot carrying the same content: the concurrent session

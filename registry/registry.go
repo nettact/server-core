@@ -91,11 +91,10 @@ type Service struct {
 	// nil is a no-op (no live session to fence).
 	DisconnectSession func(ctx context.Context, agentID string)
 	// Schema-8 rotation state, in memory by design: the live challenge bindings
-	// and the re-issuable results of committed rotations (see rotate.go). Guarded
-	// by rotMu, never by the DB.
+	// (one slot per agent, expired entries swept lazily — see rotate.go).
+	// Guarded by rotMu, never by the DB.
 	rotMu      sync.Mutex
 	challenges map[string]*rotationChallenge
-	pending    map[string]*pendingRotationResult
 }
 
 // New constructs the registry. maxAgents caps enrollment (0 = unlimited). bus may
@@ -107,7 +106,6 @@ func New(db *store.DB, maxAgents int, bus *eventbus.Bus) *Service {
 		db: db, maxAgents: maxAgents, bus: bus,
 		lastTouch:  map[string]time.Time{},
 		challenges: map[string]*rotationChallenge{},
-		pending:    map[string]*pendingRotationResult{},
 	}
 }
 

@@ -269,12 +269,17 @@ func (s *Service) Enroll(ctx context.Context, req enroll.EnrollRequest) (enroll.
 		// them: a first-time agent whose sensor is broken is precisely when an operator
 		// is looking at the page, so the "why" must be there from the first report and
 		// not only after the first reconnect refreshes it.
+		//
+		// enrollment_epoch defaults to 1; the pending-rotation staging columns are
+		// named explicitly so a fresh row reads the same shape a reader of any
+		// other row expects (0 = no pending rotation).
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO agents(id, site_id, public_key, token_hash, display_name, hostname, platform, agent_version,
 			                   perm_supported, perm_granted, perm_effective, perm_unsupported_reasons,
 			                   policy_source, policy_hash,
-			                   status, last_seen_at, created_at)
-			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'online', ?, ?)`,
+			                   status, last_seen_at, created_at,
+			                   enrollment_epoch, pending_next_epoch, pending_next_until)
+			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'online', ?, ?, 1, 0, 0)`,
 			agentID, siteID, []byte(req.PublicKey), sha256hex(agentToken), displayName,
 			req.Hostname, req.Platform, req.AgentVersion,
 			marshalStrings(req.Permissions.Supported), marshalStrings(req.Permissions.Granted),
@@ -320,13 +325,6 @@ func (s *Service) Enroll(ctx context.Context, req enroll.EnrollRequest) (enroll.
 	// old installation's high.
 	if reclaimed && s.ResetSeqWatermark != nil {
 		s.ResetSeqWatermark(ctx, agentID)
-	}
-	// A reinstall ends any prior rotation's pending window outright (the old
-	// token died with the credential swap above): clear the in-memory pending
-	// entry, so the previous generation's token can never be re-issued a
-	// rotation result that belongs to a different credential lineage.
-	if reclaimed {
-		s.clearPendingRotation(agentID)
 	}
 
 	return enroll.EnrollResponse{
@@ -378,11 +376,10 @@ func (s *Service) reinstallTarget(ctx context.Context, token string) string {
 // Schema 8: a reinstall replaces an install, so it advances the enrollment
 // epoch like the controlled wire rotation does — the (agent, epoch, sequence)
 // receipt identity must never reuse a generation, or the fresh WAL could
-// collide with durable receipts the previous installation left behind. The
-// rotation pending window is closed outright (a reinstall is not the
-// controlled rotation flow, and its OLD token must die at once): the columns
-// and the in-memory pending entry are cleared here, the latter after commit
-// in Enroll.
+// collide with durable receipts the previous installation left behind. Any
+// rotation staged for the dead lineage is invalidated outright: the staged
+// next token derives from the previous generation's HMAC input and must not
+// complete a switch the reinstall already superseded.
 //
 // Runs inside Enroll's transaction (the caller commits), so a failure rolls the
 // token consumption back together with the row update. Returns ErrReinstallAgent
@@ -417,7 +414,7 @@ func (s *Service) reenrollAgent(ctx context.Context, tx *sql.Tx, agentID string,
 			upload_interval_seconds=0,
 			last_disconnect_kind='',
 			enrollment_epoch=enrollment_epoch+1,
-			pending_prev_token_hash='', pending_prev_token_until=0
+			pending_next_epoch=0, pending_next_until=0
 		WHERE id=?`,
 		[]byte(req.PublicKey), sha256hex(agentToken),
 		req.Hostname, req.Platform, req.AgentVersion,
