@@ -1502,6 +1502,14 @@ func validateTarget(t *config.ProbeTarget) error {
 			return err
 		}
 	}
+	// A proxied TCP target cannot honor source-port fan-out: pinning the agent's
+	// LOCAL port only changes the agent→proxy tuple, while the proxy independently
+	// creates the target-facing tuple the ECMP hash keys on. The collector would
+	// silently run single-flow and report unsupported code 0, so the combination
+	// is rejected as the silent no-op it is rather than saved.
+	if t.Kind == "tcp" && t.ProxyID != "" && t.Params.FlowFanout >= 2 {
+		return errors.New("flow_fanout requires a direct target: a proxied TCP target's source port belongs to the proxy")
+	}
 	// Remaining per-kind param bounds (ICMP cycle shape, DNS record type/resolver
 	// endpoint, HTTP method/status/keyword/headers/body/redirect/read caps). Each is
 	// checked only for the kind that consumes it, so a param left over from a

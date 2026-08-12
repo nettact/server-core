@@ -165,13 +165,35 @@ func validateProbeParams(kind string, p *pcfg.ProbeParams) error {
 		// cycle, so the list is bounded the way packet_count is.
 		if len(p.PayloadSizes) > 0 {
 			if len(p.PayloadSizes) < 2 || len(p.PayloadSizes) > maxSweepSizes {
-				return errors.New("payload_sizes must list 2-" + strconv.Itoa(maxSweepSizes) + " sizes (empty = default sweep)")
+				return errors.New("payload_sizes must list 2-" + strconv.Itoa(maxSweepSizes) + " distinct sizes (empty = default sweep)")
 			}
+			seen := make(map[int]bool, len(p.PayloadSizes))
 			for _, sz := range p.PayloadSizes {
-				if sz < 1 || sz > maxPacketSize {
-					return errors.New("payload_sizes entry out of range (1-" + strconv.Itoa(maxPacketSize) + ")")
+				// A sweep entry above the shared ceiling fragments on a 1420-MTU
+				// tunnel and manufactures the size-correlated loss the sweep exists
+				// to detect (see config.MaxSweepPayloadSize) — the false diagnosis
+				// the feature is built to avoid. Duplicates collapse the smallest
+				// and largest to one bucket and permanently report a flat sweep.
+				if sz < 1 || sz > pcfg.MaxSweepPayloadSize {
+					return errors.New("payload_sizes entry out of range (1-" + strconv.Itoa(pcfg.MaxSweepPayloadSize) + ")")
 				}
+				if seen[sz] {
+					return errors.New("payload_sizes must be distinct: " + strconv.Itoa(sz) + " repeats")
+				}
+				seen[sz] = true
 			}
+		}
+		// A swept cycle sends PingCount echoes per size, so a one-echo-per-size
+		// cycle can never clear the classifier's two-echo minimum and would run the
+		// sweep's extra probes forever without ever classifying.
+		if p.SizeSweep && p.PacketCount == 1 {
+			return errors.New("packet_count must be at least 2 when size_sweep is on (one echo per size is not enough evidence to classify)")
+		}
+		// The effective total (per-size count × sizes) must stay inside the same
+		// cycle cap a plain packet_count is held to: per-dimension bounds alone let
+		// packet_count=100 × 8 sizes through as an 800-echo cycle.
+		if p.SizeSweep && pcfg.PingCount(*p) > maxPacketCount {
+			return errors.New("size_sweep cycle exceeds the " + strconv.Itoa(maxPacketCount) + "-echo cap (per-size count × sizes)")
 		}
 	case "tcp":
 		if p.FlowFanout < 0 || p.FlowFanout > maxFlowFanout {
