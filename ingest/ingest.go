@@ -198,7 +198,7 @@ func (s *Service) Ingest(ctx context.Context, agentID, siteID string, epoch uint
 	var plan PostCommitPlan
 	err = s.db.WriteTx(ctx, store.Standalone(), func(wtx store.WriteTx) (func(), error) {
 		var aerr error
-		res, plan, aerr = s.ApplyPacketTx(ctx, store.Standalone(), wtx, p, pkt, in)
+		res, plan, aerr = s.ApplyPacketTx(ctx, store.Standalone(), wtx, in)
 		return nil, aerr
 	})
 	if err != nil {
@@ -209,7 +209,7 @@ func (s *Service) Ingest(ctx context.Context, agentID, siteID string, epoch uint
 	// inside Commit is logged there and returned, but deliberately still
 	// ACKS — the SQLite state is committed and a replay would be deduplicated
 	// anyway (see Commit).
-	_ = s.Commit(ctx, res, plan)
+	_ = s.Commit(ctx, res, &plan)
 
 	return Ack{
 		HighestSequence: s.ackSequence(p.AgentID, pkt.Sequence, in.cacheEpoch, res.New, res.AdoptHigh),

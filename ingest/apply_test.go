@@ -45,13 +45,13 @@ func applyDirect(t *testing.T, h *charHarness, svc *Service, p AgentPrincipal, p
 	var plan PostCommitPlan
 	err = h.db.WriteTx(h.ctx, store.Standalone(), func(wtx store.WriteTx) (func(), error) {
 		var aerr error
-		res, plan, aerr = svc.ApplyPacketTx(h.ctx, store.Standalone(), wtx, p, pkt, in)
+		res, plan, aerr = svc.ApplyPacketTx(h.ctx, store.Standalone(), wtx, in)
 		return nil, aerr
 	})
 	if err != nil {
 		return res, plan, err
 	}
-	return res, plan, svc.Commit(h.ctx, res, plan)
+	return res, plan, svc.Commit(h.ctx, res, &plan)
 }
 
 // applyDirectErr is applyDirect without t.Fatal — safe inside goroutines.
@@ -64,7 +64,7 @@ func applyDirectErr(h *charHarness, svc *Service, p AgentPrincipal, pkt telemetr
 	var res ApplyResult
 	err = h.db.WriteTx(h.ctx, store.Standalone(), func(wtx store.WriteTx) (func(), error) {
 		var aerr error
-		res, _, aerr = svc.ApplyPacketTx(h.ctx, store.Standalone(), wtx, p, pkt, in)
+		res, _, aerr = svc.ApplyPacketTx(h.ctx, store.Standalone(), wtx, in)
 		return nil, aerr
 	})
 	if err != nil {
@@ -257,7 +257,7 @@ func TestApplyPacketTxErrorInjectionEverySubstep(t *testing.T) {
 			}
 			defer in.ReleasePending()
 			err = h.db.WriteTx(h.ctx, store.Standalone(), func(wtx store.WriteTx) (func(), error) {
-				_, _, aerr := svc.ApplyPacketTx(h.ctx, store.Standalone(), &failQueryTx{WriteTx: wtx, failOn: tc.fail, err: injected}, applyPrincipal(), pkt, in)
+				_, _, aerr := svc.ApplyPacketTx(h.ctx, store.Standalone(), &failQueryTx{WriteTx: wtx, failOn: tc.fail, err: injected}, in)
 				return nil, aerr
 			})
 			if !errors.Is(err, injected) {
@@ -359,7 +359,7 @@ func TestApplyPacketTxNeverControlsTheTransaction(t *testing.T) {
 		t.Fatal(err)
 	}
 	wtx := store.AdaptTx(raw, store.Standalone())
-	res, _, err := svc.ApplyPacketTx(h.ctx, store.Standalone(), wtx, applyPrincipal(), pkt, in)
+	res, _, err := svc.ApplyPacketTx(h.ctx, store.Standalone(), wtx, in)
 	if err != nil {
 		t.Fatalf("apply: %v", err)
 	}
@@ -402,7 +402,7 @@ func TestPostCommitPlanDiscardedOnRollback(t *testing.T) {
 	// returns before Commit, so the plan is discarded with the rollback.
 	boom := errors.New("commit failed")
 	err = h.db.WriteTx(h.ctx, store.Standalone(), func(wtx store.WriteTx) (func(), error) {
-		if _, _, aerr := svc.ApplyPacketTx(h.ctx, store.Standalone(), wtx, applyPrincipal(), pkt, in); aerr != nil {
+		if _, _, aerr := svc.ApplyPacketTx(h.ctx, store.Standalone(), wtx, in); aerr != nil {
 			return nil, aerr
 		}
 		return nil, boom
@@ -546,7 +546,7 @@ func TestApplyPacketTxGenerationRecheck(t *testing.T) {
 	var plan PostCommitPlan
 	err = h.db.WriteTx(h.ctx, store.Standalone(), func(wtx store.WriteTx) (func(), error) {
 		var aerr error
-		res, plan, aerr = svc.ApplyPacketTx(h.ctx, store.Standalone(), wtx, applyPrincipal(), pkt, in)
+		res, plan, aerr = svc.ApplyPacketTx(h.ctx, store.Standalone(), wtx, in)
 		return nil, aerr
 	})
 	if err != nil {
@@ -558,7 +558,7 @@ func TestApplyPacketTxGenerationRecheck(t *testing.T) {
 	if len(plan.AcceptedTx) != 0 || len(plan.StoredTx) != 0 {
 		t.Fatalf("post-re-check set is non-empty: accepted=%d stored=%d", len(plan.AcceptedTx), len(plan.StoredTx))
 	}
-	if err := svc.Commit(h.ctx, res, plan); err != nil {
+	if err := svc.Commit(h.ctx, res, &plan); err != nil {
 		t.Fatalf("commit: %v", err)
 	}
 	var detectors int
@@ -603,7 +603,7 @@ func TestApplyPacketTxScopeFailsClosed(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			rec := &recordingTx{scope: tc.tx}
-			_, _, err := svc.ApplyPacketTx(h.ctx, tc.call, rec, applyPrincipal(), charPacket(1, nil), in)
+			_, _, err := svc.ApplyPacketTx(h.ctx, tc.call, rec, in)
 			if err == nil {
 				t.Fatal("apply = nil, want a scope error before any query")
 			}
@@ -669,7 +669,7 @@ func TestCommitPostCommitExecutorContract(t *testing.T) {
 		var plan PostCommitPlan
 		err = h.db.WriteTx(h.ctx, store.Standalone(), func(wtx store.WriteTx) (func(), error) {
 			var aerr error
-			res, plan, aerr = svc.ApplyPacketTx(h.ctx, store.Standalone(), wtx, applyPrincipal(), pkt, in)
+			res, plan, aerr = svc.ApplyPacketTx(h.ctx, store.Standalone(), wtx, in)
 			return nil, aerr
 		})
 		if err != nil {
@@ -686,7 +686,7 @@ func TestCommitPostCommitExecutorContract(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := svc.Commit(h.ctx, res, plan); err != nil {
+		if err := svc.Commit(h.ctx, res, &plan); err != nil {
 			t.Fatalf("commit: %v", err)
 		}
 		ids, err := h.m.ResolveSeriesIDs(h.ctx, "site_default", "agent_a", "t_icmp", string(telemetry.ICMPRTTms), "192.168.1.1")
@@ -707,7 +707,7 @@ func TestCommitPostCommitExecutorContract(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := svc.Commit(h.ctx, res, plan); err != nil {
+		if err := svc.Commit(h.ctx, res, &plan); err != nil {
 			t.Fatalf("commit with permanent drops = %v, want nil", err)
 		}
 	})
@@ -724,7 +724,7 @@ func TestCommitPostCommitExecutorContract(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := svc.Commit(h.ctx, res, plan); !errors.Is(err, boom) {
+		if err := svc.Commit(h.ctx, res, &plan); !errors.Is(err, boom) {
 			t.Fatalf("commit = %v, want the append error returned (the observable gap)", err)
 		}
 		// The committed state stands: the watermark is durable and the plan's
@@ -756,5 +756,90 @@ func TestPrepareRejectsInvalidInput(t *testing.T) {
 	p.AgentID = "no_such_agent"
 	if _, err := svc.Prepare(h.ctx, p, charPacket(1, nil)); err == nil {
 		t.Fatal("prepare for a deleted agent succeeded")
+	}
+}
+
+// TestApplyPacketTxUsesPrepareBoundIdentity pins the P1 review fix: the
+// transaction commits under the identity Prepare bound the inputs to — the
+// packet's SELF-REPORTED AgentID/SiteID are transport echoes and must not
+// shift attribution, and the receipt's fingerprint describes the prepared
+// payload.
+func TestApplyPacketTxUsesPrepareBoundIdentity(t *testing.T) {
+	h := newCharHarness(t, nil)
+	svc := New(h.db, h.bus, h.m, nil, nil, nil)
+
+	pkt := charPacket(1, icmpRounds(1, 0, 30))
+	// A hostile/buggy packet that claims a foreign identity.
+	pkt.AgentID = "someone_else"
+	pkt.SiteID = "site_elsewhere"
+
+	res, _, err := applyDirect(t, h, svc, applyPrincipal(), pkt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.New {
+		t.Fatalf("apply = %+v, want an admitted packet", res)
+	}
+	// The watermark moved for the PRINCIPAL, not the self-reported id.
+	var high int
+	if err := h.db.QueryRowContext(h.ctx, `SELECT high_sequence FROM agents WHERE id='agent_a'`).Scan(&high); err != nil || high != 1 {
+		t.Fatalf("principal high_sequence=%d err=%v, want 1", high, err)
+	}
+	var foreign int
+	if err := h.db.QueryRowContext(h.ctx, `SELECT COUNT(*) FROM agents WHERE id='someone_else'`).Scan(&foreign); err != nil || foreign != 0 {
+		t.Fatalf("foreign id rows=%d err=%v, want none", foreign, err)
+	}
+	// The receipt is keyed to the principal and carries the prepared
+	// fingerprint.
+	var fp string
+	if err := h.db.QueryRowContext(h.ctx,
+		`SELECT fingerprint FROM packet_receipts WHERE agent_id='agent_a' AND enrollment_epoch=1 AND sequence=1`).Scan(&fp); err != nil {
+		t.Fatalf("receipt: %v", err)
+	}
+	if want := PacketFingerprint(pkt); fp != want {
+		t.Fatalf("receipt fingerprint = %q, want %q (the prepared packet's identity)", fp, want)
+	}
+}
+
+// TestCommitIsSingleUse pins the P2 review fix: a retried Commit after an
+// append error must not replay the plan's side effects — the remembered
+// error comes back and the publications do not double.
+func TestCommitIsSingleUse(t *testing.T) {
+	real := tsstoretest.Open(t)
+	boom := errors.New("disk gone")
+	h := newCharHarness(t, failingSeriesStore{SeriesStore: real, err: boom})
+	svc := New(h.db, h.bus, h.m, nil, nil, nil)
+	pub := &busyCounter{}
+	subscribeAll(h, pub)
+	pkt := charPacket(2, icmpRounds(1, 0, 30))
+
+	in, err := svc.Prepare(h.ctx, applyPrincipal(), pkt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer in.ReleasePending()
+	var res ApplyResult
+	var plan PostCommitPlan
+	err = h.db.WriteTx(h.ctx, store.Standalone(), func(wtx store.WriteTx) (func(), error) {
+		var aerr error
+		res, plan, aerr = svc.ApplyPacketTx(h.ctx, store.Standalone(), wtx, in)
+		return nil, aerr
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := svc.Commit(h.ctx, res, &plan); !errors.Is(err, boom) {
+		t.Fatalf("first commit = %v, want the append error", err)
+	}
+	firstPubs := pub.n
+	if firstPubs == 0 {
+		t.Fatal("no publication after the first commit")
+	}
+	if err := svc.Commit(h.ctx, res, &plan); !errors.Is(err, boom) {
+		t.Fatalf("second commit = %v, want the SAME remembered error", err)
+	}
+	if pub.n != firstPubs {
+		t.Fatalf("publications after retry = %d, want %d — the plan's side effects ran twice", pub.n, firstPubs)
 	}
 }

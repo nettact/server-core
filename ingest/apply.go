@@ -58,6 +58,13 @@ type AgentPrincipal struct {
 // never assembles these by hand, and unexported fields make the invariant
 // ("came from Prepare") structural.
 type PreparedInputs struct {
+	// principal and pkt are the identity PreparedInputs was built FOR: the
+	// fields are set by Prepare and consumed by ApplyPacketTx, which no longer
+	// accepts them separately — a caller cannot cross inputs prepared for one
+	// packet onto another principal or payload without the mismatch being
+	// structurally impossible.
+	principal AgentPrincipal
+	pkt       telemetry.Packet
 	// fingerprint is the semantic content identity, computed on the PRISTINE
 	// packet before the timestamp filter mutates it (see PacketFingerprint).
 	fingerprint string
@@ -132,6 +139,14 @@ type ApplyResult struct {
 // discarded wholesale on rollback, which is what keeps a rolled-back batch
 // from publishing, caching or appending anything.
 type PostCommitPlan struct {
+	// once/commitErr make the plan single-use: Commit runs its side effects
+	// exactly once and remembers the outcome, so a caller retrying a returned
+	// append error cannot replay the cache folds, the publications or the
+	// append. The pointer lets plans be copied safely; Commit is NOT safe for
+	// concurrent use — a plan belongs to one post-commit executor, and the
+	// single-use guarantee is for its sequential retries.
+	once      *sync.Once
+	commitErr error
 	// AgentID/SiteID/Sequence name the committed batch.
 	AgentID  string
 	SiteID   string
@@ -168,6 +183,8 @@ func (s *Service) Prepare(ctx context.Context, p AgentPrincipal, pkt telemetry.P
 	if err := protocol.ValidateSchema(pkt.SchemaVersion); err != nil {
 		return in, err
 	}
+	in.principal = p
+	in.pkt = pkt
 	in.now = time.Now().UTC()
 	// The semantic fingerprint is computed on the PRISTINE packet, before the
 	// timestamp filter below mutates it: the same WAL batch re-served after a
@@ -292,15 +309,21 @@ func (s *Service) Prepare(ctx context.Context, p AgentPrincipal, pkt telemetry.P
 // validate AND match the transaction's own Scope(); anything else fails
 // closed before the first query, because a mismatched pair means a caller
 // bug that would otherwise write to the wrong tenant.
-func (s *Service) ApplyPacketTx(ctx context.Context, scope store.Scope, wtx store.WriteTx, p AgentPrincipal, pkt telemetry.Packet, in PreparedInputs) (ApplyResult, PostCommitPlan, error) {
+func (s *Service) ApplyPacketTx(ctx context.Context, scope store.Scope, wtx store.WriteTx, in PreparedInputs) (ApplyResult, PostCommitPlan, error) {
 	var res ApplyResult
-	var plan PostCommitPlan
+	plan := PostCommitPlan{once: &sync.Once{}}
 	if err := scope.Validate(); err != nil {
 		return res, plan, err
 	}
 	if wtx.Scope() != scope {
 		return res, plan, errors.New("ingest: write transaction scope does not match the call's scope")
 	}
+	// The identity the transaction commits under is the one Prepare bound the
+	// inputs to: the principal and packet are not caller-supplied here, so a
+	// crossed prepare cannot attribute one packet's data to another principal
+	// or admit a receipt whose fingerprint describes a different payload.
+	p := in.principal
+	pkt := in.pkt
 
 	isNew := in.isNew
 
@@ -579,7 +602,17 @@ func (s *Service) ApplyPacketTx(ctx context.Context, scope store.Scope, wtx stor
 // keeps the byte-identical log line the old path had. The returned error is
 // the programmatic form of the same gap — a Cloud caller that runs its own
 // executor equivalent can surface it the same way.
-func (s *Service) Commit(ctx context.Context, res ApplyResult, plan PostCommitPlan) error {
+func (s *Service) Commit(ctx context.Context, res ApplyResult, plan *PostCommitPlan) error {
+	if plan.once == nil {
+		plan.once = &sync.Once{}
+	}
+	plan.once.Do(func() {
+		plan.commitErr = s.commitOnce(ctx, res, plan)
+	})
+	return plan.commitErr
+}
+
+func (s *Service) commitOnce(ctx context.Context, res ApplyResult, plan *PostCommitPlan) error {
 	if plan.touchPost != nil {
 		plan.touchPost()
 	}
