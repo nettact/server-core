@@ -122,7 +122,7 @@ type Deps struct {
 // ListenStatus describes the server's actual listen binding for server-info.
 type ListenStatus struct {
 	EffectiveAddr string `json:"effective_addr"`
-	Source        string `json:"source"` // "default" | "flag" | "db"
+	Source        string `json:"source"` // "default" | "flag" | "db" | "env"
 	Desktop       bool   `json:"desktop"`
 	PendingAddr   string `json:"pending_addr,omitempty"`  // stored setting differing from the effective bind
 	FallbackFrom  string `json:"fallback_from,omitempty"` // configured addr that failed to bind at startup
@@ -135,6 +135,10 @@ type ListenStatus struct {
 	// keeps the control but warns). NetworkMode is empty when Container is false.
 	Container   bool   `json:"container"`
 	NetworkMode string `json:"network_mode,omitempty"`
+}
+
+func listenExternallyManaged(ls *ListenStatus) bool {
+	return ls != nil && (ls.Source == "flag" || ls.Source == "env")
 }
 
 func Router(d Deps) http.Handler {
@@ -505,7 +509,10 @@ func (d Deps) handleServerInfo(w http.ResponseWriter, r *http.Request) {
 	}
 	if d.ListenStatus != nil {
 		ls := d.ListenStatus(r.Context())
-		if v, _ := d.Settings.Get(r.Context(), settings.KeyListenAddr); v != "" && v != ls.EffectiveAddr {
+		// A flag- or environment-owned listener is authoritative for every restart
+		// while that external configuration remains. Calling the dormant DB value
+		// "pending" would falsely imply that one restart makes it effective.
+		if v, _ := d.Settings.Get(r.Context(), settings.KeyListenAddr); !listenExternallyManaged(ls) && v != "" && v != ls.EffectiveAddr {
 			ls.PendingAddr = v
 		}
 		out["listen"] = ls
@@ -2807,22 +2814,37 @@ func (d Deps) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	var listenNew string
 	if v, ok := body[settings.KeyListenAddr]; ok {
 		v = strings.TrimSpace(v)
-		if v != "" {
-			var effective string
-			if d.ListenStatus != nil {
-				effective = d.ListenStatus(r.Context()).EffectiveAddr
-			}
-			if msg := validateListenAddr(v, effective); msg != "" {
-				writeError(w, http.StatusBadRequest, msg)
-				return
-			}
-		}
-		body[settings.KeyListenAddr] = v
 		cur, err := d.Settings.Get(r.Context(), settings.KeyListenAddr)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
+		if v != cur {
+			// Only an actual change trips the ownership guard — echoing the stored
+			// value back in a multi-key PUT (the console round-trips GET /settings)
+			// must not block the unrelated settings that ride along with it.
+			if d.ListenStatus != nil {
+				if ls := d.ListenStatus(r.Context()); listenExternallyManaged(ls) {
+					owner := "NETTACT_SERVER_ADDR"
+					if ls.Source == "flag" {
+						owner = "the -addr command-line flag"
+					}
+					writeError(w, http.StatusConflict, "listen_addr is managed by "+owner)
+					return
+				}
+			}
+			if v != "" {
+				var effective string
+				if d.ListenStatus != nil {
+					effective = d.ListenStatus(r.Context()).EffectiveAddr
+				}
+				if msg := validateListenAddr(v, effective); msg != "" {
+					writeError(w, http.StatusBadRequest, msg)
+					return
+				}
+			}
+		}
+		body[settings.KeyListenAddr] = v
 		listenChanged = v != cur
 		listenNew = v
 	}

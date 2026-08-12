@@ -131,6 +131,32 @@ func TestUpdateListenAddrSamePortSkipsProbe(t *testing.T) {
 	}
 }
 
+func TestUpdateListenAddrRejectedWhenExternallyManaged(t *testing.T) {
+	for _, tc := range []struct {
+		source string
+		owner  string
+	}{{"env", "NETTACT_SERVER_ADDR"}, {"flag", "-addr"}} {
+		t.Run(tc.source, func(t *testing.T) {
+			d := listenTestDeps(t)
+			d.ListenStatus = func(context.Context) *ListenStatus {
+				return &ListenStatus{EffectiveAddr: "127.0.0.1:12450", Source: tc.source}
+			}
+
+			w := putSettings(t, d, `{"listen_addr":"127.0.0.1:19000"}`)
+			if w.Code != http.StatusConflict {
+				t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+			}
+			if !strings.Contains(w.Body.String(), tc.owner) {
+				t.Fatalf("expected %s ownership message, got %s", tc.owner, w.Body.String())
+			}
+			stored, err := d.Settings.Get(context.Background(), settings.KeyListenAddr)
+			if err != nil || stored != "" {
+				t.Fatalf("stored=%q err=%v; rejected update must not persist", stored, err)
+			}
+		})
+	}
+}
+
 func TestUpdateListenAddrDesktopApply(t *testing.T) {
 	d := listenTestDeps(t)
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -196,5 +222,31 @@ func TestServerInfoListenBlock(t *testing.T) {
 	d.handleServerInfo(w, httptest.NewRequest(http.MethodGet, "/api/v1/server-info", nil))
 	if strings.Contains(w.Body.String(), "listen") {
 		t.Fatalf("unexpected listen block: %s", w.Body.String())
+	}
+}
+
+func TestServerInfoDoesNotReportDatabaseAddressPendingWhenExternallyManaged(t *testing.T) {
+	for _, source := range []string{"env", "flag"} {
+		t.Run(source, func(t *testing.T) {
+			d := listenTestDeps(t)
+			d.ListenStatus = func(context.Context) *ListenStatus {
+				return &ListenStatus{EffectiveAddr: "127.0.0.1:12450", Source: source}
+			}
+			if err := d.Settings.Set(context.Background(), settings.KeyListenAddr, "0.0.0.0:19000"); err != nil {
+				t.Fatalf("seed setting: %v", err)
+			}
+
+			w := httptest.NewRecorder()
+			d.handleServerInfo(w, httptest.NewRequest(http.MethodGet, "/api/v1/server-info", nil))
+			var resp struct {
+				Listen *ListenStatus `json:"listen"`
+			}
+			if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			if resp.Listen == nil || resp.Listen.Source != source || resp.Listen.PendingAddr != "" {
+				t.Fatalf("listen=%+v", resp.Listen)
+			}
+		})
 	}
 }
