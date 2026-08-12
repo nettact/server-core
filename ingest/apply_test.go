@@ -842,4 +842,14 @@ func TestCommitIsSingleUse(t *testing.T) {
 	if pub.n != firstPubs {
 		t.Fatalf("publications after retry = %d, want %d — the plan's side effects ran twice", pub.n, firstPubs)
 	}
+
+	// A COPY of the plan reports the same remembered outcome: the guard and
+	// the result share one state object, so neither copy can diverge.
+	copyPlan := plan
+	if err := svc.Commit(h.ctx, res, &copyPlan); !errors.Is(err, boom) {
+		t.Fatalf("copied plan commit = %v, want the remembered append error", err)
+	}
+	if pub.n != firstPubs {
+		t.Fatalf("publications after the copied plan = %d, want %d — copies must not replay side effects", pub.n, firstPubs)
+	}
 }

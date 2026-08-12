@@ -134,19 +134,24 @@ type ApplyResult struct {
 	AdoptHigh uint64
 }
 
+// commitState carries a plan's once-guard and its remembered outcome.
+type commitState struct {
+	once sync.Once
+	err  error
+}
+
 // PostCommitPlan is pure data describing the actions to run only after a
 // successful commit. The function itself performs none of them; it is
 // discarded wholesale on rollback, which is what keeps a rolled-back batch
 // from publishing, caching or appending anything.
 type PostCommitPlan struct {
-	// once/commitErr make the plan single-use: Commit runs its side effects
-	// exactly once and remembers the outcome, so a caller retrying a returned
-	// append error cannot replay the cache folds, the publications or the
-	// append. The pointer lets plans be copied safely; Commit is NOT safe for
-	// concurrent use — a plan belongs to one post-commit executor, and the
-	// single-use guarantee is for its sequential retries.
-	once      *sync.Once
-	commitErr error
+	// commit is the plan's single-use state: the guard and the remembered
+	// outcome live in ONE shared object, so a copy of the plan reports the
+	// same result as the original — committing either copy runs the side
+	// effects once and both return the same error. Plans are therefore
+	// copy-safe; Commit is still NOT safe for concurrent use (a plan belongs
+	// to one post-commit executor; the guarantee is for sequential retries).
+	commit *commitState
 	// AgentID/SiteID/Sequence name the committed batch.
 	AgentID  string
 	SiteID   string
@@ -311,7 +316,7 @@ func (s *Service) Prepare(ctx context.Context, p AgentPrincipal, pkt telemetry.P
 // bug that would otherwise write to the wrong tenant.
 func (s *Service) ApplyPacketTx(ctx context.Context, scope store.Scope, wtx store.WriteTx, in PreparedInputs) (ApplyResult, PostCommitPlan, error) {
 	var res ApplyResult
-	plan := PostCommitPlan{once: &sync.Once{}}
+	plan := PostCommitPlan{commit: &commitState{}}
 	if err := scope.Validate(); err != nil {
 		return res, plan, err
 	}
@@ -603,13 +608,13 @@ func (s *Service) ApplyPacketTx(ctx context.Context, scope store.Scope, wtx stor
 // the programmatic form of the same gap — a Cloud caller that runs its own
 // executor equivalent can surface it the same way.
 func (s *Service) Commit(ctx context.Context, res ApplyResult, plan *PostCommitPlan) error {
-	if plan.once == nil {
-		plan.once = &sync.Once{}
+	if plan.commit == nil {
+		plan.commit = &commitState{}
 	}
-	plan.once.Do(func() {
-		plan.commitErr = s.commitOnce(ctx, res, plan)
+	plan.commit.once.Do(func() {
+		plan.commit.err = s.commitOnce(ctx, res, plan)
 	})
-	return plan.commitErr
+	return plan.commit.err
 }
 
 func (s *Service) commitOnce(ctx context.Context, res ApplyResult, plan *PostCommitPlan) error {
