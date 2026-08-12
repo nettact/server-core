@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/nettact/protocol/telemetry"
+	"github.com/nettact/server-core/store"
 )
 
 // The system-status detectors' contract, in one place: they judge READINGS, not
@@ -48,7 +49,7 @@ func (h *hostHarness) evaluateHostAt(intervalSeconds int, cores float64, ms ...t
 	if err != nil {
 		h.t.Fatalf("begin: %v", err)
 	}
-	out, err := h.svc.EvaluateHostTx(h.ctx, tx, "agent_a", "site_default", rounds, mounts)
+	out, err := h.svc.EvaluateHostTx(h.ctx, store.AdaptTx(tx, store.Standalone()), "agent_a", "site_default", rounds, mounts)
 	if err != nil {
 		_ = tx.Rollback()
 		h.t.Fatalf("evaluate host: %v", err)

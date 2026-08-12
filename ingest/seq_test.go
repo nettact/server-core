@@ -202,11 +202,11 @@ func TestStaleWatermarkReadDoesNotAdmitTheBatch(t *testing.T) {
 
 type failingTracer struct{}
 
-func (failingTracer) IngestTracesTx(context.Context, *sql.Tx, string, string, []telemetry.TraceResult) (*incidentops.TraceOutcome, error) {
+func (failingTracer) IngestTracesTx(context.Context, store.WriteTx, string, string, []telemetry.TraceResult) (*incidentops.TraceOutcome, error) {
 	return nil, errors.New("boom")
 }
 func (failingTracer) PublishTraceOutcome(context.Context, *incidentops.TraceOutcome) {}
-func (failingTracer) IngestScenesTx(context.Context, *sql.Tx, string, string, []telemetry.SceneReport) (*incidentops.SceneOutcome, error) {
+func (failingTracer) IngestScenesTx(context.Context, store.WriteTx, string, string, []telemetry.SceneReport) (*incidentops.SceneOutcome, error) {
 	return nil, errors.New("boom")
 }
 func (failingTracer) PublishSceneOutcome(context.Context, *incidentops.SceneOutcome) {}

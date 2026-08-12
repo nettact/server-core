@@ -22,7 +22,7 @@ func ingestScenes(t *testing.T, svc *Service, ctx context.Context, agentID strin
 	if err != nil {
 		t.Fatalf("begin: %v", err)
 	}
-	out, err := svc.IngestScenesTx(ctx, tx, agentID, "site_default", reports)
+	out, err := svc.IngestScenesTx(ctx, store.AdaptTx(tx, store.Standalone()), agentID, "site_default", reports)
 	if err != nil {
 		_ = tx.Rollback()
 		t.Fatalf("ingest scenes: %v", err)

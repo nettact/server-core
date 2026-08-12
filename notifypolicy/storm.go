@@ -10,6 +10,7 @@ import (
 
 	"github.com/nettact/server-core/fault"
 	"github.com/nettact/server-core/settings"
+	"github.com/nettact/server-core/store"
 )
 
 // Alert-storm correlation (ALERT-001).
@@ -50,7 +51,7 @@ type stormMemberChannel struct {
 // PlanOpenTx, after the per-incident notice has been planned: the common case is
 // no storm at all, so the normal path stays untouched and correlation only ever
 // has to cancel and replace.
-func (s *Service) correlateStormTx(ctx context.Context, tx *sql.Tx, sc fault.IncidentScope, now time.Time) error {
+func (s *Service) correlateStormTx(ctx context.Context, tx store.Executor, sc fault.IncidentScope, now time.Time) error {
 	// A SYSTEM-STATUS incident never takes part in a storm, at any of the three
 	// points below. A storm's whole claim is that one vantage point's view of the
 	// NETWORK broke at once, and it is announced as such — "suspected WAN-layer
@@ -127,7 +128,7 @@ func (s *Service) correlateStormTx(ctx context.Context, tx *sql.Tx, sc fault.Inc
 // It is a property of the incident rather than of this signal: the "hostm:"
 // open-key prefix keeps host faults in their own incidents, so one member
 // answering yes settles it.
-func isHostIncident(ctx context.Context, tx *sql.Tx, incidentID string) (bool, error) {
+func isHostIncident(ctx context.Context, tx store.Executor, incidentID string) (bool, error) {
 	var n int
 	err := tx.QueryRowContext(ctx, `
 		SELECT COUNT(*) FROM fault_signals
@@ -140,7 +141,7 @@ func isHostIncident(ctx context.Context, tx *sql.Tx, incidentID string) (bool, e
 
 // stormOf returns the storm an incident belongs to, or "" when it belongs to
 // none (including when the incident no longer exists).
-func stormOf(ctx context.Context, tx *sql.Tx, incidentID string) (string, error) {
+func stormOf(ctx context.Context, tx store.Executor, incidentID string) (string, error) {
 	var stormID string
 	err := tx.QueryRowContext(ctx,
 		`SELECT COALESCE(storm_id,'') FROM incidents WHERE id=?`, incidentID).Scan(&stormID)
@@ -174,7 +175,7 @@ func stormOf(ctx context.Context, tx *sql.Tx, incidentID string) (string, error)
 // memory and disk faults on one machine routinely fire together — that is what a
 // machine under load looks like — so without this they would form or join a storm
 // and be summarized as a network event they are not.
-func unstormedOpenIncidents(ctx context.Context, tx *sql.Tx, siteID, agentID string, since time.Time) ([]string, error) {
+func unstormedOpenIncidents(ctx context.Context, tx store.Executor, siteID, agentID string, since time.Time) ([]string, error) {
 	rows, err := tx.QueryContext(ctx, `
 		SELECT i.id FROM incidents i
 		WHERE i.site_id=? AND i.state='open' AND i.storm_id IS NULL AND i.opened_at>=?
@@ -198,7 +199,7 @@ func unstormedOpenIncidents(ctx context.Context, tx *sql.Tx, siteID, agentID str
 }
 
 // openStormTx creates the storm and folds every qualifying incident into it.
-func (s *Service) openStormTx(ctx context.Context, tx *sql.Tx, sc fault.IncidentScope, members []string, now time.Time) error {
+func (s *Service) openStormTx(ctx context.Context, tx store.Executor, sc fault.IncidentScope, members []string, now time.Time) error {
 	stormID := "stm_" + uuid.NewString()
 	name, err := frozenAgentName(ctx, tx, sc.SiteID, sc.AgentID)
 	if err != nil {
@@ -239,7 +240,7 @@ const mergingChannel = `COALESCE((SELECT c.storm_merge FROM notification_channel
 //
 // The incident joins the storm either way — membership is about how the console
 // groups it and which faults the summary counts, not only about who was told.
-func (s *Service) joinStormTx(ctx context.Context, tx *sql.Tx, stormID string, incidentIDs []string, now time.Time) error {
+func (s *Service) joinStormTx(ctx context.Context, tx store.Executor, stormID string, incidentIDs []string, now time.Time) error {
 	var contributed []stormMemberChannel
 	var siteID string
 	for _, id := range incidentIDs {
@@ -316,7 +317,7 @@ func (s *Service) joinStormTx(ctx context.Context, tx *sql.Tx, stormID string, i
 // unique per (storm, event, channel) — so without the merge the outcome would
 // depend on which fault confirmed first, and a policy that asked for a recovery
 // notice could silently lose it. Any route asking for recovery wins.
-func (s *Service) planStormOpen(ctx context.Context, tx *sql.Tx, stormID, siteID string, c stormMemberChannel, now time.Time) error {
+func (s *Service) planStormOpen(ctx context.Context, tx store.Executor, stormID, siteID string, c stormMemberChannel, now time.Time) error {
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE notification_deliveries
 		SET due_at=MIN(due_at, ?), recovery_enabled=MAX(recovery_enabled, ?)
@@ -330,7 +331,7 @@ func (s *Service) planStormOpen(ctx context.Context, tx *sql.Tx, stormID, siteID
 
 // pendingOpenChannels reads the routing an incident had planned but not yet
 // sent, restricted to channels that accept storm summaries.
-func pendingOpenChannels(ctx context.Context, tx *sql.Tx, incidentID string) ([]stormMemberChannel, error) {
+func pendingOpenChannels(ctx context.Context, tx store.Executor, incidentID string) ([]stormMemberChannel, error) {
 	rows, err := tx.QueryContext(ctx, `
 		SELECT d.channel_id, d.policy_id, d.recovery_enabled, d.due_at
 		FROM notification_deliveries d
@@ -358,7 +359,7 @@ func pendingOpenChannels(ctx context.Context, tx *sql.Tx, incidentID string) ([]
 // firing. Without it a storm keeps the severity and layer of a fault that has
 // already recovered, and a summary still waiting out its delay goes out
 // describing a crisis that is over.
-func (s *Service) RecomputeTx(ctx context.Context, tx *sql.Tx, incidentID string, now time.Time) error {
+func (s *Service) RecomputeTx(ctx context.Context, tx store.Executor, incidentID string, now time.Time) error {
 	stormID, err := stormOf(ctx, tx, incidentID)
 	if err != nil || stormID == "" {
 		return err
@@ -375,7 +376,7 @@ func (s *Service) RecomputeTx(ctx context.Context, tx *sql.Tx, incidentID string
 // nothing to pair with and is covered by the storm's summary, while a channel
 // that opted out of merging (or was notified before the storm formed) gets the
 // paired recovery it is owed. One rule, no special case.
-func (s *Service) settleStormTx(ctx context.Context, tx *sql.Tx, incidentID string, now time.Time) error {
+func (s *Service) settleStormTx(ctx context.Context, tx store.Executor, incidentID string, now time.Time) error {
 	var stormID string
 	if err := tx.QueryRowContext(ctx,
 		`SELECT COALESCE(storm_id,'') FROM incidents WHERE id=?`, incidentID).Scan(&stormID); err != nil {
@@ -409,7 +410,7 @@ func (s *Service) settleStormTx(ctx context.Context, tx *sql.Tx, incidentID stri
 // would be false. That is the same distinction the per-incident path draws, and
 // it is also what stops a storm from becoming a zombie when its members are
 // deleted mid-event.
-func (s *Service) closeStormTx(ctx context.Context, tx *sql.Tx, stormID string, now time.Time) error {
+func (s *Service) closeStormTx(ctx context.Context, tx store.Executor, stormID string, now time.Time) error {
 	res, err := tx.ExecContext(ctx,
 		`UPDATE alert_storms SET state='resolved', resolved_at=? WHERE id=? AND state='open'`, now, stormID)
 	if err != nil {
@@ -464,7 +465,7 @@ func (s *Service) closeStormTx(ctx context.Context, tx *sql.Tx, stormID string, 
 // recomputeStormTx refreshes a storm's severity and suspected layer from the
 // members that are still open, so the notice that eventually goes out describes
 // what is broken now rather than what was broken when the first member fell over.
-func recomputeStormTx(ctx context.Context, tx *sql.Tx, stormID string) error {
+func recomputeStormTx(ctx context.Context, tx store.Executor, stormID string) error {
 	rows, err := tx.QueryContext(ctx,
 		`SELECT severity, COALESCE(suspected_layer,'') FROM incidents WHERE storm_id=? AND state='open'`, stormID)
 	if err != nil {
@@ -498,7 +499,7 @@ func recomputeStormTx(ctx context.Context, tx *sql.Tx, stormID string) error {
 // frozenAgentName resolves the display name to freeze onto a storm, preferring
 // the name a fault signal already froze (so the storm says what its members say)
 // and falling back to the live agent row.
-func frozenAgentName(ctx context.Context, tx *sql.Tx, siteID, agentID string) (string, error) {
+func frozenAgentName(ctx context.Context, tx store.Executor, siteID, agentID string) (string, error) {
 	var name string
 	err := tx.QueryRowContext(ctx, `
 		SELECT agent_name FROM fault_signals

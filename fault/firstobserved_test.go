@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/nettact/protocol/telemetry"
+	"github.com/nettact/server-core/store"
 )
 
 // incidentTimes reads the two instants an incident carries, plus its state.
@@ -64,7 +65,7 @@ func (h *harness) evaluateTarget(id string, det DetectionSettings, tss ...int64)
 	if err != nil {
 		h.t.Fatalf("begin: %v", err)
 	}
-	if _, err := h.svc.EvaluateAgentTx(h.ctx, tx, "agent_a", "site_default", BuildRounds(ms, meta)); err != nil {
+	if _, err := h.svc.EvaluateAgentTx(h.ctx, store.AdaptTx(tx, store.Standalone()), "agent_a", "site_default", BuildRounds(ms, meta)); err != nil {
 		_ = tx.Rollback()
 		h.t.Fatalf("evaluate %s: %v", id, err)
 	}

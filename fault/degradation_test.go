@@ -7,6 +7,7 @@ import (
 
 	"github.com/nettact/protocol/telemetry"
 	"github.com/nettact/server-core/baseline"
+	"github.com/nettact/server-core/store"
 )
 
 // The degradation detectors' contract: they judge a round against the target's
@@ -59,7 +60,7 @@ func (h *harness) evalDeg(det DetectionSettings, band baseline.Band, ms ...telem
 	if err != nil {
 		h.t.Fatalf("begin: %v", err)
 	}
-	out, err := h.svc.EvaluateAgentTx(h.ctx, tx, "agent_a", "site_default", rounds)
+	out, err := h.svc.EvaluateAgentTx(h.ctx, store.AdaptTx(tx, store.Standalone()), "agent_a", "site_default", rounds)
 	if err != nil {
 		_ = tx.Rollback()
 		h.t.Fatalf("evaluate: %v", err)

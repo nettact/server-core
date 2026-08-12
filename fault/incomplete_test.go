@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/nettact/protocol/telemetry"
+	"github.com/nettact/server-core/store"
 )
 
 // An ICMP round's loss is a ratio over the echoes the agent actually SENT, and
@@ -219,7 +220,7 @@ func (h *harness) evaluateRounds(rounds []Round) {
 	if err != nil {
 		h.t.Fatalf("begin: %v", err)
 	}
-	if _, err := h.svc.EvaluateAgentTx(h.ctx, tx, "agent_a", "site_default", rounds); err != nil {
+	if _, err := h.svc.EvaluateAgentTx(h.ctx, store.AdaptTx(tx, store.Standalone()), "agent_a", "site_default", rounds); err != nil {
 		_ = tx.Rollback()
 		h.t.Fatalf("evaluate: %v", err)
 	}

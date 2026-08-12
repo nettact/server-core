@@ -12,6 +12,7 @@ import (
 	"github.com/nettact/protocol/telemetry"
 	"github.com/nettact/server-core/eventbus"
 	"github.com/nettact/server-core/fault"
+	"github.com/nettact/server-core/store"
 )
 
 // sceneClaimWindow is how far back a claim looks for a scene, and how old a
@@ -138,7 +139,7 @@ type SceneOutcome struct {
 // A report with no triggers is dropped rather than stored: the trigger IS the
 // claim key, so a scene without one could never be filed against anything and
 // would sit unreadable until retention removed it.
-func (s *Service) IngestScenesTx(ctx context.Context, tx *sql.Tx, agentID, siteID string, reports []telemetry.SceneReport) (*SceneOutcome, error) {
+func (s *Service) IngestScenesTx(ctx context.Context, tx store.WriteTx, agentID, siteID string, reports []telemetry.SceneReport) (*SceneOutcome, error) {
 	if len(reports) == 0 {
 		return nil, nil
 	}
@@ -204,7 +205,7 @@ func (s *Service) PublishSceneOutcome(ctx context.Context, out *SceneOutcome) {
 // replayed packet re-presents an id already stored, and an id claimed by a
 // different agent collides with the row that agent owns. Either way the stored
 // scene stands and nothing is overwritten.
-func insertSceneReport(ctx context.Context, tx *sql.Tx, agentID, siteID, agentName string,
+func insertSceneReport(ctx context.Context, tx store.Executor, agentID, siteID, agentName string,
 	rep telemetry.SceneReport, now time.Time, maxBytes int) (bool, error) {
 	payload, truncated := capScenePayload(mustJSON(buildScenePayload(rep)), maxBytes)
 	lagMs, clockAhead := deliveryLag(rep.CollectedAt, now)
@@ -345,7 +346,7 @@ func stripSceneLevel(payload string, level int) (string, bool) {
 // position in the agent's own list. The position is part of the key rather than a
 // minted id because it is already unique within the report and stable across a
 // replay, which is exactly what an idempotent insert needs.
-func insertSceneTriggers(ctx context.Context, tx *sql.Tx, rep telemetry.SceneReport) error {
+func insertSceneTriggers(ctx context.Context, tx store.Executor, rep telemetry.SceneReport) error {
 	for i, tr := range rep.Triggers {
 		kind := tr.Kind
 		if kind != telemetry.SceneTriggerProbeFault && kind != telemetry.SceneTriggerServerDisconnect {
@@ -382,7 +383,7 @@ type sceneRef struct {
 // Each trigger is matched on its own, because one scene can legitimately explain
 // several unrelated faults: an edge crossed while the scene was already being
 // gathered joined it rather than queueing a second copy of the same machine.
-func attachScene(ctx context.Context, tx *sql.Tx, agentID string, rep telemetry.SceneReport, now time.Time) ([]string, error) {
+func attachScene(ctx context.Context, tx store.Executor, agentID string, rep telemetry.SceneReport, now time.Time) ([]string, error) {
 	seen := map[string]bool{}
 	var incidents []string
 	for _, tr := range rep.Triggers {
@@ -425,7 +426,7 @@ func attachScene(ctx context.Context, tx *sql.Tx, agentID string, rep telemetry.
 // slowly, and the agent's local streak that produced the scene is an
 // availability streak; sharing a monitor with a hard failure must not put that
 // failure's scene in a latency trend's evidence.
-func probeFaultRefs(ctx context.Context, tx *sql.Tx, agentID string, tr telemetry.SceneTrigger, now time.Time) ([]sceneRef, error) {
+func probeFaultRefs(ctx context.Context, tx store.Executor, agentID string, tr telemetry.SceneTrigger, now time.Time) ([]sceneRef, error) {
 	if tr.MonitorID == "" {
 		return nil, nil
 	}
@@ -587,7 +588,7 @@ func ownerOfDisconnect(ctx context.Context, q rowQuerier, agentID string, edge, 
 // belongs to, at ingest time. That detector is per-agent and carries no target,
 // so the agent id plus the edge's timing is the whole key — there is nothing
 // further to discriminate on, and exactly one outage can own an edge.
-func disconnectRefs(ctx context.Context, tx *sql.Tx, agentID string, tr telemetry.SceneTrigger, now time.Time) ([]sceneRef, error) {
+func disconnectRefs(ctx context.Context, tx store.Executor, agentID string, tr telemetry.SceneTrigger, now time.Time) ([]sceneRef, error) {
 	r, ok, err := ownerOfDisconnect(ctx, tx, agentID, tr.DisconnectedAt, now)
 	if err != nil || !ok {
 		return nil, err
@@ -612,7 +613,7 @@ func orderedWithinSlack(agentEdge, observedAt time.Time) bool {
 // is new. INSERT OR IGNORE is the whole idempotency story here — unlike a trace
 // reference there is no active flag to reactivate, because a scene is never
 // deactivated (see the scene_report_refs comment in the schema).
-func insertSceneRef(ctx context.Context, tx *sql.Tx, reportID string, r sceneRef, now time.Time) (bool, error) {
+func insertSceneRef(ctx context.Context, tx store.Executor, reportID string, r sceneRef, now time.Time) (bool, error) {
 	res, err := tx.ExecContext(ctx, `
 		INSERT OR IGNORE INTO scene_report_refs(report_id, incident_id, signal_id, created_at)
 		VALUES(?,?,?,?)`, reportID, r.incidentID, r.signalID, now)
@@ -631,7 +632,7 @@ func insertSceneRef(ctx context.Context, tx *sql.Tx, reportID string, r sceneRef
 // includes signal_id — and each confirmation would otherwise write its own
 // "scene collected" row for a scene the snapshot itself shows only once. The
 // reader would count evidence that does not exist.
-func addSceneTimeline(ctx context.Context, tx *sql.Tx, incidentID, reportID string, now time.Time) error {
+func addSceneTimeline(ctx context.Context, tx store.Executor, incidentID, reportID string, now time.Time) error {
 	_, err := tx.ExecContext(ctx, `
 		INSERT INTO incident_timeline(id, incident_id, ts, kind, message, ref)
 		SELECT ?,?,?,?,?,?

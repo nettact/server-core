@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/nettact/server-core/store"
 )
 
 // Outcome is one evaluation pass's post-commit work: the lifecycle events the tx
@@ -52,7 +53,7 @@ type detectorState struct {
 // delivering five failing cycles in one packet confirms exactly as if they had
 // arrived separately, and a replayed packet — whose rounds are all at or below
 // the detector's watermark — advances nothing.
-func (s *Service) EvaluateAgentTx(ctx context.Context, tx *sql.Tx, agentID, siteID string, rounds []Round) (*Outcome, error) {
+func (s *Service) EvaluateAgentTx(ctx context.Context, tx store.WriteTx, agentID, siteID string, rounds []Round) (*Outcome, error) {
 	out := &txOut{}
 	if len(rounds) == 0 {
 		return &Outcome{out: out, siteID: siteID}, nil
@@ -110,7 +111,7 @@ func (s *Service) EvaluateAgentTx(ctx context.Context, tx *sql.Tx, agentID, site
 // one walk over the rounds. That is not a micro-optimisation: it is the only
 // place where "was availability failing at the moment of THIS round" is knowable,
 // which is what keeps a target that is down from also being reported as slow.
-func (s *Service) advanceDetector(ctx context.Context, tx *sql.Tx, agentID, siteID, agentName string, rounds []Round, now time.Time, out *txOut) error {
+func (s *Service) advanceDetector(ctx context.Context, tx store.Executor, agentID, siteID, agentName string, rounds []Round, now time.Time, out *txOut) error {
 	targetID := rounds[0].TargetID
 	st, err := loadDetectorState(ctx, tx, targetID, agentID, DetectorAvailability)
 	if err != nil {
@@ -182,7 +183,7 @@ func (s *Service) advanceDetector(ctx context.Context, tx *sql.Tx, agentID, site
 
 // advanceAvailabilityRound folds one round into the availability detector's
 // state.
-func (s *Service) advanceAvailabilityRound(ctx context.Context, tx *sql.Tx, agentID, siteID, agentName string,
+func (s *Service) advanceAvailabilityRound(ctx context.Context, tx store.Executor, agentID, siteID, agentName string,
 	r Round, st *detectorState, now time.Time, out *txOut) error {
 	// Watermark: a round at or before the newest already-folded round is a
 	// duplicate or an out-of-order straggler. Its sample is still stored (history
@@ -274,7 +275,7 @@ func (s *Service) advanceAvailabilityRound(ctx context.Context, tx *sql.Tx, agen
 // confirmSignal opens a fault signal with its evidence frozen from the confirming
 // round, attaches it to an incident (merged per its group's policy) and plans the
 // incident's open notification.
-func (s *Service) confirmSignal(ctx context.Context, tx *sql.Tx, agentID, siteID, agentName string, r Round, st detectorState, now time.Time, out *txOut) (string, error) {
+func (s *Service) confirmSignal(ctx context.Context, tx store.Executor, agentID, siteID, agentName string, r Round, st detectorState, now time.Time, out *txOut) (string, error) {
 	groupName, mergeEnabled, err := groupMeta(ctx, tx, r.GroupID)
 	if err != nil {
 		return "", err
@@ -354,7 +355,7 @@ func (s *Service) confirmSignal(ctx context.Context, tx *sql.Tx, agentID, siteID
 // copy six calls in the right order. sig.ID and sig.Severity must already be set;
 // a non-zero precursorsFrom asks for sub-threshold fluctuations since that moment
 // to be claimed as this incident's precursors.
-func (s *Service) openSignal(ctx context.Context, tx *sql.Tx, sig Signal, port int,
+func (s *Service) openSignal(ctx context.Context, tx store.Executor, sig Signal, port int,
 	openKey, title string, precursorsFrom, now time.Time, roundGap time.Duration, out *txOut) error {
 	incidentID, opened, oldSeverity, err := findOrCreateIncident(ctx, tx,
 		openKey, sig.SiteID, sig.GroupID, sig.GroupName, title, sig.Severity, sig.Layer, sig.ObservedAt, now)
@@ -427,7 +428,7 @@ func (s *Service) openSignal(ctx context.Context, tx *sql.Tx, sig Signal, port i
 // ended (the recovering round's timestamp, or the config change's wall time);
 // now is the transaction's wall clock, used for the timeline and the delivery
 // plan.
-func (s *Service) resolveSignal(ctx context.Context, tx *sql.Tx, signalID, reason string, resolvedAt, now time.Time, out *txOut) error {
+func (s *Service) resolveSignal(ctx context.Context, tx store.Executor, signalID, reason string, resolvedAt, now time.Time, out *txOut) error {
 	var incidentID, siteID, groupID, targetID, agentID, severity, title, detectorKey string
 	err := tx.QueryRowContext(ctx, `
 		SELECT incident_id, site_id, group_id, target_id, agent_id, severity, target_name, detector_key
@@ -509,7 +510,7 @@ func (s *Service) resolveSignal(ctx context.Context, tx *sql.Tx, signalID, reaso
 // The comparison is in SQL rather than in Go so it is one statement rather than
 // a read followed by a conditional write inside a transaction other writers are
 // interleaved with.
-func lowerFirstObserved(ctx context.Context, tx *sql.Tx, incidentID string, observed time.Time) error {
+func lowerFirstObserved(ctx context.Context, tx store.Executor, incidentID string, observed time.Time) error {
 	if observed.IsZero() {
 		return nil
 	}
@@ -520,7 +521,7 @@ func lowerFirstObserved(ctx context.Context, tx *sql.Tx, incidentID string, obse
 	return err
 }
 
-func loadDetectorState(ctx context.Context, tx *sql.Tx, targetID, agentID, detector string) (detectorState, error) {
+func loadDetectorState(ctx context.Context, tx store.Executor, targetID, agentID, detector string) (detectorState, error) {
 	var st detectorState
 	var pending string
 	err := tx.QueryRowContext(ctx, `
@@ -563,7 +564,7 @@ func loadDetectorState(ctx context.Context, tx *sql.Tx, targetID, agentID, detec
 	return st, nil
 }
 
-func saveDetectorState(ctx context.Context, tx *sql.Tx, targetID, agentID, detector string,
+func saveDetectorState(ctx context.Context, tx store.Executor, targetID, agentID, detector string,
 	configSerial, detectionRev int, st detectorState, now time.Time) error {
 	pending, err := encodeRounds(st.pendingFails)
 	if err != nil {
@@ -587,7 +588,7 @@ func saveDetectorState(ctx context.Context, tx *sql.Tx, targetID, agentID, detec
 }
 
 // insertSignal writes a confirmed signal with all its display facts frozen.
-func insertSignal(ctx context.Context, tx *sql.Tx, sig Signal, port int) error {
+func insertSignal(ctx context.Context, tx store.Executor, sig Signal, port int) error {
 	roundsJSON, err := encodeRounds(sig.Rounds)
 	if err != nil {
 		return err
@@ -653,7 +654,7 @@ func factsJSON(v any) (any, error) {
 // re-selects the winner. Ended incidents never reopen — a new fault under the
 // same key opens a new incident. oldSeverity is the severity before this
 // attachment (empty for a freshly opened incident).
-func findOrCreateIncident(ctx context.Context, tx *sql.Tx, openKey, siteID, groupID, groupName, title, severity, layer string, firstObserved, now time.Time) (id string, opened bool, oldSeverity string, err error) {
+func findOrCreateIncident(ctx context.Context, tx store.Executor, openKey, siteID, groupID, groupName, title, severity, layer string, firstObserved, now time.Time) (id string, opened bool, oldSeverity string, err error) {
 	err = tx.QueryRowContext(ctx,
 		`SELECT id, severity FROM incidents WHERE open_key=? AND state='open'`, openKey).Scan(&id, &oldSeverity)
 	if err == nil {
@@ -690,7 +691,7 @@ func findOrCreateIncident(ctx context.Context, tx *sql.Tx, openKey, siteID, grou
 // state (EvaluateAgentTx processes targets in (targetID, ts) order). That
 // ordering skew is advisory only — attribution is recomputed on every recompute
 // and converges on the next one.
-func recomputeIncident(ctx context.Context, tx *sql.Tx, incidentID string) (string, error) {
+func recomputeIncident(ctx context.Context, tx store.Executor, incidentID string) (string, error) {
 	members, err := loadMembers(ctx, tx, incidentID)
 	if err != nil {
 		return "", err
@@ -742,12 +743,12 @@ func recomputeIncident(ctx context.Context, tx *sql.Tx, incidentID string) (stri
 // Exported so the notification-policy layer can record on the incident's own
 // timeline why its notice was suppressed in favour of a storm summary — the
 // operator reads one timeline, not two.
-func AddTimelineTx(ctx context.Context, tx *sql.Tx, incidentID, kind, message, ref string, now time.Time) {
+func AddTimelineTx(ctx context.Context, tx store.Executor, incidentID, kind, message, ref string, now time.Time) {
 	addTimeline(ctx, tx, incidentID, kind, message, ref, now)
 }
 
 // addTimeline appends a timeline entry with an entity ref.
-func addTimeline(ctx context.Context, tx *sql.Tx, incidentID, kind, message, ref string, now time.Time) {
+func addTimeline(ctx context.Context, tx store.Executor, incidentID, kind, message, ref string, now time.Time) {
 	if incidentID == "" {
 		return
 	}
@@ -758,7 +759,7 @@ func addTimeline(ctx context.Context, tx *sql.Tx, incidentID, kind, message, ref
 
 // groupMeta loads a monitor group's display name and merge policy inside the tx.
 // A missing group (agent-connectivity signals carry none) yields no merge.
-func groupMeta(ctx context.Context, tx *sql.Tx, groupID string) (name string, mergeEnabled bool, err error) {
+func groupMeta(ctx context.Context, tx store.Executor, groupID string) (name string, mergeEnabled bool, err error) {
 	if groupID == "" {
 		return "", false, nil
 	}
@@ -771,7 +772,7 @@ func groupMeta(ctx context.Context, tx *sql.Tx, groupID string) (name string, me
 }
 
 // agentDisplayName resolves an agent's display name for freezing onto signals.
-func agentDisplayName(ctx context.Context, tx *sql.Tx, agentID string) (string, error) {
+func agentDisplayName(ctx context.Context, tx store.Executor, agentID string) (string, error) {
 	var name string
 	err := tx.QueryRowContext(ctx,
 		`SELECT COALESCE(NULLIF(display_name,''), hostname, id) FROM agents WHERE id=?`, agentID).Scan(&name)

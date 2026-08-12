@@ -55,7 +55,7 @@ func applyAll(t *testing.T, db *store.DB, agentID string, runs []gamesense.Run, 
 	if err != nil {
 		t.Fatalf("begin: %v", err)
 	}
-	res, err := Apply(ctx, tx, agentID, "site_default", runs, buckets, gaps, hosts)
+	res, err := Apply(ctx, store.AdaptTx(tx, store.Standalone()), agentID, "site_default", runs, buckets, gaps, hosts)
 	if err != nil {
 		tx.Rollback()
 		t.Fatalf("apply: %v", err)

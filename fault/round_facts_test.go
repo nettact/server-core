@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/nettact/protocol/telemetry"
+	"github.com/nettact/server-core/store"
 )
 
 // Round-facts tests for DEGRADE-001/002. A size sweep (probe.icmp.size_sweep) and
@@ -84,7 +85,7 @@ func (h *harness) evaluateMetaMap(det DetectionSettings, meta map[string]TargetM
 	if err != nil {
 		h.t.Fatalf("begin: %v", err)
 	}
-	out, err := h.svc.EvaluateAgentTx(h.ctx, tx, "agent_a", "site_default", rounds)
+	out, err := h.svc.EvaluateAgentTx(h.ctx, store.AdaptTx(tx, store.Standalone()), "agent_a", "site_default", rounds)
 	if err != nil {
 		_ = tx.Rollback()
 		h.t.Fatalf("evaluate: %v", err)

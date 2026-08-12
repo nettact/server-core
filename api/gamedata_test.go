@@ -45,7 +45,7 @@ func seedGameRun(t *testing.T, db *store.DB, agentID, runID string, start time.T
 	if err != nil {
 		t.Fatalf("begin: %v", err)
 	}
-	if _, err := gamedata.Apply(ctx, tx, agentID, "site_default", []gamesense.Run{{
+	if _, err := gamedata.Apply(ctx, store.AdaptTx(tx, store.Standalone()), agentID, "site_default", []gamesense.Run{{
 		ID: runID, Proc: "game.exe", Title: "A Game",
 		StartedAt: start, LastSeenAt: start.Add(time.Duration(seconds) * time.Second),
 		Source: gamesense.SourcePresentMonService, Caps: []string{gamesense.CapDisplayed},
@@ -274,7 +274,7 @@ func TestHostSecondsEndpoint(t *testing.T) {
 	if err != nil {
 		t.Fatalf("begin: %v", err)
 	}
-	if _, err := gamedata.Apply(ctx, tx, "agent_game", "site_default", nil, nil, nil, hosts); err != nil {
+	if _, err := gamedata.Apply(ctx, store.AdaptTx(tx, store.Standalone()), "agent_game", "site_default", nil, nil, nil, hosts); err != nil {
 		tx.Rollback()
 		t.Fatalf("apply: %v", err)
 	}
@@ -344,7 +344,7 @@ func TestGameRunGapsEndpoint(t *testing.T) {
 	seedGameRun(t, db, "agent_game", "run_1", start, 3)
 
 	tx, _ := db.BeginTx(ctx, nil)
-	if _, err := gamedata.Apply(ctx, tx, "agent_game", "site_default", nil, nil, []gamesense.Gap{{
+	if _, err := gamedata.Apply(ctx, store.AdaptTx(tx, store.Standalone()), "agent_game", "site_default", nil, nil, []gamesense.Gap{{
 		ID: "gap_1", RunID: "run_1", Reason: gamesense.GapBackground,
 		StartedAt: start.Add(4 * time.Second), EndedAt: start.Add(time.Hour),
 	}}, nil); err != nil {
@@ -384,7 +384,7 @@ func TestHostSecondsWithoutTheGPUPermission(t *testing.T) {
 	util := 87.5
 	coreMHz := 2610.5
 	tx, _ := db.BeginTx(ctx, nil)
-	if _, err := gamedata.Apply(ctx, tx, "agent_game", "site_default", nil, nil, nil, []gamesense.HostSecond{
+	if _, err := gamedata.Apply(ctx, store.AdaptTx(tx, store.Standalone()), "agent_game", "site_default", nil, nil, nil, []gamesense.HostSecond{
 		{TS: start, HostSample: gamesense.HostSample{
 			CPU:      &gamesense.HostCPU{TotalPct: 41.5, BusiestPct: 99.25},
 			CPUClock: &gamesense.HostCPUClock{CurrentMHz: 4900, MaxMHz: 3600},

@@ -9,6 +9,7 @@ import (
 
 	"github.com/nettact/protocol/gamesense"
 	"github.com/nettact/protocol/permission"
+	"github.com/nettact/server-core/store"
 )
 
 // Result reports what one packet's game payload did, for the ingest log. A packet
@@ -35,7 +36,7 @@ type Result struct {
 // are INSERT OR IGNORE on their identity like every other replay-safe write here
 // — an at-least-once uploader must be able to retry a batch without duplicating
 // or rewriting a second that is already recorded.
-func Apply(ctx context.Context, tx *sql.Tx, agentID, siteID string, runs []gamesense.Run, buckets []gamesense.Bucket, gaps []gamesense.Gap, hosts []gamesense.HostSecond) (Result, error) {
+func Apply(ctx context.Context, tx store.WriteTx, agentID, siteID string, runs []gamesense.Run, buckets []gamesense.Bucket, gaps []gamesense.Gap, hosts []gamesense.HostSecond) (Result, error) {
 	var res Result
 	if len(runs) == 0 && len(buckets) == 0 && len(gaps) == 0 && len(hosts) == 0 {
 		return res, nil
@@ -189,7 +190,7 @@ func Apply(ctx context.Context, tx *sql.Tx, agentID, siteID string, runs []games
 // agentPermissions returns the agent's reported effective set. An agent row that
 // has vanished mid-batch yields the empty set rather than an error: there is
 // nothing left to attribute the data to, so it fails every test below on its own.
-func agentPermissions(ctx context.Context, tx *sql.Tx, agentID string) (permission.Set, error) {
+func agentPermissions(ctx context.Context, tx store.Executor, agentID string) (permission.Set, error) {
 	var effective string
 	err := tx.QueryRowContext(ctx, `SELECT COALESCE(perm_effective,'[]') FROM agents WHERE id=?`, agentID).Scan(&effective)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -221,7 +222,7 @@ func knownLayout(h gamesense.Histogram) bool {
 // Identity columns (agent, site, start, source, caps) are never updated. They
 // describe the session and how it was measured, and a run whose measurement basis
 // changed under it is a different run.
-func upsertRun(ctx context.Context, tx *sql.Tx, agentID, siteID string, run gamesense.Run) error {
+func upsertRun(ctx context.Context, tx store.Executor, agentID, siteID string, run gamesense.Run) error {
 	var ended sql.NullInt64
 	if run.EndedAt != nil {
 		ended = sql.NullInt64{Int64: run.EndedAt.Unix(), Valid: true}
@@ -265,7 +266,7 @@ func upsertRun(ctx context.Context, tx *sql.Tx, agentID, siteID string, run game
 // ownedRuns returns which of the referenced run ids exist and belong to this
 // agent. Read after the upserts so a run arriving in the same packet as its first
 // buckets is already there.
-func ownedRuns(ctx context.Context, tx *sql.Tx, agentID string, buckets []gamesense.Bucket) (map[string]bool, error) {
+func ownedRuns(ctx context.Context, tx store.Executor, agentID string, buckets []gamesense.Bucket) (map[string]bool, error) {
 	want := map[string]bool{}
 	args := []any{agentID}
 	for _, b := range buckets {
@@ -298,7 +299,7 @@ func ownedRuns(ctx context.Context, tx *sql.Tx, agentID string, buckets []gamese
 	return want, rows.Err()
 }
 
-func insertBucket(ctx context.Context, tx *sql.Tx, b gamesense.Bucket) (bool, error) {
+func insertBucket(ctx context.Context, tx store.Executor, b gamesense.Bucket) (bool, error) {
 	var (
 		dispAvg, dispP95              sql.NullFloat64
 		mode, api                     sql.NullString
@@ -421,7 +422,7 @@ func insertBucket(ctx context.Context, tx *sql.Tx, b gamesense.Bucket) (bool, er
 // generic over both because a gap's run and a bucket's run are different sets:
 // the whole point of a gap is a stretch that produced no bucket, so a packet can
 // easily carry a gap whose run no bucket in it mentions.
-func ownedGapRuns(ctx context.Context, tx *sql.Tx, agentID string, gaps []gamesense.Gap) (map[string]bool, error) {
+func ownedGapRuns(ctx context.Context, tx store.Executor, agentID string, gaps []gamesense.Gap) (map[string]bool, error) {
 	want := map[string]bool{}
 	args := []any{agentID}
 	for _, g := range gaps {
@@ -470,7 +471,7 @@ func ownedGapRuns(ctx context.Context, tx *sql.Tx, agentID string, gaps []gamese
 // so advancing last_seen_at or clearing ended_at over it would make a minimized
 // game look alive to the reaper and stretch the run's duration across time no
 // frame covered.
-func upsertGap(ctx context.Context, tx *sql.Tx, g gamesense.Gap) error {
+func upsertGap(ctx context.Context, tx store.Executor, g gamesense.Gap) error {
 	_, err := tx.ExecContext(ctx, `
 		INSERT INTO game_run_gaps(id, run_id, reason, started_at, ended_at)
 		VALUES(?,?,?,?,?)
@@ -491,7 +492,7 @@ func upsertGap(ctx context.Context, tx *sql.Tx, g gamesense.Gap) error {
 // Each block's columns are written and left NULL together, and each block's
 // first column is what read-back tests. Zeros inside a present block are
 // measurements: an idle machine really was at 0%.
-func insertHostSecond(ctx context.Context, tx *sql.Tx, agentID, siteID string, h gamesense.HostSecond) (bool, error) {
+func insertHostSecond(ctx context.Context, tx store.Executor, agentID, siteID string, h gamesense.HostSecond) (bool, error) {
 	var (
 		cpuTotal, cpuBusiest sql.NullFloat64
 		cpuMHz, cpuMaxMHz    sql.NullFloat64
@@ -602,7 +603,7 @@ func fold(deltas map[string]*runDelta, b gamesense.Bucket) {
 // expressed in SQL. It runs in the caller's transaction, so a second's row and
 // its contribution to the run reach one committed state together — the two can
 // never disagree about what has been counted.
-func writeAggregates(ctx context.Context, tx *sql.Tx, deltas map[string]*runDelta) error {
+func writeAggregates(ctx context.Context, tx store.Executor, deltas map[string]*runDelta) error {
 	for id, d := range deltas {
 		var (
 			presented          int64

@@ -2,11 +2,11 @@ package fault
 
 import (
 	"context"
-	"database/sql"
 	"testing"
 	"time"
 
 	"github.com/nettact/protocol/telemetry"
+	"github.com/nettact/server-core/store"
 )
 
 // The engine's contract with the notification-policy layer, pinned from this
@@ -22,22 +22,22 @@ type spyPlanner struct {
 	recomputed []string
 }
 
-func (p *spyPlanner) PlanOpenTx(_ context.Context, _ *sql.Tx, sc IncidentScope, _ time.Time) error {
+func (p *spyPlanner) PlanOpenTx(_ context.Context, _ store.Executor, sc IncidentScope, _ time.Time) error {
 	p.opened = append(p.opened, sc.IncidentID)
 	return nil
 }
 
-func (p *spyPlanner) EscalateTx(_ context.Context, _ *sql.Tx, sc IncidentScope, _ time.Time) error {
+func (p *spyPlanner) EscalateTx(_ context.Context, _ store.Executor, sc IncidentScope, _ time.Time) error {
 	p.escalated = append(p.escalated, sc.IncidentID)
 	return nil
 }
 
-func (p *spyPlanner) ResolveTx(_ context.Context, _ *sql.Tx, incidentID, _ string, _ time.Time) error {
+func (p *spyPlanner) ResolveTx(_ context.Context, _ store.Executor, incidentID, _ string, _ time.Time) error {
 	p.resolved = append(p.resolved, incidentID)
 	return nil
 }
 
-func (p *spyPlanner) RecomputeTx(_ context.Context, _ *sql.Tx, incidentID string, _ time.Time) error {
+func (p *spyPlanner) RecomputeTx(_ context.Context, _ store.Executor, incidentID string, _ time.Time) error {
 	p.recomputed = append(p.recomputed, incidentID)
 	return nil
 }
@@ -77,7 +77,7 @@ func (h *harness) evaluateMeta(det DetectionSettings, ms ...telemetry.Metric) {
 	if err != nil {
 		h.t.Fatalf("begin: %v", err)
 	}
-	if _, err := h.svc.EvaluateAgentTx(h.ctx, tx, "agent_a", "site_default", rounds); err != nil {
+	if _, err := h.svc.EvaluateAgentTx(h.ctx, store.AdaptTx(tx, store.Standalone()), "agent_a", "site_default", rounds); err != nil {
 		_ = tx.Rollback()
 		h.t.Fatalf("evaluate: %v", err)
 	}

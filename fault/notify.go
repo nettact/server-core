@@ -6,6 +6,7 @@ import (
 
 	"github.com/nettact/server-core/eventbus"
 	"github.com/nettact/server-core/notification"
+	"github.com/nettact/server-core/store"
 )
 
 // txOut accumulates the lifecycle events produced inside the fault write
@@ -98,7 +99,7 @@ const signalDetailCols = `probe_kind, metric_kind, comparator, threshold, value,
 
 // renderIncidentSummary builds an incident's one-line summary from its firing
 // members, inside the write tx.
-func renderIncidentSummary(ctx context.Context, tx *sql.Tx, incidentID string) (string, error) {
+func renderIncidentSummary(ctx context.Context, tx store.Executor, incidentID string) (string, error) {
 	rows, err := tx.QueryContext(ctx,
 		`SELECT `+signalDetailCols+` FROM fault_signals WHERE incident_id=? AND state='firing'`, incidentID)
 	if err != nil {

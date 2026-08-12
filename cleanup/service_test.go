@@ -47,7 +47,7 @@ func newTestService(t *testing.T) (*store.DB, *metrics.Store, *Service) {
 		if err != nil {
 			t.Fatalf("BeginTx: %v", err)
 		}
-		if err := m.RewindForBatch(ctx, tx, "ag1", ids, ms); err != nil {
+		if err := m.RewindForBatch(ctx, store.AdaptTx(tx, store.Standalone()), "ag1", ids, ms); err != nil {
 			t.Fatalf("RewindForBatch: %v", err)
 		}
 		pendingDone := m.BeginPendingAppend(ids)

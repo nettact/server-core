@@ -8,6 +8,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/nettact/protocol/telemetry"
 	"github.com/nettact/server-core/baseline"
+	"github.com/nettact/server-core/store"
 )
 
 // The degradation detectors (ALERT-003) answer a question the availability
@@ -80,7 +81,7 @@ func DegradationMetricKinds(det DetectionSettings, probeKind string) []string {
 // loadDegradationChecks builds the runnable check set for a target and loads each
 // one's stored counters, applying the same generation/revision pin the
 // availability detector uses.
-func loadDegradationChecks(ctx context.Context, tx *sql.Tx, targetID, agentID string, cur Round) ([]degCheck, error) {
+func loadDegradationChecks(ctx context.Context, tx store.Executor, targetID, agentID string, cur Round) ([]degCheck, error) {
 	checks := degradationChecks(cur.Det, cur.Kind)
 	for i := range checks {
 		st, err := loadDetectorState(ctx, tx, targetID, agentID, checks[i].key)
@@ -121,7 +122,7 @@ type availabilityView struct {
 }
 
 // advance folds one round into one degradation check.
-func (s *Service) advance(ctx context.Context, tx *sql.Tx, c *degCheck,
+func (s *Service) advance(ctx context.Context, tx store.Executor, c *degCheck,
 	agentID, siteID, agentName string, r Round, avail availabilityView, now time.Time, out *txOut) error {
 	st := &c.st
 	if r.TS <= st.lastRoundTS {
@@ -229,7 +230,7 @@ func (s *Service) advance(ctx context.Context, tx *sql.Tx, c *degCheck,
 
 // confirmDegradation opens a degradation signal with the band it was judged
 // against frozen alongside the breaching value.
-func (s *Service) confirmDegradation(ctx context.Context, tx *sql.Tx, agentID, siteID, agentName string,
+func (s *Service) confirmDegradation(ctx context.Context, tx store.Executor, agentID, siteID, agentName string,
 	c degCheck, r Round, band baseline.Band, value, threshold float64, now time.Time, out *txOut) (string, error) {
 	groupName, mergeEnabled, err := groupMeta(ctx, tx, r.GroupID)
 	if err != nil {
@@ -291,7 +292,7 @@ func (s *Service) confirmDegradation(ctx context.Context, tx *sql.Tx, agentID, s
 // same reason the availability row is written unconditionally: the watermark is
 // what rejects an already-folded round, and a watermark left behind re-opens the
 // window it closes.
-func saveDegradationChecks(ctx context.Context, tx *sql.Tx, targetID, agentID string,
+func saveDegradationChecks(ctx context.Context, tx store.Executor, targetID, agentID string,
 	checks []degCheck, cur Round, now time.Time) error {
 	for i := range checks {
 		if err := saveDetectorState(ctx, tx, targetID, agentID, checks[i].key,

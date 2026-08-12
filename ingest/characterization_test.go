@@ -392,7 +392,7 @@ func TestCharacterizationObsoleteGenerationFilteredPreTx(t *testing.T) {
 // including writes made before the failure, rolls back with the batch.
 type failAfterWriteEvaluator struct{}
 
-func (failAfterWriteEvaluator) EvaluateAgentTx(ctx context.Context, tx *sql.Tx, agentID, siteID string, rounds []fault.Round) (*fault.Outcome, error) {
+func (failAfterWriteEvaluator) EvaluateAgentTx(ctx context.Context, tx store.WriteTx, agentID, siteID string, rounds []fault.Round) (*fault.Outcome, error) {
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO events(id, agent_id, site_id, ts, type, layer, severity, message, attrs)
 		VALUES('evt-poison-eval', 'agent_a', 'site_default', 0, 'custom', '', 'warn', 'poison', '')`); err != nil {
@@ -401,7 +401,7 @@ func (failAfterWriteEvaluator) EvaluateAgentTx(ctx context.Context, tx *sql.Tx, 
 	return nil, errors.New("evaluator exploded mid-transaction")
 }
 
-func (failAfterWriteEvaluator) EvaluateHostTx(ctx context.Context, tx *sql.Tx, agentID, siteID string, rounds []fault.HostRound, mounts map[string]fault.HostMountView) (*fault.Outcome, error) {
+func (failAfterWriteEvaluator) EvaluateHostTx(ctx context.Context, tx store.WriteTx, agentID, siteID string, rounds []fault.HostRound, mounts map[string]fault.HostMountView) (*fault.Outcome, error) {
 	return nil, errors.New("host evaluator exploded mid-transaction")
 }
 
@@ -458,7 +458,7 @@ func TestCharacterizationEvaluatorErrorRollsBackTheWholeBatch(t *testing.T) {
 // failAfterWriteTracer mirrors the evaluator stub on the evidence path.
 type failAfterWriteTracer struct{}
 
-func (failAfterWriteTracer) IngestTracesTx(ctx context.Context, tx *sql.Tx, agentID, siteID string, results []telemetry.TraceResult) (*incidentops.TraceOutcome, error) {
+func (failAfterWriteTracer) IngestTracesTx(ctx context.Context, tx store.WriteTx, agentID, siteID string, results []telemetry.TraceResult) (*incidentops.TraceOutcome, error) {
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO events(id, agent_id, site_id, ts, type, layer, severity, message, attrs)
 		VALUES('evt-poison-trace', 'agent_a', 'site_default', 0, 'custom', '', 'warn', 'poison', '')`); err != nil {
@@ -469,7 +469,7 @@ func (failAfterWriteTracer) IngestTracesTx(ctx context.Context, tx *sql.Tx, agen
 
 func (failAfterWriteTracer) PublishTraceOutcome(context.Context, *incidentops.TraceOutcome) {}
 
-func (failAfterWriteTracer) IngestScenesTx(ctx context.Context, tx *sql.Tx, agentID, siteID string, reports []telemetry.SceneReport) (*incidentops.SceneOutcome, error) {
+func (failAfterWriteTracer) IngestScenesTx(ctx context.Context, tx store.WriteTx, agentID, siteID string, reports []telemetry.SceneReport) (*incidentops.SceneOutcome, error) {
 	return nil, errors.New("scene store exploded mid-transaction")
 }
 

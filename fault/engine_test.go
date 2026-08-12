@@ -66,7 +66,7 @@ func (h *harness) evaluate(det DetectionSettings, ms ...telemetry.Metric) *Outco
 	if err != nil {
 		h.t.Fatalf("begin: %v", err)
 	}
-	out, err := h.svc.EvaluateAgentTx(h.ctx, tx, "agent_a", "site_default", rounds)
+	out, err := h.svc.EvaluateAgentTx(h.ctx, store.AdaptTx(tx, store.Standalone()), "agent_a", "site_default", rounds)
 	if err != nil {
 		_ = tx.Rollback()
 		h.t.Fatalf("evaluate: %v", err)
@@ -503,7 +503,7 @@ func TestMergedGroupSharesOneIncident(t *testing.T) {
 		if err != nil {
 			t.Fatalf("begin: %v", err)
 		}
-		if _, err := h.svc.EvaluateAgentTx(h.ctx, tx, "agent_a", "site_default", rounds); err != nil {
+		if _, err := h.svc.EvaluateAgentTx(h.ctx, store.AdaptTx(tx, store.Standalone()), "agent_a", "site_default", rounds); err != nil {
 			_ = tx.Rollback()
 			t.Fatalf("evaluate: %v", err)
 		}

@@ -294,7 +294,7 @@ func (s *Store) EnsureSeries(ctx context.Context, agentID, siteID string, ms []t
 // deliberate and cheap: a replayed old packet may issue a rewind whose
 // recompute finds nothing changed, and the rollup upsert's unchanged-guard
 // then writes nothing. ids comes from EnsureSeries.
-func (s *Store) RewindForBatch(ctx context.Context, tx *sql.Tx, agentID string, ids map[string]int64, ms []telemetry.Metric) error {
+func (s *Store) RewindForBatch(ctx context.Context, tx store.WriteTx, agentID string, ids map[string]int64, ms []telemetry.Metric) error {
 	oldest := make(map[int64]int64, len(ids))
 	for i := range ms {
 		m := &ms[i]
@@ -409,7 +409,7 @@ func (s *Store) isPendingAppend(id int64) bool {
 // overlap absorbs ordinary upload jitter), so for them the guarded UPDATE
 // matches nothing and dirties no page. Only a genuine backfill writes, and then
 // only one small rollup_state row per affected series.
-func rewindRollups(ctx context.Context, tx *sql.Tx, oldest map[int64]int64) error {
+func rewindRollups(ctx context.Context, tx store.WriteTx, oldest map[int64]int64) error {
 	if len(oldest) == 0 {
 		return nil
 	}

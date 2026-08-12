@@ -12,6 +12,7 @@ import (
 	"github.com/google/uuid"
 	pcfg "github.com/nettact/protocol/config"
 	"github.com/nettact/protocol/telemetry"
+	"github.com/nettact/server-core/store"
 )
 
 // The system-status detectors: the built-in fault detection over a machine's own
@@ -485,7 +486,7 @@ func bpsToMbps(bytesPerSec float64) float64 { return bytesPerSec * 8 / 1e6 }
 // mounts maps anchor id to what this batch said about that anchor's disks. A nil
 // map (or a missing anchor) means the batch carried no disk readings, which is
 // silence, not evidence of a removed disk.
-func (s *Service) EvaluateHostTx(ctx context.Context, tx *sql.Tx, agentID, siteID string,
+func (s *Service) EvaluateHostTx(ctx context.Context, tx store.WriteTx, agentID, siteID string,
 	rounds []HostRound, mounts map[string]HostMountView) (*Outcome, error) {
 	out := &txOut{}
 	if len(rounds) == 0 && len(mounts) == 0 {
@@ -536,7 +537,7 @@ func (s *Service) EvaluateHostTx(ctx context.Context, tx *sql.Tx, agentID, siteI
 
 // advanceHostDetector folds one (anchor, detector) group's readings into its
 // state row and drives the confirm/resolve transitions.
-func (s *Service) advanceHostDetector(ctx context.Context, tx *sql.Tx, agentID, siteID, agentName string,
+func (s *Service) advanceHostDetector(ctx context.Context, tx store.Executor, agentID, siteID, agentName string,
 	rounds []HostRound, now time.Time, out *txOut) error {
 	cur := rounds[len(rounds)-1]
 	st, err := loadDetectorState(ctx, tx, cur.TargetID, agentID, cur.DetectorKey)
@@ -566,7 +567,7 @@ func (s *Service) advanceHostDetector(ctx context.Context, tx *sql.Tx, agentID, 
 }
 
 // advanceHostRound folds one reading into a system-status detector's state.
-func (s *Service) advanceHostRound(ctx context.Context, tx *sql.Tx, agentID, siteID, agentName string,
+func (s *Service) advanceHostRound(ctx context.Context, tx store.Executor, agentID, siteID, agentName string,
 	r HostRound, st *detectorState, now time.Time, out *txOut) error {
 	// Watermark: a reading at or before the newest already-folded one is a
 	// duplicate or an out-of-order straggler. Its sample is still stored, but it
@@ -680,7 +681,7 @@ const hostLayer = "local"
 
 // confirmHostSignal opens a system-status fault with its evidence frozen from the
 // confirming reading, attaches it to an incident and plans the notification.
-func (s *Service) confirmHostSignal(ctx context.Context, tx *sql.Tx, agentID, siteID, agentName string,
+func (s *Service) confirmHostSignal(ctx context.Context, tx store.Executor, agentID, siteID, agentName string,
 	r HostRound, st detectorState, now time.Time, out *txOut) (string, error) {
 	groupName, mergeEnabled, err := groupMeta(ctx, tx, r.GroupID)
 	if err != nil {
@@ -750,7 +751,7 @@ const hostDiskMissesBeforeGone = 2
 // have actually been OBSERVED without the mount, so that is what is counted:
 // misses accumulate on the mount's own detector row and reset the moment it
 // reports again.
-func (s *Service) resolveVanishedMounts(ctx context.Context, tx *sql.Tx, agentID, targetID string,
+func (s *Service) resolveVanishedMounts(ctx context.Context, tx store.Executor, agentID, targetID string,
 	view HostMountView, now time.Time, out *txOut) (int, error) {
 	rows, err := tx.QueryContext(ctx, `
 		SELECT s.id, s.detector_key, COALESCE(d.subject_misses, 0)

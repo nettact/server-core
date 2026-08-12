@@ -40,7 +40,7 @@ func seedMetrics(t *testing.T, db *store.DB, ms *metrics.Store, agentID string, 
 	if err != nil {
 		t.Fatalf("BeginTx: %v", err)
 	}
-	if err := ms.RewindForBatch(ctx, tx, agentID, ids, batch); err != nil {
+	if err := ms.RewindForBatch(ctx, store.AdaptTx(tx, store.Standalone()), agentID, ids, batch); err != nil {
 		t.Fatalf("RewindForBatch: %v", err)
 	}
 	pendingDone := ms.BeginPendingAppend(ids)

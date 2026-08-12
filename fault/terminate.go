@@ -3,6 +3,7 @@ package fault
 import (
 	"context"
 	"database/sql"
+	"github.com/nettact/server-core/store"
 	"strings"
 	"time"
 )
@@ -92,7 +93,7 @@ func (s *Service) TerminateForGroupTx(ctx context.Context, tx *sql.Tx, groupID s
 // publisher for the resolved signals plus the recomputed siblings. refAgents are
 // the agents whose detector_state was just cleared and must have been captured
 // BEFORE the delete.
-func (s *Service) terminationPub(ctx context.Context, tx *sql.Tx, targets, agents []string, siteID string, out *txOut, refAgents []string) ([]string, postCommit, error) {
+func (s *Service) terminationPub(ctx context.Context, tx store.Executor, targets, agents []string, siteID string, out *txOut, refAgents []string) ([]string, postCommit, error) {
 	statusTargets, err := s.recomputeSiblingAttributions(ctx, tx, siteID, append(agents, refAgents...), out)
 	if err != nil {
 		return nil, nil, err
@@ -108,7 +109,7 @@ func (s *Service) terminationPub(ctx context.Context, tx *sql.Tx, targets, agent
 // detectorAgentsForTargets returns the distinct agents that have detector_state
 // for the given targets — i.e. the agents for which those targets were a
 // possible healthy reference before being cleared.
-func (s *Service) detectorAgentsForTargets(ctx context.Context, tx *sql.Tx, targetIDs []string) ([]string, error) {
+func (s *Service) detectorAgentsForTargets(ctx context.Context, tx store.Executor, targetIDs []string) ([]string, error) {
 	if len(targetIDs) == 0 {
 		return nil, nil
 	}
@@ -142,7 +143,7 @@ func anySlice(ss []string) []any {
 // on the given agents after a mutation shrank the agent-wide firing/reference
 // set, appending the changed incidents' events to out and returning the targets
 // whose status changed.
-func (s *Service) recomputeSiblingAttributions(ctx context.Context, tx *sql.Tx, siteID string, agents []string, out *txOut) ([]string, error) {
+func (s *Service) recomputeSiblingAttributions(ctx context.Context, tx store.Executor, siteID string, agents []string, out *txOut) ([]string, error) {
 	var changedTargets []string
 	for _, agentID := range dedupeStrings(agents) {
 		changedIncidents, targets, err := recomputeAgentAttributions(ctx, tx, agentID)
@@ -229,7 +230,7 @@ func (s *Service) terminate(ctx context.Context, reason string, extra func(conte
 // closed targets, the affected agents, the site id and the accumulated lifecycle
 // events; sibling-attribution recomputation is deliberately deferred to the
 // caller (terminationPub) so it runs AFTER any detector_state is cleared.
-func (s *Service) terminateTx(ctx context.Context, tx *sql.Tx, reason, whereSQL string, args ...any) ([]string, []string, string, *txOut, error) {
+func (s *Service) terminateTx(ctx context.Context, tx store.Executor, reason, whereSQL string, args ...any) ([]string, []string, string, *txOut, error) {
 	rows, err := tx.QueryContext(ctx,
 		`SELECT id, site_id, target_id, agent_id FROM fault_signals WHERE state='firing' AND (`+whereSQL+`)`, args...)
 	if err != nil {

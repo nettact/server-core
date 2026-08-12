@@ -177,7 +177,7 @@ func (s *Service) TouchLastSeenThrottled(ctx context.Context, id string) error {
 // throttle clock and publishes the liveness event. When no touch is due it
 // returns (nil, nil). On rollback the caller simply discards post, leaving the
 // throttle due, so the skipped write is retried by the next packet.
-func (s *Service) TouchLastSeenTx(ctx context.Context, tx *sql.Tx, id string) (post func(), err error) {
+func (s *Service) TouchLastSeenTx(ctx context.Context, tx store.WriteTx, id string) (post func(), err error) {
 	if !s.touchDue(id) {
 		return nil, nil
 	}

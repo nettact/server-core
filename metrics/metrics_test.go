@@ -34,7 +34,7 @@ func ingestBatch(t testing.TB, db *store.DB, s *Store, agentID string, ms []tele
 	if err != nil {
 		t.Fatalf("BeginTx: %v", err)
 	}
-	if err := s.RewindForBatch(ctx, tx, agentID, ids, ms); err != nil {
+	if err := s.RewindForBatch(ctx, store.AdaptTx(tx, store.Standalone()), agentID, ids, ms); err != nil {
 		t.Fatalf("RewindForBatch: %v", err)
 	}
 	pendingDone := s.BeginPendingAppend(ids)
@@ -844,7 +844,7 @@ func BenchmarkIngestBatch(b *testing.B) {
 		if err != nil {
 			b.Fatal(err)
 		}
-		if err := s.RewindForBatch(ctx, tx, "agent_bench", ids, ms); err != nil {
+		if err := s.RewindForBatch(ctx, store.AdaptTx(tx, store.Standalone()), "agent_bench", ids, ms); err != nil {
 			b.Fatal(err)
 		}
 		pendingDone := s.BeginPendingAppend(ids)

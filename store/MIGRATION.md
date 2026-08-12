@@ -1,45 +1,55 @@
-# Store contract migration ledger (CLOUD-014A)
+# Store contract migration ledger (CLOUD-014A → CLOUD-015)
 
 Internal working document for the Scope/Executor/WriteTx store-contract
 migration. Tracks which call sites speak the new contract, which still speak
-raw `*sql.Tx` / `*store.DB`, and who owns closing each gap. Updated per slice;
-deleted when CLOUD-015 lands.
+raw `*sql.Tx` / `*store.DB`, and who owns closing each gap.
 
-## What this milestone shipped
+## What shipped
 
-- `store/contract.go` — `Scope` (+ `Validate`, `IsSystem`, `SystemScope`,
-  `Standalone`), `Dialect` (+ `Rebind`), `Executor`, `WriteTx`.
-- `store/tx.go` — the SQLite adapter (`sqliteTx`) and the entry points
-  `DB.WriteTx`, `DB.ReadTx`, plus the migration seam `DB.SQLiteTx(WriteTx)`.
-- `store/contract_test.go` — scope matrix, post-after-commit visibility,
-  post-discarded-on-error paths, bridge behavior.
-- **One vertical slice migrated: ingest** (see below). Everything else is
-  explicitly unchanged and enumerated here.
+- **CLOUD-014A** — `store/contract.go` (`Scope`, `Dialect`, `Executor`,
+  `WriteTx`), the SQLite adapter (`store/tx.go`), `DB.WriteTx`/`DB.ReadTx`,
+  the `SQLiteTx` migration seam, and the ingest vertical slice.
+- **CLOUD-015** — the ingest transaction core extracted as
+  `ingest.Prepare`/`ApplyPacketTx`/`Commit` (ingest/apply.go) so a Cloud
+  state consumer runs the same domain logic inside a PostgreSQL tenant
+  transaction; the **`SQLiteTx` seam is DELETED** (the scope-bypass it
+  enabled no longer exists); `store.AdaptTx` added as the safe,
+  owner-side direction (`*sql.Tx` → `WriteTx`) for the tx owners still on
+  this ledger and for tests; `store.WriteTx` extended with `PrepareContext`
+  (the rewind's prepared UPDATE).
 
-## Migrated in this slice (ingest)
+## Migrated in CLOUD-015 (the ingest transaction slice)
 
 | Site | Before | After |
 | --- | --- | --- |
-| `ingest.Ingest` transaction | `s.db.BeginTx` + manual commit/rollback/`committed` flag | `s.db.WriteTx(ctx, store.Standalone(), fn)`; the post-commit block (touchPost → AppendRawSamples → UpdateLatest → PublishOutcome) is the returned post closure, preserving the old ordering; append failure still acks |
-| `ingest.probeMeta` / `ingest.hostMeta` / `ingest.reportedUploadSeconds` | `rowQuerier` (QueryContext-only) | `store.Executor` (read pool and WriteTx both satisfy it) |
-| `ingest.applyInventory`, `ingest.applyInterfaceSnapshot` | `*sql.Tx` | `store.WriteTx` |
-| events `INSERT OR IGNORE`, admission `UPDATE agents SET high_sequence` | `*sql.Tx` | `store.WriteTx` |
-| `fault.EvaluateAgentTx` / `EvaluateHostTx`, `gamedata.Apply`, `incidentops.IngestTracesTx` / `IngestScenesTx`, `metrics.RewindForBatch` | `*sql.Tx` | **unchanged** — called through `DB.SQLiteTx` inside `Ingest`; they migrate in CLOUD-015 |
-| `ingest.TouchAgentTx` (wired to `registry.TouchLastSeenTx` from `server.Start`) | `*sql.Tx` | **unchanged by design** — migrating it ripples into registry, out of scope for this slice |
+| `ingest.Ingest` | single function: prepare + `WriteTx` + post closure | three phases: `Prepare` (pre-tx) → `ApplyPacketTx` (tx core, no commit/rollback/conn/network) → `Commit` (post-commit executor); `Ingest` = wiring of the three, external behavior byte-identical (characterization suite) |
+| `ingest.Evaluator` (`fault.EvaluateAgentTx`/`EvaluateHostTx`) | `*sql.Tx` via `SQLiteTx` | `store.WriteTx` |
+| `ingest.AgentEvidence` (`incidentops.IngestTracesTx`/`IngestScenesTx`) | `*sql.Tx` via `SQLiteTx` | `store.WriteTx` |
+| `ingest.TouchAgentTx` (→ `registry.TouchLastSeenTx`) | `*sql.Tx` via `SQLiteTx` | `store.WriteTx`; `server.Start` wiring assignment unchanged |
+| `gamedata.Apply` | `*sql.Tx` | `store.WriteTx` |
+| `metrics.RewindForBatch` / `rewindRollups` | `*sql.Tx` | `store.WriteTx` (the rewind's prepared UPDATE rides the new `WriteTx.PrepareContext`) |
+| fault engine/host/degradation/fluctuation/attribution/notify helpers (~45 functions), `Planner` + `SnapshotWriter` interfaces | `*sql.Tx` | `store.Executor` (reachable from both the ingest WriteTx and the remaining `*sql.Tx` owners; `*sql.Tx` satisfies Executor by the compile-time pin) |
+| notifypolicy `PlanOpenTx`/`EscalateTx`/`ResolveTx`/`RecomputeTx` + storm/deliver helpers | `*sql.Tx` | `store.Executor` (called from fault's Planner interface, both paths) |
+| incidentops scene/trace/snapshot helpers, `WriteIncidentBase` | `*sql.Tx` | `store.Executor` |
+| gamedata helpers (`agentPermissions`, `upsertRun`, `ownedRuns`, `insertBucket`, `ownedGapRuns`, `upsertGap`, `insertHostSecond`, `writeAggregates`) | `*sql.Tx` | `store.Executor` |
+| `fault.RecomputeAttributionTx`, `fault.AddTimelineTx` | `*sql.Tx` | `store.Executor` (called from incidentops and notifypolicy with both tx kinds) |
+| `fault.TerminateForTargetsTx` / `TerminateForGroupTx` / `ClearDetectorStateTx` | `*sql.Tx` | **kept `*sql.Tx` by design** — the config-change path, not the ingest slice; they implement `config.FaultTerminator` and migrate with config's tx owners (below). Their internal helpers (`terminateTx`, `terminationPub`, …) are Executor-typed so both directions compile. |
+| `store.DB.SQLiteTx` bridge + its tests | present | **deleted**; its commit-error test moved to `store/tx_internal_test.go` (package-internal, reaches the adapter directly) |
+| `store.WriteTx` | ExecContext/QueryContext/QueryRowContext/Dialect/Scope | + `PrepareContext` (additive; trivial for the SQLite adapter) |
+| `store.AdaptTx(tx *sql.Tx, s Scope) WriteTx` | — | **added**: the safe seam for owners still on BeginTx and for tests; deliberately one-directional |
 
-## Remaining call sites (尚未迁移清单)
+## Remaining call sites (014B)
 
-Owner column: **014B** = migrate the package onto the contract in a later
-slice; **015** = the PostgreSQL-adapter milestone (dialect-flag SQL, RLS,
-`SQLiteTx` seam removal). "Owns a tx" = the function opens/commits/rollbacks a
-transaction itself; "consumes `*sql.Tx`" = the function receives one from an
-owner.
+Owner column: **014B** = migrate the package onto the contract (tx owners
+move to `DB.WriteTx`; their remaining `*sql.Tx` consumers follow). "Owns a
+tx" = the function opens/commits/rollbacks a transaction itself; "consumes
+`*sql.Tx`" = the function receives one from an owner.
 
 ### baseline
 
 | Function | Kind | Owner |
 | --- | --- | --- |
-| `foldBatch`, `Prune` | owns a tx (`db.BeginTx`) | 014B |
+| `foldBatch`, `Prune` | own a tx (`db.BeginTx`) | 014B |
 | `foldOne`, `foldBucket` | consume `*sql.Tx` | 014B |
 | `Bands` (and the rest of the read surface) | read pool (`db.Read()`) | 014B |
 
@@ -62,8 +72,8 @@ owner.
 
 | Function | Kind | Owner |
 | --- | --- | --- |
-| `OpenAgentSignal`, `ResolveAgentSignal`, `RecomputeOpenAttributions`, `terminate` (+ its `extra func(*sql.Tx) error` hook) | own a tx | 014B |
-| ~50 functions across `engine.go` (`EvaluateAgentTx`, detector/signal/incident helpers), `host.go` (`EvaluateHostTx` + helpers), `degradation.go`, `fluctuation.go`, `attribution.go`, `terminate.go`, `notify.go` | consume `*sql.Tx` | 014B |
+| `OpenAgentSignal`, `ResolveAgentSignal`, `RecomputeOpenAttributions`, `terminate` (+ its `extra func(*sql.Tx) error` hook) | own a tx | 014B — wrap the tx with `store.AdaptTx` or move to `DB.WriteTx` |
+| `TerminateForTargetsTx`, `TerminateForGroupTx`, `ClearDetectorStateTx` | consume `*sql.Tx` | 014B (with config — they implement `config.FaultTerminator`) |
 | signal/fluctuation read paths | read pool | 014B |
 
 ### gamedata
@@ -71,7 +81,6 @@ owner.
 | Function | Kind | Owner |
 | --- | --- | --- |
 | `DeleteRun` | owns a tx | 014B |
-| `Apply`, `agentPermissions`, `upsertRun`, `ownedRuns`, `insertBucket`, `ownedGapRuns`, `upsertGap`, `insertHostSecond`, `writeAggregates` | consume `*sql.Tx` | 014B |
 | `read.go` queries | read pool (one opens a read tx) | 014B |
 
 ### identity
@@ -85,27 +94,18 @@ owner.
 | Function | Kind | Owner |
 | --- | --- | --- |
 | `claimScenes`, `fileReconciledScene`, `claimTraces` | own a tx | 014B |
-| `IngestScenesTx` / `IngestTracesTx` + scene/trace/snapshot helpers | consume `*sql.Tx` | 015 (called via `SQLiteTx` from ingest today) |
-
-### ingest
-
-| Function | Kind | Owner |
-| --- | --- | --- |
-| `TouchAgentTx` field (→ `registry.TouchLastSeenTx`) | consumes `*sql.Tx` | 015 — deliberately kept this slice (ripples into registry) |
 
 ### metrics
 
 | Function | Kind | Owner |
 | --- | --- | --- |
 | `rollupTier` (two tx sites) | owns a tx | 014B |
-| `RewindForBatch`, `rewindRollups` | consume `*sql.Tx` | 015 (called via `SQLiteTx` from ingest today) |
 
 ### notifypolicy
 
 | Function | Kind | Owner |
 | --- | --- | --- |
 | `AttachChannelToBuiltins` | owns a tx | 014B |
-| `PlanOpenTx`, `EscalateTx`, `ResolveTx`, `RecomputeTx`, `insertDeliver*`, storm helpers | consume `*sql.Tx` | 014B (called from fault's tx) |
 
 ### opissue
 
@@ -119,7 +119,7 @@ owner.
 | Function | Kind | Owner |
 | --- | --- | --- |
 | `CreateReinstallToken`, `Enroll`, `UpdateGroup`, `DeleteGroup`, `DeleteAgent` | own a tx | 014B |
-| `reenrollAgent`, `TouchLastSeenTx` | consume `*sql.Tx` | 014B (TouchLastSeenTx blocks the ingest TouchAgentTx migration — do both together) |
+| `reenrollAgent` | consume `*sql.Tx` | 014B |
 
 ### statuspage
 
@@ -135,16 +135,16 @@ owner.
 | `SiteStatuses` | owns a **read** tx (`db.Read().BeginTx(ctx, &sql.TxOptions{ReadOnly: true})`) — the pre-contract read-tx precedent; fold into `DB.ReadTx` | 014B |
 | `loadTargets`, `loadApplicablePairs`, `loadMonitorStatus`, `loadLatestSamples`, `loadDetectorState`, `loadFiringSignals` | consume `*sql.Tx` | 014B |
 
-### Not tx-shaped but dialect-bound (015)
+### Not tx-shaped but dialect-bound (PostgreSQL adapter milestone)
 
 Everything above still speaks SQLite SQL. The dialect surface is narrow and
 enumerable — `?` placeholders (covered by `Dialect.Rebind`), `INSERT OR
 IGNORE`, `ON CONFLICT … DO UPDATE`, no RETURNING, JSON marshalled in Go, times
 as strings/ints. Any statement needing more than Rebind (upsert syntax,
 RETURNING, JSON operators) gets one explicit implementation per dialect behind
-a repository interface — no ORM, no inline dialect branching. The `SQLiteTx`
-seam is removed when the last `*sql.Tx` consumer above migrates; `db.BeginTx`
-owners become `DB.WriteTx` callers as their slices land.
+a repository interface — no ORM, no inline dialect branching. The removed
+`SQLiteTx` seam was the last way to reach a raw handle out of a WriteTx;
+`AdaptTx` is the only remaining bridge and points the other way.
 
 ## Constraints observed
 
@@ -153,8 +153,10 @@ owners become `DB.WriteTx` callers as their slices land.
 - `store/migrations/0001_init.sql` is shipped; never edited.
 - Per-row tenant enforcement (RLS) does not exist here; the scope field is
   carried for assertion and future adapters, and repositories must not use it
-  as a filter.
+  as a filter. `ingest.ApplyPacketTx` fails closed when the call's scope does
+  not validate or does not match the transaction's own scope.
 - The commit-error arm of `DB.WriteTx` is hard to exercise against SQLite (no
-  deferred constraints; statement errors surface inside fn). `contract_test.go`
-  simulates it by rolling back the underlying tx so `Commit` fails with
-  `sql.ErrTxDone`, and documents what that does and does not cover.
+  deferred constraints; statement errors surface inside fn).
+  `store/tx_internal_test.go` simulates it by rolling back the underlying tx
+  so `Commit` fails with `sql.ErrTxDone`, and documents what that does and
+  does not cover.

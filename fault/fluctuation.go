@@ -2,13 +2,13 @@ package fault
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"log"
 	"strconv"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/nettact/server-core/store"
 )
 
 // A fluctuation is a failing streak that recovered before it could confirm a
@@ -123,7 +123,7 @@ const fluctuationCols = `id, site_id, agent_id, agent_name, target_id, target_na
 //
 // Idempotent on (target, agent, detector, started_at): a streak begins once, so a
 // replay of the same rounds updates nothing rather than filing the same dip twice.
-func insertFluctuation(ctx context.Context, tx *sql.Tx, agentID, siteID, agentName string, r Round, st detectorState, ended time.Time) error {
+func insertFluctuation(ctx context.Context, tx store.Executor, agentID, siteID, agentName string, r Round, st detectorState, ended time.Time) error {
 	started := timeFromUnix(r.TS)
 	if st.firstFailTS.Valid {
 		started = timeFromUnix(st.firstFailTS.Int64)
@@ -167,7 +167,7 @@ type fluctuationRow struct {
 }
 
 // insertFluctuationRow is the single write path into fluctuations.
-func insertFluctuationRow(ctx context.Context, tx *sql.Tx, f fluctuationRow) error {
+func insertFluctuationRow(ctx context.Context, tx store.Executor, f fluctuationRow) error {
 	summary := FailEvidence{}
 	if n := len(f.Rounds); n > 0 {
 		summary = f.Rounds[n-1]
@@ -213,7 +213,7 @@ func insertFluctuationRow(ctx context.Context, tx *sql.Tx, f fluctuationRow) err
 //
 // A failure here is advisory. The fault itself is already recorded, and losing the
 // precursor annotation must never roll back the confirmation.
-func linkPrecursors(ctx context.Context, tx *sql.Tx, incidentID, targetID, agentID string, streakStart, now time.Time) {
+func linkPrecursors(ctx context.Context, tx store.Executor, incidentID, targetID, agentID string, streakStart, now time.Time) {
 	res, err := tx.ExecContext(ctx, `
 		UPDATE fluctuations SET incident_id=?
 		WHERE target_id=? AND agent_id=? AND incident_id IS NULL

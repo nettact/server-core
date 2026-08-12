@@ -2,7 +2,6 @@ package incidentops
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"time"
 
@@ -10,6 +9,7 @@ import (
 
 	pcfg "github.com/nettact/protocol/config"
 	"github.com/nettact/server-core/metrics"
+	"github.com/nettact/server-core/store"
 )
 
 // ---- snapshot base (written synchronously in the incident-open transaction) ----
@@ -124,7 +124,7 @@ const recentSampleFetchCap = 600
 // whatever it managed to assemble instead of aborting: the returned error is
 // advisory (the caller logs and continues), and the incident still opens.
 // Idempotent via the incident_snapshots.incident_id UNIQUE constraint.
-func (s *Service) WriteIncidentBase(ctx context.Context, tx *sql.Tx, incidentID string, now time.Time) error {
+func (s *Service) WriteIncidentBase(ctx context.Context, tx store.Executor, incidentID string, now time.Time) error {
 	base, buildErr := s.buildBase(ctx, tx, incidentID, now)
 	payload := mustJSON(base)
 	truncated := 0
@@ -144,7 +144,7 @@ func (s *Service) WriteIncidentBase(ctx context.Context, tx *sql.Tx, incidentID 
 // buildBase assembles the snapshot base. An unreadable incident row or member set
 // yields a partial base and an error: the row is still written, so the incident
 // always has a snapshot, and the caller logs what was missing.
-func (s *Service) buildBase(ctx context.Context, tx *sql.Tx, incidentID string, now time.Time) (SnapshotBase, error) {
+func (s *Service) buildBase(ctx context.Context, tx store.Executor, incidentID string, now time.Time) (SnapshotBase, error) {
 	base := SnapshotBase{IncidentID: incidentID, ReceivedAt: now}
 	var siteID, groupID, groupName, severity, suspected, attribution, attrEv string
 	var openedAt time.Time
@@ -181,7 +181,7 @@ func (s *Service) buildBase(ctx context.Context, tx *sql.Tx, incidentID string, 
 // baseMembers reads the incident's member fault signals with their frozen
 // evidence, attaching a bounded recent-sample summary per member. It also returns
 // the distinct agent ids and target ids referenced, for the agent/target sections.
-func (s *Service) baseMembers(ctx context.Context, tx *sql.Tx, incidentID string) ([]baseMember, []string, []string, error) {
+func (s *Service) baseMembers(ctx context.Context, tx store.Executor, incidentID string) ([]baseMember, []string, []string, error) {
 	rows, err := tx.QueryContext(ctx, `
 		SELECT id, detector_key, agent_id, COALESCE(agent_name,''), severity, COALESCE(layer,''),
 		       observed_at, confirmed_at,
@@ -340,7 +340,7 @@ func (s *Service) baseAgents(ctx context.Context, agentIDs []string) []baseAgent
 // probe_tasks (read through tx so an in-flight target edit is not seen
 // mid-open). A target deleted after the fact simply drops out — the frozen
 // evidence still carries its name/address.
-func (s *Service) baseTargets(ctx context.Context, tx *sql.Tx, targetIDs []string) []baseTarget {
+func (s *Service) baseTargets(ctx context.Context, tx store.Executor, targetIDs []string) []baseTarget {
 	out := make([]baseTarget, 0, len(targetIDs))
 	for _, id := range targetIDs {
 		var t baseTarget

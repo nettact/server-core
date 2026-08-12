@@ -12,6 +12,7 @@ import (
 	"github.com/nettact/protocol/telemetry"
 	"github.com/nettact/server-core/eventbus"
 	"github.com/nettact/server-core/fault"
+	"github.com/nettact/server-core/store"
 )
 
 // claimWindow is how far back a newly-confirmed fault looks for a traceroute
@@ -120,7 +121,7 @@ type TraceOutcome struct {
 // Matching is by report id, which the Agent minted, with the authenticated agent
 // id as the guard: a duplicate, replayed or foreign-agent report is a silent
 // no-op and can never overwrite a stored execution.
-func (s *Service) IngestTracesTx(ctx context.Context, tx *sql.Tx, agentID, siteID string, results []telemetry.TraceResult) (*TraceOutcome, error) {
+func (s *Service) IngestTracesTx(ctx context.Context, tx store.WriteTx, agentID, siteID string, results []telemetry.TraceResult) (*TraceOutcome, error) {
 	if len(results) == 0 {
 		return nil, nil
 	}
@@ -206,7 +207,7 @@ func (s *Service) PublishTraceOutcome(ctx context.Context, out *TraceOutcome) {
 // replayed packet re-presents an id already stored, and an id claimed by a
 // different agent collides with the row that agent owns. Either way the stored
 // execution stands and nothing is overwritten.
-func insertTraceReport(ctx context.Context, tx *sql.Tx, agentID, siteID, agentName string, res telemetry.TraceResult, now time.Time) (bool, error) {
+func insertTraceReport(ctx context.Context, tx store.Executor, agentID, siteID, agentName string, res telemetry.TraceResult, now time.Time) (bool, error) {
 	status := res.Status
 	if !terminalTraceStatus(status) {
 		status = telemetry.TraceStatusFailed
@@ -282,7 +283,7 @@ func nullTimeOf(t time.Time) any {
 // DNS monitor's to its resolver, and matching by monitor would attach a resolver
 // trace to nothing while three monitors sharing one dead host each waited for a
 // trace of their own.
-func attachTrace(ctx context.Context, tx *sql.Tx, agentID string, res telemetry.TraceResult, now time.Time) ([]string, error) {
+func attachTrace(ctx context.Context, tx store.Executor, agentID string, res telemetry.TraceResult, now time.Time) ([]string, error) {
 	if res.DestKey == "" {
 		return nil, nil
 	}
@@ -375,7 +376,7 @@ func attachTrace(ctx context.Context, tx *sql.Tx, agentID string, res telemetry.
 // destination is destKey. It re-derives the destination from the signal's FROZEN
 // trigger-time evidence with the same rules the Agent used, so a target edited
 // after the fault cannot make an unrelated report look like its evidence.
-func signalMatchesDest(ctx context.Context, tx *sql.Tx, signalID, destKey string) (bool, error) {
+func signalMatchesDest(ctx context.Context, tx store.Executor, signalID, destKey string) (bool, error) {
 	evd, metricKind, err := readSignalEvidence(ctx, tx, signalID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
@@ -606,7 +607,7 @@ func (s *Service) publishAttributionRefresh(ctx context.Context, siteID, inciden
 // insertHops writes the per-attempt hop rows, clamped to the report's own
 // bounds so a malformed oversized result cannot bloat storage. RTT is stored in
 // microseconds; a timed-out attempt stores no address.
-func insertHops(ctx context.Context, tx *sql.Tx, reportID string, hops []telemetry.TraceHop, maxHops, attempts int) error {
+func insertHops(ctx context.Context, tx store.Executor, reportID string, hops []telemetry.TraceHop, maxHops, attempts int) error {
 	for _, h := range hops {
 		if h.TTL < 1 || h.TTL > maxHops {
 			continue

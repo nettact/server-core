@@ -38,6 +38,7 @@ import (
 
 	"github.com/nettact/server-core/eventbus"
 	"github.com/nettact/server-core/notification"
+	"github.com/nettact/server-core/store"
 )
 
 // Location codes (incidents.attribution). The user-language positions map onto
@@ -148,7 +149,7 @@ func scanMemberFacts(rows *sql.Rows) ([]memberFact, error) {
 
 // loadMembers reads an incident's currently-firing members. Used by both
 // recomputeIncident and RecomputeAttributionTx so the two can never diverge.
-func loadMembers(ctx context.Context, tx *sql.Tx, incidentID string) ([]memberFact, error) {
+func loadMembers(ctx context.Context, tx store.Executor, incidentID string) ([]memberFact, error) {
 	rows, err := tx.QueryContext(ctx,
 		`SELECT `+memberFactCols+` FROM fault_signals fs LEFT JOIN proxies px ON px.id=fs.proxy_id
 		 WHERE fs.incident_id=? AND fs.state='firing'`, incidentID)
@@ -161,7 +162,7 @@ func loadMembers(ctx context.Context, tx *sql.Tx, incidentID string) ([]memberFa
 // loadAgentFiring returns every availability signal currently firing on one
 // agent — the incident's own members plus sibling signals in other incidents —
 // so the rules can see what else this vantage point observed.
-func loadAgentFiring(ctx context.Context, tx *sql.Tx, agentID string) ([]memberFact, error) {
+func loadAgentFiring(ctx context.Context, tx store.Executor, agentID string) ([]memberFact, error) {
 	rows, err := tx.QueryContext(ctx,
 		`SELECT `+memberFactCols+` FROM fault_signals fs LEFT JOIN proxies px ON px.id=fs.proxy_id
 		 WHERE fs.agent_id=? AND fs.state='firing' AND fs.detector_key='availability'`, agentID)
@@ -175,7 +176,7 @@ func loadAgentFiring(ctx context.Context, tx *sql.Tx, agentID string) ([]memberF
 // the agent reports as running — the evidence behind "gateway is healthy" and
 // "the other N targets are fine". A row whose active signal is firing is not
 // healthy even when its streak counters were reset by another path.
-func loadReferences(ctx context.Context, tx *sql.Tx, agentID string) ([]refState, error) {
+func loadReferences(ctx context.Context, tx store.Executor, agentID string) ([]refState, error) {
 	rows, err := tx.QueryContext(ctx, `
 		SELECT pt.id, pt.kind, COALESCE(pt.target,''), COALESCE(pt.name,''), COALESCE(pt.proxy_id,''),
 		       ds.fail_rounds, ds.last_round_ts,
@@ -272,7 +273,7 @@ func referenceStaleAfter(kind, paramsJSON string, eff, cycle, upload sql.NullInt
 // the shape R4 reads as "the trace died in the LAN". Left in, an agent-side NIC
 // or route failure would argue for an ISP verdict. The hops stay on the report
 // for the console to show; they simply are not path evidence.
-func loadTraceFacts(ctx context.Context, tx *sql.Tx, incidentID string) ([]traceFact, error) {
+func loadTraceFacts(ctx context.Context, tx store.Executor, incidentID string) ([]traceFact, error) {
 	rows, err := tx.QueryContext(ctx, `
 		SELECT tr.id, tr.subject_kind, tr.status, tr.reached, fs.target_id
 		FROM trace_report_refs r
@@ -322,7 +323,7 @@ func loadTraceFacts(ctx context.Context, tx *sql.Tx, incidentID string) ([]trace
 	return cands, nil
 }
 
-func queryTraceHops(ctx context.Context, tx *sql.Tx, reportID string) ([]string, error) {
+func queryTraceHops(ctx context.Context, tx store.Executor, reportID string) ([]string, error) {
 	rows, err := tx.QueryContext(ctx,
 		`SELECT addr FROM trace_hops WHERE report_id=? AND addr<>'' ORDER BY ttl, attempt`, reportID)
 	if err != nil {
@@ -390,7 +391,7 @@ func factClues(members []memberFact) []notification.AttributionClue {
 // computeAttribution runs the rule set. members are the incident's firing
 // members; traces are the incident's terminal reports. Returns (empty, nil) when
 // the evidence is insufficient — the renderers then fall back to layer wording.
-func computeAttribution(ctx context.Context, tx *sql.Tx, members []memberFact, traces []traceFact) (string, []notification.AttributionClue, error) {
+func computeAttribution(ctx context.Context, tx store.Executor, members []memberFact, traces []traceFact) (string, []notification.AttributionClue, error) {
 	if len(members) == 0 {
 		return "", nil, nil
 	}
@@ -597,7 +598,7 @@ func computeAttribution(ctx context.Context, tx *sql.Tx, members []memberFact, t
 // attribution changed (and the incident's site id, so the caller can publish a
 // refresh). No firing members ⇒ no change — a resolved incident's attribution
 // is frozen and a late trace cannot rewrite it.
-func RecomputeAttributionTx(ctx context.Context, tx *sql.Tx, incidentID string) (changed bool, siteID string, err error) {
+func RecomputeAttributionTx(ctx context.Context, tx store.Executor, incidentID string) (changed bool, siteID string, err error) {
 	members, err := loadMembers(ctx, tx, incidentID)
 	if err != nil {
 		return false, "", err
@@ -714,7 +715,7 @@ func (s *Service) RecomputeOpenAttributions(ctx context.Context) {
 // sibling resolve reverses it). The changed targets let the caller publish
 // target-status refreshes for the SIBLINGS too, not just the batch's own
 // targets — their FaultRef attribution moved even though no round ran for them.
-func recomputeAgentAttributions(ctx context.Context, tx *sql.Tx, agentID string) (changedIncidents, changedTargets []string, err error) {
+func recomputeAgentAttributions(ctx context.Context, tx store.Executor, agentID string) (changedIncidents, changedTargets []string, err error) {
 	rows, err := tx.QueryContext(ctx,
 		`SELECT DISTINCT incident_id FROM fault_signals
 		 WHERE agent_id=? AND state='firing' AND detector_key='availability'`, agentID)

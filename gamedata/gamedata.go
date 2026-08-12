@@ -31,7 +31,7 @@ import (
 // Service owns the game_runs / game_buckets / game_run_gaps / game_host_seconds
 // tables: the read surface the console charts from, and the retention that
 // bounds them. The write path is Apply, which runs inside the ingest transaction
-// and therefore takes a *sql.Tx instead.
+// and therefore takes a store.WriteTx instead.
 type Service struct {
 	db       *store.DB
 	settings *settings.Service

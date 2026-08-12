@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/nettact/server-core/eventbus"
+	"github.com/nettact/server-core/store"
 	"github.com/nettact/server-core/store/storetest"
 )
 
@@ -73,7 +74,7 @@ func TestTouchLastSeenTxRollbackKeepsDue(t *testing.T) {
 	if err != nil {
 		t.Fatalf("begin: %v", err)
 	}
-	post, err := reg.TouchLastSeenTx(ctx, tx, "agent_t")
+	post, err := reg.TouchLastSeenTx(ctx, store.AdaptTx(tx, store.Standalone()), "agent_t")
 	if err != nil {
 		t.Fatalf("TouchLastSeenTx: %v", err)
 	}
@@ -87,7 +88,7 @@ func TestTouchLastSeenTxRollbackKeepsDue(t *testing.T) {
 	if err != nil {
 		t.Fatalf("begin2: %v", err)
 	}
-	post2, err := reg.TouchLastSeenTx(ctx, tx2, "agent_t")
+	post2, err := reg.TouchLastSeenTx(ctx, store.AdaptTx(tx2, store.Standalone()), "agent_t")
 	if err != nil {
 		t.Fatalf("TouchLastSeenTx 2: %v", err)
 	}
@@ -101,7 +102,7 @@ func TestTouchLastSeenTxRollbackKeepsDue(t *testing.T) {
 
 	// And now it is NOT due (committed + post ran).
 	tx3, _ := db.BeginTx(ctx, nil)
-	post3, err := reg.TouchLastSeenTx(ctx, tx3, "agent_t")
+	post3, err := reg.TouchLastSeenTx(ctx, store.AdaptTx(tx3, store.Standalone()), "agent_t")
 	if err != nil {
 		t.Fatalf("TouchLastSeenTx 3: %v", err)
 	}
@@ -128,7 +129,7 @@ func TestTouchTxRecordsTransition(t *testing.T) {
 	if err != nil {
 		t.Fatalf("begin: %v", err)
 	}
-	post, err := reg.TouchLastSeenTx(ctx, tx, "agent_t")
+	post, err := reg.TouchLastSeenTx(ctx, store.AdaptTx(tx, store.Standalone()), "agent_t")
 	if err != nil || post == nil {
 		t.Fatalf("TouchLastSeenTx: post-nil=%v err=%v", post == nil, err)
 	}

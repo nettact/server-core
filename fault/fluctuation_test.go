@@ -7,6 +7,7 @@ import (
 
 	pcfg "github.com/nettact/protocol/config"
 	"github.com/nettact/protocol/telemetry"
+	"github.com/nettact/server-core/store"
 )
 
 // A fluctuation exists to close one specific hole: a dip that is visible in the
@@ -549,7 +550,7 @@ func TestLongIntervalTargetToleratesItsOwnCadence(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := h.svc.EvaluateAgentTx(h.ctx, tx, "agent_a", "site_default",
+		if _, err := h.svc.EvaluateAgentTx(h.ctx, store.AdaptTx(tx, store.Standalone()), "agent_a", "site_default",
 			BuildRounds([]telemetry.Metric{ok(ts, 0)}, meta)); err != nil {
 			_ = tx.Rollback()
 			t.Fatalf("evaluate: %v", err)
@@ -586,7 +587,7 @@ func (h *harness) addSecondTarget(det DetectionSettings) func(ms ...telemetry.Me
 		if err != nil {
 			h.t.Fatalf("begin: %v", err)
 		}
-		if _, err := h.svc.EvaluateAgentTx(h.ctx, tx, "agent_a", "site_default", BuildRounds(ms, meta)); err != nil {
+		if _, err := h.svc.EvaluateAgentTx(h.ctx, store.AdaptTx(tx, store.Standalone()), "agent_a", "site_default", BuildRounds(ms, meta)); err != nil {
 			_ = tx.Rollback()
 			h.t.Fatalf("evaluate second target: %v", err)
 		}

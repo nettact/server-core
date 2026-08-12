@@ -13,6 +13,7 @@ import (
 
 	"github.com/nettact/server-core/fault"
 	"github.com/nettact/server-core/notification"
+	"github.com/nettact/server-core/store"
 )
 
 // Delivery is one planned or completed notification, surfaced on the incident
@@ -94,7 +95,7 @@ func queryFor(sc fault.IncidentScope) Query {
 // what it was, and gives correlation the concrete routing it needs to move: the
 // storm inherits the exact channels and due times the members had planned,
 // rather than re-deriving them from a policy that may since have changed.
-func (s *Service) PlanOpenTx(ctx context.Context, tx *sql.Tx, sc fault.IncidentScope, now time.Time) error {
+func (s *Service) PlanOpenTx(ctx context.Context, tx store.Executor, sc fault.IncidentScope, now time.Time) error {
 	eff, err := s.Resolve(ctx, queryFor(sc))
 	if err != nil {
 		return err
@@ -153,7 +154,7 @@ func dueDelay(policyDelay, replayLag time.Duration) time.Duration {
 // It deliberately does NOT re-notify a channel that was already sent to: an
 // incident growing worse while someone is already looking at it is not worth a
 // second message, and the incident's own severity is live in the console.
-func (s *Service) EscalateTx(ctx context.Context, tx *sql.Tx, sc fault.IncidentScope, now time.Time) error {
+func (s *Service) EscalateTx(ctx context.Context, tx store.Executor, sc fault.IncidentScope, now time.Time) error {
 	eff, err := s.Resolve(ctx, queryFor(sc))
 	if err != nil {
 		return err
@@ -199,7 +200,7 @@ func (s *Service) EscalateTx(ctx context.Context, tx *sql.Tx, sc fault.IncidentS
 // free: a channel whose open notice was swallowed by a storm has no sent row, so
 // it gets no lone recovery here and is covered by the storm's one summary
 // instead — while a channel that opted out of merging still gets its pair.
-func (s *Service) ResolveTx(ctx context.Context, tx *sql.Tx, incidentID, reason string, now time.Time) error {
+func (s *Service) ResolveTx(ctx context.Context, tx store.Executor, incidentID, reason string, now time.Time) error {
 	if _, err := tx.ExecContext(ctx,
 		`UPDATE notification_deliveries SET status=? WHERE incident_id=? AND status=?`,
 		statusCanceled, incidentID, statusPending); err != nil {
@@ -250,7 +251,7 @@ func (s *Service) ResolveTx(ctx context.Context, tx *sql.Tx, incidentID, reason 
 	return nil
 }
 
-func insertDeliveries(ctx context.Context, tx *sql.Tx, sb subject, siteID, event string, p Policy, due, now time.Time) error {
+func insertDeliveries(ctx context.Context, tx store.Executor, sb subject, siteID, event string, p Policy, due, now time.Time) error {
 	for _, ch := range p.ChannelIDs {
 		if ch == "" {
 			continue
@@ -266,7 +267,7 @@ func insertDeliveries(ctx context.Context, tx *sql.Tx, sb subject, siteID, event
 // (subject, event, channel) UNIQUE constraint is the idempotency guarantee: a
 // replayed event, a reconnect or a restart can re-plan freely and still deliver
 // at most once.
-func insertDelivery(ctx context.Context, tx *sql.Tx, sb subject, siteID, event, channelID, policyID string, recovery bool, due, now time.Time) error {
+func insertDelivery(ctx context.Context, tx store.Executor, sb subject, siteID, event, channelID, policyID string, recovery bool, due, now time.Time) error {
 	incidentID, stormID := sb.cols()
 	_, err := tx.ExecContext(ctx, `
 		INSERT OR IGNORE INTO notification_deliveries(id, incident_id, storm_id, site_id, event_kind, channel_id,

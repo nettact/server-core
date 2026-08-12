@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/nettact/protocol/telemetry"
+	"github.com/nettact/server-core/store"
 )
 
 // The diagnosis subject must be frozen from the confirming round's own samples,
@@ -105,7 +106,7 @@ func TestConfirmedSignalFreezesTheDiagnosisSubject(t *testing.T) {
 	if err != nil {
 		t.Fatalf("begin: %v", err)
 	}
-	if _, err := h.svc.EvaluateAgentTx(h.ctx, tx, "agent_a", "site_default", rounds); err != nil {
+	if _, err := h.svc.EvaluateAgentTx(h.ctx, store.AdaptTx(tx, store.Standalone()), "agent_a", "site_default", rounds); err != nil {
 		_ = tx.Rollback()
 		t.Fatalf("evaluate: %v", err)
 	}

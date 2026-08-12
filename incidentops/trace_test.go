@@ -21,7 +21,7 @@ func ingestTraces(t *testing.T, svc *Service, ctx context.Context, agentID strin
 	if err != nil {
 		t.Fatalf("begin: %v", err)
 	}
-	out, err := svc.IngestTracesTx(ctx, tx, agentID, "site_default", results)
+	out, err := svc.IngestTracesTx(ctx, store.AdaptTx(tx, store.Standalone()), agentID, "site_default", results)
 	if err != nil {
 		_ = tx.Rollback()
 		t.Fatalf("ingest traces: %v", err)

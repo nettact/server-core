@@ -26,7 +26,6 @@ package fault
 
 import (
 	"context"
-	"database/sql"
 	"strings"
 	"time"
 
@@ -228,7 +227,7 @@ func builtinLayer(probeKind string) string {
 // *incidentops.Service) so this package does not import the orchestration layer.
 // Nil-safe; a returned error is advisory and never blocks the incident.
 type SnapshotWriter interface {
-	WriteIncidentBase(ctx context.Context, tx *sql.Tx, incidentID string, now time.Time) error
+	WriteIncidentBase(ctx context.Context, tx store.Executor, incidentID string, now time.Time) error
 }
 
 // IncidentScope describes the incident a delivery plan is being made for: enough
@@ -326,21 +325,21 @@ func replayLagOf(evidence, now time.Time, tolerance time.Duration) time.Duration
 // policy layer's read models. Nil-safe.
 type Planner interface {
 	// PlanOpenTx schedules the open notification for a newly-opened incident.
-	PlanOpenTx(ctx context.Context, tx *sql.Tx, sc IncidentScope, now time.Time) error
+	PlanOpenTx(ctx context.Context, tx store.Executor, sc IncidentScope, now time.Time) error
 	// EscalateTx tightens an already-planned open notification when a merged
 	// incident's severity rises (and plans one that a lower severity had skipped).
-	EscalateTx(ctx context.Context, tx *sql.Tx, sc IncidentScope, now time.Time) error
+	EscalateTx(ctx context.Context, tx store.Executor, sc IncidentScope, now time.Time) error
 	// RecomputeTx notes that an incident's severity or suspected layer changed
 	// while it stayed OPEN — a partial recovery, where one member came back and
 	// others are still firing. There is nothing to re-plan for the incident
 	// itself, but any aggregate the policy layer maintains over it has to be
 	// refreshed, or a notice still waiting out its delay would describe a state
 	// that has already passed.
-	RecomputeTx(ctx context.Context, tx *sql.Tx, incidentID string, now time.Time) error
+	RecomputeTx(ctx context.Context, tx store.Executor, incidentID string, now time.Time) error
 	// ResolveTx cancels anything still pending and, for a genuine recovery, plans
 	// the paired recovery notification for the channels that actually received the
 	// open notification.
-	ResolveTx(ctx context.Context, tx *sql.Tx, incidentID, reason string, now time.Time) error
+	ResolveTx(ctx context.Context, tx store.Executor, incidentID, reason string, now time.Time) error
 }
 
 // Service is the fault engine.
