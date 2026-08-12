@@ -161,4 +161,11 @@ type WriteTx interface {
 	// may assert on it (fail loudly rather than write to the wrong tenant);
 	// per-row enforcement is the adapter's job, not theirs.
 	Scope() Scope
+	// PrepareContext prepares a statement on the transaction for repeated
+	// execution (metrics' rewindRollups runs one prepared UPDATE per series
+	// on the hot ingest path). Prepared statements stay bound to the
+	// transaction, so a repository cannot smuggle one past the transaction's
+	// lifetime. Added for CLOUD-015; additive and trivial for the SQLite
+	// adapter.
+	PrepareContext(ctx context.Context, query string) (*sql.Stmt, error)
 }

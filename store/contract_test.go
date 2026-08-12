@@ -161,37 +161,9 @@ func TestWriteTxPostDiscardedOnFnError(t *testing.T) {
 	}
 }
 
-// TestWriteTxPostDiscardedOnCommitError covers the commit-failure arm, which
-// SQLite makes hard to trigger honestly: the shipped schema has no deferred
-// constraints, and statement-time failures surface at Exec, inside fn. The
-// test therefore sabotages the transaction by rolling the underlying *sql.Tx
-// back out from under WriteTx — Commit then fails with sql.ErrTxDone, the
-// exact shape of a driver-level COMMIT failure — and asserts post was not run
-// and the error surfaced. The constraint this does NOT simulate (a COMMIT
-// rejected by the engine after statements succeeded) shares the same code
-// path: post is only ever invoked after Commit returns nil.
-func TestWriteTxPostDiscardedOnCommitError(t *testing.T) {
-	db := storetest.Open(t)
-	ctx := context.Background()
-
-	var posts atomic.Int32
-	err := db.WriteTx(ctx, store.Standalone(), func(wtx store.WriteTx) (func(), error) {
-		raw, ok := db.SQLiteTx(wtx)
-		if !ok {
-			t.Fatal("SQLiteTx bridge failed")
-		}
-		if err := raw.Rollback(); err != nil {
-			return nil, err
-		}
-		return func() { posts.Add(1) }, nil
-	})
-	if err == nil {
-		t.Fatal("WriteTx = nil, want the commit error")
-	}
-	if posts.Load() != 0 {
-		t.Fatalf("post ran %d times after commit error, want 0", posts.Load())
-	}
-}
+// TestWriteTxPostDiscardedOnCommitError is in tx_internal_test.go (package
+// store): it sabotages the underlying *sql.Tx to force the commit-error arm,
+// which needs the unexported adapter now that the SQLiteTx bridge is gone.
 
 func TestWriteTxRejectsInvalidScope(t *testing.T) {
 	db := storetest.Open(t)
@@ -271,7 +243,47 @@ func TestWriteTxReportsScopeAndDialect(t *testing.T) {
 	}
 }
 
-func TestSQLiteTxBridge(t *testing.T) {
+// TestAdaptTxRoundTrip pins the owner-side seam: AdaptTx hands a manually
+// opened *sql.Tx to WriteTx-typed entry points, and the wrap is transparent —
+// a write through the WriteTx facade is visible to the raw transaction.
+func TestAdaptTxRoundTrip(t *testing.T) {
+	db := storetest.Open(t)
+	ctx := context.Background()
+	if _, err := db.Exec(`CREATE TABLE contract_kv(id TEXT PRIMARY KEY, v TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+
+	raw, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wtx := store.AdaptTx(raw, store.Standalone())
+	if got := wtx.Scope(); got != store.Standalone() {
+		t.Fatalf("AdaptTx Scope() = %+v", got)
+	}
+	if got := wtx.Dialect(); got != store.DialectSQLite {
+		t.Fatalf("AdaptTx Dialect() = %v", got)
+	}
+	if _, err := wtx.ExecContext(ctx, `INSERT INTO contract_kv(id, v) VALUES('k1', 'v1')`); err != nil {
+		t.Fatal(err)
+	}
+	// Same underlying transaction: the raw handle sees the facade's write.
+	var v string
+	if err := raw.QueryRowContext(ctx, `SELECT v FROM contract_kv WHERE id='k1'`).Scan(&v); err != nil {
+		t.Fatal(err)
+	}
+	if v != "v1" {
+		t.Fatalf("raw handle saw %q, want v1", v)
+	}
+	if err := raw.Commit(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestWriteTxPrepareContext pins the CLOUD-015 extension: a statement prepared
+// on the WriteTx executes against the same transaction and is callable
+// repeatedly.
+func TestWriteTxPrepareContext(t *testing.T) {
 	db := storetest.Open(t)
 	ctx := context.Background()
 	if _, err := db.Exec(`CREATE TABLE contract_kv(id TEXT PRIMARY KEY, v TEXT)`); err != nil {
@@ -279,32 +291,26 @@ func TestSQLiteTxBridge(t *testing.T) {
 	}
 
 	err := db.WriteTx(ctx, store.Standalone(), func(wtx store.WriteTx) (func(), error) {
-		raw, ok := db.SQLiteTx(wtx)
-		if !ok {
-			t.Fatal("SQLiteTx(WriteTx) = !ok")
-		}
-		// Same underlying transaction: a write through the raw handle must be
-		// visible to the WriteTx facade inside the same transaction.
-		if _, err := raw.ExecContext(ctx, `INSERT INTO contract_kv(id, v) VALUES('k1', 'v1')`); err != nil {
+		stmt, err := wtx.PrepareContext(ctx, `INSERT INTO contract_kv(id, v) VALUES(?, ?)`)
+		if err != nil {
 			return nil, err
 		}
-		var v string
-		if err := wtx.QueryRowContext(ctx, `SELECT v FROM contract_kv WHERE id='k1'`).Scan(&v); err != nil {
+		defer stmt.Close()
+		for _, kv := range [][2]string{{"k1", "v1"}, {"k2", "v2"}} {
+			if _, err := stmt.ExecContext(ctx, kv[0], kv[1]); err != nil {
+				return nil, err
+			}
+		}
+		var n int
+		if err := wtx.QueryRowContext(ctx, `SELECT COUNT(*) FROM contract_kv`).Scan(&n); err != nil {
 			return nil, err
 		}
-		if v != "v1" {
-			t.Fatalf("WriteTx facade saw %q, want v1", v)
+		if n != 2 {
+			t.Fatalf("rows=%d, want 2", n)
 		}
 		return nil, nil
 	})
 	if err != nil {
 		t.Fatal(err)
-	}
-
-	// A non-adapter WriteTx (nil today; the future PostgreSQL adapter, or a
-	// test fake) must report !ok — callers treat that as a hard error rather
-	// than guessing at a raw handle.
-	if _, ok := db.SQLiteTx(nil); ok {
-		t.Fatal("SQLiteTx(nil) = ok, want !ok for a non-sqliteTx WriteTx")
 	}
 }

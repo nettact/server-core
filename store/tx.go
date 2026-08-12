@@ -45,6 +45,10 @@ func (t *sqliteTx) Dialect() Dialect { return t.dialect }
 
 func (t *sqliteTx) Scope() Scope { return t.scope }
 
+func (t *sqliteTx) PrepareContext(ctx context.Context, query string) (*sql.Stmt, error) {
+	return t.tx.PrepareContext(ctx, query)
+}
+
 // WriteTx opens a write transaction on the single writer handle — SQLite
 // semantics preserved: the existing DSN's _txlock=immediate makes the BEGIN
 // take the write lock up front, under the busy handler, exactly as every
@@ -108,21 +112,17 @@ func (d *DB) ReadTx(ctx context.Context, s Scope, fn func(Executor) error) error
 	return fn(&sqliteTx{tx: tx, scope: s, dialect: DialectSQLite})
 }
 
-// SQLiteTx unwraps a WriteTx back to the *sql.Tx it wraps, reporting whether
-// it could. It is a MIGRATION SEAM, not part of the contract's long-term
-// surface: call sites not yet migrated (fault, gamedata, incidentops, the
-// metrics rewind, registry's TouchLastSeenTx) still take *sql.Tx and bridge
-// through here inside a WriteTx — see MIGRATION.md for the full list.
-// CLOUD-015 removes it once those packages take WriteTx directly.
+// AdaptTx wraps an already-open *sql.Tx as a WriteTx for a transaction OWNER
+// that still manages its own BeginTx/Commit/Rollback (the packages on the
+// 014B ledger) and for tests that need to hand a WriteTx-typed entry point a
+// transaction whose lifetime they control. This is the safe direction of the
+// old migration seam: *sql.Tx → WriteTx loses nothing, while the removed
+// SQLiteTx bridge went the other way and let code reach a raw handle back out
+// of a WriteTx — the scope bypass CLOUD-015 deleted. Owners should prefer
+// DB.WriteTx and are migrated onto it as their 014B slices land.
 //
-// ok is false for any WriteTx that is not this SQLite adapter (the future
-// PostgreSQL one, a test fake), and callers must treat that as a hard error:
-// guessing at a raw handle would silently run SQLite-flavoured SQL against a
-// tenant transaction.
-func (d *DB) SQLiteTx(wtx WriteTx) (*sql.Tx, bool) {
-	t, ok := wtx.(*sqliteTx)
-	if !ok {
-		return nil, false
-	}
-	return t.tx, true
+// scope must be the scope the owner opened the transaction under; domain code
+// downstream asserts on it.
+func AdaptTx(tx *sql.Tx, s Scope) WriteTx {
+	return &sqliteTx{tx: tx, scope: s, dialect: DialectSQLite}
 }
