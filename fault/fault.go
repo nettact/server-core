@@ -449,10 +449,10 @@ type Signal struct {
 	// signal carries. Nil when no such sample backed the confirmation, and never
 	// set by a latency degradation.
 	SizeSweep *SizeSweepFacts `json:"size_sweep,omitempty"`
-	// FlowFanout is the confirming round's probe.tcp.flow_fanout classification,
-	// frozen when an availability fault opened with member-level flow loss
-	// (FlowFanout.Code == 2). It is the evidence for the ECMP/LAG member-level
-	// claim the signal carries. Nil when the fault opened without it.
+	// FlowFanout is the confirming round's TCP/HTTP flow_fanout classification,
+	// frozen when an availability fault opened with a stable bad subset (code 2).
+	// TCP facts can support ECMP/LAG attribution; HTTP facts remain service-layer
+	// inconsistency evidence because status/content routing can also explain them.
 	FlowFanout *FlowFanoutFacts `json:"flow_fanout,omitempty"`
 
 	ObservedAt        time.Time  `json:"observed_at"`

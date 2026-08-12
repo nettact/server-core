@@ -48,6 +48,38 @@ func TestValidateTargetRejectsProxiedFanout(t *testing.T) {
 	if err := validateTarget(&tgt); err != nil {
 		t.Fatalf("proxied single-flow rejected: %v", err)
 	}
+
+	httpTarget := config.ProbeTarget{Kind: "http", Name: "web", Target: "https://example.com", ProxyID: "prx_socks", Enabled: true}
+	httpTarget.Params.FlowFanout = 8
+	if err := validateTarget(&httpTarget); err == nil || !strings.Contains(err.Error(), "flow_fanout requires a direct target") {
+		t.Fatalf("proxied HTTP fan-out = %v, want direct-target rejection", err)
+	}
+}
+
+func TestValidateHTTPFanoutRequiresSafeMethod(t *testing.T) {
+	for _, method := range []string{"", "GET", "HEAD"} {
+		tgt := config.ProbeTarget{Kind: "http", Name: "web", Target: "https://example.com", Enabled: true}
+		tgt.Params.Method = method
+		tgt.Params.FlowFanout = 32
+		tgt.Params.MaxRedirects = -1
+		if err := validateTarget(&tgt); err != nil {
+			t.Errorf("method %q rejected: %v", method, err)
+		}
+	}
+	for _, method := range []string{"POST", "PUT", "PATCH", "DELETE"} {
+		tgt := config.ProbeTarget{Kind: "http", Name: "web", Target: "https://example.com", Enabled: true}
+		tgt.Params.Method = method
+		tgt.Params.FlowFanout = 4
+		tgt.Params.MaxRedirects = -1
+		if err := validateTarget(&tgt); err == nil || !strings.Contains(err.Error(), "requires GET or HEAD") {
+			t.Errorf("method %q fan-out = %v, want safe-method rejection", method, err)
+		}
+	}
+	tgt := config.ProbeTarget{Kind: "http", Name: "web", Target: "https://example.com", Enabled: true}
+	tgt.Params.FlowFanout = 4
+	if err := validateTarget(&tgt); err == nil || !strings.Contains(err.Error(), "max_redirects=-1") {
+		t.Fatalf("redirect-following HTTP fan-out = %v, want fixed-destination rejection", err)
+	}
 }
 
 func TestValidateBareHost(t *testing.T) {
@@ -152,6 +184,8 @@ func TestValidateProbeParams(t *testing.T) {
 		{name: "tcp fanout at bound", kind: "tcp", params: pcfg.ProbeParams{FlowFanout: 32}},
 		{name: "tcp fanout too high", kind: "tcp", params: pcfg.ProbeParams{FlowFanout: 33}, wantErr: "flow_fanout out of range (0-32)"},
 		{name: "tcp fanout negative", kind: "tcp", params: pcfg.ProbeParams{FlowFanout: -1}, wantErr: "flow_fanout out of range (0-32)"},
+		{name: "http fanout ok", kind: "http", params: pcfg.ProbeParams{FlowFanout: 32, MaxRedirects: -1}},
+		{name: "http fanout too high", kind: "http", params: pcfg.ProbeParams{FlowFanout: 33, MaxRedirects: -1}, wantErr: "flow_fanout out of range (0-32)"},
 
 		// DNS record type + resolver endpoint.
 		{name: "dns default record", kind: "dns"},

@@ -999,6 +999,20 @@ func TestAttributionFactClues(t *testing.T) {
 	}
 }
 
+func TestHTTPFlowFanoutDoesNotClaimECMPMember(t *testing.T) {
+	h := newHarness(t)
+	h.seedIncident("inc_http")
+	h.seedFiringSignal("inc_http", "t_http", "Web", "https://example.com", "http", telemetry.ProbeReasonHTTPStatus, noProxy())
+	h.exec(`UPDATE fault_signals SET flow_fanout_json=? WHERE id='t_http_sig'`,
+		`{"code":2,"flows":4,"bad_stable":1,"bad_new":0,"ok":3}`)
+	_, clues := attributionFor(t, h.db, "inc_http", nil)
+	for _, clue := range clues {
+		if clue.Kind == notification.ClueEcmpMember {
+			t.Fatalf("HTTP service inconsistency produced ECMP attribution: %+v", clue)
+		}
+	}
+}
+
 // TestAttributionSkipsNonFingerprintFacts: only the fingerprint codes produce a
 // clue. A flat sweep (code 0) and a uniform fan-out (code 1) are the congestion
 // signatures that argue AGAINST those claims, so they must stay out.
@@ -1019,4 +1033,3 @@ func TestAttributionSkipsNonFingerprintFacts(t *testing.T) {
 		}
 	}
 }
-

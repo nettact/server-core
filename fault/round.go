@@ -287,19 +287,19 @@ const (
 // labels on the sample (telemetry.SizeSmallLabel … CountLargeLabel) and are
 // frozen here so a signal can render the evidence without re-deriving it.
 type SizeSweepFacts struct {
-	Code        int     `json:"code"`
-	SizeSmall   int     `json:"size_small"`
-	SizeLarge   int     `json:"size_large"`
-	LossSmall   float64 `json:"loss_small"`
-	LossLarge   float64 `json:"loss_large"`
-	CountSmall  int     `json:"count_small"`
-	CountLarge  int     `json:"count_large"`
+	Code       int     `json:"code"`
+	SizeSmall  int     `json:"size_small"`
+	SizeLarge  int     `json:"size_large"`
+	LossSmall  float64 `json:"loss_small"`
+	LossLarge  float64 `json:"loss_large"`
+	CountSmall int     `json:"count_small"`
+	CountLarge int     `json:"count_large"`
 }
 
 // FlowFanoutFacts is the per-cycle classification and supporting evidence of a
-// probe.tcp.flow_fanout sample: do a deterministic subset of pinned source-port
-// flows fail (ECMP/LAG member-level fault) or is loss uniform. Code semantics:
-// 0 single flow, 1 uniform, 2 member-level, 3 all flows failed, 4 insufficient.
+// TCP or HTTP source-port fan-out sample. Code 2 means a repeatable bad subset:
+// TCP can use that as ECMP/LAG evidence, while HTTP keeps it as service-branch
+// inconsistency because status/content routing can also explain the result.
 // The flow counts ride as labels (telemetry.FlowFanoutFlowsLabel … OKLabel) and
 // are frozen here so a signal can render the evidence without re-deriving it.
 type FlowFanoutFacts struct {
@@ -367,10 +367,9 @@ type Round struct {
 	// as the physical-layer evidence. These are dedicated round facts, NOT baseline
 	// kinds — they are never folded into Latencies or judged by a detector.
 	SizeSweep *SizeSweepFacts
-	// FlowFanout is the round's probe.tcp.flow_fanout classification, set when the
-	// round carried one. An availability fault that confirms on this round freezes
-	// it as the ECMP/LAG member-level evidence. A dedicated round fact, not a
-	// baseline kind.
+	// FlowFanout is the round's TCP/HTTP flow_fanout classification. Availability
+	// freezes code 2 as evidence; attribution promotes it to an ECMP/LAG clue only
+	// for TCP. This is a dedicated round fact, not a baseline kind.
 	FlowFanout *FlowFanoutFacts
 }
 
@@ -606,7 +605,7 @@ func BuildRounds(ms []telemetry.Metric, meta map[string]TargetMeta) []Round {
 		// judge the same round.
 		latencies map[string]float64
 		// sizeSweep and flowFanout are this cycle's dedicated classification samples
-		// (probe.icmp.size_sweep / probe.tcp.flow_fanout). They are NOT baseline kinds
+		// (probe.icmp.size_sweep / probe.{tcp,http}.flow_fanout). They are NOT baseline kinds
 		// — never folded into latencies — they are frozen as round evidence only.
 		sizeSweep  *SizeSweepFacts
 		flowFanout *FlowFanoutFacts
@@ -632,7 +631,8 @@ func BuildRounds(ms []telemetry.Metric, meta map[string]TargetMeta) []Round {
 		isQuality := baselineKinds[kind]
 		isSent := kind == string(telemetry.ICMPSent) && (tm.Kind == "icmp" || tm.Kind == "gateway")
 		isSizeSweep := kind == string(telemetry.ICMPSizeSweep) && (tm.Kind == "icmp" || tm.Kind == "gateway")
-		isFlowFanout := kind == string(telemetry.TCPFlowFanout) && tm.Kind == "tcp"
+		isFlowFanout := (kind == string(telemetry.TCPFlowFanout) && tm.Kind == "tcp") ||
+			(kind == string(telemetry.HTTPFlowFanout) && tm.Kind == "http")
 		if !isPrimary && !isReason && !isQuality && !isSent && !isSizeSweep && !isFlowFanout {
 			continue
 		}
@@ -729,17 +729,17 @@ func BuildRounds(ms []telemetry.Metric, meta map[string]TargetMeta) []Round {
 // zero value — the sample still carries Code, which is what the hooks branch on.
 func sizeSweepFactsFrom(m *telemetry.Metric) *SizeSweepFacts {
 	return &SizeSweepFacts{
-		Code:        int(m.Value),
-		SizeSmall:   atoiLabel(m, telemetry.SizeSmallLabel),
-		SizeLarge:   atoiLabel(m, telemetry.SizeLargeLabel),
-		LossSmall:   parseFloatLabel(m, telemetry.LossSmallLabel),
-		LossLarge:   parseFloatLabel(m, telemetry.LossLargeLabel),
-		CountSmall:  atoiLabel(m, telemetry.CountSmallLabel),
-		CountLarge:  atoiLabel(m, telemetry.CountLargeLabel),
+		Code:       int(m.Value),
+		SizeSmall:  atoiLabel(m, telemetry.SizeSmallLabel),
+		SizeLarge:  atoiLabel(m, telemetry.SizeLargeLabel),
+		LossSmall:  parseFloatLabel(m, telemetry.LossSmallLabel),
+		LossLarge:  parseFloatLabel(m, telemetry.LossLargeLabel),
+		CountSmall: atoiLabel(m, telemetry.CountSmallLabel),
+		CountLarge: atoiLabel(m, telemetry.CountLargeLabel),
 	}
 }
 
-// flowFanoutFactsFrom reads one probe.tcp.flow_fanout sample's classification
+// flowFanoutFactsFrom reads one TCP/HTTP flow_fanout sample's classification
 // code (Metric.Value) and its flow-count labels. Same leniency as
 // sizeSweepFactsFrom.
 func flowFanoutFactsFrom(m *telemetry.Metric) *FlowFanoutFacts {

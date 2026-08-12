@@ -354,8 +354,8 @@ func traceForTarget(traces []traceFact, subject, targetID string) *traceFact {
 
 // factClues turns a member's frozen classification facts into evidence clues
 // (DEGRADE-001/002): a size-correlated loss signal (SizeSweep.Code == 1) argues
-// physical-layer degradation, a member-level flow signal (FlowFanout.Code == 2)
-// argues an ECMP/LAG member fault. Produced once from the incident's own members
+// physical-layer degradation; a TCP member-level flow signal (code 2) argues an
+// ECMP/LAG member fault. Produced once from the incident's own members
 // and appended to EVERY rule's clue list, so the facts ship as evidence even
 // when the rule that concluded the attribution does not rest on them — and the
 // console can render them whether or not the conclusion named the cause.
@@ -371,7 +371,10 @@ func factClues(members []memberFact) []notification.AttributionClue {
 				LossLarge: m.sizeSweep.LossLarge,
 			})
 		}
-		if m.flowFanout != nil && m.flowFanout.Code == 2 {
+		// HTTP fan-out code 2 is useful service-layer evidence (a repeatable
+		// source-port branch differs), but it does not prove an ECMP/LAG member
+		// fault: status/content differences may come from application routing.
+		if m.probeKind == "tcp" && m.flowFanout != nil && m.flowFanout.Code == 2 {
 			out = append(out, notification.AttributionClue{
 				Kind:      notification.ClueEcmpMember,
 				Flows:     m.flowFanout.Flows,

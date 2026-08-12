@@ -3,6 +3,7 @@ package api
 import (
 	"errors"
 	"net"
+	"net/http"
 	"net/netip"
 	"net/url"
 	"strconv"
@@ -132,7 +133,7 @@ const (
 	// minimum meaningful comparison; beyond eight the round-robin sample per size
 	// thins out below statistical usefulness.
 	maxSweepSizes = 8
-	// maxFlowFanout bounds the TCP source-port fan-out count. Each pinned port is
+	// maxFlowFanout bounds the TCP/HTTP source-port fan-out count. Each pinned port is
 	// a separate connect, so an unbounded fan-out would let one target monopolize
 	// the agent's probe budget; 32 is already an aggressive ECMP spread.
 	maxFlowFanout = 32
@@ -234,6 +235,15 @@ func validateProbeParams(kind string, p *pcfg.ProbeParams) error {
 		p.Method = strings.ToUpper(strings.TrimSpace(p.Method))
 		if !validHTTPMethods[p.Method] {
 			return errors.New("invalid http method: " + p.Method)
+		}
+		if p.FlowFanout < 0 || p.FlowFanout > maxFlowFanout {
+			return errors.New("flow_fanout out of range (0-" + strconv.Itoa(maxFlowFanout) + ")")
+		}
+		if p.FlowFanout >= 2 && p.Method != "" && p.Method != http.MethodGet && p.Method != http.MethodHead {
+			return errors.New("flow_fanout requires GET or HEAD because every branch repeats the HTTP request")
+		}
+		if p.FlowFanout >= 2 && p.MaxRedirects >= 0 {
+			return errors.New("flow_fanout requires max_redirects=-1 so every branch keeps the same destination")
 		}
 		if utf8.RuneCountInString(p.Keyword) > maxKeywordLen {
 			return errors.New("keyword too long (max " + strconv.Itoa(maxKeywordLen) + " characters)")

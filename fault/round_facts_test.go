@@ -10,7 +10,7 @@ import (
 )
 
 // Round-facts tests for DEGRADE-001/002. A size sweep (probe.icmp.size_sweep) and
-// a TCP flow fan-out (probe.tcp.flow_fanout) are dedicated classification samples:
+// TCP/HTTP flow fan-out metrics are dedicated classification samples:
 // BuildRounds must parse them onto the round so the detectors can freeze them as
 // evidence, but never fold them into the judged latencies. The two hooks then
 // freeze the facts onto exactly the signals whose claim they support — and no
@@ -41,7 +41,7 @@ func flowFanout(ts int64, code, flows, badStable, badNew, ok int) telemetry.Metr
 		TS: time.Unix(ts, 0).UTC(), Kind: telemetry.TCPFlowFanout, Target: "1.2.3.4:443",
 		Value: float64(code), Unit: telemetry.UnitCode, MonitorID: "t_tcp", ConfigSerial: 1,
 		Labels: map[string]string{
-			telemetry.FlowFanoutFlowsLabel:    strconv.Itoa(flows),
+			telemetry.FlowFanoutFlowsLabel:     strconv.Itoa(flows),
 			telemetry.FlowFanoutBadStableLabel: strconv.Itoa(badStable),
 			telemetry.FlowFanoutBadNewLabel:    strconv.Itoa(badNew),
 			telemetry.FlowFanoutOKLabel:        strconv.Itoa(ok),
@@ -65,6 +65,13 @@ func tcpOK(ts int64, ok bool) telemetry.Metric {
 func tcpMeta(det DetectionSettings) map[string]TargetMeta {
 	return map[string]TargetMeta{
 		"t_tcp": {ID: "t_tcp", Kind: "tcp", GroupID: "mg", Name: "Svc", Addr: "1.2.3.4:443",
+			Enabled: true, ConfigSerial: 1, Det: det.Normalize(), MaxRoundGap: degGap},
+	}
+}
+
+func httpMeta(det DetectionSettings) map[string]TargetMeta {
+	return map[string]TargetMeta{
+		"t_http": {ID: "t_http", Kind: "http", GroupID: "mg", Name: "Web", Addr: "https://example.com",
 			Enabled: true, ConfigSerial: 1, Det: det.Normalize(), MaxRoundGap: degGap},
 	}
 }
@@ -138,6 +145,20 @@ func TestBuildRoundsParsesFlowFanoutFacts(t *testing.T) {
 	}
 	if _, ok := rounds[0].Latencies[string(telemetry.TCPFlowFanout)]; ok {
 		t.Fatal("flow_fanout folded into latencies")
+	}
+}
+
+func TestBuildRoundsParsesHTTPFlowFanoutFacts(t *testing.T) {
+	ts := time.Now().Unix()
+	ff := flowFanout(ts, 2, 4, 1, 0, 3)
+	ff.Kind = telemetry.HTTPFlowFanout
+	ff.Target = "https://example.com"
+	ff.MonitorID = "t_http"
+	ok := telemetry.Metric{TS: time.Unix(ts, 0).UTC(), Kind: telemetry.HTTPOK, Target: ff.Target,
+		Value: 0, Unit: telemetry.UnitBool, MonitorID: "t_http", ConfigSerial: 1}
+	rounds := BuildRounds([]telemetry.Metric{ok, ff}, httpMeta(smartDet()))
+	if len(rounds) != 1 || rounds[0].FlowFanout == nil || rounds[0].FlowFanout.Code != 2 {
+		t.Fatalf("HTTP flow fan-out facts not parsed: %+v", rounds)
 	}
 }
 
