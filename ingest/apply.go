@@ -25,7 +25,6 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"fmt"
 	"log"
 	"math"
 	"sync"
@@ -195,21 +194,24 @@ func (s *Service) Prepare(ctx context.Context, p AgentPrincipal, pkt telemetry.P
 	if err := protocol.ValidateSchema(pkt.SchemaVersion); err != nil {
 		return in, err
 	}
-	// Non-finite metric values are rejected before anything consumes them: the
-	// protobuf double can carry NaN/Inf, JSON cannot encode them, and hashing
-	// them would collapse every non-finite payload into one digest (a false
-	// duplicate). They are corrupt telemetry, not a value to store.
-	if err := rejectNonFinite(pkt.Metrics); err != nil {
-		return in, err
-	}
 	in.principal = p
-	// Snapshot the packet BEFORE the fingerprint and the filter: the transaction
+	// Snapshot the packet BEFORE the fingerprint and the filters: the transaction
 	// commits this copy, so a caller that reuses or mutates its decoded object
 	// after Prepare cannot make the committed payload diverge from the
-	// fingerprint. The fingerprint is computed on the PRISTINE snapshot, before
-	// the timestamp filter mutates its Metrics — the same WAL batch re-served
-	// after a clock correction must hash identically to its admission.
+	// fingerprint.
 	pkt = snapshotPacket(pkt)
+	// Non-finite metric values are DROPPED, not rejected: the protobuf double
+	// can carry NaN/Inf, JSON cannot encode them, and hashing them would
+	// collapse every non-finite payload into one digest (a false duplicate).
+	// Rejecting the whole packet would be worse — the FIFO WAL re-serves an
+	// un-acked in-flight sequence after every reconnect, so one bad sample
+	// would block the agent's entire telemetry stream forever. Dropping the
+	// corrupt sample and admitting the rest keeps that from happening; the
+	// fingerprint is computed on the surviving (finite) metrics, so a replay of
+	// the same batch hashes identically.
+	if n := dropNonFinite(&pkt.Metrics); n > 0 {
+		log.Printf("ingest: dropped %d non-finite samples from agent %s (corrupt telemetry)", n, p.AgentID)
+	}
 	in.now = time.Now().UTC()
 	in.fingerprint = PacketFingerprint(pkt)
 
@@ -763,13 +765,23 @@ func cloneStrMap(m map[string]string) map[string]string {
 	return out
 }
 
-// rejectNonFinite fails closed on a non-finite metric value. NaN/Inf is
-// corrupt telemetry that must not be stored or fingerprinted.
-func rejectNonFinite(ms []telemetry.Metric) error {
-	for _, m := range ms {
-		if math.IsNaN(m.Value) || math.IsInf(m.Value, 0) {
-			return fmt.Errorf("ingest: non-finite %s value %v for target %q", m.Kind, m.Value, m.Target)
-		}
+// dropNonFinite removes NaN/Inf metric values in place and reports how many
+// were dropped. Non-finite values are corrupt protobuf telemetry (JSON cannot
+// encode them, so they can never be fingerprinted or stored); dropping them
+// admits the rest of the packet rather than re-serving the whole batch forever.
+func dropNonFinite(ms *[]telemetry.Metric) int {
+	if ms == nil || len(*ms) == 0 {
+		return 0
 	}
-	return nil
+	kept := (*ms)[:0]
+	dropped := 0
+	for _, m := range *ms {
+		if math.IsNaN(m.Value) || math.IsInf(m.Value, 0) {
+			dropped++
+			continue
+		}
+		kept = append(kept, m)
+	}
+	*ms = kept
+	return dropped
 }

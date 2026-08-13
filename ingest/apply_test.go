@@ -884,19 +884,27 @@ func TestPrepareSnapshotsPacket(t *testing.T) {
 	}
 }
 
-// TestPrepareRejectsNonFinite pins the P2 review fix: a non-finite metric
-// value is corrupt telemetry and is refused before it can reach the fingerprint
-// (where JSON cannot encode it and every non-finite payload would collide) or
-// the data plane.
-func TestPrepareRejectsNonFinite(t *testing.T) {
+// TestPrepareDropsNonFinite pins the non-finite fix: a NaN/Inf sample is
+// dropped (admitting the rest of the packet) rather than rejected, so one
+// corrupt sample can never block the whole WAL behind an un-acked sequence;
+// and the surviving finite metrics are what the fingerprint hashes.
+func TestPrepareDropsNonFinite(t *testing.T) {
 	h := newCharHarness(t, nil)
 	svc := New(h.db, h.bus, h.m, nil, nil, nil)
 
 	for _, v := range []float64{math.NaN(), math.Inf(1), math.Inf(-1)} {
 		pkt := charPacket(1, icmpRounds(1, 0, 30))
 		pkt.Metrics[0].Value = v
-		if _, err := svc.Prepare(h.ctx, applyPrincipal(), pkt); err == nil {
-			t.Fatalf("prepare with value %v succeeded, want a non-finite rejection", v)
+		in, err := svc.Prepare(h.ctx, applyPrincipal(), pkt)
+		if err != nil {
+			t.Fatalf("prepare with value %v: %v", v, err)
+		}
+		defer in.ReleasePending()
+		if len(in.metrics) != len(pkt.Metrics)-1 {
+			t.Fatalf("value %v: %d metrics after prepare, want %d (one dropped)", v, len(in.metrics), len(pkt.Metrics)-1)
+		}
+		if in.fingerprint != PacketFingerprint(in.pkt) {
+			t.Fatal("fingerprint does not describe the surviving (finite) metrics")
 		}
 	}
 }
