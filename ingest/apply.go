@@ -25,7 +25,9 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"log"
+	"math"
 	"sync"
 	"time"
 
@@ -145,6 +147,11 @@ type commitState struct {
 // discarded wholesale on rollback, which is what keeps a rolled-back batch
 // from publishing, caching or appending anything.
 type PostCommitPlan struct {
+	// new is the admission verdict the plan was built for. It is set by
+	// ApplyPacketTx and consumed by Commit, so a caller cannot pair a
+	// duplicate verdict with a fresh plan and silently skip the data plane —
+	// the plan is self-describing.
+	new bool
 	// commit is the plan's single-use state: the guard and the remembered
 	// outcome live in ONE shared object, so a copy of the plan reports the
 	// same result as the original — committing either copy runs the side
@@ -188,13 +195,22 @@ func (s *Service) Prepare(ctx context.Context, p AgentPrincipal, pkt telemetry.P
 	if err := protocol.ValidateSchema(pkt.SchemaVersion); err != nil {
 		return in, err
 	}
+	// Non-finite metric values are rejected before anything consumes them: the
+	// protobuf double can carry NaN/Inf, JSON cannot encode them, and hashing
+	// them would collapse every non-finite payload into one digest (a false
+	// duplicate). They are corrupt telemetry, not a value to store.
+	if err := rejectNonFinite(pkt.Metrics); err != nil {
+		return in, err
+	}
 	in.principal = p
-	in.pkt = pkt
+	// Snapshot the packet BEFORE the fingerprint and the filter: the transaction
+	// commits this copy, so a caller that reuses or mutates its decoded object
+	// after Prepare cannot make the committed payload diverge from the
+	// fingerprint. The fingerprint is computed on the PRISTINE snapshot, before
+	// the timestamp filter mutates its Metrics — the same WAL batch re-served
+	// after a clock correction must hash identically to its admission.
+	pkt = snapshotPacket(pkt)
 	in.now = time.Now().UTC()
-	// The semantic fingerprint is computed on the PRISTINE packet, before the
-	// timestamp filter below mutates it: the same WAL batch re-served after a
-	// clock correction must hash identically to its admission, or the filter's
-	// per-serve view of "future/ancient" would fabricate conflicts.
 	in.fingerprint = PacketFingerprint(pkt)
 
 	// Timestamp policy, enforced before ANYTHING sees the metrics. The data
@@ -215,6 +231,7 @@ func (s *Service) Prepare(ctx context.Context, p AgentPrincipal, pkt telemetry.P
 		}
 	}
 	in.metrics = pkt.Metrics
+	in.pkt = pkt
 
 	// Provenance gate (pre-tx, read pool): a probe sample is accepted only if its
 	// monitor still belongs to this site AND is still in this agent's scope AND its
@@ -457,6 +474,7 @@ func (s *Service) ApplyPacketTx(ctx context.Context, scope store.Scope, wtx stor
 		res.Duplicate = true
 	}
 	res.New = isNew
+	plan.new = isNew
 
 	if isNew {
 		// Authoritative in-tx re-check: config edits serialize on the single write
@@ -607,21 +625,21 @@ func (s *Service) ApplyPacketTx(ctx context.Context, scope store.Scope, wtx stor
 // keeps the byte-identical log line the old path had. The returned error is
 // the programmatic form of the same gap — a Cloud caller that runs its own
 // executor equivalent can surface it the same way.
-func (s *Service) Commit(ctx context.Context, res ApplyResult, plan *PostCommitPlan) error {
+func (s *Service) Commit(ctx context.Context, plan *PostCommitPlan) error {
 	if plan.commit == nil {
 		plan.commit = &commitState{}
 	}
 	plan.commit.once.Do(func() {
-		plan.commit.err = s.commitOnce(ctx, res, plan)
+		plan.commit.err = s.commitOnce(ctx, plan)
 	})
 	return plan.commit.err
 }
 
-func (s *Service) commitOnce(ctx context.Context, res ApplyResult, plan *PostCommitPlan) error {
+func (s *Service) commitOnce(ctx context.Context, plan *PostCommitPlan) error {
 	if plan.touchPost != nil {
 		plan.touchPost()
 	}
-	if !res.New {
+	if !plan.new {
 		return nil
 	}
 	var appendErr error
@@ -685,4 +703,73 @@ func (s *Service) commitOnce(ctx context.Context, res ApplyResult, plan *PostCom
 		}
 	}
 	return appendErr
+}
+
+// snapshotPacket deep-copies a packet so the transaction commits an immutable
+// copy: Prepare is the boundary at which the caller's decoded object stops
+// being observed. The fingerprint-relevant fields (metrics, events, inventory)
+// are copied through their nested maps; the remaining payload slices (latest-
+// wins interface/game/trace/scene records, which the fingerprint deliberately
+// excludes) get a top-level slice copy so a concurrent append cannot panic the
+// transaction, though a caller racing a mutation of their contents owns that
+// race exactly as it would with any other shared slice.
+func snapshotPacket(pkt telemetry.Packet) telemetry.Packet {
+	pkt.Metrics = snapshotMetrics(pkt.Metrics)
+	pkt.Events = snapshotEvents(pkt.Events)
+	pkt.InventoryDelta = append(pkt.InventoryDelta[:0:0], pkt.InventoryDelta...)
+	pkt.InterfaceSnapshots = append(pkt.InterfaceSnapshots[:0:0], pkt.InterfaceSnapshots...)
+	pkt.GameRuns = append(pkt.GameRuns[:0:0], pkt.GameRuns...)
+	pkt.GameBuckets = append(pkt.GameBuckets[:0:0], pkt.GameBuckets...)
+	pkt.GameGaps = append(pkt.GameGaps[:0:0], pkt.GameGaps...)
+	pkt.GameHostSeconds = append(pkt.GameHostSeconds[:0:0], pkt.GameHostSeconds...)
+	pkt.TraceResults = append(pkt.TraceResults[:0:0], pkt.TraceResults...)
+	pkt.SceneReports = append(pkt.SceneReports[:0:0], pkt.SceneReports...)
+	return pkt
+}
+
+func snapshotMetrics(ms []telemetry.Metric) []telemetry.Metric {
+	if ms == nil {
+		return nil
+	}
+	out := make([]telemetry.Metric, len(ms))
+	copy(out, ms)
+	for i := range out {
+		if out[i].Labels != nil {
+			out[i].Labels = cloneStrMap(out[i].Labels)
+		}
+	}
+	return out
+}
+
+func snapshotEvents(es []telemetry.Event) []telemetry.Event {
+	if es == nil {
+		return nil
+	}
+	out := make([]telemetry.Event, len(es))
+	copy(out, es)
+	for i := range out {
+		if out[i].Attrs != nil {
+			out[i].Attrs = cloneStrMap(out[i].Attrs)
+		}
+	}
+	return out
+}
+
+func cloneStrMap(m map[string]string) map[string]string {
+	out := make(map[string]string, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
+}
+
+// rejectNonFinite fails closed on a non-finite metric value. NaN/Inf is
+// corrupt telemetry that must not be stored or fingerprinted.
+func rejectNonFinite(ms []telemetry.Metric) error {
+	for _, m := range ms {
+		if math.IsNaN(m.Value) || math.IsInf(m.Value, 0) {
+			return fmt.Errorf("ingest: non-finite %s value %v for target %q", m.Kind, m.Value, m.Target)
+		}
+	}
+	return nil
 }

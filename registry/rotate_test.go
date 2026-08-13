@@ -558,3 +558,44 @@ func TestPhase2CompletesAfterWindowExpiry(t *testing.T) {
 		t.Errorf("old token after phase 2 = %v, want ErrAuth", err)
 	}
 }
+
+// TestRotationPurgesOldEpochReceipts pins the P2 review fix: completing a
+// rotation drops the previous epoch's receipt rows, so packet_receipts stays
+// bounded to one epoch per agent instead of accumulating forever across
+// credential generations.
+func TestRotationPurgesOldEpochReceipts(t *testing.T) {
+	db := storetest.Open(t)
+	ctx := context.Background()
+	mustExec(t, db, `INSERT INTO sites(id,name,created_at) VALUES('site_default','def',?)`, time.Now().UTC())
+	reg := New(db, 0, nil)
+
+	priv, token, agentID := enrollTestAgent(t, reg, "site_default")
+	ch := reg.IssueRotationChallenge(agentID, 1, "sequence_conflict")
+	newEpoch, newToken, err := reg.RotateEpoch(ctx, agentID, wire.EpochRotationRequest{
+		Challenge: ch.Challenge,
+		OldEpoch:  1,
+		Signature: ed25519.Sign(priv, []byte(ch.Challenge)),
+	})
+	if err != nil {
+		t.Fatalf("RotateEpoch: %v", err)
+	}
+	// A receipt the OLD epoch left behind, still sitting in the ledger.
+	mustExec(t, db, `INSERT INTO packet_receipts(agent_id, enrollment_epoch, sequence, fingerprint, received_at) VALUES(?,1,1,'fp',?)`, agentID, time.Now().UTC().Unix())
+
+	// Phase 2 completes the switch and must drop the old epoch's rows.
+	if _, err := reg.AuthenticateAgent(ctx, newToken); err != nil {
+		t.Fatalf("phase-2 auth: %v", err)
+	}
+	var n int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM packet_receipts WHERE agent_id=? AND enrollment_epoch<?`, agentID, newEpoch).Scan(&n); err != nil {
+		t.Fatalf("count receipts: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("%d old-epoch receipts survived the rotation, want 0", n)
+	}
+	// The old token is now dead, proving the receipt was the old epoch's only
+	// trail and the ledger no longer references it.
+	if _, err := reg.AuthenticateAgent(ctx, token); !errors.Is(err, ErrAuth) {
+		t.Errorf("old token after rotation = %v, want ErrAuth", err)
+	}
+}

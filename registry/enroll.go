@@ -425,6 +425,13 @@ func (s *Service) reenrollAgent(ctx context.Context, tx *sql.Tx, agentID string,
 		agentID); err != nil {
 		return "", 0, "", 0, err
 	}
+	// The reinstalled lineage's receipts are dead: every (agent, epoch,
+	// sequence) slot from before this generation is unreachable, so dropping
+	// them bounds the ledger to one epoch per agent.
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM packet_receipts WHERE agent_id=?`, agentID); err != nil {
+		return "", 0, "", 0, err
+	}
 	// The new generation this reinstall just minted, for the EnrollResponse (the
 	// agent persists it with the new credential and presents it in every Hello).
 	if err := tx.QueryRowContext(ctx,

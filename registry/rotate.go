@@ -239,6 +239,15 @@ func (s *Service) completeRotation(ctx context.Context, agentID, siteID string, 
 		if n == 0 {
 			return nil, ErrAuth
 		}
+		// The old epoch's receipts are dead with the switch: the ledger keys on
+		// (agent, epoch, sequence) and a new epoch can never replay an old slot,
+		// so dropping them bounds the table to one epoch's worth of rows per
+		// agent instead of letting it accumulate forever across rotations.
+		if _, err := wtx.ExecContext(ctx,
+			`DELETE FROM packet_receipts WHERE agent_id=? AND enrollment_epoch<?`,
+			agentID, nextEpoch); err != nil {
+			return nil, err
+		}
 		return nil, nil
 	})
 	if err != nil {

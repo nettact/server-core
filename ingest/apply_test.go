@@ -13,6 +13,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"math"
 	"strings"
 	"sync"
 	"testing"
@@ -51,7 +52,7 @@ func applyDirect(t *testing.T, h *charHarness, svc *Service, p AgentPrincipal, p
 	if err != nil {
 		return res, plan, err
 	}
-	return res, plan, svc.Commit(h.ctx, res, &plan)
+	return res, plan, svc.Commit(h.ctx, &plan)
 }
 
 // applyDirectErr is applyDirect without t.Fatal — safe inside goroutines.
@@ -558,7 +559,7 @@ func TestApplyPacketTxGenerationRecheck(t *testing.T) {
 	if len(plan.AcceptedTx) != 0 || len(plan.StoredTx) != 0 {
 		t.Fatalf("post-re-check set is non-empty: accepted=%d stored=%d", len(plan.AcceptedTx), len(plan.StoredTx))
 	}
-	if err := svc.Commit(h.ctx, res, &plan); err != nil {
+	if err := svc.Commit(h.ctx, &plan); err != nil {
 		t.Fatalf("commit: %v", err)
 	}
 	var detectors int
@@ -682,11 +683,11 @@ func TestCommitPostCommitExecutorContract(t *testing.T) {
 		h := newCharHarness(t, nil)
 		svc := New(h.db, h.bus, h.m, nil, nil, nil)
 		pkt := charPacket(2, icmpRounds(1, 0, 30))
-		res, plan, err := commitVia(t, h, svc, pkt)
+		_, plan, err := commitVia(t, h, svc, pkt)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := svc.Commit(h.ctx, res, &plan); err != nil {
+		if err := svc.Commit(h.ctx, &plan); err != nil {
 			t.Fatalf("commit: %v", err)
 		}
 		ids, err := h.m.ResolveSeriesIDs(h.ctx, "site_default", "agent_a", "t_icmp", string(telemetry.ICMPRTTms), "192.168.1.1")
@@ -703,11 +704,11 @@ func TestCommitPostCommitExecutorContract(t *testing.T) {
 		h := newCharHarness(t, droppingSeriesStore{SeriesStore: real})
 		svc := New(h.db, h.bus, h.m, nil, nil, nil)
 		pkt := charPacket(2, icmpRounds(1, 0, 30))
-		res, plan, err := commitVia(t, h, svc, pkt)
+		_, plan, err := commitVia(t, h, svc, pkt)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := svc.Commit(h.ctx, res, &plan); err != nil {
+		if err := svc.Commit(h.ctx, &plan); err != nil {
 			t.Fatalf("commit with permanent drops = %v, want nil", err)
 		}
 	})
@@ -720,11 +721,11 @@ func TestCommitPostCommitExecutorContract(t *testing.T) {
 		pub := &busyCounter{}
 		subscribeAll(h, pub)
 		pkt := charPacket(2, icmpRounds(1, 0, 30))
-		res, plan, err := commitVia(t, h, svc, pkt)
+		_, plan, err := commitVia(t, h, svc, pkt)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := svc.Commit(h.ctx, res, &plan); !errors.Is(err, boom) {
+		if err := svc.Commit(h.ctx, &plan); !errors.Is(err, boom) {
 			t.Fatalf("commit = %v, want the append error returned (the observable gap)", err)
 		}
 		// The committed state stands: the watermark is durable and the plan's
@@ -818,25 +819,24 @@ func TestCommitIsSingleUse(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer in.ReleasePending()
-	var res ApplyResult
 	var plan PostCommitPlan
 	err = h.db.WriteTx(h.ctx, store.Standalone(), func(wtx store.WriteTx) (func(), error) {
 		var aerr error
-		res, plan, aerr = svc.ApplyPacketTx(h.ctx, store.Standalone(), wtx, in)
+		_, plan, aerr = svc.ApplyPacketTx(h.ctx, store.Standalone(), wtx, in)
 		return nil, aerr
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	if err := svc.Commit(h.ctx, res, &plan); !errors.Is(err, boom) {
+	if err := svc.Commit(h.ctx, &plan); !errors.Is(err, boom) {
 		t.Fatalf("first commit = %v, want the append error", err)
 	}
 	firstPubs := pub.n
 	if firstPubs == 0 {
 		t.Fatal("no publication after the first commit")
 	}
-	if err := svc.Commit(h.ctx, res, &plan); !errors.Is(err, boom) {
+	if err := svc.Commit(h.ctx, &plan); !errors.Is(err, boom) {
 		t.Fatalf("second commit = %v, want the SAME remembered error", err)
 	}
 	if pub.n != firstPubs {
@@ -846,10 +846,93 @@ func TestCommitIsSingleUse(t *testing.T) {
 	// A COPY of the plan reports the same remembered outcome: the guard and
 	// the result share one state object, so neither copy can diverge.
 	copyPlan := plan
-	if err := svc.Commit(h.ctx, res, &copyPlan); !errors.Is(err, boom) {
+	if err := svc.Commit(h.ctx, &copyPlan); !errors.Is(err, boom) {
 		t.Fatalf("copied plan commit = %v, want the remembered append error", err)
 	}
 	if pub.n != firstPubs {
 		t.Fatalf("publications after the copied plan = %d, want %d — copies must not replay side effects", pub.n, firstPubs)
+	}
+}
+
+// TestPrepareSnapshotsPacket pins the P2 review fix: Prepare deep-copies the
+// packet, so a caller that reuses or mutates its decoded object afterwards
+// cannot make the committed payload diverge from the computed fingerprint.
+func TestPrepareSnapshotsPacket(t *testing.T) {
+	h := newCharHarness(t, nil)
+	svc := New(h.db, h.bus, h.m, nil, nil, nil)
+
+	pkt := charPacket(1, icmpRounds(1, 0, 30))
+	in, err := svc.Prepare(h.ctx, applyPrincipal(), pkt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer in.ReleasePending()
+
+	// Mutate the caller's object after Prepare. The snapshot must be untouched,
+	// and the fingerprint must describe the snapshot, not the mutated caller.
+	pkt.Metrics[0].Value = 9999
+	if in.pkt.Metrics[0].Value == 9999 {
+		t.Fatal("Prepare's snapshot shares the caller's metric slice")
+	}
+	if in.fingerprint != PacketFingerprint(in.pkt) {
+		t.Fatal("fingerprint no longer describes the snapshot")
+	}
+	// Labels/Attrs maps are copied too.
+	pkt.Metrics[0].Labels = map[string]string{"x": "y"}
+	if in.pkt.Metrics[0].Labels != nil {
+		t.Fatal("Prepare's snapshot shares the caller's label map")
+	}
+}
+
+// TestPrepareRejectsNonFinite pins the P2 review fix: a non-finite metric
+// value is corrupt telemetry and is refused before it can reach the fingerprint
+// (where JSON cannot encode it and every non-finite payload would collide) or
+// the data plane.
+func TestPrepareRejectsNonFinite(t *testing.T) {
+	h := newCharHarness(t, nil)
+	svc := New(h.db, h.bus, h.m, nil, nil, nil)
+
+	for _, v := range []float64{math.NaN(), math.Inf(1), math.Inf(-1)} {
+		pkt := charPacket(1, icmpRounds(1, 0, 30))
+		pkt.Metrics[0].Value = v
+		if _, err := svc.Prepare(h.ctx, applyPrincipal(), pkt); err == nil {
+			t.Fatalf("prepare with value %v succeeded, want a non-finite rejection", v)
+		}
+	}
+}
+
+// TestCommitPlanCarriesVerdict pins the P2 review fix: Commit derives the
+// duplicate/new verdict from the plan itself, so a caller cannot pair a
+// duplicate verdict with a fresh plan and silently skip the data plane. A
+// duplicate plan commits nothing post-commit; a new one appends.
+func TestCommitPlanCarriesVerdict(t *testing.T) {
+	h := newCharHarness(t, nil)
+	svc := New(h.db, h.bus, h.m, nil, nil, nil)
+
+	// First: a fresh batch.
+	_, plan, err := applyDirect(t, h, svc, applyPrincipal(), charPacket(1, icmpRounds(1, 0, 30)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !plan.new {
+		t.Fatal("fresh plan.new = false")
+	}
+
+	// Replay the same slot: a duplicate plan must report new=false and, when
+	// committed again, not re-append.
+	dupRes, dupPlan, err := applyDirect(t, h, svc, applyPrincipal(), charPacket(1, icmpRounds(1, 0, 30)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dupRes.New || !dupRes.Duplicate {
+		t.Fatalf("replay verdict = %+v, want a duplicate", dupRes)
+	}
+	if dupPlan.new {
+		t.Fatal("duplicate plan.new = true")
+	}
+	// Commit the duplicate plan directly (the shape the reviewer worried about):
+	// it must be a no-op for the data plane, derived from the plan alone.
+	if err := svc.Commit(h.ctx, &dupPlan); err != nil {
+		t.Fatalf("commit duplicate: %v", err)
 	}
 }

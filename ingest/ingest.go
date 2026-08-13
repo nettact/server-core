@@ -209,7 +209,7 @@ func (s *Service) Ingest(ctx context.Context, agentID, siteID string, epoch uint
 	// inside Commit is logged there and returned, but deliberately still
 	// ACKS — the SQLite state is committed and a replay would be deduplicated
 	// anyway (see Commit).
-	_ = s.Commit(ctx, res, &plan)
+	_ = s.Commit(ctx, &plan)
 
 	return Ack{
 		HighestSequence: s.ackSequence(p.AgentID, pkt.Sequence, in.cacheEpoch, res.New, res.AdoptHigh),
