@@ -1899,11 +1899,21 @@ type fluctuationView struct {
 // target / incident (an incident's precursors) and a time range.
 func (d Deps) handleListFluctuations(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
+	pageNumber, pageSize := 1, 50
+	if q.Has("page") || q.Has("page_size") {
+		pageNumber, pageSize = pageParams(r, 50, 500)
+	} else if n, err := strconv.Atoi(q.Get("limit")); err == nil && n > 0 && n <= 500 {
+		// `limit` predates page/page_size and remains supported for older clients.
+		// It is page 1 by definition, and the response describes it as such.
+		pageSize = n
+	}
 	f := fault.FluctuationFilter{
 		SiteID:     siteParam(r),
 		AgentID:    q.Get("agent"),
 		TargetID:   q.Get("target"),
 		IncidentID: q.Get("incident"),
+		Limit:      pageSize,
+		Offset:     (pageNumber - 1) * pageSize,
 	}
 	if n, err := strconv.ParseInt(q.Get("since"), 10, 64); err == nil && n > 0 {
 		f.Since = n
@@ -1911,16 +1921,13 @@ func (d Deps) handleListFluctuations(w http.ResponseWriter, r *http.Request) {
 	if n, err := strconv.ParseInt(q.Get("until"), 10, 64); err == nil && n > 0 {
 		f.Until = n
 	}
-	if n, err := strconv.Atoi(q.Get("limit")); err == nil && n > 0 {
-		f.Limit = n
-	}
-	page, err := d.Fault.ListFluctuations(r.Context(), f)
+	result, err := d.Fault.ListFluctuations(r.Context(), f)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	views := make([]fluctuationView, 0, len(page.Items))
-	for _, fl := range page.Items {
+	views := make([]fluctuationView, 0, len(result.Items))
+	for _, fl := range result.Items {
 		det := notification.FaultDetail{
 			ProbeKind:    fl.ProbeKind,
 			MetricKind:   fl.MetricKind,
@@ -1941,9 +1948,11 @@ func (d Deps) handleListFluctuations(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	writeJSON(w, http.StatusOK, struct {
-		Items []fluctuationView `json:"items"`
-		Total int               `json:"total"`
-	}{Items: views, Total: page.Total})
+		Items    []fluctuationView `json:"items"`
+		Total    int               `json:"total"`
+		Page     int               `json:"page"`
+		PageSize int               `json:"page_size"`
+	}{Items: views, Total: result.Total, Page: pageNumber, PageSize: pageSize})
 }
 
 // ---- monitor groups ----

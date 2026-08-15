@@ -696,6 +696,33 @@ func TestListTotalIgnoresLimit(t *testing.T) {
 	}
 }
 
+// TestListOffsetPagesWithoutChangingTotal pins the service-level paging
+// contract used by the Agent history: OFFSET selects a later slice, while Total
+// continues to describe the whole filtered history.
+func TestListOffsetPagesWithoutChangingTotal(t *testing.T) {
+	h := newHarness(t)
+	det := DefaultDetection()
+	for i := int64(0); i < 4; i++ {
+		ts := 91000 + i*100
+		h.evaluate(det, loss(ts, 100), reason(ts, telemetry.ProbeReasonTimeout, "x"))
+		h.evaluate(det, loss(ts+10, 0))
+	}
+	page, err := h.svc.ListFluctuations(h.ctx, FluctuationFilter{
+		TargetID: "t_icmp",
+		Limit:    2,
+		Offset:   2,
+	})
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if page.Total != 4 || len(page.Items) != 2 {
+		t.Fatalf("expected total=4 items=2, got total=%d items=%d", page.Total, len(page.Items))
+	}
+	if got := page.Items[0].EndedAt.Unix(); got != 91110 {
+		t.Fatalf("first item on page 2 ended at %d, want 91110", got)
+	}
+}
+
 // TestListFiltersByTimeRange: the target history page selects a window, and a
 // fluctuation outside it must not appear in that window's evidence.
 func TestListFiltersByTimeRange(t *testing.T) {

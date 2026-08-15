@@ -2,6 +2,7 @@ package agentstatus
 
 import (
 	"context"
+	"math"
 	"testing"
 	"time"
 
@@ -139,7 +140,7 @@ func TestStatusPriority(t *testing.T) {
 	}
 }
 
-func TestResourcesStaleAndWorstMount(t *testing.T) {
+func TestResourcesStaleAndAggregateDisk(t *testing.T) {
 	db := openDB(t)
 	ctx := context.Background()
 	now := time.Now().UTC()
@@ -156,14 +157,14 @@ func TestResourcesStaleAndWorstMount(t *testing.T) {
 			{TS: old, Kind: string(telemetry.HostMemPct), Target: "host", Value: 55, Unit: "pct"},
 			{TS: old, Kind: string(telemetry.HostMemUsed), Target: "host", Value: 8e9},
 			{TS: old, Kind: string(telemetry.HostMemTotal), Target: "host", Value: 16e9},
-			// two mounts; C: is worse (higher pct) → picked for Pct/Mount, but Used/Total
-			// are summed across both.
-			{TS: fresh, Kind: string(telemetry.HostDiskPct), Target: "D:", Value: 30, Unit: "pct"},
-			{TS: fresh, Kind: string(telemetry.HostDiskUsed), Target: "D:", Value: 1e11},
-			{TS: fresh, Kind: string(telemetry.HostDiskTotal), Target: "D:", Value: 5e11},
-			{TS: fresh, Kind: string(telemetry.HostDiskPct), Target: "C:", Value: 88, Unit: "pct"},
-			{TS: fresh, Kind: string(telemetry.HostDiskUsed), Target: "C:", Value: 4e11},
-			{TS: fresh, Kind: string(telemetry.HostDiskTotal), Target: "C:", Value: 5e11},
+			// Unequal mounts: (90 GB + 80 GB) / (900 GB + 100 GB) = 17%.
+			// That differs from both the 80% peak and the unweighted 45% average.
+			{TS: fresh, Kind: string(telemetry.HostDiskPct), Target: "D:", Value: 10, Unit: "pct"},
+			{TS: fresh, Kind: string(telemetry.HostDiskUsed), Target: "D:", Value: 9e10},
+			{TS: fresh, Kind: string(telemetry.HostDiskTotal), Target: "D:", Value: 9e11},
+			{TS: fresh, Kind: string(telemetry.HostDiskPct), Target: "C:", Value: 80, Unit: "pct"},
+			{TS: fresh, Kind: string(telemetry.HostDiskUsed), Target: "C:", Value: 8e10},
+			{TS: fresh, Kind: string(telemetry.HostDiskTotal), Target: "C:", Value: 1e11},
 			{TS: fresh, Kind: string(telemetry.HostNetRxBps), Target: "host", Value: 1000},
 			{TS: fresh, Kind: string(telemetry.HostNetTxBps), Target: "host", Value: 2000},
 			{TS: fresh, Kind: string(telemetry.HostUptime), Target: "host", Value: 123456, Unit: "s"},
@@ -186,10 +187,16 @@ func TestResourcesStaleAndWorstMount(t *testing.T) {
 	if r.Resources.Memory == nil || r.Resources.Memory.Pct != 55 || !r.Resources.Memory.Stale {
 		t.Fatalf("mem should be present and stale: %+v", r.Resources.Memory)
 	}
-	if r.Resources.Disk == nil || r.Resources.Disk.Mount != "C:" || r.Resources.Disk.Pct != 88 || r.Resources.Disk.Mounts != 2 {
-		t.Fatalf("disk worst-mount: %+v", r.Resources.Disk)
+	if r.Resources.Disk == nil || r.Resources.Disk.Pct != 80 || r.Resources.Disk.Mounts != 2 {
+		t.Fatalf("disk compatibility fields: %+v", r.Resources.Disk)
 	}
-	if r.Resources.Disk.Used != 5e11 || r.Resources.Disk.Total != 1e12 {
+	if r.Resources.Disk.AggregatePct == nil || *r.Resources.Disk.AggregatePct != 17 {
+		t.Fatalf("capacity-weighted disk percentage: %+v", r.Resources.Disk)
+	}
+	if r.Resources.Disk.Mount != "C:" {
+		t.Fatalf("highest-percentage mount metadata: %+v", r.Resources.Disk)
+	}
+	if r.Resources.Disk.Used != 1.7e11 || r.Resources.Disk.Total != 1e12 {
 		t.Fatalf("disk used/total should be summed across mounts, got used=%v total=%v", r.Resources.Disk.Used, r.Resources.Disk.Total)
 	}
 	if r.Resources.Net == nil || r.Resources.Net.RxBps != 1000 || r.Resources.Net.TxBps != 2000 {
@@ -205,12 +212,10 @@ func TestResourcesStaleAndWorstMount(t *testing.T) {
 
 // TestDepartedMountDoesNotDecideDiskCell covers a mount that stopped reporting
 // while the agent kept running. The latest-sample snapshot has no lower time
-// bound, so such a mount stays at its final value forever — and since the cell
-// shows the worst mount, a full one would own the percentage, the mountpoint and
-// the timestamp permanently. The case that produced it: an OpenWrt agent stopped
+// bound, so such a mount stays at its final value forever and would remain in the
+// host-wide used/total sums. The case that produced it: an OpenWrt agent stopped
 // collecting its read-only /rom image, whose last sample was 100% by
-// construction, and the console showed "100%, stale" indefinitely for a router
-// with 0.9% of its writable space used.
+// construction, and the console showed misleading disk usage indefinitely.
 func TestDepartedMountDoesNotDecideDiskCell(t *testing.T) {
 	db := openDB(t)
 	ctx := context.Background()
@@ -246,8 +251,17 @@ func TestDepartedMountDoesNotDecideDiskCell(t *testing.T) {
 	if d == nil {
 		t.Fatal("disk should be present")
 	}
-	if d.Mount != "/boot" || d.Pct != 6.5 {
-		t.Errorf("worst LIVE mount should decide the headline, got mount=%q pct=%v", d.Mount, d.Pct)
+	wantUsed := float64(18350080 + 8404992)
+	wantTotal := float64(2040373248 + 132075520)
+	wantPct := wantUsed / wantTotal * 100
+	if d.AggregatePct == nil || math.Abs(*d.AggregatePct-wantPct) > 1e-9 {
+		t.Errorf("live mounts should determine aggregate pct: got %v, want %v", d.AggregatePct, wantPct)
+	}
+	if d.Pct != 6.5 {
+		t.Errorf("legacy pct = %v, want live-mount peak 6.5", d.Pct)
+	}
+	if d.Mount != "/boot" {
+		t.Errorf("highest-percentage mount metadata = %q, want /boot", d.Mount)
 	}
 	if d.Stale {
 		t.Error("cell should not be stale: the mounts that still report are fresh")
@@ -255,8 +269,8 @@ func TestDepartedMountDoesNotDecideDiskCell(t *testing.T) {
 	if d.Mounts != 2 {
 		t.Errorf("mount count should exclude the departed mount, got %d", d.Mounts)
 	}
-	if d.Total != 2040373248+132075520 {
-		t.Errorf("departed mount should not add to capacity, got total=%v", d.Total)
+	if d.Used != wantUsed || d.Total != wantTotal {
+		t.Errorf("departed mount should not add to capacity, got used=%v total=%v", d.Used, d.Total)
 	}
 }
 
@@ -276,8 +290,10 @@ func TestAllMountsStaleKeepsThemAll(t *testing.T) {
 	fm := &fakeMetrics{byAgent: map[string][]metrics.Point{
 		"agent_a": {
 			{TS: old, Kind: string(telemetry.HostDiskPct), Target: "C:", Value: 88, Unit: "pct"},
+			{TS: old, Kind: string(telemetry.HostDiskUsed), Target: "C:", Value: 4.4e11},
 			{TS: old, Kind: string(telemetry.HostDiskTotal), Target: "C:", Value: 5e11},
 			{TS: old, Kind: string(telemetry.HostDiskPct), Target: "D:", Value: 30, Unit: "pct"},
+			{TS: old, Kind: string(telemetry.HostDiskUsed), Target: "D:", Value: 1.5e11},
 			{TS: old, Kind: string(telemetry.HostDiskTotal), Target: "D:", Value: 5e11},
 		},
 	}}
@@ -295,8 +311,37 @@ func TestAllMountsStaleKeepsThemAll(t *testing.T) {
 	if !d.Stale {
 		t.Error("cell should be stale")
 	}
-	if d.Mounts != 2 || d.Mount != "C:" || d.Total != 1e12 {
-		t.Errorf("every mount should be kept, got %+v", d)
+	if d.Mounts != 2 || d.Mount != "C:" || d.Pct != 88 || d.AggregatePct == nil || *d.AggregatePct != 59 || d.Total != 1e12 {
+		t.Errorf("every mount should be kept in the last-known aggregate, got %+v", d)
+	}
+}
+
+func TestDiskAggregateRequiresCompleteCapacity(t *testing.T) {
+	now := time.Now().UTC()
+	got := buildResources([]metrics.Point{
+		{TS: now, Kind: string(telemetry.HostDiskPct), Target: "C:", Value: 88, Unit: "pct"},
+		{TS: now, Kind: string(telemetry.HostDiskTotal), Target: "C:", Value: 5e11}, // used missing
+		{TS: now, Kind: string(telemetry.HostDiskPct), Target: "D:", Value: 30, Unit: "pct"},
+		{TS: now, Kind: string(telemetry.HostDiskUsed), Target: "D:", Value: 1.5e11},
+		{TS: now, Kind: string(telemetry.HostDiskTotal), Target: "D:", Value: 5e11},
+	}, now.Add(-2*time.Minute)).Disk
+	if got == nil || got.Pct != 88 || got.Mount != "C:" {
+		t.Fatalf("incomplete capacity should keep the released peak fallback: %+v", got)
+	}
+	if got.AggregatePct != nil {
+		t.Fatalf("incomplete capacity produced aggregate percentage %v", *got.AggregatePct)
+	}
+}
+
+func TestDiskAggregatePreservesZeroUsage(t *testing.T) {
+	now := time.Now().UTC()
+	got := buildResources([]metrics.Point{
+		{TS: now, Kind: string(telemetry.HostDiskPct), Target: "C:", Value: 0, Unit: "pct"},
+		{TS: now, Kind: string(telemetry.HostDiskUsed), Target: "C:", Value: 0},
+		{TS: now, Kind: string(telemetry.HostDiskTotal), Target: "C:", Value: 5e11},
+	}, now.Add(-2*time.Minute)).Disk
+	if got == nil || got.AggregatePct == nil || *got.AggregatePct != 0 {
+		t.Fatalf("zero usage should be a present aggregate reading: %+v", got)
 	}
 }
 

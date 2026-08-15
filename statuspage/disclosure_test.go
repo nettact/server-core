@@ -21,12 +21,13 @@ import (
 // fullResources is one agent reporting every host family, with values distinct
 // enough that a field landing in the wrong slot is obvious.
 func fullResources() agentstatus.Resources {
+	diskAggregatePct := 280_000_000_000.0 / 460_000_000_000.0 * 100
 	return agentstatus.Resources{
 		CPU:    &agentstatus.ScalarSample{Value: 12.5, Unit: "pct"},
 		Load:   &agentstatus.LoadSample{Load1: 0.42, Load5: 0.31, Load15: 0.28},
 		Memory: &agentstatus.MemSample{Pct: 48, Used: 8_160_000_000, Total: 17_000_000_000},
 		Disk: &agentstatus.DiskSample{
-			Pct: 61, Used: 280_000_000_000, Total: 460_000_000_000,
+			Pct: 82, AggregatePct: &diskAggregatePct, Used: 280_000_000_000, Total: 460_000_000_000,
 			Mount: "/mnt/backup-nas", Mounts: 3,
 		},
 		Net:    &agentstatus.NetSample{RxBps: 1_200_000, TxBps: 340_000},
@@ -51,7 +52,8 @@ func TestPublicResourcesDisclosureGate(t *testing.T) {
 	// Present: how the node is doing.
 	for name, got := range map[string]*float64{
 		"cpu_pct": basic.CPUPct, "mem_pct": basic.MemPct, "disk_pct": basic.DiskPct,
-		"rx_bps": basic.RxBps, "tx_bps": basic.TxBps, "uptime_s": basic.UptimeSec,
+		"disk_aggregate_pct": basic.DiskAggregatePct,
+		"rx_bps":             basic.RxBps, "tx_bps": basic.TxBps, "uptime_s": basic.UptimeSec,
 	} {
 		if got == nil {
 			t.Errorf("basic omitted %s, which is not machine detail", name)
@@ -59,6 +61,12 @@ func TestPublicResourcesDisclosureGate(t *testing.T) {
 	}
 	if basic.Load == nil || *basic.Load != [3]float64{0.42, 0.31, 0.28} {
 		t.Errorf("basic load = %v, want 1/5/15 in that order", basic.Load)
+	}
+	if basic.DiskPct == nil || *basic.DiskPct != r.Disk.Pct {
+		t.Errorf("basic legacy disk pct = %v, want %v", basic.DiskPct, r.Disk.Pct)
+	}
+	if basic.DiskAggregatePct == nil || *basic.DiskAggregatePct != *r.Disk.AggregatePct {
+		t.Errorf("basic disk aggregate = %v, want %v", basic.DiskAggregatePct, *r.Disk.AggregatePct)
 	}
 	// Absent: what the node is made of.
 	if basic.MemUsed != nil || basic.MemTotal != nil || basic.DiskUsed != nil || basic.DiskTotal != nil {
@@ -101,7 +109,7 @@ func TestPublicResourcesKeepsDeniedFamiliesAbsent(t *testing.T) {
 	if got == nil || got.CPUPct == nil || *got.CPUPct != 7 {
 		t.Fatalf("cpu missing: %+v", got)
 	}
-	if got.MemPct != nil || got.DiskPct != nil || got.RxBps != nil || got.Load != nil || got.UptimeSec != nil {
+	if got.MemPct != nil || got.DiskPct != nil || got.DiskAggregatePct != nil || got.RxBps != nil || got.Load != nil || got.UptimeSec != nil {
 		t.Fatalf("a denied family was published as a value: %+v", got)
 	}
 	// Nothing reported at all: the object itself goes away, so a renderer is not

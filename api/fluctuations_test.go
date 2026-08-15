@@ -132,6 +132,40 @@ func TestFluctuationsTotalSurvivesLimit(t *testing.T) {
 	if total, _ := body["total"].(float64); int(total) != 3 {
 		t.Fatalf("total = %v, want 3 regardless of limit", body["total"])
 	}
+	if page, _ := body["page"].(float64); int(page) != 1 {
+		t.Fatalf("legacy limit page = %v, want 1", body["page"])
+	}
+	if size, _ := body["page_size"].(float64); int(size) != 1 {
+		t.Fatalf("legacy limit page_size = %v, want 1", body["page_size"])
+	}
+}
+
+func TestFluctuationsUseServerSidePages(t *testing.T) {
+	db := openFluxDB(t)
+	d := Deps{Fault: fault.New(db, nil, nil)}
+	now := time.Now().UTC()
+	for i := 0; i < 3; i++ {
+		insertFlux(t, db, "flx_"+string(rune('a'+i)), "t_icmp",
+			telemetry.ProbeReasonTimeout, "i/o timeout", now.Add(-time.Duration(i)*time.Minute))
+	}
+
+	body := getFluctuations(t, d, "?page=2&page_size=1")
+	items, _ := body["items"].([]any)
+	if len(items) != 1 {
+		t.Fatalf("page 2 should return one item, got %d", len(items))
+	}
+	if got := items[0].(map[string]any)["id"]; got != "flx_b" {
+		t.Fatalf("page 2 returned %v, want flx_b", got)
+	}
+	if total, _ := body["total"].(float64); int(total) != 3 {
+		t.Fatalf("total = %v, want 3", body["total"])
+	}
+	if page, _ := body["page"].(float64); int(page) != 2 {
+		t.Fatalf("page = %v, want 2", body["page"])
+	}
+	if size, _ := body["page_size"].(float64); int(size) != 1 {
+		t.Fatalf("page_size = %v, want 1", body["page_size"])
+	}
 }
 
 // TestFluctuationsFilterByTarget: every surface asks about one target, so an
@@ -161,4 +195,3 @@ func TestFluctuationsFilterByTarget(t *testing.T) {
 		t.Fatalf("expected total 0, got %v", empty["total"])
 	}
 }
-

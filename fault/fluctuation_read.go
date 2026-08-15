@@ -18,6 +18,7 @@ type FluctuationFilter struct {
 	Since      int64
 	Until      int64
 	Limit      int // default 50, max 500 (same clamp as ListSignals)
+	Offset     int // zero-based row offset; used with Limit for server-side pages
 }
 
 // FluctuationPage is a listing plus the filter's TOTAL match count, which is not
@@ -78,8 +79,12 @@ func (s *Service) ListFluctuations(ctx context.Context, f FluctuationFilter) (Fl
 	// on ended_at instead would put rows of differing duration out of visible order
 	// for no gain. The filter still bounds ended_at — that is the moment a dip became
 	// a complete, recorded fact.
-	q += ` ORDER BY started_at DESC, id DESC LIMIT ?`
-	items, err := s.queryFluctuations(ctx, q, append(args, limit)...)
+	q += ` ORDER BY started_at DESC, id DESC LIMIT ? OFFSET ?`
+	offset := f.Offset
+	if offset < 0 {
+		offset = 0
+	}
+	items, err := s.queryFluctuations(ctx, q, append(args, limit, offset)...)
 	if err != nil {
 		return page, err
 	}

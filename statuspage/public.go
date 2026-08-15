@@ -73,12 +73,13 @@ type PublicResources struct {
 	MemUsed  *float64 `json:"mem_used,omitempty"`  // bytes; full only
 	MemTotal *float64 `json:"mem_total,omitempty"` // bytes; full only
 
-	// Disk is the busiest filesystem, matching what the console's agent list
-	// shows. The anonymous contract publishes its usage but never its mount
-	// identity or the machine's filesystem count.
-	DiskPct   *float64 `json:"disk_pct,omitempty"`
-	DiskUsed  *float64 `json:"disk_used,omitempty"`  // bytes; full only
-	DiskTotal *float64 `json:"disk_total,omitempty"` // bytes; full only
+	// DiskPct retains the released busiest-filesystem contract for older clients;
+	// new clients display DiskAggregatePct, which weights all included filesystems
+	// by capacity. Neither field reveals mount identity or filesystem count.
+	DiskPct          *float64 `json:"disk_pct,omitempty"`
+	DiskAggregatePct *float64 `json:"disk_aggregate_pct,omitempty"`
+	DiskUsed         *float64 `json:"disk_used,omitempty"`  // bytes; full only
+	DiskTotal        *float64 `json:"disk_total,omitempty"` // bytes; full only
 
 	RxBps *float64 `json:"rx_bps,omitempty"`
 	TxBps *float64 `json:"tx_bps,omitempty"`
@@ -345,6 +346,10 @@ func publicResources(r agentstatus.Resources, mode string) *PublicResources {
 	if r.Disk != nil {
 		v := r.Disk.Pct
 		out.DiskPct = &v
+		if r.Disk.AggregatePct != nil {
+			aggregate := *r.Disk.AggregatePct
+			out.DiskAggregatePct = &aggregate
+		}
 		if full {
 			used, total := r.Disk.Used, r.Disk.Total
 			out.DiskUsed, out.DiskTotal = &used, &total

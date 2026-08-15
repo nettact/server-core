@@ -111,13 +111,14 @@ type MemSample struct {
 }
 
 type DiskSample struct {
-	Pct    float64   `json:"pct"`
-	Used   float64   `json:"used"`  // bytes
-	Total  float64   `json:"total"` // bytes
-	Mount  string    `json:"mount"` // worst mount (highest pct)
-	Mounts int       `json:"mounts"`
-	TS     time.Time `json:"ts"`
-	Stale  bool      `json:"stale"`
+	Pct          float64   `json:"pct"`                     // highest-percentage mount; compatibility field
+	AggregatePct *float64  `json:"aggregate_pct,omitempty"` // capacity-weighted usage across reported mounts
+	Used         float64   `json:"used"`                    // bytes
+	Total        float64   `json:"total"`                   // bytes
+	Mount        string    `json:"mount"`                   // mount represented by Pct
+	Mounts       int       `json:"mounts"`
+	TS           time.Time `json:"ts"`
+	Stale        bool      `json:"stale"`
 }
 
 type NetSample struct {
@@ -487,7 +488,7 @@ func (s *Service) loadStatusSince(ctx context.Context, siteID string) (map[strin
 func buildResources(points []metrics.Point, staleCutoff time.Time) Resources {
 	var res Resources
 
-	// Disk is per-mount; collect then pick the worst (highest pct).
+	// Disk is reported per mount; collect it before building the host-wide card.
 	type diskAgg struct {
 		pct, used, total *float64
 		ts               time.Time
@@ -589,11 +590,9 @@ func buildResources(points []metrics.Point, staleCutoff time.Time) Resources {
 		// snapshot feeding this function returns the newest sample of every series
 		// ever seen, with no lower time bound, so a mount that goes away — an
 		// unplugged disk, an unmounted share, a filesystem the agent stopped
-		// collecting — lingers at its final value indefinitely. Because the headline
-		// is the WORST mount, a departed mount that happened to be full captures the
-		// percentage, the mountpoint AND the timestamp permanently: the cell reads
-		// "100%, stale" forever while every live filesystem is nearly empty. It also
-		// keeps adding its capacity to the sum, overstating the host's storage.
+		// collecting — lingers at its final value indefinitely. Leaving it in the
+		// host-wide sums would overstate both used storage and total capacity, and
+		// therefore distort the aggregate percentage indefinitely.
 		//
 		// Keeping every mount when they are ALL stale is the deliberate other half:
 		// that is an agent gone quiet rather than a disk gone away, and showing its
@@ -611,12 +610,20 @@ func buildResources(points []metrics.Point, staleCutoff time.Time) Resources {
 		var worstMount string
 		var worst *diskAgg
 		var sumUsed, sumTotal float64
+		aggregateReady := true
 		for mount, d := range live {
 			if d.used != nil {
 				sumUsed += *d.used
+			} else {
+				aggregateReady = false
 			}
 			if d.total != nil {
 				sumTotal += *d.total
+				if *d.total <= 0 {
+					aggregateReady = false
+				}
+			} else {
+				aggregateReady = false
 			}
 			if d.pct == nil {
 				continue
@@ -625,10 +632,21 @@ func buildResources(points []metrics.Point, staleCutoff time.Time) Resources {
 				worst, worstMount = d, mount
 			}
 		}
-		if worst != nil {
-			// Used/Total are summed across every mount so a multi-disk host can show
-			// its total capacity; Pct/Mount stay the worst mount — the most actionable
-			// single signal.
+		if aggregateReady && sumTotal > 0 && worst != nil {
+			// The headline and the byte totals describe the same host-wide quantity:
+			// capacity weights each mount, so a tiny full partition cannot make a
+			// mostly-empty multi-disk host read as 100% used. Pct/Mount retain their
+			// released worst-mount contract while new clients use AggregatePct.
+			aggregatePct := sumUsed / sumTotal * 100
+			res.Disk = &DiskSample{
+				Pct: *worst.pct, AggregatePct: &aggregatePct, Used: sumUsed, Total: sumTotal,
+				Mount: worstMount, Mounts: len(live),
+				TS: worst.ts, Stale: worst.ts.Before(staleCutoff),
+			}
+		} else if worst != nil {
+			// Older or partial snapshots may have percentages without a complete
+			// used/total pair for every mount. Preserve their previous display instead
+			// of manufacturing an understated aggregate from incomplete capacity data.
 			res.Disk = &DiskSample{
 				Pct: *worst.pct, Used: sumUsed, Total: sumTotal,
 				Mount: worstMount, Mounts: len(live),

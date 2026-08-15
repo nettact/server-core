@@ -94,7 +94,7 @@ const defaultCacheTTL = 5 * time.Second
 const defaultAvailabilityTTL = 60 * time.Second
 
 // How much a published node discloses about itself. Off is up/down only; basic is
-// percentages and rates; full adds the byte totals and the busiest mount's name.
+// percentages and rates; full adds memory and disk byte totals.
 // See the agent_metrics column comment in the schema for why this is an enum.
 const (
 	AgentMetricsOff   = "off"
