@@ -43,7 +43,6 @@ package baseline
 
 import (
 	"context"
-	"database/sql"
 	"sort"
 	"strings"
 	"time"
@@ -298,29 +297,17 @@ func (s *Service) eligibleSeries(ctx context.Context) ([]foldSeries, error) {
 
 // foldBatch folds one batch of series inside a single write transaction.
 func (s *Service) foldBatch(ctx context.Context, batch []foldSeries, now time.Time) error {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			_ = tx.Rollback()
+	return s.db.WriteTx(ctx, store.Standalone(), func(wtx store.WriteTx) (func(), error) {
+		for _, f := range batch {
+			if err := s.foldOne(ctx, wtx, f, now); err != nil {
+				return nil, err
+			}
 		}
-	}()
-	for _, f := range batch {
-		if err := s.foldOne(ctx, tx, f, now); err != nil {
-			return err
-		}
-	}
-	if err := tx.Commit(); err != nil {
-		return err
-	}
-	committed = true
-	return nil
+		return nil, nil
+	})
 }
 
-func (s *Service) foldOne(ctx context.Context, tx *sql.Tx, f foldSeries, now time.Time) error {
+func (s *Service) foldOne(ctx context.Context, tx store.Executor, f foldSeries, now time.Time) error {
 	// Bounded above by server time, and this is load-bearing rather than tidy.
 	// Sample timestamps come from the AGENT's clock. One running ahead writes
 	// samples stamped in the future; folding them would park this series'
@@ -375,7 +362,7 @@ func (s *Service) foldOne(ctx context.Context, tx *sql.Tx, f foldSeries, now tim
 // An emptied bucket (every sample aged out of raw retention between two runs)
 // leaves any existing row alone: a stale reference is better than silently
 // dropping a day out of the median.
-func (s *Service) foldBucket(ctx context.Context, tx *sql.Tx, f foldSeries, bStart, bEnd int64, now time.Time) error {
+func (s *Service) foldBucket(ctx context.Context, tx store.Executor, f foldSeries, bStart, bEnd int64, now time.Time) error {
 	samples, err := s.ts.RawRange(ctx, f.seriesID, bStart, bEnd, 0)
 	if err != nil {
 		return err
@@ -431,37 +418,25 @@ func (s *Service) Prune(ctx context.Context, keepDays int) error {
 		keepDays = DefaultKeepDays
 	}
 	cutoff := dayCutoff(time.Now(), keepDays)
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			_ = tx.Rollback()
+	return s.db.WriteTx(ctx, store.Standalone(), func(wtx store.WriteTx) (func(), error) {
+		if _, err := wtx.ExecContext(ctx, `DELETE FROM baseline_daily WHERE day < ?`, cutoff); err != nil {
+			return nil, err
 		}
-	}()
-	if _, err := tx.ExecContext(ctx, `DELETE FROM baseline_daily WHERE day < ?`, cutoff); err != nil {
-		return err
-	}
-	// Rows dated in the future are impossible data, not old data: the day bound
-	// above can never reach them, so without this they would sit in the table
-	// forever. The fold refuses to create them, but one written by an earlier
-	// build (or by a clock since corrected) has to be cleaned up rather than
-	// merely ignored by readers.
-	if _, err := tx.ExecContext(ctx,
-		`DELETE FROM baseline_daily WHERE day > ?`, dayCutoff(time.Now(), -1)); err != nil {
-		return err
-	}
-	if _, err := tx.ExecContext(ctx,
-		`DELETE FROM baseline_state WHERE series_id NOT IN (SELECT id FROM series)`); err != nil {
-		return err
-	}
-	if err := tx.Commit(); err != nil {
-		return err
-	}
-	committed = true
-	return nil
+		// Rows dated in the future are impossible data, not old data: the day bound
+		// above can never reach them, so without this they would sit in the table
+		// forever. The fold refuses to create them, but one written by an earlier
+		// build (or by a clock since corrected) has to be cleaned up rather than
+		// merely ignored by readers.
+		if _, err := wtx.ExecContext(ctx,
+			`DELETE FROM baseline_daily WHERE day > ?`, dayCutoff(time.Now(), -1)); err != nil {
+			return nil, err
+		}
+		if _, err := wtx.ExecContext(ctx,
+			`DELETE FROM baseline_state WHERE series_id NOT IN (SELECT id FROM series)`); err != nil {
+			return nil, err
+		}
+		return nil, nil
+	})
 }
 
 // ---- read ----

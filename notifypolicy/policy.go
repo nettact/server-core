@@ -203,53 +203,49 @@ func (s *Service) ensureScope(ctx context.Context, siteID, kind, name string, en
 // Idempotent, and one transaction: a new channel ends up in both built-ins or in
 // neither, never half-wired.
 func (s *Service) AttachChannelToBuiltins(ctx context.Context, siteID, channelID string) error {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = tx.Rollback() }() // no-op once Commit succeeded
-
-	rows, err := tx.QueryContext(ctx, `SELECT id, channel_ids FROM notification_policies
+	return s.db.WriteTx(ctx, store.Standalone(), func(wtx store.WriteTx) (func(), error) {
+		rows, err := wtx.QueryContext(ctx, `SELECT id, channel_ids FROM notification_policies
 		WHERE site_id=? AND (is_default=1 OR scope_kind=?)`, siteID, ScopeAgent)
-	if err != nil {
-		return err
-	}
-	type builtin struct{ id, chans string }
-	var found []builtin
-	for rows.Next() {
-		var b builtin
-		if err := rows.Scan(&b.id, &b.chans); err != nil {
-			_ = rows.Close()
-			return err
-		}
-		found = append(found, b)
-	}
-	err = rows.Err()
-	// Drained and closed before the updates run: the write handle is a single
-	// connection (MaxOpenConns(1)), so an open cursor and an UPDATE cannot share it.
-	_ = rows.Close()
-	if err != nil {
-		return err
-	}
-
-	for _, b := range found {
-		ids := []string{}
-		if b.chans != "" {
-			_ = json.Unmarshal([]byte(b.chans), &ids)
-		}
-		if slices.Contains(ids, channelID) {
-			continue
-		}
-		enc, err := json.Marshal(append(ids, channelID))
 		if err != nil {
-			return err
+			return nil, err
 		}
-		if _, err := tx.ExecContext(ctx,
-			`UPDATE notification_policies SET channel_ids=? WHERE id=?`, string(enc), b.id); err != nil {
-			return err
+		type builtin struct{ id, chans string }
+		var found []builtin
+		for rows.Next() {
+			var b builtin
+			if err := rows.Scan(&b.id, &b.chans); err != nil {
+				_ = rows.Close()
+				return nil, err
+			}
+			found = append(found, b)
 		}
-	}
-	return tx.Commit()
+		err = rows.Err()
+		// Drained and closed before the updates run: the write handle is a single
+		// connection (MaxOpenConns(1)), so an open cursor and an UPDATE cannot share it.
+		_ = rows.Close()
+		if err != nil {
+			return nil, err
+		}
+
+		for _, b := range found {
+			ids := []string{}
+			if b.chans != "" {
+				_ = json.Unmarshal([]byte(b.chans), &ids)
+			}
+			if slices.Contains(ids, channelID) {
+				continue
+			}
+			enc, err := json.Marshal(append(ids, channelID))
+			if err != nil {
+				return nil, err
+			}
+			if _, err := wtx.ExecContext(ctx,
+				`UPDATE notification_policies SET channel_ids=? WHERE id=?`, string(enc), b.id); err != nil {
+				return nil, err
+			}
+		}
+		return nil, nil
+	})
 }
 
 // List returns a site's policies, default first then by scope kind and name.

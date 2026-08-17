@@ -6,6 +6,8 @@ import (
 	"time"
 
 	"github.com/nettact/server-core/tsstore"
+
+	"github.com/nettact/server-core/store"
 )
 
 // RetentionConfig is how long each tier is kept (seconds); 0 = keep forever.
@@ -298,19 +300,16 @@ func (s *Store) rollupTier(ctx context.Context, series []rollupSeries, res strin
 	// Phase B: every changed series' parent rewind, one transaction, BEFORE any
 	// append (the durable intent — see the ordering comment on Rollup).
 	if parentRes != "" && len(repairs) > 0 {
-		tx, err := s.db.BeginTx(ctx, nil)
-		if err != nil {
-			return err
-		}
-		for _, r := range repairs {
-			if _, err := tx.ExecContext(ctx,
-				`UPDATE rollup_state SET last_ts=? WHERE resolution=? AND series_id=? AND last_ts>?`,
-				alignDown(r.oldest, parentBucket), parentRes, r.rs.id, alignDown(r.oldest, parentBucket)); err != nil {
-				_ = tx.Rollback()
-				return err
+		if err := s.db.WriteTx(ctx, store.Standalone(), func(wtx store.WriteTx) (func(), error) {
+			for _, r := range repairs {
+				if _, err := wtx.ExecContext(ctx,
+					`UPDATE rollup_state SET last_ts=? WHERE resolution=? AND series_id=? AND last_ts>?`,
+					alignDown(r.oldest, parentBucket), parentRes, r.rs.id, alignDown(r.oldest, parentBucket)); err != nil {
+					return nil, err
+				}
 			}
-		}
-		if err := tx.Commit(); err != nil {
+			return nil, nil
+		}); err != nil {
 			return err
 		}
 	}
@@ -322,31 +321,28 @@ func (s *Store) rollupTier(ctx context.Context, series []rollupSeries, res strin
 	}
 	// Phase D: watermark advances, one transaction.
 	if len(casses) > 0 {
-		tx, err := s.db.BeginTx(ctx, nil)
-		if err != nil {
-			return err
-		}
-		for _, c := range casses {
-			// Re-check the in-flight mark here, not only at the top of the pass.
-			// A series can be created (EnsureSeries commits it), picked up by
-			// this pass, and only then marked pending by the ingest that is
-			// about to append its first samples. That batch's rewind updates
-			// zero rows — there is no rollup_state row yet — so the INSERT
-			// below would be unconditional and would park the watermark at upTo
-			// with the samples still in flight. Skipping the advance leaves the
-			// series stateless, and the next pass aggregates it in full.
-			if srcRaw && s.isPendingAppend(c.id) {
-				continue
-			}
-			if _, err := tx.ExecContext(ctx, `
+		if err := s.db.WriteTx(ctx, store.Standalone(), func(wtx store.WriteTx) (func(), error) {
+			for _, c := range casses {
+				// Re-check the in-flight mark here, not only at the top of the pass.
+				// A series can be created (EnsureSeries commits it), picked up by
+				// this pass, and only then marked pending by the ingest that is
+				// about to append its first samples. That batch's rewind updates
+				// zero rows — there is no rollup_state row yet — so the INSERT
+				// below would be unconditional and would park the watermark at upTo
+				// with the samples still in flight. Skipping the advance leaves the
+				// series stateless, and the next pass aggregates it in full.
+				if srcRaw && s.isPendingAppend(c.id) {
+					continue
+				}
+				if _, err := wtx.ExecContext(ctx, `
 				INSERT INTO rollup_state(resolution, series_id, last_ts) VALUES(?,?,?)
 				ON CONFLICT(resolution, series_id) DO UPDATE SET last_ts=excluded.last_ts
 				WHERE last_ts=?`, res, c.id, upTo, c.from); err != nil {
-				_ = tx.Rollback()
-				return err
+					return nil, err
+				}
 			}
-		}
-		if err := tx.Commit(); err != nil {
+			return nil, nil
+		}); err != nil {
 			return err
 		}
 	}
