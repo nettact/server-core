@@ -663,16 +663,18 @@ func (s *Service) RecomputeOpenAttributions(ctx context.Context) {
 	}
 	var changed []target
 	for _, t := range all {
-		tx, err := s.db.BeginTx(ctx, nil)
-		if err != nil {
-			continue
-		}
-		c, siteID, err := RecomputeAttributionTx(ctx, tx, t.incidentID)
-		if err != nil {
-			_ = tx.Rollback()
-			continue
-		}
-		if err := tx.Commit(); err != nil {
+		// One transaction per incident, and a failure on any one of them is
+		// skipped rather than aborting the sweep — the pre-contract code's
+		// `continue` on every error arm, preserved.
+		var (
+			c      bool
+			siteID string
+		)
+		if err := s.db.WriteTx(ctx, store.Standalone(), func(wtx store.WriteTx) (func(), error) {
+			var err error
+			c, siteID, err = RecomputeAttributionTx(ctx, wtx, t.incidentID)
+			return nil, err
+		}); err != nil {
 			continue
 		}
 		if c {

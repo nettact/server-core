@@ -187,40 +187,29 @@ func (s *Service) ResolveOutOfScope(ctx context.Context, siteID string) error {
 // publishes post-commit. Callers must invoke it OUTSIDE any open write
 // transaction (SQLite has a single writer).
 func (s *Service) terminate(ctx context.Context, reason string, extra func(context.Context, store.Executor) error, whereSQL string, args ...any) error {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			_ = tx.Rollback()
+	return s.db.WriteTx(ctx, store.Standalone(), func(wtx store.WriteTx) (func(), error) {
+		targets, agents, siteID, out, err := s.terminateTx(ctx, wtx, reason, whereSQL, args...)
+		if err != nil {
+			return nil, err
 		}
-	}()
-	targets, agents, siteID, out, err := s.terminateTx(ctx, tx, reason, whereSQL, args...)
-	if err != nil {
-		return err
-	}
-	if extra != nil {
-		if err := extra(ctx, tx); err != nil {
-			return err
+		if extra != nil {
+			if err := extra(ctx, wtx); err != nil {
+				return nil, err
+			}
 		}
-	}
-	// Recompute sibling attributions for the affected agents AFTER the extra
-	// cleanup (e.g. an agent's detector_state being deleted), so a removed
-	// healthy reference is not still treated as healthy.
-	statusTargets, err := s.recomputeSiblingAttributions(ctx, tx, siteID, agents, out)
-	if err != nil {
-		return err
-	}
-	captured := dedupeStrings(append(targets, statusTargets...))
-	if err := tx.Commit(); err != nil {
-		return err
-	}
-	committed = true
-	s.publish(out)
-	s.publishTargetStatus(siteID, captured)
-	return nil
+		// Recompute sibling attributions for the affected agents AFTER the extra
+		// cleanup (e.g. an agent's detector_state being deleted), so a removed
+		// healthy reference is not still treated as healthy.
+		statusTargets, err := s.recomputeSiblingAttributions(ctx, wtx, siteID, agents, out)
+		if err != nil {
+			return nil, err
+		}
+		captured := dedupeStrings(append(targets, statusTargets...))
+		return func() {
+			s.publish(out)
+			s.publishTargetStatus(siteID, captured)
+		}, nil
+	})
 }
 
 // terminateTx closes every firing signal matched by whereSQL (correlated to the

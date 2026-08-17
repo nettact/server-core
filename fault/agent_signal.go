@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+
+	"github.com/nettact/server-core/store"
 )
 
 // Agent connectivity is a built-in detector like any other, not a parallel
@@ -41,99 +43,92 @@ type AgentSignalInput struct {
 // signal id, or "" when one is already firing for the Agent (the partial unique
 // index makes a duplicate impossible, so this is simply idempotent).
 func (s *Service) OpenAgentSignal(ctx context.Context, in AgentSignalInput, now time.Time) (string, error) {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return "", err
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			_ = tx.Rollback()
+	var signalIDOut string
+	if err := s.db.WriteTx(ctx, store.Standalone(), func(wtx store.WriteTx) (func(), error) {
+		tx := wtx
+
+		var existing string
+		err := tx.QueryRowContext(ctx,
+			`SELECT id FROM fault_signals WHERE agent_id=? AND target_id='' AND detector_key=? AND state='firing'`,
+			in.AgentID, DetectorAgentConnectivity).Scan(&existing)
+		if err == nil {
+			return nil, nil
 		}
-	}()
+		if !errors.Is(err, sql.ErrNoRows) {
+			return nil, err
+		}
 
-	var existing string
-	err = tx.QueryRowContext(ctx,
-		`SELECT id FROM fault_signals WHERE agent_id=? AND target_id='' AND detector_key=? AND state='firing'`,
-		in.AgentID, DetectorAgentConnectivity).Scan(&existing)
-	if err == nil {
-		return "", nil
-	}
-	if !errors.Is(err, sql.ErrNoRows) {
-		return "", err
-	}
-
-	signalID := "sig_" + uuid.NewString()
-	observed := in.OfflineSince
-	if observed.IsZero() {
-		observed = now
-	}
-	sig := Signal{
-		ID: signalID, SiteID: in.SiteID, AgentID: in.AgentID, AgentName: in.Name,
-		DetectorKey: DetectorAgentConnectivity, Severity: SeverityCritical, Layer: "local",
-		ReasonDetail: in.Reason, ObservedAt: observed.UTC(), ConfirmedAt: now,
-	}
-	incidentID, opened, _, err := findOrCreateIncident(ctx, tx,
-		"agent:"+in.AgentID, in.SiteID, "", "", SignalTitle(sig), sig.Severity, sig.Layer, observed, now)
-	if err != nil {
-		return "", err
-	}
-	sig.IncidentID = incidentID
-	if err := insertSignal(ctx, tx, sig, 0); err != nil {
-		return "", err
-	}
-	// The Agent went offline when it was last seen, not when the grace period
-	// expired — the same distinction observed_at already carries on the signal.
-	if err := lowerFirstObserved(ctx, tx, incidentID, observed); err != nil {
-		return "", err
-	}
-	if _, err := tx.ExecContext(ctx,
-		`UPDATE incidents SET severity=?, summary=? WHERE id=?`, sig.Severity, SignalTitle(sig), incidentID); err != nil {
-		return "", err
-	}
-	out := &txOut{}
-	addTimeline(ctx, tx, incidentID, "fault.confirmed", SignalTitle(sig), signalID, now)
-	out.confirmed = append(out.confirmed, SignalEvent{
-		SignalID: signalID, IncidentID: incidentID, SiteID: in.SiteID,
-		AgentID: in.AgentID, Severity: sig.Severity,
-		// Stated, not left zero: a consumer that has to tell an Agent-connectivity
-		// verdict from a probe one has nothing else in the event to do it with. The
-		// scene claim-back needs exactly that — a disconnect scene is filed against
-		// this detector's per-agent signal, and every other detector's signal is
-		// matched by target instead.
-		DetectorKey: sig.DetectorKey,
-	})
-	if opened {
-		// Same immutable base snapshot a target fault gets. Without it the
-		// post-commit orchestrator only writes its empty-base fallback row, and an
-		// offline-Agent incident loses the frozen identity its detail view shows.
-		if s.snap != nil {
-			if err := s.snap.WriteIncidentBase(ctx, tx, incidentID, now); err != nil {
-				log.Printf("fault: incident base snapshot for %s: %v", incidentID, err)
+		signalID := "sig_" + uuid.NewString()
+		observed := in.OfflineSince
+		if observed.IsZero() {
+			observed = now
+		}
+		sig := Signal{
+			ID: signalID, SiteID: in.SiteID, AgentID: in.AgentID, AgentName: in.Name,
+			DetectorKey: DetectorAgentConnectivity, Severity: SeverityCritical, Layer: "local",
+			ReasonDetail: in.Reason, ObservedAt: observed.UTC(), ConfirmedAt: now,
+		}
+		incidentID, opened, _, err := findOrCreateIncident(ctx, tx,
+			"agent:"+in.AgentID, in.SiteID, "", "", SignalTitle(sig), sig.Severity, sig.Layer, observed, now)
+		if err != nil {
+			return nil, err
+		}
+		sig.IncidentID = incidentID
+		if err := insertSignal(ctx, tx, sig, 0); err != nil {
+			return nil, err
+		}
+		// The Agent went offline when it was last seen, not when the grace period
+		// expired — the same distinction observed_at already carries on the signal.
+		if err := lowerFirstObserved(ctx, tx, incidentID, observed); err != nil {
+			return nil, err
+		}
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE incidents SET severity=?, summary=? WHERE id=?`, sig.Severity, SignalTitle(sig), incidentID); err != nil {
+			return nil, err
+		}
+		out := &txOut{}
+		addTimeline(ctx, tx, incidentID, "fault.confirmed", SignalTitle(sig), signalID, now)
+		out.confirmed = append(out.confirmed, SignalEvent{
+			SignalID: signalID, IncidentID: incidentID, SiteID: in.SiteID,
+			AgentID: in.AgentID, Severity: sig.Severity,
+			// Stated, not left zero: a consumer that has to tell an Agent-connectivity
+			// verdict from a probe one has nothing else in the event to do it with. The
+			// scene claim-back needs exactly that — a disconnect scene is filed against
+			// this detector's per-agent signal, and every other detector's signal is
+			// matched by target instead.
+			DetectorKey: sig.DetectorKey,
+		})
+		if opened {
+			// Same immutable base snapshot a target fault gets. Without it the
+			// post-commit orchestrator only writes its empty-base fallback row, and an
+			// offline-Agent incident loses the frozen identity its detail view shows.
+			if s.snap != nil {
+				if err := s.snap.WriteIncidentBase(ctx, tx, incidentID, now); err != nil {
+					log.Printf("fault: incident base snapshot for %s: %v", incidentID, err)
+				}
+			}
+			addTimeline(ctx, tx, incidentID, "incident.opened", "", incidentID, now)
+			out.incidentOpened = append(out.incidentOpened, incidentEvent(incidentID, in.SiteID, "", sig.Severity, false))
+			if s.planner != nil {
+				if err := s.planner.PlanOpenTx(ctx, tx, IncidentScope{
+					IncidentID: incidentID, SiteID: in.SiteID, Severity: sig.Severity,
+					AgentConnectivity: true,
+					// Confirmed by the sweeper against the wall clock, so this is always
+					// live evidence — the Agent is offline right now. Stated rather than
+					// left to the zero value so the contrast with the replayed target
+					// faults is on the page.
+					ReplayLag: 0,
+				}, now); err != nil {
+					return nil, err
+				}
 			}
 		}
-		addTimeline(ctx, tx, incidentID, "incident.opened", "", incidentID, now)
-		out.incidentOpened = append(out.incidentOpened, incidentEvent(incidentID, in.SiteID, "", sig.Severity, false))
-		if s.planner != nil {
-			if err := s.planner.PlanOpenTx(ctx, tx, IncidentScope{
-				IncidentID: incidentID, SiteID: in.SiteID, Severity: sig.Severity,
-				AgentConnectivity: true,
-				// Confirmed by the sweeper against the wall clock, so this is always
-				// live evidence — the Agent is offline right now. Stated rather than
-				// left to the zero value so the contrast with the replayed target
-				// faults is on the page.
-				ReplayLag: 0,
-			}, now); err != nil {
-				return "", err
-			}
-		}
-	}
-	if err := tx.Commit(); err != nil {
+		signalIDOut = signalID
+		return func() { s.publish(out) }, nil
+	}); err != nil {
 		return "", err
 	}
-	committed = true
-	s.publish(out)
-	return signalID, nil
+	return signalIDOut, nil
 }
 
 // ResolveAgentSignal ends an Agent's firing connectivity fault with the given
@@ -142,36 +137,25 @@ func (s *Service) OpenAgentSignal(ctx context.Context, in AgentSignalInput, now 
 // operator turned the detector off rather than the Agent coming back.
 // Idempotent: resolving an absent signal is a no-op.
 func (s *Service) ResolveAgentSignal(ctx context.Context, agentID, reason string, now time.Time) error {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			_ = tx.Rollback()
+	return s.db.WriteTx(ctx, store.Standalone(), func(tx store.WriteTx) (func(), error) {
+		var signalID string
+		err := tx.QueryRowContext(ctx,
+			`SELECT id FROM fault_signals WHERE agent_id=? AND target_id='' AND detector_key=? AND state='firing'`,
+			agentID, DetectorAgentConnectivity).Scan(&signalID)
+		if errors.Is(err, sql.ErrNoRows) {
+			// Idempotent no-op: nothing written, so committing is equivalent to
+			// the old rollback, and there is nothing to publish.
+			return nil, nil
 		}
-	}()
-	var signalID string
-	err = tx.QueryRowContext(ctx,
-		`SELECT id FROM fault_signals WHERE agent_id=? AND target_id='' AND detector_key=? AND state='firing'`,
-		agentID, DetectorAgentConnectivity).Scan(&signalID)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	out := &txOut{}
-	if err := s.resolveSignal(ctx, tx, signalID, reason, now, now, out); err != nil {
-		return err
-	}
-	if err := tx.Commit(); err != nil {
-		return err
-	}
-	committed = true
-	s.publish(out)
-	return nil
+		if err != nil {
+			return nil, err
+		}
+		out := &txOut{}
+		if err := s.resolveSignal(ctx, tx, signalID, reason, now, now, out); err != nil {
+			return nil, err
+		}
+		return func() { s.publish(out) }, nil
+	})
 }
 
 // FiringAgentSignals returns the agent ids that currently have a firing
