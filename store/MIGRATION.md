@@ -67,10 +67,32 @@ Two consequences for how the remaining rows get cleared:
    They still move to `DB.ReadTx` for scope-carrying uniformity, but clearing
    them buys no SC-8 mitigation and should not be confused with it.
 
-**Progress (W2-02):** `gamedata` and `identity` are clear (0 `BeginTx`
-outside tests). Remaining non-test `BeginTx` sites by package: baseline 2,
-cleanup 3, config 9, fault 4, incidentops 3, metrics 2, notifypolicy 1,
-opissue 5, registry 5, statuspage 3, targetstatus 1.
+**Progress (W2-02):** **complete.** Zero non-test `BeginTx` sites remain in
+the whole repo. Every row above is cleared: owners all call `DB.WriteTx`, the
+`config`↔`fault` seam and every shared owner (`inTx`, `inGameTx`, the opissue
+set) retyped their callbacks/consumers, and `AdaptTx` is no longer used by any
+owner (it remains for tests and as the one-directional owner-side bridge).
+
+Two notes for the record, both of which cost review time and are now in the
+git history as concrete examples:
+
+1. **Wholesale scripted rewrites of `opissue` failed repeatedly** — regexes
+   tripped over `return err` at different nesting depths, in-closure `err`
+   scope, and a `})` that read as a function close leaving a stray `}`. The
+   reliable method turned out to be whole-function replacement (old body text
+   → new body text) with a build after each. This is the same lesson as the
+   `targetstatus` revert: the ledger rows are not templates, and a script can
+   only move code, never judge it.
+2. **The two sites that looked like they needed special handling resolved
+   cleanly once scoped deliberately**: `targetstatus.SiteStatuses` (the only
+   read-tx owner; its snapshot boundary is now the closure braces) and
+   `statuspage.PublicIncidentHistory` (incidentMu defer + cache early-return
+   both live correctly inside the ReadTx closure because the closure's end is
+   the function's decision point).
+
+SC-8's conclusion held throughout: closing this ledger was the only real
+mitigation for the self-reported-scope seam, and RLS was never a backstop for
+it.
 
 ### baseline
 
