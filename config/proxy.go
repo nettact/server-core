@@ -22,6 +22,8 @@ import (
 	"github.com/google/uuid"
 
 	pcfg "github.com/nettact/protocol/config"
+
+	"github.com/nettact/server-core/store"
 )
 
 // ErrProxyInUse reports an attempt to delete a proxy that targets still
@@ -249,124 +251,119 @@ func (s *Service) CreateProxy(ctx context.Context, siteID string, p Proxy) (stri
 // generation and no DesiredState push happens. Returns the site id, or
 // sql.ErrNoRows when the proxy is gone.
 func (s *Service) UpdateProxy(ctx context.Context, proxyID string, p Proxy) (string, error) {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return "", err
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			_ = tx.Rollback()
+	var siteIDOut string
+	if err := s.db.WriteTx(ctx, store.Standalone(), func(wtx store.WriteTx) (func(), error) {
+		tx := wtx
+
+		// Read the stored proxy inside the write tx: SQLite serializes writers, so this
+		// is the state the UPDATE below actually replaces — a pre-transaction snapshot
+		// could classify the edit against a generation someone else already changed.
+		old, err := scanProxy(tx.QueryRowContext(ctx,
+			`SELECT `+proxyColumns+` FROM proxies WHERE id=?`, proxyID))
+		if err != nil {
+			return nil, err
 		}
-	}()
+		siteID := old.SiteID
+		material := materialProxyChange(old, p)
 
-	// Read the stored proxy inside the write tx: SQLite serializes writers, so this
-	// is the state the UPDATE below actually replaces — a pre-transaction snapshot
-	// could classify the edit against a generation someone else already changed.
-	old, err := scanProxy(tx.QueryRowContext(ctx,
-		`SELECT `+proxyColumns+` FROM proxies WHERE id=?`, proxyID))
-	if err != nil {
-		return "", err
-	}
-	siteID := old.SiteID
-	material := materialProxyChange(old, p)
+		// The capability of the CURRENTLY pinned targets is enforced here, inside the write
+		// transaction, rather than only in the API handler.
+		//
+		// SQLite serializes writers, so an in-tx read sees every committed target — which
+		// closes a real window: a SetSiteTargets that commits an ICMP pin after the
+		// handler's pre-check but before this transaction would have been validated against
+		// the OLD proxy type, and the switch would then leave that monitor permanently
+		// un-runnable with both writes reporting success. Rolling back here is what makes
+		// the invariant hold rather than merely usually hold.
+		if err := validateProxyPinsTx(ctx, tx, proxyID, p.Type); err != nil {
+			return nil, err
+		}
 
-	// The capability of the CURRENTLY pinned targets is enforced here, inside the write
-	// transaction, rather than only in the API handler.
-	//
-	// SQLite serializes writers, so an in-tx read sees every committed target — which
-	// closes a real window: a SetSiteTargets that commits an ICMP pin after the
-	// handler's pre-check but before this transaction would have been validated against
-	// the OLD proxy type, and the switch would then leave that monitor permanently
-	// un-runnable with both writes reporting success. Rolling back here is what makes
-	// the invariant hold rather than merely usually hold.
-	if err := validateProxyPinsTx(ctx, tx, proxyID, p.Type); err != nil {
-		return "", err
-	}
+		targetIDs, err := proxyTargetIDs(ctx, tx, proxyID)
+		if err != nil {
+			return nil, err
+		}
 
-	targetIDs, err := proxyTargetIDs(ctx, tx, proxyID)
-	if err != nil {
-		return "", err
-	}
-
-	now := time.Now().UTC()
-	// config_serial is the proxy's own material generation; it advances only on a
-	// material edit so a rename cannot invalidate agent-side dialers.
-	serialExpr := "config_serial"
-	if material {
-		serialExpr = "config_serial+1"
-	}
-	if _, err := tx.ExecContext(ctx,
-		`UPDATE proxies SET name=?, type=?, enabled=?,
+		now := time.Now().UTC()
+		// config_serial is the proxy's own material generation; it advances only on a
+		// material edit so a rename cannot invalidate agent-side dialers.
+		serialExpr := "config_serial"
+		if material {
+			serialExpr = "config_serial+1"
+		}
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE proxies SET name=?, type=?, enabled=?,
 			host=?, port=?, username=?, password=?, dns_mode=?, connect_timeout_ms=?,
 			wg_private_key=?, wg_peer_public_key=?, wg_preshared_key=?, wg_endpoint=?,
 			wg_allowed_ips=?, wg_local_addrs=?, wg_dns=?, wg_mtu=?, wg_keepalive_seconds=?,
 			config_serial=`+serialExpr+`, updated_at=?
 		 WHERE id=?`,
-		p.Name, p.Type, boolInt(p.Enabled),
-		p.Host, p.Port, p.Username, p.Password, p.DNSMode, p.ConnectTimeoutMs,
-		p.WGPrivateKey, p.WGPeerPublicKey, p.WGPresharedKey, p.WGEndpoint,
-		p.WGAllowedIPs, p.WGLocalAddrs, p.WGDNS, p.WGMTU, p.WGKeepaliveSeconds,
-		now, proxyID); err != nil {
-		if isUniqueViolation(err) {
-			return "", ErrProxyNameTaken
+			p.Name, p.Type, boolInt(p.Enabled),
+			p.Host, p.Port, p.Username, p.Password, p.DNSMode, p.ConnectTimeoutMs,
+			p.WGPrivateKey, p.WGPeerPublicKey, p.WGPresharedKey, p.WGEndpoint,
+			p.WGAllowedIPs, p.WGLocalAddrs, p.WGDNS, p.WGMTU, p.WGKeepaliveSeconds,
+			now, proxyID); err != nil {
+			if isUniqueViolation(err) {
+				return nil, ErrProxyNameTaken
+			}
+			return nil, err
 		}
+
+		var termPubs []PostCommit
+		var termAffected []string
+		if material && len(targetIDs) > 0 {
+			// Force-resolve the affected targets' firing signals BEFORE the new generation
+			// is stamped, under the reason that actually applies. A proxy edit is a
+			// reconfiguration, never a recovery: announcing "recovered" at the moment the
+			// operator changed the egress path would be a lie.
+			if s.term != nil {
+				affected, pub, terr := s.term.TerminateForTargetsTx(ctx, tx, targetIDs, ReasonConfigChanged)
+				if terr != nil {
+					return nil, terr
+				}
+				termAffected = append(termAffected, affected...)
+				if pub != nil {
+					termPubs = append(termPubs, pub)
+				}
+				// Targets whose generation advances without anything firing still need their
+				// counters cleared, or a streak measured through the old proxy continues
+				// through the new one.
+				if terr := s.term.ClearDetectorStateTx(ctx, tx, targetIDs); terr != nil {
+					return nil, terr
+				}
+			}
+			if _, err := tx.ExecContext(ctx,
+				`UPDATE sites SET config_serial=config_serial+1 WHERE id=?`, siteID); err != nil {
+				return nil, err
+			}
+			var newSerial int
+			if err := tx.QueryRowContext(ctx,
+				`SELECT config_serial FROM sites WHERE id=?`, siteID).Scan(&newSerial); err != nil {
+				return nil, err
+			}
+			if _, err := tx.ExecContext(ctx,
+				`UPDATE probe_tasks SET config_serial=?, config_changed_at=? WHERE proxy_id=?`,
+				newSerial, now, proxyID); err != nil {
+				return nil, err
+			}
+		}
+
+		siteIDOut = siteID
+		return func() {
+			for _, pub := range termPubs {
+				pub(ctx)
+			}
+			if material && len(targetIDs) > 0 {
+				s.announce(siteID)
+			}
+			// The status event fires even for a rename: the proxy name is user-visible on
+			// the affected monitors, so the console must re-read them either way.
+			s.publishTargetStatus(siteID, append(targetIDs, termAffected...))
+		}, nil
+	}); err != nil {
 		return "", err
 	}
-
-	var termPubs []PostCommit
-	var termAffected []string
-	if material && len(targetIDs) > 0 {
-		// Force-resolve the affected targets' firing signals BEFORE the new generation
-		// is stamped, under the reason that actually applies. A proxy edit is a
-		// reconfiguration, never a recovery: announcing "recovered" at the moment the
-		// operator changed the egress path would be a lie.
-		if s.term != nil {
-			affected, pub, terr := s.term.TerminateForTargetsTx(ctx, tx, targetIDs, ReasonConfigChanged)
-			if terr != nil {
-				return "", terr
-			}
-			termAffected = append(termAffected, affected...)
-			if pub != nil {
-				termPubs = append(termPubs, pub)
-			}
-			// Targets whose generation advances without anything firing still need their
-			// counters cleared, or a streak measured through the old proxy continues
-			// through the new one.
-			if terr := s.term.ClearDetectorStateTx(ctx, tx, targetIDs); terr != nil {
-				return "", terr
-			}
-		}
-		if _, err := tx.ExecContext(ctx,
-			`UPDATE sites SET config_serial=config_serial+1 WHERE id=?`, siteID); err != nil {
-			return "", err
-		}
-		var newSerial int
-		if err := tx.QueryRowContext(ctx,
-			`SELECT config_serial FROM sites WHERE id=?`, siteID).Scan(&newSerial); err != nil {
-			return "", err
-		}
-		if _, err := tx.ExecContext(ctx,
-			`UPDATE probe_tasks SET config_serial=?, config_changed_at=? WHERE proxy_id=?`,
-			newSerial, now, proxyID); err != nil {
-			return "", err
-		}
-	}
-
-	if err := tx.Commit(); err != nil {
-		return "", err
-	}
-	committed = true
-	for _, pub := range termPubs {
-		pub(ctx)
-	}
-	if material && len(targetIDs) > 0 {
-		s.announce(siteID)
-	}
-	// The status event fires even for a rename: the proxy name is user-visible on
-	// the affected monitors, so the console must re-read them either way.
-	s.publishTargetStatus(siteID, append(targetIDs, termAffected...))
-	return siteID, nil
+	return siteIDOut, nil
 }
 
 // DeleteProxy removes a proxy that no target references. A referenced proxy is
@@ -374,40 +371,34 @@ func (s *Service) UpdateProxy(ctx context.Context, proxyID string, p Proxy) (str
 // for why unpinning automatically is not an option). Returns the site id, or
 // sql.ErrNoRows when the proxy is gone.
 func (s *Service) DeleteProxy(ctx context.Context, proxyID string) (string, error) {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return "", err
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			_ = tx.Rollback()
+	var siteIDOut string
+	if err := s.db.WriteTx(ctx, store.Standalone(), func(wtx store.WriteTx) (func(), error) {
+		tx := wtx
+		var siteID string
+		if err := tx.QueryRowContext(ctx,
+			`SELECT site_id FROM proxies WHERE id=?`, proxyID).Scan(&siteID); err != nil {
+			return nil, err
 		}
-	}()
-	var siteID string
-	if err := tx.QueryRowContext(ctx,
-		`SELECT site_id FROM proxies WHERE id=?`, proxyID).Scan(&siteID); err != nil {
+		// The reference check runs inside the write tx, so a target pinned to this proxy
+		// by a concurrent save cannot slip in between the check and the delete.
+		users, total, err := proxyUsers(ctx, tx, proxyID)
+		if err != nil {
+			return nil, err
+		}
+		if total > 0 {
+			return nil, &ErrProxyInUse{ProxyID: proxyID, Monitors: users, Total: total}
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM proxies WHERE id=?`, proxyID); err != nil {
+			return nil, err
+		}
+		siteIDOut = siteID
+		// No announce: an unreferenced proxy was never in any DesiredState, so no
+		// agent's config changed.
+		return nil, nil
+	}); err != nil {
 		return "", err
 	}
-	// The reference check runs inside the write tx, so a target pinned to this proxy
-	// by a concurrent save cannot slip in between the check and the delete.
-	users, total, err := proxyUsers(ctx, tx, proxyID)
-	if err != nil {
-		return "", err
-	}
-	if total > 0 {
-		return "", &ErrProxyInUse{ProxyID: proxyID, Monitors: users, Total: total}
-	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM proxies WHERE id=?`, proxyID); err != nil {
-		return "", err
-	}
-	if err := tx.Commit(); err != nil {
-		return "", err
-	}
-	committed = true
-	// No announce: an unreferenced proxy was never in any DesiredState, so no
-	// agent's config changed.
-	return siteID, nil
+	return siteIDOut, nil
 }
 
 // materialProxyChange reports whether the edit changes how the agent dials — i.e.
