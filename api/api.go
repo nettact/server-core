@@ -1,5 +1,5 @@
-// Package api exposes the HTTP surface (chi router + handlers), reusable by the
-// future cloud server. M2 adds real auth: a single-user session (HttpOnly
+// Package api exposes the HTTP surface (chi router + handlers) shared by the
+// self-hosted server and the desktop app. Auth is a single-user session (HttpOnly
 // cookie) for the UI and ed25519 enrollment for agents. Telemetry and the
 // config downlink ride the persistent agent WebSocket (package agentws),
 // mounted here at /agent/ws.

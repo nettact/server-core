@@ -5,10 +5,10 @@ import (
 	"database/sql"
 )
 
-// This file is the SQLite adapter for the CLOUD-014A contract: the sqliteTx
+// This file is the SQLite adapter for the store contract: the sqliteTx
 // wrapper plus the DB.WriteTx / DB.ReadTx entry points. It is the ONLY
-// adapter in this milestone; the PostgreSQL adapter arrives with the cloud
-// milestone and must satisfy the same contract (see contract.go).
+// adapter in this repo; any future adapter must satisfy the same contract
+// (see contract.go).
 
 // Compile-time pins: the read pool and an open *sql.Tx satisfy Executor, and
 // the adapter satisfies WriteTx. Kept in the shipped package (not a test) so
@@ -98,8 +98,8 @@ func (d *DB) WriteTx(ctx context.Context, s Scope, fn func(WriteTx) (post func()
 // enforcement this store has always relied on; ReadOnly TxOptions are not
 // used because driver support for them varies and the pragma is stronger.
 // fn receives an Executor — not a WriteTx — so a read path cannot even reach
-// for the SQLiteTx bridge or a write; read-side tenant enforcement arrives
-// with the PostgreSQL adapter's RLS policy.
+// for the SQLiteTx bridge or a write; read-side tenant enforcement is a
+// future adapter's job.
 func (d *DB) ReadTx(ctx context.Context, s Scope, fn func(Executor) error) error {
 	if err := s.Validate(); err != nil {
 		return err
@@ -112,14 +112,14 @@ func (d *DB) ReadTx(ctx context.Context, s Scope, fn func(Executor) error) error
 	return fn(&sqliteTx{tx: tx, scope: s, dialect: DialectSQLite})
 }
 
-// AdaptTx wraps an already-open *sql.Tx as a WriteTx for a transaction OWNER
-// that still manages its own BeginTx/Commit/Rollback (the packages on the
-// 014B ledger) and for tests that need to hand a WriteTx-typed entry point a
-// transaction whose lifetime they control. This is the safe direction of the
-// old migration seam: *sql.Tx → WriteTx loses nothing, while the removed
-// SQLiteTx bridge went the other way and let code reach a raw handle back out
-// of a WriteTx — the scope bypass CLOUD-015 deleted. Owners should prefer
-// DB.WriteTx and are migrated onto it as their 014B slices land.
+// AdaptTx wraps an already-open *sql.Tx as a WriteTx, for tests that need to
+// hand a WriteTx-typed entry point a transaction whose lifetime they control.
+// This is the safe direction of the old migration seam: *sql.Tx → WriteTx
+// loses nothing, while the removed SQLiteTx bridge went the other way and let
+// code reach a raw handle back out of a WriteTx — a scope bypass, since
+// deleted. Every production transaction owner calls DB.WriteTx, which
+// validates the scope before the connection is touched; AdaptTx's scope is
+// self-reported by its caller, which is why owners must not come back to it.
 //
 // scope must be the scope the owner opened the transaction under; domain code
 // downstream asserts on it.

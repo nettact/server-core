@@ -1,8 +1,8 @@
 package ingest
 
-// This file is the CLOUD-015 contract suite for the extracted API: the
-// properties ApplyPacketTx/Prepare/Commit must hold for any caller — the
-// self-hosted Ingest today and a Cloud tenant transaction tomorrow. The
+// The contract suite for the extracted API: the properties
+// ApplyPacketTx/Prepare/Commit must hold for any caller — the self-hosted
+// Ingest today, or any external transaction owner tomorrow. The
 // behavioral matrix (duplicate/conflict/gap/concurrency) is re-run here
 // against ApplyPacketTx directly, alongside the transactional properties the
 // characterization suite cannot reach through Ingest: per-substep error
@@ -34,7 +34,7 @@ func applyPrincipal() AgentPrincipal {
 }
 
 // applyDirect runs the full three-phase pipeline exactly the way Ingest does,
-// but against the extracted API — the harness the Cloud consumer uses.
+// but against the extracted API — the harness an external caller uses.
 func applyDirect(t *testing.T, h *charHarness, svc *Service, p AgentPrincipal, pkt telemetry.Packet) (ApplyResult, PostCommitPlan, error) {
 	t.Helper()
 	in, err := svc.Prepare(h.ctx, p, pkt)

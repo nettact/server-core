@@ -50,8 +50,8 @@ var ErrSequenceConflict = errors.New("ingest: sequence conflict")
 // transaction so telemetry samples and their fault evaluation reach one committed
 // state atomically. Satisfied by *fault.Service; kept as a small interface so
 // ingest unit tests can pass nil (evaluation is then skipped). PublishOutcome runs
-// post-commit, off the write path. The tx methods take a store.WriteTx (CLOUD-015):
-// the evaluator runs inside the caller's transaction and must never need a raw
+// post-commit, off the write path. The tx methods take a store.WriteTx: the
+// evaluator runs inside the caller's transaction and must never need a raw
 // handle back out of it.
 type Evaluator interface {
 	EvaluateAgentTx(ctx context.Context, tx store.WriteTx, agentID, siteID string, rounds []fault.Round) (*fault.Outcome, error)
@@ -107,9 +107,9 @@ type Service struct {
 	// (nil, nil) when the durable last_seen is fresh enough. A function field
 	// rather than a registry reference so ingest stays free of a registry
 	// import; wired at composition (server.Start), mirroring
-	// registry.ResetSeqWatermark. nil is a no-op. Takes the WriteTx since
-	// CLOUD-015 — it runs inside the packet transaction and must not reach a
-	// raw handle back out of it.
+	// registry.ResetSeqWatermark. nil is a no-op. Takes the WriteTx — it runs
+	// inside the packet transaction and must not reach a raw handle back out
+	// of it.
 	TouchAgentTx func(ctx context.Context, tx store.WriteTx, agentID string) (post func(), err error)
 
 	// Per-agent highest-committed-sequence watermark, mirroring

@@ -1,6 +1,6 @@
 package ingest
 
-// This file is the CLOUD-015 characterization suite: it pins, against the
+// This file is the ingest characterization suite: it pins, against the
 // CURRENT implementation, the observable behavior the extraction of
 // ApplyPacketTx must not change. The existing tests are the contract; these
 // pin the seams that extraction is most likely to disturb (replay admission,

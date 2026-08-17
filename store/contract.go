@@ -8,15 +8,14 @@ import (
 	"strings"
 )
 
-// This file is the CLOUD-014A milestone: the minimal Scope/Executor/WriteTx
-// store contract that shared domain logic can be written against once and run
-// on the SQLite single-writer connection today and on PostgreSQL tenant
-// transactions later. Deliberately absent: a PostgreSQL implementation (the
-// dialect + adapter here are the SQLite ones), row-level security (per-row
-// tenant enforcement lands with the PostgreSQL adapter, not in this contract),
-// and any kind of ORM — repositories needing truly different SQL per store
-// keep two explicit implementations behind one interface, they do not get a
-// query builder.
+// This file is the minimal Scope/Executor/WriteTx store contract: shared
+// domain logic is written against it once and runs on the SQLite single-writer
+// connection today and on other SQL backends behind future adapters.
+// Deliberately absent: any second adapter implementation (the dialect +
+// adapter here are the SQLite ones), row-level security (per-row tenant
+// enforcement is an adapter's job, not this contract's), and any kind of ORM —
+// repositories needing truly different SQL per store keep two explicit
+// implementations behind one interface, they do not get a query builder.
 
 // Scope identifies the tenant boundary a call runs under. Zero-value scopes
 // are invalid by construction: every read and write must carry one, and the
@@ -26,11 +25,10 @@ import (
 // The scope is carried on the transaction so repository code can assert which
 // tenant it was opened under (WriteTx.Scope), but it is NOT an enforcement
 // mechanism: nothing here filters rows by TenantID. The single-tenant
-// deployments this milestone serves have exactly one tenant in the database,
-// and per-row enforcement arrives with the PostgreSQL adapter's RLS policy in
-// the cloud milestone — a repository that relies on the scope field for
-// filtering would silently break the day the adapter starts enforcing
-// differently.
+// deployments this store serves have exactly one tenant in the database, and
+// per-row enforcement is a future adapter's job — a repository that relies on
+// the scope field for filtering would silently break the day an adapter
+// starts enforcing differently.
 type Scope struct {
 	// TenantID is the tenant the call reads or writes under. Empty only for
 	// system scopes (see SystemScope) and account scopes (see AccountScope);
@@ -43,8 +41,8 @@ type Scope struct {
 	// reached under a system scope — see AccountScope.
 	AccountID string
 	// ActorID identifies the acting principal — the user id for console
-	// actions, a job name for platform jobs. It is provenance for audit and
-	// RLS policy resolution, not authorization by itself.
+	// actions, a job name for platform jobs. It is provenance for audit, not
+	// authorization by itself.
 	ActorID string
 
 	// system marks a scope opened for a platform job that runs outside any
@@ -66,8 +64,7 @@ type Scope struct {
 //     conflating two boundaries, not a usable scope;
 //   - system scope: must carry neither TenantID nor AccountID, because it
 //     deliberately runs outside both;
-//   - account scope: requires a non-empty AccountID and an empty TenantID
-//     (cloud/adr/0006 JB-2).
+//   - account scope: requires a non-empty AccountID and an empty TenantID.
 //
 // ActorID is not validated: provenance may legitimately be absent.
 func (s Scope) Validate() error {
@@ -88,7 +85,7 @@ func (s Scope) Validate() error {
 			return errors.New("store: account scope has no account (construct with AccountScope)")
 		}
 		if s.TenantID != "" {
-			return errors.New("store: account scope must not name a tenant (cloud/adr/0006 JB-2)")
+			return errors.New("store: account scope must not name a tenant")
 		}
 		return nil
 	default:
@@ -111,14 +108,6 @@ func (s Scope) IsSystem() bool { return s.system }
 // IsSystem: never infer the kind from a field being empty.
 func (s Scope) IsAccount() bool { return s.account }
 
-// AccountGUC is the PostgreSQL session variable an account-scoped transaction
-// must set before it runs anything, mirroring the tenant GUC. Frozen here by
-// cloud/adr/0006 JB-2; the adapter obligation ("SET LOCAL app.account_id
-// before executing fn") and the account-table RLS policies belong to the
-// PostgreSQL adapter work (W3-06/W3-08). Nothing in this repo executes it yet
-// — the constant exists so there is exactly one spelling to implement against.
-const AccountGUC = "app.account_id"
-
 // SystemScope returns the scope for platform jobs that run outside any tenant.
 // It is the ONLY way to construct a system scope — the flag is unexported and
 // Validate rejects a zero-value Scope — so a call that must cross tenant
@@ -129,8 +118,8 @@ func SystemScope(actor string) Scope {
 
 // AccountScope returns the scope for account-domain work: billing identity and
 // the account→tenant ownership edges, which by construction live outside any
-// one tenant. It is the ONLY way to construct one (cloud/adr/0006 JB-2), so
-// account access is greppable and cannot be reached by accident.
+// one tenant. It is the ONLY way to construct one, so account access is
+// greppable and cannot be reached by accident.
 //
 // It exists so that account-table access has a scope of its own instead of
 // borrowing SystemScope. Borrowing would be worse than untidy: a system scope
@@ -144,27 +133,27 @@ func SystemScope(actor string) Scope {
 // AccountScope is an exported function, so what this buys is a single
 // construction point that can be enumerated by grep — NOT inexpressibility.
 //
-// More importantly, the database is not the boundary here. A PostgreSQL role
+// More importantly, the database is not the boundary here. A database role
 // constrains *capability* (which tables and which DML are reachable), never
-// *identity*: the adapter sets app.account_id to whatever accountID the caller
-// passed, and RLS then correctly authorizes that account's rows. The database
-// holds no Principal and cannot tell a mistaken or substituted id from a
-// genuine one; a shared role can tell even less. "Which account's rows is this"
-// is enforceable only in the application layer, by the Principal and the
-// job→account binding (cloud/adr/0001 P-2/P-3/P-5, cloud/adr/0006 JB-1's
-// re-authorization rule). Calling the role an authorization boundary would
-// invite implementations to skip that re-authorization and leak across
-// accounts. This paragraph is deliberately the same argument SC-8 makes for
-// tenant scopes — it is the same mistake, one boundary over.
+// *identity*: an adapter authorizes whatever accountID the caller passed. The
+// database holds no notion of the acting principal and cannot tell a mistaken
+// or substituted id from a genuine one; a shared role can tell even less.
+// "Which account's rows is this" is enforceable only in the application
+// layer, by whoever authenticated the caller and bound the work to its
+// account. Calling the role an authorization boundary would invite
+// implementations to skip that re-authorization and leak across accounts.
+// The same argument holds one boundary over, for tenant scopes: a scope is
+// caller-supplied everywhere, and no adapter can verify the caller attached
+// the right one.
 func AccountScope(accountID, actorID string) Scope {
 	return Scope{AccountID: accountID, ActorID: actorID, account: true}
 }
 
 // Standalone returns the fixed scope the self-hosted server and the desktop
 // app run under: exactly one tenant, conventionally named "standalone". Domain
-// code calls this unconditionally — there is no `if cloud` branch anywhere;
-// the cloud milestone swaps the scope construction at the composition seam,
-// not inside the packages.
+// code calls this unconditionally — there is no host-specific branch anywhere;
+// a host with real tenancy swaps the scope construction at its composition
+// seam, not inside the packages.
 func Standalone() Scope {
 	return Scope{TenantID: "standalone"}
 }
@@ -181,8 +170,9 @@ const (
 	// OR IGNORE, ON CONFLICT ... DO UPDATE, no RETURNING, JSON marshalled in
 	// Go, times stored as strings/ints.
 	DialectSQLite Dialect = iota
-	// DialectPostgres is the cloud-milestone dialect. Declared now so the
-	// contract is complete; nothing in this repo executes it yet.
+	// DialectPostgres is declared so the contract is complete; nothing in
+	// this repo executes it — its adapter lives with the deployment that
+	// needs it.
 	DialectPostgres
 )
 
@@ -252,7 +242,6 @@ type WriteTx interface {
 	// execution (metrics' rewindRollups runs one prepared UPDATE per series
 	// on the hot ingest path). Prepared statements stay bound to the
 	// transaction, so a repository cannot smuggle one past the transaction's
-	// lifetime. Added for CLOUD-015; additive and trivial for the SQLite
-	// adapter.
+	// lifetime. Additive and trivial for the SQLite adapter.
 	PrepareContext(ctx context.Context, query string) (*sql.Stmt, error)
 }

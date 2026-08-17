@@ -556,8 +556,7 @@ func (s *Service) HomeSlug(ctx context.Context) (string, bool, error) {
 
 // inTx is the package's shared write-transaction owner. It takes a WriteTx-shaped
 // callback rather than *sql.Tx so the scope is validated by DB.WriteTx before the
-// connection is touched, instead of being self-reported at the seam (root
-// adr/0004 SC-8).
+// connection is touched, instead of being self-reported at the seam.
 func (s *Service) inTx(ctx context.Context, fn func(tx store.WriteTx) error) error {
 	return s.db.WriteTx(ctx, store.Standalone(), func(wtx store.WriteTx) (func(), error) {
 		return nil, fn(wtx)

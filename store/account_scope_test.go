@@ -1,10 +1,10 @@
 package store
 
-// Fail-closed contract tests for AccountScope (cloud/adr/0006 JB-2).
+// Fail-closed contract tests for AccountScope.
 //
-// JB-2 requires: AccountScope is the only construction point; Validate is
-// fail-closed (AccountID non-empty AND TenantID empty); the three scope kinds
-// are mutually exclusive and any two holding at once is an error.
+// The frozen contract: AccountScope is the only construction point; Validate
+// is fail-closed (AccountID non-empty AND TenantID empty); the three scope
+// kinds are mutually exclusive and any two holding at once is an error.
 //
 // This file is deliberately in package `store` rather than `store_test`: the
 // cases below build Scope struct literals with the unexported discriminants
@@ -82,14 +82,5 @@ func TestScopeValidateIsFailClosed(t *testing.T) {
 				t.Fatalf("Validate accepted %+v; it must be refused", tc.scope)
 			}
 		})
-	}
-}
-
-// The GUC name is frozen by JB-2 so the PostgreSQL adapter (W3-06) has exactly
-// one spelling to implement against. Asserting it here keeps a rename from
-// passing review unnoticed.
-func TestAccountGUCNameIsFrozen(t *testing.T) {
-	if AccountGUC != "app.account_id" {
-		t.Errorf("AccountGUC = %q, cloud/adr/0006 JB-2 froze app.account_id", AccountGUC)
 	}
 }

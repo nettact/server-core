@@ -39,7 +39,7 @@ type session struct {
 	agentID string
 	siteID  string
 
-	// Schema-8 (CLOUD-013C) session state. epoch/floorSent/floorPushed are set
+	// Schema-8 session state. epoch/floorSent/floorPushed are set
 	// by serve before readLoop starts; floorApplied is read and written only by
 	// readLoop; rotated is set by the rotation paths before their close so the
 	// teardown classifies the disconnect for what it was.

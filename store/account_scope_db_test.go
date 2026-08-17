@@ -1,6 +1,6 @@
 package store_test
 
-// The DB-touching half of the AccountScope contract (cloud/adr/0006 JB-2).
+// The DB-touching half of the AccountScope contract.
 // Split from account_scope_test.go because storetest imports store, so an
 // in-package test file cannot import it back.
 

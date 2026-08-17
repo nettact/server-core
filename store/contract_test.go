@@ -280,7 +280,7 @@ func TestAdaptTxRoundTrip(t *testing.T) {
 	}
 }
 
-// TestWriteTxPrepareContext pins the CLOUD-015 extension: a statement prepared
+// TestWriteTxPrepareContext pins the PrepareContext extension: a statement prepared
 // on the WriteTx executes against the same transaction and is callable
 // repeatedly.
 func TestWriteTxPrepareContext(t *testing.T) {

@@ -1,10 +1,9 @@
 package ingest
 
-// This file is the CLOUD-015 extraction: the ingest transaction core, split
-// out of Ingest so a Cloud state consumer can run the same domain logic
-// inside a PostgreSQL tenant transaction, while the self-hosted Ingest keeps
-// its exact external behavior. The split is the three phases Ingest always
-// had, made explicit:
+// The ingest transaction core, split out of Ingest so an external host can
+// run the same domain logic inside its own store transaction, while the
+// self-hosted Ingest keeps its exact external behavior. The split is the
+// three phases Ingest always had, made explicit:
 //
 //	Prepare        — everything resolved OUTSIDE the write transaction
 //	                 (schema, timestamp policy, provenance pre-filter, series
@@ -55,8 +54,8 @@ type AgentPrincipal struct {
 // write transaction. It is NOT an authorization decision: the authoritative
 // re-check (probe provenance against the transaction) stays inside
 // ApplyPacketTx and can only shrink what Prepare accepted. Fields are
-// unexported because the only way to build one is Prepare — a Cloud consumer
-// never assembles these by hand, and unexported fields make the invariant
+// unexported because the only way to build one is Prepare — an external
+// caller never assembles these by hand, and unexported fields make the invariant
 // ("came from Prepare") structural.
 type PreparedInputs struct {
 	// principal and pkt are the identity PreparedInputs was built FOR: the
@@ -323,8 +322,8 @@ func (s *Service) Prepare(ctx context.Context, p AgentPrincipal, pkt telemetry.P
 // transaction's verdict and the post-commit plan.
 //
 // Hard rules: it never begins, commits or rolls back a transaction — the
-// WriteTx type has no such surface, and the caller (store.DB.WriteTx, or the
-// Cloud tenant-transaction equivalent) owns the lifetime; it never opens a
+// WriteTx type has no such surface, and the caller (store.DB.WriteTx, or an
+// equivalent transaction owner in another host) owns the lifetime; it never opens a
 // connection on the global DB; it never does network I/O. On error the caller
 // rolls back and discards the plan — the characterization suite pins that
 // nothing survives that path.
@@ -625,7 +624,7 @@ func (s *Service) ApplyPacketTx(ctx context.Context, scope store.Scope, wtx stor
 // Observability: the append step is the only one with an error channel today
 // (UpdateLatest and the publish surfaces return nothing), and its failure
 // keeps the byte-identical log line the old path had. The returned error is
-// the programmatic form of the same gap — a Cloud caller that runs its own
+// the programmatic form of the same gap — a caller that runs its own
 // executor equivalent can surface it the same way.
 func (s *Service) Commit(ctx context.Context, plan *PostCommitPlan) error {
 	if plan.commit == nil {

@@ -38,7 +38,7 @@ import (
 // Inventory items are included in full: a device delta is content, and its
 // LastSeen is part of what the agent recorded about the device.
 //
-// This function is the single place Cloud's extended spec later replaces — a
+// This function is the single place a future richer spec would replace — a
 // richer content hash or a Merkle structure lands here, and the ledger
 // semantics stay unchanged.
 func PacketFingerprint(pkt telemetry.Packet) string {

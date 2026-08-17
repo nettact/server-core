@@ -1,4 +1,4 @@
-// Schema 8 (CLOUD-013C): credential generations and the controlled epoch
+// Schema 8: credential generations and the controlled epoch
 // rotation. Everything about the (agent, enrollment_epoch, sequence) identity
 // — the challenge/request/result exchange, the two-phase credential switch,
 // and the bearer authentication that reports which generation a token belongs
