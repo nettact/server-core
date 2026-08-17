@@ -495,161 +495,175 @@ func incidentSelectionKey(p pageRow, targets, agents []publicSubjectRef) string 
 func (s *Service) PublicIncidentHistory(ctx context.Context, slug string) (PublicIncidentHistory, error) {
 	now := s.now().UTC()
 	windowStart := now.AddDate(0, 0, -PublicIncidentWindowDays)
-	tx, err := s.db.Read().BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
-	if err != nil {
-		return PublicIncidentHistory{}, err
-	}
-	defer func() { _ = tx.Rollback() }()
 
-	p, err := scanPageRow(tx.QueryRowContext(ctx, publicPageQuery, slug))
-	if err != nil {
-		return PublicIncidentHistory{}, err
-	}
-	if !p.showIncidents {
-		return PublicIncidentHistory{}, ErrPageNotFound
-	}
-	targets, agents, err := loadPublicIncidentSubjects(ctx, tx, p.id)
-	if err != nil {
-		return PublicIncidentHistory{}, err
-	}
-	selection := incidentSelectionKey(p, targets, agents)
-	s.incidentMu.Lock()
-	defer s.incidentMu.Unlock()
-	if cached, ok := s.incidentCache[p.id]; ok && cached.selection == selection && now.Sub(cached.at) < s.ttl {
-		return cached.data, nil
-	}
-
-	// Candidate selection is capped BEFORE the outer join expands incidents into
-	// their matching signals. Open incidents are retained even when they started
-	// before the window; resolved ones qualify when either their start or recovery
-	// landed inside it.
-	rows, err := tx.QueryContext(ctx, `
-		WITH
-		selected_targets(target_id) AS (
-			SELECT target_id FROM status_page_targets WHERE page_id=?
-		),
-		selected_agents(agent_id) AS (
-			SELECT DISTINCT m.agent_id
-			  FROM agent_group_members m
-			 WHERE m.group_id IN (
-				SELECT group_id FROM status_page_agent_groups WHERE page_id=?
-			 )
-		),
-		matching_signals AS (
-			SELECT s.*
-			  FROM fault_signals s
-			  JOIN incidents i ON i.id=s.incident_id
-			 WHERE i.site_id=?
-			   AND (s.target_id IN selected_targets OR s.agent_id IN selected_agents)
-		),
-		candidates AS (
-			SELECT incident_id,
-			       MAX(CASE WHEN state='firing' THEN 1 ELSE 0 END) AS open_rank,
-			       MAX(observed_at) AS last_observed
-			  FROM matching_signals
-			 WHERE state='firing' OR observed_at>=? OR resolved_at>=?
-			 GROUP BY incident_id
-			 ORDER BY open_rank DESC, last_observed DESC, incident_id
-			 LIMIT ?
-		)
-		SELECT s.incident_id, s.agent_id, s.target_id, s.severity, s.state,
-		       s.observed_at, s.resolved_at
-		  FROM candidates c
-		  JOIN matching_signals s ON s.incident_id=c.incident_id
-		 ORDER BY c.open_rank DESC, c.last_observed DESC, s.incident_id, s.id`,
-		p.id, p.id, p.siteID, windowStart, windowStart, PublicIncidentLimit+1)
-	if err != nil {
-		return PublicIncidentHistory{}, err
-	}
-	defer rows.Close()
-
-	byID := map[string]*publicIncidentAccum{}
-	order := make([]string, 0, PublicIncidentLimit+1)
-	for rows.Next() {
-		var incidentID, agentID, targetID, severity, state string
-		var observed time.Time
-		var resolved sql.NullTime
-		if err := rows.Scan(&incidentID, &agentID, &targetID, &severity, &state, &observed, &resolved); err != nil {
-			return PublicIncidentHistory{}, err
+	// Everything — page, subjects, the incident query, and the cache write — runs
+	// inside one read snapshot (WAL isolation, so selection and labels come from one
+	// committed page version), and the incidentMu cache check sits between the
+	// cheap reads and the expensive query. The closure's end is the function's
+	// decision point, so deferring the mutex unlock in the closure releases it at
+	// the same moment the old code's function-level defer did.
+	var (
+		p       pageRow
+		targets []publicSubjectRef
+		agents  []publicSubjectRef
+		cached  PublicIncidentHistory
+	)
+	err := s.db.ReadTx(ctx, store.Standalone(), func(tx store.Executor) error {
+		var err error
+		if p, err = scanPageRow(tx.QueryRowContext(ctx, publicPageQuery, slug)); err != nil {
+			return err
 		}
-		a := byID[incidentID]
-		if a == nil {
-			a = &publicIncidentAccum{
-				row:    PublicIncident{State: "resolved", Impact: "degraded", StartedAt: observed},
-				latest: observed, targetIDs: map[string]bool{}, agentIDs: map[string]bool{},
+		if !p.showIncidents {
+			return ErrPageNotFound
+		}
+		if targets, agents, err = loadPublicIncidentSubjects(ctx, tx, p.id); err != nil {
+			return err
+		}
+		selection := incidentSelectionKey(p, targets, agents)
+		s.incidentMu.Lock()
+		defer s.incidentMu.Unlock()
+		if c, ok := s.incidentCache[p.id]; ok && c.selection == selection && now.Sub(c.at) < s.ttl {
+			cached = c.data
+			return nil
+		}
+
+		// Candidate selection is capped BEFORE the outer join expands incidents into
+		// their matching signals. Open incidents are retained even when they started
+		// before the window; resolved ones qualify when either their start or recovery
+		// landed inside it.
+		rows, err := tx.QueryContext(ctx, `
+			WITH
+			selected_targets(target_id) AS (
+				SELECT target_id FROM status_page_targets WHERE page_id=?
+			),
+			selected_agents(agent_id) AS (
+				SELECT DISTINCT m.agent_id
+				  FROM agent_group_members m
+				 WHERE m.group_id IN (
+					SELECT group_id FROM status_page_agent_groups WHERE page_id=?
+				 )
+			),
+			matching_signals AS (
+				SELECT s.*
+				  FROM fault_signals s
+				  JOIN incidents i ON i.id=s.incident_id
+				 WHERE i.site_id=?
+				   AND (s.target_id IN selected_targets OR s.agent_id IN selected_agents)
+			),
+			candidates AS (
+				SELECT incident_id,
+				       MAX(CASE WHEN state='firing' THEN 1 ELSE 0 END) AS open_rank,
+				       MAX(observed_at) AS last_observed
+				  FROM matching_signals
+				 WHERE state='firing' OR observed_at>=? OR resolved_at>=?
+				 GROUP BY incident_id
+				 ORDER BY open_rank DESC, last_observed DESC, incident_id
+				 LIMIT ?
+			)
+			SELECT s.incident_id, s.agent_id, s.target_id, s.severity, s.state,
+			       s.observed_at, s.resolved_at
+			  FROM candidates c
+			  JOIN matching_signals s ON s.incident_id=c.incident_id
+			 ORDER BY c.open_rank DESC, c.last_observed DESC, s.incident_id, s.id`,
+			p.id, p.id, p.siteID, windowStart, windowStart, PublicIncidentLimit+1)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+
+		byID := map[string]*publicIncidentAccum{}
+		order := make([]string, 0, PublicIncidentLimit+1)
+		for rows.Next() {
+			var incidentID, agentID, targetID, severity, state string
+			var observed time.Time
+			var resolved sql.NullTime
+			if err := rows.Scan(&incidentID, &agentID, &targetID, &severity, &state, &observed, &resolved); err != nil {
+				return err
 			}
-			byID[incidentID] = a
-			order = append(order, incidentID)
-		}
-		if observed.Before(a.row.StartedAt) {
-			a.row.StartedAt = observed
-		}
-		if observed.After(a.latest) {
-			a.latest = observed
-		}
-		if state == "firing" {
-			a.row.State = "open"
-		}
-		if severity != "info" {
-			a.row.Impact = "outage"
-		}
-		if resolved.Valid {
-			r := resolved.Time
-			if r.After(a.latest) {
-				a.latest = r
+			a := byID[incidentID]
+			if a == nil {
+				a = &publicIncidentAccum{
+					row:    PublicIncident{State: "resolved", Impact: "degraded", StartedAt: observed},
+					latest: observed, targetIDs: map[string]bool{}, agentIDs: map[string]bool{},
+				}
+				byID[incidentID] = a
+				order = append(order, incidentID)
 			}
-			if a.row.ResolvedAt == nil || r.After(*a.row.ResolvedAt) {
-				a.row.ResolvedAt = &r
+			if observed.Before(a.row.StartedAt) {
+				a.row.StartedAt = observed
 			}
-		}
-		if targetID != "" {
-			a.targetIDs[targetID] = true
-		}
-		if agentID != "" {
-			a.agentIDs[agentID] = true
-		}
-	}
-	if err := rows.Err(); err != nil {
-		return PublicIncidentHistory{}, err
-	}
-
-	out := PublicIncidentHistory{
-		GeneratedAt: now,
-		WindowStart: windowStart,
-		Incidents:   []PublicIncident{},
-		Truncated:   len(order) > PublicIncidentLimit,
-	}
-	if len(order) > PublicIncidentLimit {
-		order = order[:PublicIncidentLimit]
-	}
-	for _, id := range order {
-		a := byID[id]
-		if a.row.State == "open" {
-			a.row.ResolvedAt = nil
-		}
-		// A target-scoped signal is named by its monitor. Agent subjects are the
-		// fallback for connectivity and host faults, where no selected probe target
-		// exists. This avoids saying "Website + Node A" for one target outage.
-		for _, subject := range targets {
-			if a.targetIDs[subject.id] {
-				a.row.Subjects = append(a.row.Subjects, subject.PublicIncidentSubject)
+			if observed.After(a.latest) {
+				a.latest = observed
+			}
+			if state == "firing" {
+				a.row.State = "open"
+			}
+			if severity != "info" {
+				a.row.Impact = "outage"
+			}
+			if resolved.Valid {
+				r := resolved.Time
+				if r.After(a.latest) {
+					a.latest = r
+				}
+				if a.row.ResolvedAt == nil || r.After(*a.row.ResolvedAt) {
+					a.row.ResolvedAt = &r
+				}
+			}
+			if targetID != "" {
+				a.targetIDs[targetID] = true
+			}
+			if agentID != "" {
+				a.agentIDs[agentID] = true
 			}
 		}
-		if len(a.row.Subjects) == 0 {
-			for _, subject := range agents {
-				if a.agentIDs[subject.id] {
+		if err := rows.Err(); err != nil {
+			return err
+		}
+
+		out := PublicIncidentHistory{
+			GeneratedAt: now,
+			WindowStart: windowStart,
+			Incidents:   []PublicIncident{},
+			Truncated:   len(order) > PublicIncidentLimit,
+		}
+		if len(order) > PublicIncidentLimit {
+			order = order[:PublicIncidentLimit]
+		}
+		for _, id := range order {
+			a := byID[id]
+			if a.row.State == "open" {
+				a.row.ResolvedAt = nil
+			}
+			// A target-scoped signal is named by its monitor. Agent subjects are the
+			// fallback for connectivity and host faults, where no selected probe target
+			// exists. This avoids saying "Website + Node A" for one target outage.
+			for _, subject := range targets {
+				if a.targetIDs[subject.id] {
 					a.row.Subjects = append(a.row.Subjects, subject.PublicIncidentSubject)
 				}
 			}
+			if len(a.row.Subjects) == 0 {
+				for _, subject := range agents {
+					if a.agentIDs[subject.id] {
+						a.row.Subjects = append(a.row.Subjects, subject.PublicIncidentSubject)
+					}
+				}
+			}
+			// matching_signals only admits selected target/agent ids, so a valid
+			// database always resolves at least one subject. Keep the frontend's
+			// anonymous fallback useful if that invariant is ever violated rather
+			// than silently dropping a row after Truncated was computed.
+			out.Incidents = append(out.Incidents, a.row)
 		}
-		// matching_signals only admits selected target/agent ids, so a valid
-		// database always resolves at least one subject. Keep the frontend's
-		// anonymous fallback useful if that invariant is ever violated rather
-		// than silently dropping a row after Truncated was computed.
-		out.Incidents = append(out.Incidents, a.row)
+		s.incidentCache[p.id] = incidentSnapshot{at: now, selection: selection, data: out}
+		cached = out
+		return nil
+	})
+	if err != nil {
+		return PublicIncidentHistory{}, err
 	}
-	s.incidentCache[p.id] = incidentSnapshot{at: now, selection: selection, data: out}
-	return out, nil
+	return cached, nil
 }
 
 // loadPublicIncidentSubjects builds the same stable anonymous labels used by the
