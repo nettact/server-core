@@ -152,50 +152,46 @@ func (s *Service) SetPassword(ctx context.Context, userID, newPassword, keepSess
 // setPassword is the shared transaction. verify, when non-nil, is the
 // old-password check, run against the hash read inside the transaction.
 func (s *Service) setPassword(ctx context.Context, userID, newPassword, keepSessionID string, verify func(hash string) error) error {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-
-	var hash string
-	err = tx.QueryRowContext(ctx,
-		`SELECT password_hash FROM users WHERE id=?`, userID).Scan(&hash)
-	if errors.Is(err, sql.ErrNoRows) {
-		return ErrAuth
-	}
-	if err != nil {
-		return err
-	}
-	if verify != nil {
-		if err := verify(hash); err != nil {
-			return err
+	return s.db.WriteTx(ctx, store.Standalone(), func(wtx store.WriteTx) (func(), error) {
+		var hash string
+		err := wtx.QueryRowContext(ctx,
+			`SELECT password_hash FROM users WHERE id=?`, userID).Scan(&hash)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrAuth
 		}
-	}
-	if err := ValidatePassword(newPassword); err != nil {
-		return err
-	}
-	newHash, err := bcrypt.GenerateFromPassword([]byte(newPassword), bcrypt.DefaultCost)
-	if err != nil {
-		return err
-	}
-	res, err := tx.ExecContext(ctx,
-		`UPDATE users SET password_hash=? WHERE id=? AND password_hash=?`,
-		string(newHash), userID, hash)
-	if err != nil {
-		return err
-	}
-	if n, err := res.RowsAffected(); err != nil {
-		return err
-	} else if n == 0 {
-		// The row changed out from under us since the SELECT above.
-		return ErrAuth
-	}
-	if _, err := tx.ExecContext(ctx,
-		`DELETE FROM sessions WHERE user_id=? AND id<>?`, userID, keepSessionID); err != nil {
-		return err
-	}
-	return tx.Commit()
+		if err != nil {
+			return nil, err
+		}
+		if verify != nil {
+			if err := verify(hash); err != nil {
+				return nil, err
+			}
+		}
+		if err := ValidatePassword(newPassword); err != nil {
+			return nil, err
+		}
+		newHash, err := bcrypt.GenerateFromPassword([]byte(newPassword), bcrypt.DefaultCost)
+		if err != nil {
+			return nil, err
+		}
+		res, err := wtx.ExecContext(ctx,
+			`UPDATE users SET password_hash=? WHERE id=? AND password_hash=?`,
+			string(newHash), userID, hash)
+		if err != nil {
+			return nil, err
+		}
+		if n, err := res.RowsAffected(); err != nil {
+			return nil, err
+		} else if n == 0 {
+			// The row changed out from under us since the SELECT above.
+			return nil, ErrAuth
+		}
+		if _, err := wtx.ExecContext(ctx,
+			`DELETE FROM sessions WHERE user_id=? AND id<>?`, userID, keepSessionID); err != nil {
+			return nil, err
+		}
+		return nil, nil
+	})
 }
 
 // ResetAdminPassword replaces the single admin's password out of band (the CLI
@@ -209,33 +205,31 @@ func (s *Service) ResetAdminPassword(ctx context.Context, newPassword string) (s
 	if err := ValidatePassword(newPassword); err != nil {
 		return "", err
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
+	var username string
+	err := s.db.WriteTx(ctx, store.Standalone(), func(wtx store.WriteTx) (func(), error) {
+		var id string
+		err := wtx.QueryRowContext(ctx,
+			`SELECT id, username FROM users ORDER BY created_at LIMIT 1`).Scan(&id, &username)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, errors.New("no admin user exists to reset")
+		}
+		if err != nil {
+			return nil, err
+		}
+		hash, err := bcrypt.GenerateFromPassword([]byte(newPassword), bcrypt.DefaultCost)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := wtx.ExecContext(ctx,
+			`UPDATE users SET password_hash=? WHERE id=?`, string(hash), id); err != nil {
+			return nil, err
+		}
+		if _, err := wtx.ExecContext(ctx, `DELETE FROM sessions WHERE user_id=?`, id); err != nil {
+			return nil, err
+		}
+		return nil, nil
+	})
 	if err != nil {
-		return "", err
-	}
-	defer tx.Rollback()
-
-	var id, username string
-	err = tx.QueryRowContext(ctx,
-		`SELECT id, username FROM users ORDER BY created_at LIMIT 1`).Scan(&id, &username)
-	if errors.Is(err, sql.ErrNoRows) {
-		return "", errors.New("no admin user exists to reset")
-	}
-	if err != nil {
-		return "", err
-	}
-	hash, err := bcrypt.GenerateFromPassword([]byte(newPassword), bcrypt.DefaultCost)
-	if err != nil {
-		return "", err
-	}
-	if _, err := tx.ExecContext(ctx,
-		`UPDATE users SET password_hash=? WHERE id=?`, string(hash), id); err != nil {
-		return "", err
-	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM sessions WHERE user_id=?`, id); err != nil {
-		return "", err
-	}
-	if err := tx.Commit(); err != nil {
 		return "", err
 	}
 	return username, nil
@@ -283,35 +277,30 @@ func (s *Service) LoginSession(ctx context.Context, username, password string) (
 		return User{}, "", time.Time{}, ErrAuth
 	}
 
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return User{}, "", time.Time{}, err
-	}
-	defer tx.Rollback()
-
-	var currentHash string
-	err = tx.QueryRowContext(ctx,
-		`SELECT password_hash FROM users WHERE id=?`, u.ID).Scan(&currentHash)
-	if errors.Is(err, sql.ErrNoRows) {
-		return User{}, "", time.Time{}, ErrAuth
-	}
-	if err != nil {
-		return User{}, "", time.Time{}, err
-	}
-	if currentHash != verifiedHash {
-		// The password rotated between the bcrypt check and here.
-		return User{}, "", time.Time{}, ErrAuth
-	}
-
 	id := randToken()
 	now := time.Now().UTC()
 	exp := now.Add(sessionTTL)
-	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO sessions(id, user_id, created_at, expires_at) VALUES(?,?,?,?)`,
-		id, u.ID, now, exp); err != nil {
-		return User{}, "", time.Time{}, err
-	}
-	if err := tx.Commit(); err != nil {
+	if err := s.db.WriteTx(ctx, store.Standalone(), func(wtx store.WriteTx) (func(), error) {
+		var currentHash string
+		err := wtx.QueryRowContext(ctx,
+			`SELECT password_hash FROM users WHERE id=?`, u.ID).Scan(&currentHash)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrAuth
+		}
+		if err != nil {
+			return nil, err
+		}
+		if currentHash != verifiedHash {
+			// The password rotated between the bcrypt check and here.
+			return nil, ErrAuth
+		}
+		if _, err := wtx.ExecContext(ctx,
+			`INSERT INTO sessions(id, user_id, created_at, expires_at) VALUES(?,?,?,?)`,
+			id, u.ID, now, exp); err != nil {
+			return nil, err
+		}
+		return nil, nil
+	}); err != nil {
 		return User{}, "", time.Time{}, err
 	}
 	return u, id, exp, nil

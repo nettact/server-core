@@ -45,6 +45,33 @@ move to `DB.WriteTx`; their remaining `*sql.Tx` consumers follow). "Owns a
 tx" = the function opens/commits/rollbacks a transaction itself; "consumes
 `*sql.Tx`" = the function receives one from an owner.
 
+### Write owners first — and why the target is `DB.WriteTx`, not `AdaptTx`
+
+Root `adr/0004` **SC-8** names `AdaptTx` an honest residue: the scope is
+**self-reported by the owner** and the contract layer cannot check it. It also
+rules out the tempting backstop — if a request belonging to tenant A is wrapped
+in a `Scope` for tenant B, SC-6 sets `app.tenant_id` to B and RLS *correctly*
+authorizes B's rows; the database holds no Principal and cannot see the
+mismatch. RLS defends against "the SQL forgot `WHERE tenant_id`", **not**
+against "the scope argument was wrong". SC-8's conclusion is that closing this
+ledger is the *only* real mitigation.
+
+Two consequences for how the remaining rows get cleared:
+
+1. **Wrapping an owner's `*sql.Tx` in `AdaptTx` does not clear its row.** That
+   keeps the self-reported scope and merely changes its spelling. A row is done
+   when the owner calls `DB.WriteTx`, which validates the scope *before* the
+   connection is touched.
+2. **Write owners are the priority; read-pool rows are not on the SC-8 path.**
+   `AdaptTx` is a write-side seam, so read paths carry no equivalent trust gap.
+   They still move to `DB.ReadTx` for scope-carrying uniformity, but clearing
+   them buys no SC-8 mitigation and should not be confused with it.
+
+**Progress (W2-02):** `gamedata` and `identity` are clear (0 `BeginTx`
+outside tests). Remaining non-test `BeginTx` sites by package: baseline 2,
+cleanup 3, config 9, fault 4, incidentops 3, metrics 2, notifypolicy 1,
+opissue 5, registry 5, statuspage 3, targetstatus 1.
+
 ### baseline
 
 | Function | Kind | Owner |
@@ -80,14 +107,14 @@ tx" = the function opens/commits/rollbacks a transaction itself; "consumes
 
 | Function | Kind | Owner |
 | --- | --- | --- |
-| `DeleteRun` | owns a tx | 014B |
-| `read.go` queries | read pool (one opens a read tx) | 014B |
+| `DeleteRun` | owns a tx | **done (W2-02)** — `DB.WriteTx` + `store.Standalone()`. Returning `ErrNotFound` from `fn` rolls back exactly as the pre-contract fall-through-to-deferred-`Rollback` did, and `WriteTx` propagates `fn`'s error unwrapped so callers' `errors.Is(err, ErrNotFound)` is unchanged |
+| `read.go` queries | read pool | 014B — read paths only; no `AdaptTx` seam on this side (see "Write owners first") |
 
 ### identity
 
 | Function | Kind | Owner |
 | --- | --- | --- |
-| `setPassword`, `ResetAdminPassword`, `LoginSession` | own a tx | 014B |
+| `setPassword`, `ResetAdminPassword`, `LoginSession` | own a tx | **done (W2-02)** — all three on `DB.WriteTx` + `store.Standalone()`; zero `BeginTx` left in the package. `LoginSession`'s session id/expiry are minted *before* the transaction so the values returned to the caller are the committed ones; `ResetAdminPassword` closes over `username` for the same reason |
 
 ### incidentops
 

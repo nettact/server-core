@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/nettact/protocol/gamesense"
+	"github.com/nettact/server-core/store"
 )
 
 // ErrNotFound is returned for a run id that does not exist, so callers can map it
@@ -100,26 +101,26 @@ func (s *Service) GetRun(ctx context.Context, id string) (Run, error) {
 // blank the machine curves of every OTHER run overlapping the same seconds —
 // including runs on other games that have nothing to do with this deletion.
 func (s *Service) DeleteRun(ctx context.Context, id string) error {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-
-	if _, err := tx.ExecContext(ctx, `DELETE FROM game_buckets WHERE run_id=?`, id); err != nil {
-		return err
-	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM game_run_gaps WHERE run_id=?`, id); err != nil {
-		return err
-	}
-	res, err := tx.ExecContext(ctx, `DELETE FROM game_runs WHERE id=?`, id)
-	if err != nil {
-		return err
-	}
-	if n, _ := res.RowsAffected(); n == 0 {
-		return ErrNotFound
-	}
-	return tx.Commit()
+	return s.db.WriteTx(ctx, store.Standalone(), func(wtx store.WriteTx) (func(), error) {
+		if _, err := wtx.ExecContext(ctx, `DELETE FROM game_buckets WHERE run_id=?`, id); err != nil {
+			return nil, err
+		}
+		if _, err := wtx.ExecContext(ctx, `DELETE FROM game_run_gaps WHERE run_id=?`, id); err != nil {
+			return nil, err
+		}
+		res, err := wtx.ExecContext(ctx, `DELETE FROM game_runs WHERE id=?`, id)
+		if err != nil {
+			return nil, err
+		}
+		// Returning the error rolls the transaction back, which is what the
+		// pre-contract code did by falling through to the deferred Rollback
+		// without committing. WriteTx propagates fn's error unwrapped, so
+		// callers' errors.Is(err, ErrNotFound) keeps working.
+		if n, _ := res.RowsAffected(); n == 0 {
+			return nil, ErrNotFound
+		}
+		return nil, nil
+	})
 }
 
 const runCols = `r.id, r.agent_id, r.site_id, r.proc, r.title, r.profile_id, gp.name,
