@@ -33,8 +33,15 @@ import (
 // differently.
 type Scope struct {
 	// TenantID is the tenant the call reads or writes under. Empty only for
-	// system scopes (see SystemScope); every other scope must name a tenant.
+	// system scopes (see SystemScope) and account scopes (see AccountScope);
+	// every other scope must name a tenant.
 	TenantID string
+	// AccountID is the account an account-domain call runs under. Empty for
+	// every scope except the ones AccountScope builds. Account-domain rows
+	// (billing identity, cross-tenant ownership) live outside any single
+	// tenant, so they cannot be reached under a tenant scope and must not be
+	// reached under a system scope — see AccountScope.
+	AccountID string
 	// ActorID identifies the acting principal — the user id for console
 	// actions, a job name for platform jobs. It is provenance for audit and
 	// RLS policy resolution, not authorization by itself.
@@ -44,20 +51,55 @@ type Scope struct {
 	// tenant boundary (migrations, sweepers, cross-tenant reconciliation).
 	// Unexported so SystemScope is the only way to get one.
 	system bool
+	// account marks a scope opened for the account domain. Unexported so
+	// AccountScope is the only way to get one, for the same reason as
+	// `system`: the two must stay tellable apart from a scope that simply
+	// forgot to name a tenant.
+	account bool
 }
 
-// Validate reports whether the scope may open a transaction. Tenant scopes
-// require a non-empty TenantID; system scopes (created exclusively by
-// SystemScope) are exempt because platform jobs deliberately run outside a
-// tenant. ActorID is not validated: provenance may legitimately be absent.
+// Validate reports whether the scope may open a transaction. The three scope
+// kinds are mutually exclusive and each is checked fail-closed:
+//
+//   - tenant scope (neither flag): requires a non-empty TenantID, and must not
+//     carry an AccountID — a tenant scope holding an account id is a caller
+//     conflating two boundaries, not a usable scope;
+//   - system scope: must carry neither TenantID nor AccountID, because it
+//     deliberately runs outside both;
+//   - account scope: requires a non-empty AccountID and an empty TenantID
+//     (cloud/adr/0006 JB-2).
+//
+// ActorID is not validated: provenance may legitimately be absent.
 func (s Scope) Validate() error {
-	if s.system {
+	if s.system && s.account {
+		return errors.New("store: scope is both system and account (they are mutually exclusive)")
+	}
+	switch {
+	case s.system:
+		if s.TenantID != "" {
+			return errors.New("store: system scope must not name a tenant")
+		}
+		if s.AccountID != "" {
+			return errors.New("store: system scope must not name an account")
+		}
+		return nil
+	case s.account:
+		if s.AccountID == "" {
+			return errors.New("store: account scope has no account (construct with AccountScope)")
+		}
+		if s.TenantID != "" {
+			return errors.New("store: account scope must not name a tenant (cloud/adr/0006 JB-2)")
+		}
+		return nil
+	default:
+		if s.TenantID == "" {
+			return errors.New("store: scope has no tenant (construct with Standalone, SystemScope or AccountScope, never Scope{})")
+		}
+		if s.AccountID != "" {
+			return errors.New("store: tenant scope must not name an account (construct with AccountScope)")
+		}
 		return nil
 	}
-	if s.TenantID == "" {
-		return errors.New("store: scope has no tenant (construct with Standalone or SystemScope, never Scope{})")
-	}
-	return nil
 }
 
 // IsSystem reports whether this is a platform-job scope. Domain code that must
@@ -65,12 +107,57 @@ func (s Scope) Validate() error {
 // so a tenant that is genuinely named "" can never masquerade as system.
 func (s Scope) IsSystem() bool { return s.system }
 
+// IsAccount reports whether this is an account-domain scope. Same reasoning as
+// IsSystem: never infer the kind from a field being empty.
+func (s Scope) IsAccount() bool { return s.account }
+
+// AccountGUC is the PostgreSQL session variable an account-scoped transaction
+// must set before it runs anything, mirroring the tenant GUC. Frozen here by
+// cloud/adr/0006 JB-2; the adapter obligation ("SET LOCAL app.account_id
+// before executing fn") and the account-table RLS policies belong to the
+// PostgreSQL adapter work (W3-06/W3-08). Nothing in this repo executes it yet
+// — the constant exists so there is exactly one spelling to implement against.
+const AccountGUC = "app.account_id"
+
 // SystemScope returns the scope for platform jobs that run outside any tenant.
 // It is the ONLY way to construct a system scope — the flag is unexported and
 // Validate rejects a zero-value Scope — so a call that must cross tenant
 // boundaries can always be told apart from one that forgot its scope.
 func SystemScope(actor string) Scope {
 	return Scope{ActorID: actor, system: true}
+}
+
+// AccountScope returns the scope for account-domain work: billing identity and
+// the account→tenant ownership edges, which by construction live outside any
+// one tenant. It is the ONLY way to construct one (cloud/adr/0006 JB-2), so
+// account access is greppable and cannot be reached by accident.
+//
+// It exists so that account-table access has a scope of its own instead of
+// borrowing SystemScope. Borrowing would be worse than untidy: a system scope
+// says "this deliberately crosses every tenant", which is a strictly wider
+// claim than "this touches one account", and once the two are spelled the same
+// way no reviewer or policy can tell them apart again.
+//
+// # Honest limit
+//
+// The unexported discriminant stops a struct literal, not a determined caller:
+// AccountScope is an exported function, so what this buys is a single
+// construction point that can be enumerated by grep — NOT inexpressibility.
+//
+// More importantly, the database is not the boundary here. A PostgreSQL role
+// constrains *capability* (which tables and which DML are reachable), never
+// *identity*: the adapter sets app.account_id to whatever accountID the caller
+// passed, and RLS then correctly authorizes that account's rows. The database
+// holds no Principal and cannot tell a mistaken or substituted id from a
+// genuine one; a shared role can tell even less. "Which account's rows is this"
+// is enforceable only in the application layer, by the Principal and the
+// job→account binding (cloud/adr/0001 P-2/P-3/P-5, cloud/adr/0006 JB-1's
+// re-authorization rule). Calling the role an authorization boundary would
+// invite implementations to skip that re-authorization and leak across
+// accounts. This paragraph is deliberately the same argument SC-8 makes for
+// tenant scopes — it is the same mistake, one boundary over.
+func AccountScope(accountID, actorID string) Scope {
+	return Scope{AccountID: accountID, ActorID: actorID, account: true}
 }
 
 // Standalone returns the fixed scope the self-hosted server and the desktop
