@@ -12,6 +12,8 @@ import (
 	"github.com/nettact/server-core/agentstatus"
 	"github.com/nettact/server-core/metrics"
 	"github.com/nettact/server-core/targetstatus"
+
+	"github.com/nettact/server-core/store"
 )
 
 // ---- public DTOs ----
@@ -24,13 +26,13 @@ import (
 // PublicPage is the page's own description — enough to render a header and decide
 // which lists to request. It carries no ids and no site.
 type PublicPage struct {
-	Slug              string    `json:"slug"`
-	Title             string    `json:"title"`
-	Description       string    `json:"description,omitempty"`
-	ShowAgentView     bool      `json:"show_agent_view"`
-	ShowTargetView    bool      `json:"show_target_view"`
-	ShowIncidents     bool      `json:"show_incidents"`
-	ShowTargetAddress bool      `json:"show_target_address"`
+	Slug              string `json:"slug"`
+	Title             string `json:"title"`
+	Description       string `json:"description,omitempty"`
+	ShowAgentView     bool   `json:"show_agent_view"`
+	ShowTargetView    bool   `json:"show_target_view"`
+	ShowIncidents     bool   `json:"show_incidents"`
+	ShowTargetAddress bool   `json:"show_target_address"`
 	// IsHome tells the page it is this server's front door, which is the ONLY
 	// condition under which it offers a link back to the console. It discloses
 	// nothing a stranger could not already observe: visiting the root and being
@@ -653,7 +655,7 @@ func (s *Service) PublicIncidentHistory(ctx context.Context, slug string) (Publi
 // loadPublicIncidentSubjects builds the same stable anonymous labels used by the
 // live views, inside the incident read's transaction. Current selection and
 // labels therefore come from one committed page version.
-func loadPublicIncidentSubjects(ctx context.Context, tx *sql.Tx, pageID string) ([]publicSubjectRef, []publicSubjectRef, error) {
+func loadPublicIncidentSubjects(ctx context.Context, tx store.Executor, pageID string) ([]publicSubjectRef, []publicSubjectRef, error) {
 	targetRows, err := tx.QueryContext(ctx, `
 		SELECT t.id, COALESCE(t.name,''), t.kind
 		  FROM probe_tasks t
@@ -809,33 +811,32 @@ func scanPageRow(row *sql.Row) (pageRow, error) {
 // same indistinguishable ErrPageNotFound.
 func (s *Service) resolveWithSelection(ctx context.Context, slug, memberQuery string,
 	visible func(pageRow) bool) (pageRow, map[string]bool, error) {
-	tx, err := s.db.Read().BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
-	if err != nil {
-		return pageRow{}, nil, err
-	}
-	defer func() { _ = tx.Rollback() }()
-
-	p, err := scanPageRow(tx.QueryRowContext(ctx, publicPageQuery, slug))
-	if err != nil {
-		return pageRow{}, nil, err
-	}
-	if !visible(p) {
-		return pageRow{}, nil, ErrPageNotFound
-	}
-	rows, err := tx.QueryContext(ctx, memberQuery, p.id)
-	if err != nil {
-		return pageRow{}, nil, err
-	}
-	defer rows.Close()
-	selected := map[string]bool{}
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			return pageRow{}, nil, err
+	var (
+		p        pageRow
+		selected = map[string]bool{}
+	)
+	if err := s.db.ReadTx(ctx, store.Standalone(), func(tx store.Executor) error {
+		var err error
+		if p, err = scanPageRow(tx.QueryRowContext(ctx, publicPageQuery, slug)); err != nil {
+			return err
 		}
-		selected[id] = true
-	}
-	if err := rows.Err(); err != nil {
+		if !visible(p) {
+			return ErrPageNotFound
+		}
+		rows, err := tx.QueryContext(ctx, memberQuery, p.id)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var id string
+			if err := rows.Scan(&id); err != nil {
+				return err
+			}
+			selected[id] = true
+		}
+		return rows.Err()
+	}); err != nil {
 		return pageRow{}, nil, err
 	}
 	return p, selected, nil

@@ -356,7 +356,7 @@ func (s *Service) Create(ctx context.Context, siteID string, spec Spec) (Page, e
 	}
 	id := "spg_" + uuid.NewString()
 	now := s.now().UTC()
-	err := s.inTx(ctx, func(tx *sql.Tx) error {
+	err := s.inTx(ctx, func(tx store.WriteTx) error {
 		if err := ensureSlugFree(ctx, tx, spec.Slug, ""); err != nil {
 			return err
 		}
@@ -387,7 +387,7 @@ func (s *Service) Update(ctx context.Context, id string, spec Spec) (Page, error
 	if err := spec.Validate(); err != nil {
 		return Page{}, err
 	}
-	err := s.inTx(ctx, func(tx *sql.Tx) error {
+	err := s.inTx(ctx, func(tx store.WriteTx) error {
 		var siteID string
 		if err := tx.QueryRowContext(ctx,
 			`SELECT site_id FROM status_pages WHERE id=?`, id).Scan(&siteID); err != nil {
@@ -520,7 +520,7 @@ func (s *Service) loadMembers(ctx context.Context, siteID string, byID map[strin
 //
 // exceptID keeps an update of the page that ALREADY holds the flag from
 // demoting itself (Create passes "", which matches no id).
-func clearHome(ctx context.Context, tx *sql.Tx, spec Spec, exceptID string, now time.Time) error {
+func clearHome(ctx context.Context, tx store.Executor, spec Spec, exceptID string, now time.Time) error {
 	if !spec.IsHome {
 		return nil
 	}
@@ -554,22 +554,20 @@ func (s *Service) HomeSlug(ctx context.Context) (string, bool, error) {
 	return slug, true, nil
 }
 
-func (s *Service) inTx(ctx context.Context, fn func(tx *sql.Tx) error) error {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	if err := fn(tx); err != nil {
-		return err
-	}
-	return tx.Commit()
+// inTx is the package's shared write-transaction owner. It takes a WriteTx-shaped
+// callback rather than *sql.Tx so the scope is validated by DB.WriteTx before the
+// connection is touched, instead of being self-reported at the seam (root
+// adr/0004 SC-8).
+func (s *Service) inTx(ctx context.Context, fn func(tx store.WriteTx) error) error {
+	return s.db.WriteTx(ctx, store.Standalone(), func(wtx store.WriteTx) (func(), error) {
+		return nil, fn(wtx)
+	})
 }
 
 // ensureSlugFree rejects a slug already used by another page. The UNIQUE index is
 // still the real guarantee; this exists so the common case reports ErrSlugTaken
 // (409, "pick another address") instead of surfacing a driver constraint string.
-func ensureSlugFree(ctx context.Context, tx *sql.Tx, slug, exceptID string) error {
+func ensureSlugFree(ctx context.Context, tx store.Executor, slug, exceptID string) error {
 	var found string
 	err := tx.QueryRowContext(ctx,
 		`SELECT id FROM status_pages WHERE slug=? AND id<>?`, slug, exceptID).Scan(&found)
@@ -590,7 +588,7 @@ func ensureSlugFree(ctx context.Context, tx *sql.Tx, slug, exceptID string) erro
 // silently dropped. Silently dropping is the dangerous half of that choice in the
 // other direction too: an operator who pasted the wrong id would get a page that
 // looks saved and publishes less than they think.
-func replaceMembers(ctx context.Context, tx *sql.Tx, pageID, siteID string, spec Spec) error {
+func replaceMembers(ctx context.Context, tx store.Executor, pageID, siteID string, spec Spec) error {
 	if _, err := tx.ExecContext(ctx, `DELETE FROM status_page_agent_groups WHERE page_id=?`, pageID); err != nil {
 		return err
 	}
