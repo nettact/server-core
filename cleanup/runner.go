@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/nettact/server-core/metrics"
+
+	"github.com/nettact/server-core/store"
 )
 
 // Recover requeues any job left 'running' by a process stop. Its still-pending
@@ -246,38 +248,30 @@ func (s *Service) persistPlanned(ctx context.Context, jobID string, idx int, p p
 // markDone flips an item to done and folds its planned counts into the job in one
 // transaction, so the item state and the job counters can't diverge on a crash.
 func (s *Service) markDone(ctx context.Context, jobID string, idx int, p plannedCounts, detail string) error {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	if _, err := tx.ExecContext(ctx, `UPDATE cleanup_job_items SET state='done', detail=? WHERE job_id=? AND idx=?`, detail, jobID, idx); err != nil {
-		_ = tx.Rollback()
-		return err
-	}
-	if _, err := tx.ExecContext(ctx,
-		`UPDATE cleanup_jobs SET done_items=done_items+1, del_samples=del_samples+?, del_rollups=del_rollups+?, del_series=del_series+? WHERE id=?`,
-		p.S, p.R, p.E, jobID); err != nil {
-		_ = tx.Rollback()
-		return err
-	}
-	return tx.Commit()
+	return s.db.WriteTx(ctx, store.Standalone(), func(wtx store.WriteTx) (func(), error) {
+		if _, err := wtx.ExecContext(ctx, `UPDATE cleanup_job_items SET state='done', detail=? WHERE job_id=? AND idx=?`, detail, jobID, idx); err != nil {
+			return nil, err
+		}
+		if _, err := wtx.ExecContext(ctx,
+			`UPDATE cleanup_jobs SET done_items=done_items+1, del_samples=del_samples+?, del_rollups=del_rollups+?, del_series=del_series+? WHERE id=?`,
+			p.S, p.R, p.E, jobID); err != nil {
+			return nil, err
+		}
+		return nil, nil
+	})
 }
 
 // markFailed flips an item to failed and bumps the job's failed counter.
 func (s *Service) markFailed(ctx context.Context, jobID string, idx int, detail string) error {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	if _, err := tx.ExecContext(ctx, `UPDATE cleanup_job_items SET state='failed', detail=? WHERE job_id=? AND idx=?`, detail, jobID, idx); err != nil {
-		_ = tx.Rollback()
-		return err
-	}
-	if _, err := tx.ExecContext(ctx, `UPDATE cleanup_jobs SET failed_items=failed_items+1 WHERE id=?`, jobID); err != nil {
-		_ = tx.Rollback()
-		return err
-	}
-	return tx.Commit()
+	return s.db.WriteTx(ctx, store.Standalone(), func(wtx store.WriteTx) (func(), error) {
+		if _, err := wtx.ExecContext(ctx, `UPDATE cleanup_job_items SET state='failed', detail=? WHERE job_id=? AND idx=?`, detail, jobID, idx); err != nil {
+			return nil, err
+		}
+		if _, err := wtx.ExecContext(ctx, `UPDATE cleanup_jobs SET failed_items=failed_items+1 WHERE id=?`, jobID); err != nil {
+			return nil, err
+		}
+		return nil, nil
+	})
 }
 
 func (s *Service) finishJob(ctx context.Context, jobID string) error {
