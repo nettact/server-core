@@ -549,57 +549,51 @@ func (s *Service) UpdateAgent(ctx context.Context, id, displayName string) error
 // batch-driven consoles drop the removed agent (and its per-target contribution)
 // immediately instead of at the next unrelated event.
 func (s *Service) DeleteAgent(ctx context.Context, id string) error {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-
-	// Capture the agent's site before its row is removed so the post-commit refresh
-	// targets the right site. A missing row surfaces as sql.ErrNoRows (not-found).
-	var siteID string
-	if err := tx.QueryRowContext(ctx, `SELECT site_id FROM agents WHERE id=?`, id).Scan(&siteID); err != nil {
-		return err
-	}
-
-	for _, stmt := range []string{
-		`DELETE FROM interfaces WHERE agent_id=?`,
-		`DELETE FROM agent_wifi WHERE agent_id=?`,
-		`DELETE FROM agent_status_history WHERE agent_id=?`,
-		`DELETE FROM agent_group_members WHERE agent_id=?`,
-		`DELETE FROM monitor_status WHERE agent_id=?`,
-		`DELETE FROM operational_issues WHERE agent_id=?`,
-		`DELETE FROM events WHERE agent_id=?`,
-		`DELETE FROM detector_state WHERE agent_id=?`,
-		`DELETE FROM game_buckets WHERE run_id IN (SELECT id FROM game_runs WHERE agent_id=?)`,
-		`DELETE FROM game_run_gaps WHERE run_id IN (SELECT id FROM game_runs WHERE agent_id=?)`,
-		`DELETE FROM game_runs WHERE agent_id=?`,
-		// The machine's own seconds. They hang off the AGENT rather than off a run,
-		// so deleting the runs above leaves them behind — and their foreign key to
-		// agents then blocks the row delete below outright, failing the whole
-		// deletion after the caller has already purged the agent's metrics.
-		//
-		// This is the one game table that survives DeleteRun on purpose (the stream
-		// is the machine's, and one run must not blank an overlapping run's curves),
-		// which is exactly why deleting the AGENT has to name it explicitly.
-		`DELETE FROM game_host_seconds WHERE agent_id=?`,
-	} {
-		if _, err := tx.ExecContext(ctx, stmt, id); err != nil {
-			return err
+	return s.db.WriteTx(ctx, store.Standalone(), func(wtx store.WriteTx) (func(), error) {
+		// Capture the agent's site before its row is removed so the post-commit refresh
+		// targets the right site. A missing row surfaces as sql.ErrNoRows (not-found).
+		var siteID string
+		if err := wtx.QueryRowContext(ctx, `SELECT site_id FROM agents WHERE id=?`, id).Scan(&siteID); err != nil {
+			return nil, err
 		}
-	}
 
-	res, err := tx.ExecContext(ctx, `DELETE FROM agents WHERE id=?`, id)
-	if err != nil {
-		return err
-	}
-	if n, _ := res.RowsAffected(); n == 0 {
-		return sql.ErrNoRows
-	}
-	if err := tx.Commit(); err != nil {
-		return err
-	}
-	s.forgetTouch(id)
-	s.publishSiteStatus(siteID)
-	return nil
+		for _, stmt := range []string{
+			`DELETE FROM interfaces WHERE agent_id=?`,
+			`DELETE FROM agent_wifi WHERE agent_id=?`,
+			`DELETE FROM agent_status_history WHERE agent_id=?`,
+			`DELETE FROM agent_group_members WHERE agent_id=?`,
+			`DELETE FROM monitor_status WHERE agent_id=?`,
+			`DELETE FROM operational_issues WHERE agent_id=?`,
+			`DELETE FROM events WHERE agent_id=?`,
+			`DELETE FROM detector_state WHERE agent_id=?`,
+			`DELETE FROM game_buckets WHERE run_id IN (SELECT id FROM game_runs WHERE agent_id=?)`,
+			`DELETE FROM game_run_gaps WHERE run_id IN (SELECT id FROM game_runs WHERE agent_id=?)`,
+			`DELETE FROM game_runs WHERE agent_id=?`,
+			// The machine's own seconds. They hang off the AGENT rather than off a run,
+			// so deleting the runs above leaves them behind — and their foreign key to
+			// agents then blocks the row delete below outright, failing the whole
+			// deletion after the caller has already purged the agent's metrics.
+			//
+			// This is the one game table that survives DeleteRun on purpose (the stream
+			// is the machine's, and one run must not blank an overlapping run's curves),
+			// which is exactly why deleting the AGENT has to name it explicitly.
+			`DELETE FROM game_host_seconds WHERE agent_id=?`,
+		} {
+			if _, err := wtx.ExecContext(ctx, stmt, id); err != nil {
+				return nil, err
+			}
+		}
+
+		res, err := wtx.ExecContext(ctx, `DELETE FROM agents WHERE id=?`, id)
+		if err != nil {
+			return nil, err
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			return nil, sql.ErrNoRows
+		}
+		return func() {
+			s.forgetTouch(id)
+			s.publishSiteStatus(siteID)
+		}, nil
+	})
 }

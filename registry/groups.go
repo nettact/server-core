@@ -6,6 +6,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+
+	"github.com/nettact/server-core/store"
 )
 
 // AgentGroup is a named set of agents within a site. A monitor group scoped to
@@ -82,47 +84,43 @@ func (s *Service) CreateGroup(ctx context.Context, siteID, name string) (string,
 // alerts stranded by agents leaving the group's scope) and sql.ErrNoRows if no
 // such group.
 func (s *Service) UpdateGroup(ctx context.Context, groupID, name string, agentIDs []string) (string, error) {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return "", err
-	}
-	defer tx.Rollback()
-
 	var siteID string
-	if err := tx.QueryRowContext(ctx, `SELECT site_id FROM agent_groups WHERE id=?`, groupID).Scan(&siteID); err != nil {
-		return "", err // sql.ErrNoRows when the group is gone
-	}
-	if _, err := tx.ExecContext(ctx, `UPDATE agent_groups SET name=? WHERE id=?`, name, groupID); err != nil {
-		return "", err
-	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM agent_group_members WHERE group_id=?`, groupID); err != nil {
-		return "", err
-	}
-	// Only agents in this group's own site may be members: the INSERT..SELECT
-	// filters by site_id so a cross-site (or unknown) agent id inserts no row and
-	// is rejected. A group must not scope another site's targets onto an agent the
-	// site-wide config bump below would never reach.
-	seen := make(map[string]bool, len(agentIDs))
-	for _, aid := range agentIDs {
-		if seen[aid] {
-			continue
+	if err := s.db.WriteTx(ctx, store.Standalone(), func(wtx store.WriteTx) (func(), error) {
+		if err := wtx.QueryRowContext(ctx, `SELECT site_id FROM agent_groups WHERE id=?`, groupID).Scan(&siteID); err != nil {
+			return nil, err // sql.ErrNoRows when the group is gone
 		}
-		seen[aid] = true
-		res, err := tx.ExecContext(ctx,
-			`INSERT INTO agent_group_members(group_id, agent_id)
-			 SELECT ?, id FROM agents WHERE id=? AND site_id=?`, groupID, aid, siteID)
-		if err != nil {
-			return "", err
+		if _, err := wtx.ExecContext(ctx, `UPDATE agent_groups SET name=? WHERE id=?`, name, groupID); err != nil {
+			return nil, err
 		}
-		if n, _ := res.RowsAffected(); n == 0 {
-			return "", fmt.Errorf("agent %q does not belong to site %s", aid, siteID)
+		if _, err := wtx.ExecContext(ctx, `DELETE FROM agent_group_members WHERE group_id=?`, groupID); err != nil {
+			return nil, err
 		}
-	}
-	if _, err := tx.ExecContext(ctx,
-		`UPDATE sites SET config_serial=config_serial+1 WHERE id=?`, siteID); err != nil {
-		return "", err
-	}
-	if err := tx.Commit(); err != nil {
+		// Only agents in this group's own site may be members: the INSERT..SELECT
+		// filters by site_id so a cross-site (or unknown) agent id inserts no row and
+		// is rejected. A group must not scope another site's targets onto an agent the
+		// site-wide config bump below would never reach.
+		seen := make(map[string]bool, len(agentIDs))
+		for _, aid := range agentIDs {
+			if seen[aid] {
+				continue
+			}
+			seen[aid] = true
+			res, err := wtx.ExecContext(ctx,
+				`INSERT INTO agent_group_members(group_id, agent_id)
+				 SELECT ?, id FROM agents WHERE id=? AND site_id=?`, groupID, aid, siteID)
+			if err != nil {
+				return nil, err
+			}
+			if n, _ := res.RowsAffected(); n == 0 {
+				return nil, fmt.Errorf("agent %q does not belong to site %s", aid, siteID)
+			}
+		}
+		if _, err := wtx.ExecContext(ctx,
+			`UPDATE sites SET config_serial=config_serial+1 WHERE id=?`, siteID); err != nil {
+			return nil, err
+		}
+		return nil, nil
+	}); err != nil {
 		return "", err
 	}
 	return siteID, nil
@@ -134,30 +132,26 @@ func (s *Service) UpdateGroup(ctx context.Context, groupID, name string, agentID
 // agents until re-scoped. Returns the group's site id (so the caller can resolve
 // alerts stranded by the removed bindings) and sql.ErrNoRows if no such group.
 func (s *Service) DeleteGroup(ctx context.Context, groupID string) (string, error) {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return "", err
-	}
-	defer tx.Rollback()
-
 	var siteID string
-	if err := tx.QueryRowContext(ctx, `SELECT site_id FROM agent_groups WHERE id=?`, groupID).Scan(&siteID); err != nil {
-		return "", err
-	}
-	for _, stmt := range []string{
-		`DELETE FROM agent_group_members WHERE group_id=?`,
-		`DELETE FROM monitor_group_agent_groups WHERE agent_group_id=?`,
-		`DELETE FROM agent_groups WHERE id=?`,
-	} {
-		if _, err := tx.ExecContext(ctx, stmt, groupID); err != nil {
-			return "", err
+	if err := s.db.WriteTx(ctx, store.Standalone(), func(wtx store.WriteTx) (func(), error) {
+		if err := wtx.QueryRowContext(ctx, `SELECT site_id FROM agent_groups WHERE id=?`, groupID).Scan(&siteID); err != nil {
+			return nil, err
 		}
-	}
-	if _, err := tx.ExecContext(ctx,
-		`UPDATE sites SET config_serial=config_serial+1 WHERE id=?`, siteID); err != nil {
-		return "", err
-	}
-	if err := tx.Commit(); err != nil {
+		for _, stmt := range []string{
+			`DELETE FROM agent_group_members WHERE group_id=?`,
+			`DELETE FROM monitor_group_agent_groups WHERE agent_group_id=?`,
+			`DELETE FROM agent_groups WHERE id=?`,
+		} {
+			if _, err := wtx.ExecContext(ctx, stmt, groupID); err != nil {
+				return nil, err
+			}
+		}
+		if _, err := wtx.ExecContext(ctx,
+			`UPDATE sites SET config_serial=config_serial+1 WHERE id=?`, siteID); err != nil {
+			return nil, err
+		}
+		return nil, nil
+	}); err != nil {
 		return "", err
 	}
 	return siteID, nil

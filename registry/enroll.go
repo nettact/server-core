@@ -16,6 +16,8 @@ import (
 
 	"github.com/nettact/protocol"
 	"github.com/nettact/protocol/enroll"
+
+	"github.com/nettact/server-core/store"
 )
 
 var (
@@ -109,33 +111,30 @@ func (s *Service) ListEnrollmentTokens(ctx context.Context) ([]EnrollmentToken, 
 // run in ONE transaction so two concurrent mints cannot both slip past the
 // revoke-before-insert ordering and leave two valid tokens.
 func (s *Service) CreateReinstallToken(ctx context.Context, agentID string, ttl time.Duration) (string, error) {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return "", err
-	}
-	defer tx.Rollback()
-
-	var siteID string
-	if err := tx.QueryRowContext(ctx,
-		`SELECT site_id FROM agents WHERE id=? AND revoked=0`, agentID).Scan(&siteID); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return "", sql.ErrNoRows
+	var token string
+	if err := s.db.WriteTx(ctx, store.Standalone(), func(wtx store.WriteTx) (func(), error) {
+		var siteID string
+		if err := wtx.QueryRowContext(ctx,
+			`SELECT site_id FROM agents WHERE id=? AND revoked=0`, agentID).Scan(&siteID); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return nil, sql.ErrNoRows
+			}
+			return nil, err
 		}
-		return "", err
-	}
-	if _, err := tx.ExecContext(ctx,
-		`UPDATE enrollment_tokens SET revoked=1 WHERE agent_id=? AND used_at IS NULL AND revoked=0`,
-		agentID); err != nil {
-		return "", err
-	}
-	token := randToken()
-	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO enrollment_tokens(token_hash, site_id, note, expires_at, agent_id)
-		 VALUES(?,?,?,?,?)`,
-		sha256hex(token), siteID, "reinstall:"+agentID, time.Now().UTC().Add(ttl), agentID); err != nil {
-		return "", err
-	}
-	if err := tx.Commit(); err != nil {
+		if _, err := wtx.ExecContext(ctx,
+			`UPDATE enrollment_tokens SET revoked=1 WHERE agent_id=? AND used_at IS NULL AND revoked=0`,
+			agentID); err != nil {
+			return nil, err
+		}
+		token = randToken()
+		if _, err := wtx.ExecContext(ctx,
+			`INSERT INTO enrollment_tokens(token_hash, site_id, note, expires_at, agent_id)
+			 VALUES(?,?,?,?,?)`,
+			sha256hex(token), siteID, "reinstall:"+agentID, time.Now().UTC().Add(ttl), agentID); err != nil {
+			return nil, err
+		}
+		return nil, nil
+	}); err != nil {
 		return "", err
 	}
 	return token, nil
@@ -186,145 +185,139 @@ func (s *Service) Enroll(ctx context.Context, req enroll.EnrollRequest) (enroll.
 		}
 	}
 
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return enroll.EnrollResponse{}, err
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			_ = tx.Rollback()
+	var (
+		siteID          string
+		now             time.Time
+		agentID         string
+		agentToken      string
+		siteSerial      int
+		enrollmentEpoch uint64 = 1
+		reclaimed       bool
+	)
+	if err := s.db.WriteTx(ctx, store.Standalone(), func(wtx store.WriteTx) (func(), error) {
+		var expiresAt time.Time
+		var usedAt sql.NullTime
+		var tokenAgentID sql.NullString
+		var revoked int
+		var tokenNote string
+		err := wtx.QueryRowContext(ctx,
+			`SELECT site_id, expires_at, used_at, agent_id, revoked, COALESCE(note,'') FROM enrollment_tokens WHERE token_hash=?`,
+			sha256hex(req.EnrollmentToken)).Scan(&siteID, &expiresAt, &usedAt, &tokenAgentID, &revoked, &tokenNote)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrEnrollToken
 		}
-	}()
-
-	var siteID string
-	var expiresAt time.Time
-	var usedAt sql.NullTime
-	var tokenAgentID sql.NullString
-	var revoked int
-	var tokenNote string
-	err = tx.QueryRowContext(ctx,
-		`SELECT site_id, expires_at, used_at, agent_id, revoked, COALESCE(note,'') FROM enrollment_tokens WHERE token_hash=?`,
-		sha256hex(req.EnrollmentToken)).Scan(&siteID, &expiresAt, &usedAt, &tokenAgentID, &revoked, &tokenNote)
-	if errors.Is(err, sql.ErrNoRows) {
-		return enroll.EnrollResponse{}, ErrEnrollToken
-	}
-	if err != nil {
-		return enroll.EnrollResponse{}, err
-	}
-	if revoked != 0 || usedAt.Valid || time.Now().UTC().After(expiresAt) {
-		return enroll.EnrollResponse{}, ErrEnrollToken
-	}
-
-	now := time.Now().UTC()
-	var agentID, agentToken string
-	var siteSerial int
-	var enrollmentEpoch uint64 = 1 // fresh enrollments are generation 1
-	reclaimed := false
-	if tokenAgentID.Valid && tokenAgentID.String != "" {
-		// A reinstall token (AGENT-006) rejoins the bound agent's row under the
-		// SAME agent_id instead of minting a new one: metrics, incidents and status
-		// history are inherited, and no "old offline + new online" pair is produced.
-		// The quota is irrelevant because no row is added. The bound agent must
-		// still be live (not hard-deleted) — reenrollAgent reports ErrReinstallAgent.
-		// (The old session was already fenced pre-transaction; see above.)
-		siteID, siteSerial, agentToken, enrollmentEpoch, err = s.reenrollAgent(ctx, tx, tokenAgentID.String, req)
 		if err != nil {
-			return enroll.EnrollResponse{}, err
+			return nil, err
 		}
-		agentID = tokenAgentID.String
-		reclaimed = true
-	} else {
-		if s.maxAgents > 0 {
-			var n int
-			if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM agents WHERE revoked=0`).Scan(&n); err != nil {
-				return enroll.EnrollResponse{}, err
+		if revoked != 0 || usedAt.Valid || time.Now().UTC().After(expiresAt) {
+			return nil, ErrEnrollToken
+		}
+
+		now = time.Now().UTC()
+		if tokenAgentID.Valid && tokenAgentID.String != "" {
+			// A reinstall token (AGENT-006) rejoins the bound agent's row under the
+			// SAME agent_id instead of minting a new one: metrics, incidents and status
+			// history are inherited, and no "old offline + new online" pair is produced.
+			// The quota is irrelevant because no row is added. The bound agent must
+			// still be live (not hard-deleted) — reenrollAgent reports ErrReinstallAgent.
+			// (The old session was already fenced pre-transaction; see above.)
+			siteID, siteSerial, agentToken, enrollmentEpoch, err = s.reenrollAgent(ctx, wtx, tokenAgentID.String, req)
+			if err != nil {
+				return nil, err
 			}
-			if n >= s.maxAgents {
-				return enroll.EnrollResponse{}, ErrQuota
+			agentID = tokenAgentID.String
+			reclaimed = true
+		} else {
+			if s.maxAgents > 0 {
+				var n int
+				if err := wtx.QueryRowContext(ctx, `SELECT COUNT(*) FROM agents WHERE revoked=0`).Scan(&n); err != nil {
+					return nil, err
+				}
+				if n >= s.maxAgents {
+					return nil, ErrQuota
+				}
+			}
+
+			agentID = "agent_" + uuid.NewString()
+			agentToken = randToken()
+
+			// The token's note is this device's name from the moment it appears. It is
+			// what the operator typed when minting the token to describe the machine
+			// they were about to install on, so applying it here is the difference
+			// between an agent list of hostnames the operator has to decode and one
+			// that reads the way they described their own network. It stays editable
+			// afterwards (UpdateAgent) — this only decides the FIRST name, and an empty
+			// note leaves display_name NULL so the UI falls back to the hostname.
+			//
+			// Only a fresh enrollment does this. A reinstall token takes the branch
+			// above, which must not touch the name: its note is the server-generated
+			// "reinstall:<agent_id>" (see CreateReinstallToken), and the agent it
+			// rejoins already carries whatever the operator named it.
+			var displayName sql.NullString
+			if note := strings.TrimSpace(tokenNote); note != "" {
+				displayName = sql.NullString{String: note, Valid: true}
+			}
+
+			// The enrollment report's unsupported reasons are stored like the sets beside
+			// them: a first-time agent whose sensor is broken is precisely when an operator
+			// is looking at the page, so the "why" must be there from the first report and
+			// not only after the first reconnect refreshes it.
+			//
+			// enrollment_epoch defaults to 1; the pending-rotation staging columns are
+			// named explicitly so a fresh row reads the same shape a reader of any
+			// other row expects (0 = no pending rotation).
+			if _, err := wtx.ExecContext(ctx, `
+				INSERT INTO agents(id, site_id, public_key, token_hash, display_name, hostname, platform, agent_version,
+				                   perm_supported, perm_granted, perm_effective, perm_unsupported_reasons,
+				                   policy_source, policy_hash,
+				                   status, last_seen_at, created_at,
+				                   enrollment_epoch, pending_next_epoch, pending_next_until)
+				VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'online', ?, ?, 1, 0, 0)`,
+				agentID, siteID, []byte(req.PublicKey), sha256hex(agentToken), displayName,
+				req.Hostname, req.Platform, req.AgentVersion,
+				marshalStrings(req.Permissions.Supported), marshalStrings(req.Permissions.Granted),
+				marshalStrings(req.Permissions.Effective),
+				marshalReasons(req.Permissions.UnsupportedReasons, req.Permissions.Supported),
+				req.Permissions.Source, req.Permissions.PolicyHash,
+				now, now); err != nil {
+				return nil, err
+			}
+			// The site config serial is the desired-config axis; report it (informational —
+			// the agent starts at appliedConfigVersion = -1 and applies the first pushed
+			// DesiredState regardless).
+			if err := wtx.QueryRowContext(ctx, `SELECT config_serial FROM sites WHERE id=?`, siteID).Scan(&siteSerial); err != nil {
+				return nil, err
+			}
+			// A brand-new agent is online from the moment it enrolls. A REINSTALL is
+			// deliberately not marked here — that transition belongs to the new session's
+			// Hello, so the offline→online event fires (and a reinstall that never
+			// connects stays visibly offline).
+			if _, err := wtx.ExecContext(ctx,
+				`INSERT INTO agent_status_history(id, agent_id, status, changed_at) VALUES(?,?,'online',?)`,
+				"ash_"+uuid.NewString(), agentID, now); err != nil {
+				return nil, err
 			}
 		}
 
-		agentID = "agent_" + uuid.NewString()
-		agentToken = randToken()
-
-		// The token's note is this device's name from the moment it appears. It is
-		// what the operator typed when minting the token to describe the machine
-		// they were about to install on, so applying it here is the difference
-		// between an agent list of hostnames the operator has to decode and one
-		// that reads the way they described their own network. It stays editable
-		// afterwards (UpdateAgent) — this only decides the FIRST name, and an empty
-		// note leaves display_name NULL so the UI falls back to the hostname.
-		//
-		// Only a fresh enrollment does this. A reinstall token takes the branch
-		// above, which must not touch the name: its note is the server-generated
-		// "reinstall:<agent_id>" (see CreateReinstallToken), and the agent it
-		// rejoins already carries whatever the operator named it.
-		var displayName sql.NullString
-		if note := strings.TrimSpace(tokenNote); note != "" {
-			displayName = sql.NullString{String: note, Valid: true}
+		// Shared tail: consume the one-time token and commit. A reinstall consumes its
+		// token row just like a first enrollment, so a stolen reinstall token is
+		// single-use.
+		if _, err := wtx.ExecContext(ctx,
+			`UPDATE enrollment_tokens SET used_at=? WHERE token_hash=?`, now, sha256hex(req.EnrollmentToken)); err != nil {
+			return nil, err
 		}
-
-		// The enrollment report's unsupported reasons are stored like the sets beside
-		// them: a first-time agent whose sensor is broken is precisely when an operator
-		// is looking at the page, so the "why" must be there from the first report and
-		// not only after the first reconnect refreshes it.
-		//
-		// enrollment_epoch defaults to 1; the pending-rotation staging columns are
-		// named explicitly so a fresh row reads the same shape a reader of any
-		// other row expects (0 = no pending rotation).
-		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO agents(id, site_id, public_key, token_hash, display_name, hostname, platform, agent_version,
-			                   perm_supported, perm_granted, perm_effective, perm_unsupported_reasons,
-			                   policy_source, policy_hash,
-			                   status, last_seen_at, created_at,
-			                   enrollment_epoch, pending_next_epoch, pending_next_until)
-			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'online', ?, ?, 1, 0, 0)`,
-			agentID, siteID, []byte(req.PublicKey), sha256hex(agentToken), displayName,
-			req.Hostname, req.Platform, req.AgentVersion,
-			marshalStrings(req.Permissions.Supported), marshalStrings(req.Permissions.Granted),
-			marshalStrings(req.Permissions.Effective),
-			marshalReasons(req.Permissions.UnsupportedReasons, req.Permissions.Supported),
-			req.Permissions.Source, req.Permissions.PolicyHash,
-			now, now); err != nil {
-			return enroll.EnrollResponse{}, err
-		}
-		// The site config serial is the desired-config axis; report it (informational —
-		// the agent starts at appliedConfigVersion = -1 and applies the first pushed
-		// DesiredState regardless).
-		if err := tx.QueryRowContext(ctx, `SELECT config_serial FROM sites WHERE id=?`, siteID).Scan(&siteSerial); err != nil {
-			return enroll.EnrollResponse{}, err
-		}
-		// A brand-new agent is online from the moment it enrolls. A REINSTALL is
-		// deliberately not marked here — that transition belongs to the new session's
-		// Hello, so the offline→online event fires (and a reinstall that never
-		// connects stays visibly offline).
-		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO agent_status_history(id, agent_id, status, changed_at) VALUES(?,?,'online',?)`,
-			"ash_"+uuid.NewString(), agentID, now); err != nil {
-			return enroll.EnrollResponse{}, err
-		}
-	}
-
-	// Shared tail: consume the one-time token and commit. A reinstall consumes its
-	// token row just like a first enrollment, so a stolen reinstall token is
-	// single-use.
-	if _, err := tx.ExecContext(ctx,
-		`UPDATE enrollment_tokens SET used_at=? WHERE token_hash=?`, now, sha256hex(req.EnrollmentToken)); err != nil {
+		// A reenrollment reused an identity whose WAL was wiped; reset the ingest
+		// service's in-memory sequence watermark (and bump its epoch, discarding any
+		// straggler advance from a session that authenticated before the rotation)
+		// so the first ack reflects the zeroed agents.high_sequence instead of the
+		// old installation's high.
+		return func() {
+			if reclaimed && s.ResetSeqWatermark != nil {
+				s.ResetSeqWatermark(ctx, agentID)
+			}
+		}, nil
+	}); err != nil {
 		return enroll.EnrollResponse{}, err
-	}
-	if err := tx.Commit(); err != nil {
-		return enroll.EnrollResponse{}, err
-	}
-	committed = true
-
-	// A reenrollment reused an identity whose WAL was wiped; reset the ingest
-	// service's in-memory sequence watermark (and bump its epoch, discarding any
-	// straggler advance from a session that authenticated before the rotation)
-	// so the first ack reflects the zeroed agents.high_sequence instead of the
-	// old installation's high.
-	if reclaimed && s.ResetSeqWatermark != nil {
-		s.ResetSeqWatermark(ctx, agentID)
 	}
 
 	return enroll.EnrollResponse{
@@ -384,7 +377,7 @@ func (s *Service) reinstallTarget(ctx context.Context, token string) string {
 // Runs inside Enroll's transaction (the caller commits), so a failure rolls the
 // token consumption back together with the row update. Returns ErrReinstallAgent
 // if the bound agent row is gone, and the agent's new enrollment epoch.
-func (s *Service) reenrollAgent(ctx context.Context, tx *sql.Tx, agentID string,
+func (s *Service) reenrollAgent(ctx context.Context, tx store.Executor, agentID string,
 	req enroll.EnrollRequest) (siteID string, siteSerial int, agentToken string, enrollmentEpoch uint64, err error) {
 
 	// The authoritative site comes from the existing row, never from the token's
