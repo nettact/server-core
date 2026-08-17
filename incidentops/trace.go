@@ -509,70 +509,65 @@ func (s *Service) claimTraces(ctx context.Context, ev fault.SignalEvent, destKey
 		return nil
 	}
 
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			_ = tx.Rollback()
-		}
-	}()
-	now := time.Now().UTC()
-	claimed := 0
-	for _, reportID := range reportIDs {
-		// The WHERE on the conflict arm makes RowsAffected the "was this new"
-		// signal: a fresh reference or a reactivation counts, re-claiming an
-		// already-active one does not. The timeline entry rides that signal —
-		// without it, every re-confirmation of a signal would repeat the
-		// "diagnostic completed" line for evidence the incident already shows.
-		r, err := tx.ExecContext(ctx, `
+	return s.db.WriteTx(ctx, store.Standalone(), func(wtx store.WriteTx) (func(), error) {
+		now := time.Now().UTC()
+		claimed := 0
+		for _, reportID := range reportIDs {
+			// The WHERE on the conflict arm makes RowsAffected the "was this new"
+			// signal: a fresh reference or a reactivation counts, re-claiming an
+			// already-active one does not. The timeline entry rides that signal —
+			// without it, every re-confirmation of a signal would repeat the
+			// "diagnostic completed" line for evidence the incident already shows.
+			r, err := wtx.ExecContext(ctx, `
 			INSERT INTO trace_report_refs(report_id, incident_id, signal_id, active, created_at)
 			VALUES(?,?,?,1,?)
 			ON CONFLICT(report_id, incident_id, signal_id) DO UPDATE SET active=1 WHERE active=0`,
-			reportID, ev.IncidentID, ev.SignalID, now)
-		if err != nil {
-			return err
-		}
-		if n, err := r.RowsAffected(); err != nil || n == 0 {
+				reportID, ev.IncidentID, ev.SignalID, now)
 			if err != nil {
-				return err
+				return nil, err
 			}
-			continue
+			if n, err := r.RowsAffected(); err != nil || n == 0 {
+				if err != nil {
+					return nil, err
+				}
+				continue
+			}
+			claimed++
+			if _, err := wtx.ExecContext(ctx,
+				`INSERT INTO incident_timeline(id, incident_id, ts, kind, message, ref) VALUES(?,?,?,?,?,?)`,
+				"tl_"+uuid.NewString(), ev.IncidentID, now, "diag.completed", "", reportID); err != nil {
+				return nil, err
+			}
 		}
-		claimed++
-		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO incident_timeline(id, incident_id, ts, kind, message, ref) VALUES(?,?,?,?,?,?)`,
-			"tl_"+uuid.NewString(), ev.IncidentID, now, "diag.completed", "", reportID); err != nil {
-			return err
+		if claimed == 0 {
+			// Nothing written, and nothing to announce.
+			return nil, nil
 		}
-	}
-	if claimed == 0 {
-		return tx.Rollback()
-	}
-	// The trace's reached-point is the strongest attribution evidence there is, so
-	// claiming one has to re-answer "where did this break" rather than leaving the
-	// incident on the guess it was confirmed with.
-	changed, siteID, err := fault.RecomputeAttributionTx(ctx, tx, ev.IncidentID)
-	if err != nil {
-		return err
-	}
-	if err := tx.Commit(); err != nil {
-		return err
-	}
-	committed = true
-	if changed {
-		if siteID == "" {
-			siteID = ev.SiteID
+		// The trace's reached-point is the strongest attribution evidence there is, so
+		// claiming one has to re-answer "where did this break" rather than leaving the
+		// incident on the guess it was confirmed with.
+		changed, siteID, err := fault.RecomputeAttributionTx(ctx, wtx, ev.IncidentID)
+		if err != nil {
+			return nil, err
 		}
-		s.publishAttributionRefresh(ctx, siteID, ev.IncidentID)
-	} else if s.bus != nil {
-		// The claim added evidence without moving the attribution; an open
-		// incident view still has to hear about it.
-		s.bus.Publish(eventbus.TopicIncidentUpdated, eventbus.IncidentEvent{IncidentID: ev.IncidentID, SiteID: ev.SiteID})
-	}
-	return nil
+		// Both announcements ride the post-commit closure: publishAttributionRefresh
+		// reads the read pool, which must not happen while the write transaction is
+		// still open on the single writer handle.
+		return func() {
+			if changed {
+				if siteID == "" {
+					siteID = ev.SiteID
+				}
+				s.publishAttributionRefresh(ctx, siteID, ev.IncidentID)
+				return
+			}
+			if s.bus != nil {
+				// The claim added evidence without moving the attribution; an open
+				// incident view still has to hear about it.
+				s.bus.Publish(eventbus.TopicIncidentUpdated, eventbus.IncidentEvent{IncidentID: ev.IncidentID, SiteID: ev.SiteID})
+			}
+		}, nil
+	})
 }
 
 // publishAttributionRefresh lets the console converge after an incident's

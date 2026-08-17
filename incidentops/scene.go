@@ -675,45 +675,41 @@ func (s *Service) claimScenes(ctx context.Context, ev fault.SignalEvent) error {
 		return err
 	}
 
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			_ = tx.Rollback()
+	return s.db.WriteTx(ctx, store.Standalone(), func(wtx store.WriteTx) (func(), error) {
+		now := time.Now().UTC()
+		claimed := 0
+		for _, reportID := range reportIDs {
+			// RowsAffected is the "was this new" signal, and the timeline entry rides it:
+			// without that, every re-confirmation of a signal would repeat the
+			// "scene collected" line for evidence the incident already shows.
+			inserted, err := insertSceneRef(ctx, wtx, reportID, sceneRef{signalID: ev.SignalID, incidentID: ev.IncidentID}, now)
+			if err != nil {
+				return nil, err
+			}
+			if !inserted {
+				continue
+			}
+			claimed++
+			if err := addSceneTimeline(ctx, wtx, ev.IncidentID, reportID, now); err != nil {
+				return nil, err
+			}
 		}
-	}()
-	now := time.Now().UTC()
-	claimed := 0
-	for _, reportID := range reportIDs {
-		// RowsAffected is the "was this new" signal, and the timeline entry rides it:
-		// without that, every re-confirmation of a signal would repeat the
-		// "scene collected" line for evidence the incident already shows.
-		inserted, err := insertSceneRef(ctx, tx, reportID, sceneRef{signalID: ev.SignalID, incidentID: ev.IncidentID}, now)
-		if err != nil {
-			return err
+		if claimed == 0 {
+			// Every insert was a no-op, so nothing was written: committing here is
+			// the same as the pre-contract Rollback-and-return-nil. Returning no
+			// post closure is the point — an unchanged incident must not publish.
+			return nil, nil
 		}
-		if !inserted {
-			continue
+		if s.bus == nil {
+			return nil, nil
 		}
-		claimed++
-		if err := addSceneTimeline(ctx, tx, ev.IncidentID, reportID, now); err != nil {
-			return err
-		}
-	}
-	if claimed == 0 {
-		return tx.Rollback()
-	}
-	if err := tx.Commit(); err != nil {
-		return err
-	}
-	committed = true
-	if s.bus != nil {
-		s.bus.Publish(eventbus.TopicIncidentUpdated, eventbus.IncidentEvent{IncidentID: ev.IncidentID, SiteID: ev.SiteID})
-	}
-	return nil
+		// The publish rides the post-commit closure rather than trailing the
+		// commit by hand, so it cannot be reordered ahead of durability by a
+		// later edit and cannot fire on a rollback.
+		return func() {
+			s.bus.Publish(eventbus.TopicIncidentUpdated, eventbus.IncidentEvent{IncidentID: ev.IncidentID, SiteID: ev.SiteID})
+		}, nil
+	})
 }
 
 // ReconcileSceneClaims files any scene still holding fewer references than it has
@@ -829,33 +825,29 @@ func (s *Service) ReconcileSceneClaims(ctx context.Context) error {
 // fileReconciledScene attaches one recovered claim in its own short transaction,
 // so a later failure cannot undo the ones already filed.
 func (s *Service) fileReconciledScene(ctx context.Context, reportID, siteID string, owner sceneRef, now time.Time) error {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	inserted, err := insertSceneRef(ctx, tx, reportID, owner, now)
-	if err != nil {
-		_ = tx.Rollback()
-		return err
-	}
-	if !inserted {
-		return tx.Rollback()
-	}
-	if err := addSceneTimeline(ctx, tx, owner.incidentID, reportID, now); err != nil {
-		_ = tx.Rollback()
-		return err
-	}
-	if err := tx.Commit(); err != nil {
-		return err
-	}
-	if s.bus != nil {
-		// The site id has to travel: the incident bridge notifies by exact site
-		// match, so an empty one reaches no console and the recovered claim would
-		// stay invisible until something else refreshed the page.
-		s.bus.Publish(eventbus.TopicIncidentUpdated,
-			eventbus.IncidentEvent{IncidentID: owner.incidentID, SiteID: siteID})
-	}
-	return nil
+	return s.db.WriteTx(ctx, store.Standalone(), func(wtx store.WriteTx) (func(), error) {
+		inserted, err := insertSceneRef(ctx, wtx, reportID, owner, now)
+		if err != nil {
+			return nil, err
+		}
+		if !inserted {
+			// Nothing written; same reasoning as claimScenes.
+			return nil, nil
+		}
+		if err := addSceneTimeline(ctx, wtx, owner.incidentID, reportID, now); err != nil {
+			return nil, err
+		}
+		if s.bus == nil {
+			return nil, nil
+		}
+		return func() {
+			// The site id has to travel: the incident bridge notifies by exact site
+			// match, so an empty one reaches no console and the recovered claim would
+			// stay invisible until something else refreshed the page.
+			s.bus.Publish(eventbus.TopicIncidentUpdated,
+				eventbus.IncidentEvent{IncidentID: owner.incidentID, SiteID: siteID})
+		}, nil
+	})
 }
 
 // claimableScenes lists the scene ids this signal may claim, on the read pool and
