@@ -356,64 +356,60 @@ func (s *Service) DeleteGroup(ctx context.Context, groupID string) (string, erro
 		return "", err
 	}
 
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return "", err
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			_ = tx.Rollback()
+	var siteIDOut string
+	if err := s.db.WriteTx(ctx, store.Standalone(), func(wtx store.WriteTx) (func(), error) {
+		tx := wtx
+		// Terminate the group's firing alerts (configuration_changed) INSIDE this tx, so
+		// their incidents close atomically with the group's removal.
+		var termPub PostCommit
+		var termAffected []string
+		if s.term != nil {
+			var err error
+			termAffected, termPub, err = s.term.TerminateForGroupTx(ctx, tx, groupID)
+			if err != nil {
+				return nil, err
+			}
 		}
-	}()
-	// Terminate the group's firing alerts (configuration_changed) INSIDE this tx, so
-	// their incidents close atomically with the group's removal.
-	var termPub PostCommit
-	var termAffected []string
-	if s.term != nil {
-		termAffected, termPub, err = s.term.TerminateForGroupTx(ctx, tx, groupID)
+		// The group's targets move to the default group (never deleted); capture their
+		// ids for the status event before the move.
+		targetIDs, err := groupTargetIDs(ctx, tx, groupID)
 		if err != nil {
-			return "", err
+			return nil, err
 		}
-	}
-	// The group's targets move to the default group (never deleted); capture their
-	// ids for the status event before the move.
-	targetIDs, err := groupTargetIDs(ctx, tx, groupID)
-	if err != nil {
+		// Move the group's targets to the default group (never delete them).
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE probe_tasks SET group_id=? WHERE group_id=?`, defaultID, groupID); err != nil {
+			return nil, err
+		}
+		// The group's notification-policy override goes with it, so its targets fall
+		// back to the site default rather than pointing at a policy that no longer has
+		// a scope.
+		if _, err := tx.ExecContext(ctx,
+			`DELETE FROM notification_policies WHERE scope_kind='group' AND scope_id=?`, groupID); err != nil {
+			return nil, err
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM monitor_group_agent_groups WHERE monitor_group_id=?`, groupID); err != nil {
+			return nil, err
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM monitor_groups WHERE id=?`, groupID); err != nil {
+			return nil, err
+		}
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE sites SET config_serial=config_serial+1 WHERE id=?`, siteID); err != nil {
+			return nil, err
+		}
+		siteIDOut = siteID
+		return func() {
+			if termPub != nil {
+				termPub(ctx)
+			}
+			s.announce(siteID)
+			s.publishTargetStatus(siteID, append(targetIDs, termAffected...))
+		}, nil
+	}); err != nil {
 		return "", err
 	}
-	// Move the group's targets to the default group (never delete them).
-	if _, err := tx.ExecContext(ctx,
-		`UPDATE probe_tasks SET group_id=? WHERE group_id=?`, defaultID, groupID); err != nil {
-		return "", err
-	}
-	// The group's notification-policy override goes with it, so its targets fall
-	// back to the site default rather than pointing at a policy that no longer has
-	// a scope.
-	if _, err := tx.ExecContext(ctx,
-		`DELETE FROM notification_policies WHERE scope_kind='group' AND scope_id=?`, groupID); err != nil {
-		return "", err
-	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM monitor_group_agent_groups WHERE monitor_group_id=?`, groupID); err != nil {
-		return "", err
-	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM monitor_groups WHERE id=?`, groupID); err != nil {
-		return "", err
-	}
-	if _, err := tx.ExecContext(ctx,
-		`UPDATE sites SET config_serial=config_serial+1 WHERE id=?`, siteID); err != nil {
-		return "", err
-	}
-	if err := tx.Commit(); err != nil {
-		return "", err
-	}
-	committed = true
-	if termPub != nil {
-		termPub(ctx)
-	}
-	s.announce(siteID)
-	s.publishTargetStatus(siteID, append(targetIDs, termAffected...))
-	return siteID, nil
+	return siteIDOut, nil
 }
 
 // scopeQueryer is the read subset used to validate a monitor group's Agent
@@ -574,198 +570,188 @@ func (s *Service) SetSiteTargets(ctx context.Context, siteID string, targets []P
 		keep[targets[i].ID] = true
 	}
 
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			_ = tx.Rollback()
-		}
-	}()
+	return s.db.WriteTx(ctx, store.Standalone(), func(wtx store.WriteTx) (func(), error) {
+		tx := wtx
 
-	// Validate group ownership and cross-site target-id ownership INSIDE the tx,
-	// before any mutation, so a bad group id or a cross-site id rolls the whole
-	// reconcile back with nothing terminated or written.
-	if err := validateTargetGroups(ctx, tx, siteID, targets); err != nil {
-		return err
-	}
-	if err := validateTargetOwnership(ctx, tx, siteID, targets); err != nil {
-		return err
-	}
-	if err := validateTargetProxies(ctx, tx, siteID, targets); err != nil {
-		return err
-	}
+		// Validate group ownership and cross-site target-id ownership INSIDE the tx,
+		// before any mutation, so a bad group id or a cross-site id rolls the whole
+		// reconcile back with nothing terminated or written.
+		if err := validateTargetGroups(ctx, tx, siteID, targets); err != nil {
+			return nil, err
+		}
+		if err := validateTargetOwnership(ctx, tx, siteID, targets); err != nil {
+			return nil, err
+		}
+		if err := validateTargetProxies(ctx, tx, siteID, targets); err != nil {
+			return nil, err
+		}
 
-	// Current targets and their facts, read in-tx to classify what each target's
-	// edit actually was. The classification matters beyond bookkeeping: it decides
-	// the reason a firing fault is terminated with, and a wrong reason is a wrong
-	// story told to the operator.
-	oldFacts, err := currentTargetFacts(ctx, tx, siteID)
-	if err != nil {
-		return err
-	}
-	removed := map[string]bool{}
-	moved := map[string]bool{}
-	disabled := map[string]bool{}
-	material := map[string]bool{}
-	newTargets := map[string]bool{}
-	nameOnly := map[string]bool{}
-	for id := range oldFacts {
-		if !keep[id] {
-			removed[id] = true
+		// Current targets and their facts, read in-tx to classify what each target's
+		// edit actually was. The classification matters beyond bookkeeping: it decides
+		// the reason a firing fault is terminated with, and a wrong reason is a wrong
+		// story told to the operator.
+		oldFacts, err := currentTargetFacts(ctx, tx, siteID)
+		if err != nil {
+			return nil, err
 		}
-	}
-	for i := range targets {
-		t := targets[i]
-		of, ok := oldFacts[t.ID]
-		if !ok {
-			newTargets[t.ID] = true
-			continue
+		removed := map[string]bool{}
+		moved := map[string]bool{}
+		disabled := map[string]bool{}
+		material := map[string]bool{}
+		newTargets := map[string]bool{}
+		nameOnly := map[string]bool{}
+		for id := range oldFacts {
+			if !keep[id] {
+				removed[id] = true
+			}
 		}
-		if of.groupID != t.GroupID {
-			moved[t.ID] = true // a group move changes the Agent scope
-		}
-		if of.enabled && !t.Enabled {
-			disabled[t.ID] = true
-		}
-		params, _ := json.Marshal(t.Params)
-		mat := materialTargetChange(of, t, string(params))
-		if mat {
-			material[t.ID] = true
-		}
-		// A pure name edit (unchanged group + no material change) still alters a
-		// user-visible batch field, so it must publish a status event — but it is
-		// not a material generation change and must not bump/announce.
-		if !moved[t.ID] && !mat && of.name != t.Name {
-			nameOnly[t.ID] = true
-		}
-	}
-	// One reason per target, most specific first: a deleted target is not "moved",
-	// and a disabled one is not merely "reconfigured".
-	byReason := map[string][]string{}
-	assigned := map[string]bool{}
-	assign := func(ids map[string]bool, reason string) {
-		for id := range ids {
-			if assigned[id] {
+		for i := range targets {
+			t := targets[i]
+			of, ok := oldFacts[t.ID]
+			if !ok {
+				newTargets[t.ID] = true
 				continue
 			}
-			assigned[id] = true
-			byReason[reason] = append(byReason[reason], id)
-		}
-	}
-	assign(removed, ReasonTargetDeleted)
-	assign(moved, ReasonAgentScopeChange)
-	assign(disabled, ReasonTargetDisabled)
-	assign(material, ReasonConfigChanged)
-	terminateSet := make([]string, 0, len(assigned))
-	for id := range assigned {
-		terminateSet = append(terminateSet, id)
-	}
-
-	// hasGenerationChange: does anything alter the desired/probed generation? New,
-	// removed, moved, or materially-changed targets all require a site serial bump
-	// and a DesiredState re-announce. An identical or name-only save does not.
-	hasGenerationChange := len(newTargets) > 0 || len(removed) > 0 || len(moved) > 0 || len(material) > 0
-
-	// Force-resolve the affected targets' firing fault signals INSIDE the write tx,
-	// each under its own reason, so a status reader never sees a terminated signal
-	// alongside surviving old-generation detector counters.
-	var termPubs []PostCommit
-	var termAffected []string
-	if s.term != nil {
-		for reason, ids := range byReason {
-			affected, pub, err := s.term.TerminateForTargetsTx(ctx, tx, ids, reason)
-			if err != nil {
-				return err
+			if of.groupID != t.GroupID {
+				moved[t.ID] = true // a group move changes the Agent scope
 			}
-			termAffected = append(termAffected, affected...)
-			if pub != nil {
-				termPubs = append(termPubs, pub)
+			if of.enabled && !t.Enabled {
+				disabled[t.ID] = true
+			}
+			params, _ := json.Marshal(t.Params)
+			mat := materialTargetChange(of, t, string(params))
+			if mat {
+				material[t.ID] = true
+			}
+			// A pure name edit (unchanged group + no material change) still alters a
+			// user-visible batch field, so it must publish a status event — but it is
+			// not a material generation change and must not bump/announce.
+			if !moved[t.ID] && !mat && of.name != t.Name {
+				nameOnly[t.ID] = true
 			}
 		}
-		// Targets whose generation advanced without anything firing still need their
-		// counters cleared, or a streak measured under the old configuration would
-		// continue under the new one.
-		if err := s.term.ClearDetectorStateTx(ctx, tx, terminateSet); err != nil {
-			return err
+		// One reason per target, most specific first: a deleted target is not "moved",
+		// and a disabled one is not merely "reconfigured".
+		byReason := map[string][]string{}
+		assigned := map[string]bool{}
+		assign := func(ids map[string]bool, reason string) {
+			for id := range ids {
+				if assigned[id] {
+					continue
+				}
+				assigned[id] = true
+				byReason[reason] = append(byReason[reason], id)
+			}
 		}
-	}
+		assign(removed, ReasonTargetDeleted)
+		assign(moved, ReasonAgentScopeChange)
+		assign(disabled, ReasonTargetDisabled)
+		assign(material, ReasonConfigChanged)
+		terminateSet := make([]string, 0, len(assigned))
+		for id := range assigned {
+			terminateSet = append(terminateSet, id)
+		}
 
-	// Delete removed targets. Their monitor_status / operational_issues /
-	// probe_detection_settings / detector_state rows cascade; their fault signals do
-	// NOT — those are history, and they carry frozen names precisely so they stay
-	// readable after the target is gone.
-	for id := range oldFacts {
-		if keep[id] {
-			continue
-		}
-		if _, err := tx.ExecContext(ctx, `DELETE FROM probe_tasks WHERE id=?`, id); err != nil {
-			return err
-		}
-	}
+		// hasGenerationChange: does anything alter the desired/probed generation? New,
+		// removed, moved, or materially-changed targets all require a site serial bump
+		// and a DesiredState re-announce. An identical or name-only save does not.
+		hasGenerationChange := len(newTargets) > 0 || len(removed) > 0 || len(moved) > 0 || len(material) > 0
 
-	// Bump the site serial once (in-tx) ONLY when the desired generation changes —
-	// it is the new per-target generation for every created/materially-changed
-	// target, and the DesiredState version agents re-apply on. An identical/name-only
-	// save leaves it untouched (idempotent). The current serial is always read (used
-	// to stamp created/materially-changed targets below).
-	if hasGenerationChange {
-		if _, err := tx.ExecContext(ctx, `UPDATE sites SET config_serial=config_serial+1 WHERE id=?`, siteID); err != nil {
-			return err
+		// Force-resolve the affected targets' firing fault signals INSIDE the write tx,
+		// each under its own reason, so a status reader never sees a terminated signal
+		// alongside surviving old-generation detector counters.
+		var termPubs []PostCommit
+		var termAffected []string
+		if s.term != nil {
+			for reason, ids := range byReason {
+				affected, pub, err := s.term.TerminateForTargetsTx(ctx, tx, ids, reason)
+				if err != nil {
+					return nil, err
+				}
+				termAffected = append(termAffected, affected...)
+				if pub != nil {
+					termPubs = append(termPubs, pub)
+				}
+			}
+			// Targets whose generation advanced without anything firing still need their
+			// counters cleared, or a streak measured under the old configuration would
+			// continue under the new one.
+			if err := s.term.ClearDetectorStateTx(ctx, tx, terminateSet); err != nil {
+				return nil, err
+			}
 		}
-	}
-	var newSerial int
-	if err := tx.QueryRowContext(ctx, `SELECT config_serial FROM sites WHERE id=?`, siteID).Scan(&newSerial); err != nil {
-		return err
-	}
-	now := time.Now().UTC()
 
-	for _, t := range targets {
-		params, _ := json.Marshal(t.Params)
-		serial := newSerial
-		changedAt := sql.NullTime{Time: now, Valid: true}
-		if of, ok := oldFacts[t.ID]; ok && !material[t.ID] {
-			// Non-material edit (name / group only): keep the target's generation.
-			serial = of.configSerial
-			changedAt = of.configChangedAt
+		// Delete removed targets. Their monitor_status / operational_issues /
+		// probe_detection_settings / detector_state rows cascade; their fault signals do
+		// NOT — those are history, and they carry frozen names precisely so they stay
+		// readable after the target is gone.
+		for id := range oldFacts {
+			if keep[id] {
+				continue
+			}
+			if _, err := tx.ExecContext(ctx, `DELETE FROM probe_tasks WHERE id=?`, id); err != nil {
+				return nil, err
+			}
 		}
-		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO probe_tasks(id, site_id, group_id, kind, name, target, params, enabled, proxy_id, config_serial, config_changed_at)
+
+		// Bump the site serial once (in-tx) ONLY when the desired generation changes —
+		// it is the new per-target generation for every created/materially-changed
+		// target, and the DesiredState version agents re-apply on. An identical/name-only
+		// save leaves it untouched (idempotent). The current serial is always read (used
+		// to stamp created/materially-changed targets below).
+		if hasGenerationChange {
+			if _, err := tx.ExecContext(ctx, `UPDATE sites SET config_serial=config_serial+1 WHERE id=?`, siteID); err != nil {
+				return nil, err
+			}
+		}
+		var newSerial int
+		if err := tx.QueryRowContext(ctx, `SELECT config_serial FROM sites WHERE id=?`, siteID).Scan(&newSerial); err != nil {
+			return nil, err
+		}
+		now := time.Now().UTC()
+
+		for _, t := range targets {
+			params, _ := json.Marshal(t.Params)
+			serial := newSerial
+			changedAt := sql.NullTime{Time: now, Valid: true}
+			if of, ok := oldFacts[t.ID]; ok && !material[t.ID] {
+				// Non-material edit (name / group only): keep the target's generation.
+				serial = of.configSerial
+				changedAt = of.configChangedAt
+			}
+			if _, err := tx.ExecContext(ctx,
+				`INSERT INTO probe_tasks(id, site_id, group_id, kind, name, target, params, enabled, proxy_id, config_serial, config_changed_at)
 			 VALUES(?,?,?,?,?,?,?,?,?,?,?)
 			 ON CONFLICT(id) DO UPDATE SET group_id=excluded.group_id, kind=excluded.kind, name=excluded.name,
 			   target=excluded.target, params=excluded.params, enabled=excluded.enabled, proxy_id=excluded.proxy_id,
 			   config_serial=excluded.config_serial, config_changed_at=excluded.config_changed_at`,
-			t.ID, siteID, t.GroupID, t.Kind, t.Name, t.Target, string(params), boolInt(t.Enabled),
-			nullIfEmpty(t.ProxyID), serial, changedAt); err != nil {
-			return err
+				t.ID, siteID, t.GroupID, t.Kind, t.Name, t.Target, string(params), boolInt(t.Enabled),
+				nullIfEmpty(t.ProxyID), serial, changedAt); err != nil {
+				return nil, err
+			}
 		}
-	}
-	if err := tx.Commit(); err != nil {
-		return err
-	}
-	committed = true
-	// Post-commit: publish the terminator's captured lifecycle events, push the new
-	// DesiredState only when the generation changed, then one precise status event
-	// over the affected targets (new ∪ terminated ∪ name-only ∪ terminator-affected).
-	for _, pub := range termPubs {
-		pub(ctx)
-	}
-	if hasGenerationChange {
-		s.announce(siteID)
-	}
-	eventTargets := make([]string, 0, len(newTargets)+len(terminateSet)+len(nameOnly)+len(termAffected))
-	for id := range newTargets {
-		eventTargets = append(eventTargets, id)
-	}
-	eventTargets = append(eventTargets, terminateSet...)
-	for id := range nameOnly {
-		eventTargets = append(eventTargets, id)
-	}
-	eventTargets = append(eventTargets, termAffected...)
-	s.publishTargetStatus(siteID, eventTargets)
-	return nil
+		// Post-commit: publish the terminator's captured lifecycle events, push the new
+		// DesiredState only when the generation changed, then one precise status event
+		// over the affected targets (new ∪ terminated ∪ name-only ∪ terminator-affected).
+		return func() {
+			for _, pub := range termPubs {
+				pub(ctx)
+			}
+			if hasGenerationChange {
+				s.announce(siteID)
+			}
+			eventTargets := make([]string, 0, len(newTargets)+len(terminateSet)+len(nameOnly)+len(termAffected))
+			for id := range newTargets {
+				eventTargets = append(eventTargets, id)
+			}
+			eventTargets = append(eventTargets, terminateSet...)
+			for id := range nameOnly {
+				eventTargets = append(eventTargets, id)
+			}
+			eventTargets = append(eventTargets, termAffected...)
+			s.publishTargetStatus(siteID, eventTargets)
+		}, nil
+	})
 }
 
 // keysOf returns the keys of a string-set map.
