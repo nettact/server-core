@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/nettact/server-core/fault"
+
+	"github.com/nettact/server-core/store"
 )
 
 // Detection sensitivity is server-side semantics, not probe configuration: it
@@ -87,32 +89,26 @@ func (s *Service) UpdateDetectionSettings(ctx context.Context, targetID string, 
 	}
 	in = in.Normalize()
 
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return DetectionSettings{}, err
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			_ = tx.Rollback()
+	var (
+		siteID, kind string
+		revision     int
+		now          = time.Now().UTC()
+	)
+	if err := s.db.WriteTx(ctx, store.Standalone(), func(wtx store.WriteTx) (func(), error) {
+		tx := wtx
+		if err := tx.QueryRowContext(ctx,
+			`SELECT site_id, kind FROM probe_tasks WHERE id=?`, targetID).Scan(&siteID, &kind); err != nil {
+			return nil, err
 		}
-	}()
+		if fault.SuccessMetricKind(kind) == "" {
+			return nil, fmt.Errorf("target kind %q has no built-in availability detector", kind)
+		}
 
-	var siteID, kind string
-	if err := tx.QueryRowContext(ctx,
-		`SELECT site_id, kind FROM probe_tasks WHERE id=?`, targetID).Scan(&siteID, &kind); err != nil {
-		return DetectionSettings{}, err
-	}
-	if fault.SuccessMetricKind(kind) == "" {
-		return DetectionSettings{}, fmt.Errorf("target kind %q has no built-in availability detector", kind)
-	}
-
-	now := time.Now().UTC()
-	smartEnabled := 0
-	if in.SmartEnabled {
-		smartEnabled = 1
-	}
-	if _, err := tx.ExecContext(ctx, `
+		smartEnabled := 0
+		if in.SmartEnabled {
+			smartEnabled = 1
+		}
+		if _, err := tx.ExecContext(ctx, `
 		INSERT INTO probe_detection_settings(target_id, profile, fail_rounds, recover_rounds, icmp_loss_pct,
 		    smart_enabled, smart_sensitivity, revision, updated_at)
 		VALUES(?,?,?,?,?,?,?,1,?)
@@ -121,36 +117,36 @@ func (s *Service) UpdateDetectionSettings(ctx context.Context, targetID string, 
 		  recover_rounds=excluded.recover_rounds, icmp_loss_pct=excluded.icmp_loss_pct,
 		  smart_enabled=excluded.smart_enabled, smart_sensitivity=excluded.smart_sensitivity,
 		  revision=probe_detection_settings.revision+1, updated_at=excluded.updated_at`,
-		targetID, in.Profile, in.FailRounds, in.RecoverRounds, in.ICMPLossPct,
-		smartEnabled, in.SmartSensitivity, now); err != nil {
-		return DetectionSettings{}, err
-	}
-
-	var termPub PostCommit
-	if s.term != nil {
-		_, pub, err := s.term.TerminateForTargetsTx(ctx, tx, []string{targetID}, ReasonConfigChanged)
-		if err != nil {
-			return DetectionSettings{}, err
+			targetID, in.Profile, in.FailRounds, in.RecoverRounds, in.ICMPLossPct,
+			smartEnabled, in.SmartSensitivity, now); err != nil {
+			return nil, err
 		}
-		termPub = pub
-		if err := s.term.ClearDetectorStateTx(ctx, tx, []string{targetID}); err != nil {
-			return DetectionSettings{}, err
-		}
-	}
 
-	var revision int
-	if err := tx.QueryRowContext(ctx,
-		`SELECT revision FROM probe_detection_settings WHERE target_id=?`, targetID).Scan(&revision); err != nil {
+		var termPub PostCommit
+		if s.term != nil {
+			_, pub, err := s.term.TerminateForTargetsTx(ctx, tx, []string{targetID}, ReasonConfigChanged)
+			if err != nil {
+				return nil, err
+			}
+			termPub = pub
+			if err := s.term.ClearDetectorStateTx(ctx, tx, []string{targetID}); err != nil {
+				return nil, err
+			}
+		}
+
+		if err := tx.QueryRowContext(ctx,
+			`SELECT revision FROM probe_detection_settings WHERE target_id=?`, targetID).Scan(&revision); err != nil {
+			return nil, err
+		}
+		return func() {
+			if termPub != nil {
+				termPub(ctx)
+			}
+			s.publishTargetStatus(siteID, []string{targetID})
+		}, nil
+	}); err != nil {
 		return DetectionSettings{}, err
 	}
-	if err := tx.Commit(); err != nil {
-		return DetectionSettings{}, err
-	}
-	committed = true
-	if termPub != nil {
-		termPub(ctx)
-	}
-	s.publishTargetStatus(siteID, []string{targetID})
 
 	in.Revision = revision
 	return DetectionSettings{TargetID: targetID, Kind: kind, DetectionSettings: in, UpdatedAt: &now}, nil

@@ -252,29 +252,16 @@ func (s *Service) SetGameCollection(ctx context.Context, siteID string, recordUn
 // change would simply never take effect. The probe serial is deliberately
 // untouched.
 func (s *Service) inGameTx(ctx context.Context, siteID string, fn func(tx store.Executor) error) error {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			_ = tx.Rollback()
+	return s.db.WriteTx(ctx, store.Standalone(), func(wtx store.WriteTx) (func(), error) {
+		if err := fn(wtx); err != nil {
+			return nil, err
 		}
-	}()
-	if err := fn(tx); err != nil {
-		return err
-	}
-	if _, err := tx.ExecContext(ctx,
-		`UPDATE sites SET game_config_serial=game_config_serial+1 WHERE id=?`, siteID); err != nil {
-		return err
-	}
-	if err := tx.Commit(); err != nil {
-		return err
-	}
-	committed = true
-	s.announce(siteID)
-	return nil
+		if _, err := wtx.ExecContext(ctx,
+			`UPDATE sites SET game_config_serial=game_config_serial+1 WHERE id=?`, siteID); err != nil {
+			return nil, err
+		}
+		return func() { s.announce(siteID) }, nil
+	})
 }
 
 // gameProfileSite resolves a profile's site, so the serial bump and the announce
