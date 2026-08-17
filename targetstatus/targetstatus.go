@@ -305,49 +305,58 @@ type agentAgg struct {
 // partial/empty 200).
 func (s *Service) SiteStatuses(ctx context.Context, siteID string, timeRange time.Duration) (SiteStatuses, error) {
 	now := time.Now().UTC()
+
+	// The snapshot's results, declared out here so the transaction can close
+	// before the out-of-snapshot reads below run. Which queries are inside the
+	// snapshot and which are deliberately outside it is the whole point of this
+	// function's shape, so the boundary is the closure's braces rather than a
+	// comment about where it used to end.
+	var (
+		targets   []targetRow
+		pairs     map[string][]applicablePair
+		msByKey   map[string]*msRow
+		samples   map[string]*sampleVal
+		detectors map[string]detState
+		signals   map[string]firingSignal
+	)
 	// One read snapshot: WAL isolation holds for the life of a single read
 	// transaction, so fault signals and detector counters (committed together by
 	// the fault engine) can never be observed torn across the queries below. The
-	// read pool is already query_only; ReadOnly is belt-and-braces.
-	tx, err := s.db.Read().BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
-	if err != nil {
-		return SiteStatuses{}, err
-	}
-	defer func() { _ = tx.Rollback() }()
-
-	// Site existence (404 boundary).
-	var siteSerial int
-	if err := tx.QueryRowContext(ctx, `SELECT config_serial FROM sites WHERE id=?`, siteID).Scan(&siteSerial); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return SiteStatuses{}, ErrSiteNotFound
+	// read pool is already query_only, which is the enforcement ReadTx relies on.
+	if err := s.db.ReadTx(ctx, store.Standalone(), func(tx store.Executor) error {
+		// Site existence (404 boundary).
+		var siteSerial int
+		if err := tx.QueryRowContext(ctx, `SELECT config_serial FROM sites WHERE id=?`, siteID).Scan(&siteSerial); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return ErrSiteNotFound
+			}
+			return err
 		}
+
+		var err error
+		if targets, err = s.loadTargets(ctx, tx, siteID); err != nil {
+			return err
+		}
+		if pairs, err = s.loadApplicablePairs(ctx, tx, siteID); err != nil {
+			return err
+		}
+		if msByKey, err = s.loadMonitorStatus(ctx, tx, siteID); err != nil {
+			return err
+		}
+		if samples, err = s.loadLatestSamples(ctx, tx, siteID); err != nil {
+			return err
+		}
+		if detectors, err = s.loadDetectorState(ctx, tx, siteID); err != nil {
+			return err
+		}
+		if signals, err = s.loadFiringSignals(ctx, tx, siteID); err != nil {
+			return err
+		}
+		return nil
+	}); err != nil {
 		return SiteStatuses{}, err
 	}
 
-	targets, err := s.loadTargets(ctx, tx, siteID)
-	if err != nil {
-		return SiteStatuses{}, err
-	}
-	pairs, err := s.loadApplicablePairs(ctx, tx, siteID)
-	if err != nil {
-		return SiteStatuses{}, err
-	}
-	msByKey, err := s.loadMonitorStatus(ctx, tx, siteID)
-	if err != nil {
-		return SiteStatuses{}, err
-	}
-	samples, err := s.loadLatestSamples(ctx, tx, siteID)
-	if err != nil {
-		return SiteStatuses{}, err
-	}
-	detectors, err := s.loadDetectorState(ctx, tx, siteID)
-	if err != nil {
-		return SiteStatuses{}, err
-	}
-	signals, err := s.loadFiringSignals(ctx, tx, siteID)
-	if err != nil {
-		return SiteStatuses{}, err
-	}
 	// Availability is read outside the snapshot: it aggregates rollup buckets that
 	// no other dimension depends on, so an extra query on the read pool is cheaper
 	// than widening the snapshot, and a one-round skew in the ratio is not
@@ -355,6 +364,7 @@ func (s *Service) SiteStatuses(ctx context.Context, siteID string, timeRange tim
 	avail := map[string]metrics.AvailabilityRatio{}
 	availByAgent := map[string]map[string]metrics.AvailabilityRatio{}
 	if s.metrics != nil {
+		var err error
 		avail, availByAgent, err = s.metrics.AvailabilityForSiteWithAgents(ctx, siteID, now.Add(-timeRange).Unix(), now.Unix())
 		if err != nil {
 			return SiteStatuses{}, err
@@ -755,7 +765,7 @@ func aggregate(t *targetRow, agents []agentAgg) (string, int) {
 
 // ---- queries (all inside the read snapshot tx; no per-target loop) ----
 
-func (s *Service) loadTargets(ctx context.Context, tx *sql.Tx, siteID string) ([]targetRow, error) {
+func (s *Service) loadTargets(ctx context.Context, tx store.Executor, siteID string) ([]targetRow, error) {
 	def := fault.DefaultDetection()
 	rows, err := tx.QueryContext(ctx, `
 		SELECT pt.id, pt.group_id, COALESCE(pt.name,''), pt.kind, COALESCE(pt.target,''),
@@ -801,7 +811,7 @@ func (s *Service) loadTargets(ctx context.Context, tx *sql.Tx, siteID string) ([
 // monitor-group scope (all_agents, or membership of one of the group's agent
 // groups). The scope predicate is correlated on a.id (not the shared
 // single-placeholder config.AgentScopePredicate).
-func (s *Service) loadApplicablePairs(ctx context.Context, tx *sql.Tx, siteID string) (map[string][]applicablePair, error) {
+func (s *Service) loadApplicablePairs(ctx context.Context, tx store.Executor, siteID string) (map[string][]applicablePair, error) {
 	rows, err := tx.QueryContext(ctx, `
 		SELECT pt.id, a.id,
 		       COALESCE(NULLIF(a.display_name,''), NULLIF(a.hostname,''), a.id), a.status
@@ -830,7 +840,7 @@ func (s *Service) loadApplicablePairs(ctx context.Context, tx *sql.Tx, siteID st
 	return out, rows.Err()
 }
 
-func (s *Service) loadMonitorStatus(ctx context.Context, tx *sql.Tx, siteID string) (map[string]*msRow, error) {
+func (s *Service) loadMonitorStatus(ctx context.Context, tx store.Executor, siteID string) (map[string]*msRow, error) {
 	rows, err := tx.QueryContext(ctx, `
 		SELECT ms.monitor_id, ms.agent_id, ms.status, ms.source, ms.target_config_serial,
 		       ms.assigned_at, ms.missing_permissions, COALESCE(ms.matched_selector,''),
@@ -873,7 +883,7 @@ func (s *Service) loadMonitorStatus(ctx context.Context, tx *sql.Tx, siteID stri
 // race of a single poll's width: a packet committing between this query and
 // the cache read can surface a value one beat newer than the snapshot — values
 // were never part of the config snapshot's consistency story.
-func (s *Service) loadLatestSamples(ctx context.Context, tx *sql.Tx, siteID string) (map[string]*sampleVal, error) {
+func (s *Service) loadLatestSamples(ctx context.Context, tx store.Executor, siteID string) (map[string]*sampleVal, error) {
 	rows, err := tx.QueryContext(ctx, `
 		SELECT s.id, s.agent_id, s.monitor_id, s.kind, s.unit
 		FROM series s
@@ -932,7 +942,7 @@ func (s *Service) loadLatestSamples(ctx context.Context, tx *sql.Tx, siteID stri
 // loadDetectorState returns the site's built-in availability detector counters,
 // keyed (target, agent). The needed threshold is joined from the target's own
 // sensitivity so the console can render "2 of 5" for a target tuned to stable.
-func (s *Service) loadDetectorState(ctx context.Context, tx *sql.Tx, siteID string) (map[string]detState, error) {
+func (s *Service) loadDetectorState(ctx context.Context, tx store.Executor, siteID string) (map[string]detState, error) {
 	def := fault.DefaultDetection()
 	rows, err := tx.QueryContext(ctx, `
 		SELECT ds.target_id, ds.agent_id, ds.fail_rounds, ds.first_fail_ts, ds.updated_at,
@@ -969,7 +979,7 @@ func (s *Service) loadDetectorState(ctx context.Context, tx *sql.Tx, siteID stri
 // fault is the thing the operator needs to see. Most severe wins; among equals
 // the one that has been firing longest, then by id so the answer is stable
 // across refreshes.
-func (s *Service) loadFiringSignals(ctx context.Context, tx *sql.Tx, siteID string) (map[string]firingSignal, error) {
+func (s *Service) loadFiringSignals(ctx context.Context, tx store.Executor, siteID string) (map[string]firingSignal, error) {
 	rows, err := tx.QueryContext(ctx, `
 		SELECT fs.target_id, fs.agent_id, fs.id, fs.incident_id, fs.severity, fs.target_name, fs.target_addr,
 		       fs.target_port, fs.probe_kind, fs.detector_key, fs.agent_name, fs.observed_at, fs.confirmed_at,

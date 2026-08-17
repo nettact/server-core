@@ -392,62 +392,68 @@ func (s *Service) CreateJob(ctx context.Context, siteID string, req CreateReques
 
 	jobID := "cj_" + uuid.NewString()
 	now := time.Now().UTC()
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return "", false, err
-	}
-	defer func() {
-		if tx != nil {
-			_ = tx.Rollback()
+	// outID/outCreated carry the closure's result out. The ErrJobRunning path
+	// returns a value AND an error, so the error branch below must return outID
+	// too — for every other failure it is still "".
+	var (
+		outID      string
+		outCreated bool
+	)
+	if err := s.db.WriteTx(ctx, store.Standalone(), func(wtx store.WriteTx) (func(), error) {
+		// Re-check token dedup and the one-job-at-a-time guarantee INSIDE the write
+		// transaction. The read-pool checks above are only a fast path: SQLite has a
+		// single writer, so two concurrent creates serialize on this connection, and
+		// these in-tx reads see the other's committed job — closing the race where both
+		// observed "nothing running" on the read pool and each inserted a job.
+		if req.ClientToken != "" {
+			var existing string
+			err := wtx.QueryRowContext(ctx, `SELECT id FROM cleanup_jobs WHERE client_token=?`, req.ClientToken).Scan(&existing)
+			if err == nil {
+				// Dedup hit. The pre-contract code reached its deferred Rollback
+				// here; returning nil instead commits, but nothing has been
+				// written at this point, so the observable effect is identical.
+				// Returning a fake error to force a rollback would be worse: it
+				// would make a successful dedup indistinguishable from a failure.
+				outID, outCreated = existing, false
+				return nil, nil
+			}
+			if err != sql.ErrNoRows {
+				return nil, err
+			}
 		}
-	}()
-	// Re-check token dedup and the one-job-at-a-time guarantee INSIDE the write
-	// transaction. The read-pool checks above are only a fast path: SQLite has a
-	// single writer, so two concurrent creates serialize on this connection, and
-	// these in-tx reads see the other's committed job — closing the race where both
-	// observed "nothing running" on the read pool and each inserted a job.
-	if req.ClientToken != "" {
-		var existing string
-		err := tx.QueryRowContext(ctx, `SELECT id FROM cleanup_jobs WHERE client_token=?`, req.ClientToken).Scan(&existing)
+		var runningTx string
+		err := wtx.QueryRowContext(ctx, `SELECT id FROM cleanup_jobs WHERE state IN('queued','running') ORDER BY created_at LIMIT 1`).Scan(&runningTx)
 		if err == nil {
-			return existing, false, nil
+			outID = runningTx
+			return nil, fmt.Errorf("%w (job %s)", ErrJobRunning, runningTx)
 		}
 		if err != sql.ErrNoRows {
-			return "", false, err
+			return nil, err
 		}
-	}
-	var runningTx string
-	err = tx.QueryRowContext(ctx, `SELECT id FROM cleanup_jobs WHERE state IN('queued','running') ORDER BY created_at LIMIT 1`).Scan(&runningTx)
-	if err == nil {
-		return runningTx, false, fmt.Errorf("%w (job %s)", ErrJobRunning, runningTx)
-	}
-	if err != sql.ErrNoRows {
-		return "", false, err
-	}
-	if _, err := tx.ExecContext(ctx, `
+		if _, err := wtx.ExecContext(ctx, `
 		INSERT INTO cleanup_jobs(id, site_id, client_token, mode, from_ts, to_ts, allow_live, state, total_items, created_at)
 		VALUES(?,?,?,?,?,?,?, 'queued', ?, ?)`,
-		jobID, siteID, req.ClientToken, modeOf(req.Mode), req.FromTS, req.ToTS, boolInt(req.AllowLive), len(items), now); err != nil {
-		return "", false, err
-	}
-	stmt, err := tx.PrepareContext(ctx, `
+			jobID, siteID, req.ClientToken, modeOf(req.Mode), req.FromTS, req.ToTS, boolInt(req.AllowLive), len(items), now); err != nil {
+			return nil, err
+		}
+		stmt, err := wtx.PrepareContext(ctx, `
 		INSERT INTO cleanup_job_items(job_id, idx, agent_id, monitor_id, kind, target, label, state)
 		VALUES(?,?,?,?,?,?,?, 'pending')`)
-	if err != nil {
-		return "", false, err
-	}
-	for i, it := range items {
-		if _, err := stmt.ExecContext(ctx, jobID, i, it.key.AgentID, it.key.MonitorID, it.key.Kind, it.key.Target, it.label); err != nil {
-			stmt.Close()
-			return "", false, err
+		if err != nil {
+			return nil, err
 		}
+		defer stmt.Close()
+		for i, it := range items {
+			if _, err := stmt.ExecContext(ctx, jobID, i, it.key.AgentID, it.key.MonitorID, it.key.Kind, it.key.Target, it.label); err != nil {
+				return nil, err
+			}
+		}
+		outID, outCreated = jobID, true
+		return nil, nil
+	}); err != nil {
+		return outID, false, err
 	}
-	stmt.Close()
-	if err := tx.Commit(); err != nil {
-		return "", false, err
-	}
-	tx = nil
-	return jobID, true, nil
+	return outID, outCreated, nil
 }
 
 func modeOf(m string) string {
