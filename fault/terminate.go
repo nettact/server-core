@@ -2,7 +2,6 @@ package fault
 
 import (
 	"context"
-	"database/sql"
 	"github.com/nettact/server-core/store"
 	"strings"
 	"time"
@@ -32,7 +31,7 @@ type postCommit = func(ctx context.Context)
 // the distinct target ids whose signals closed (for the caller's status event)
 // and a post-commit publisher the tx owner MUST invoke after a successful commit
 // and discard on rollback. Implements config.FaultTerminator.
-func (s *Service) TerminateForTargetsTx(ctx context.Context, tx *sql.Tx, targetIDs []string, reason string) ([]string, postCommit, error) {
+func (s *Service) TerminateForTargetsTx(ctx context.Context, tx store.Executor, targetIDs []string, reason string) ([]string, postCommit, error) {
 	if len(targetIDs) == 0 {
 		return nil, nil, nil
 	}
@@ -60,7 +59,7 @@ func (s *Service) TerminateForTargetsTx(ctx context.Context, tx *sql.Tx, targetI
 // TerminateForGroupTx force-resolves the firing signals of every target in a
 // monitor group (group deletion or merge-policy flip, which changes the incident
 // grouping identity). Same contract as TerminateForTargetsTx.
-func (s *Service) TerminateForGroupTx(ctx context.Context, tx *sql.Tx, groupID string) ([]string, postCommit, error) {
+func (s *Service) TerminateForGroupTx(ctx context.Context, tx store.Executor, groupID string) ([]string, postCommit, error) {
 	targets, agents, siteID, out, err := s.terminateTx(ctx, tx, ReasonConfigChanged, `group_id = ?`, groupID)
 	if err != nil {
 		return nil, nil, err
@@ -161,7 +160,7 @@ func (s *Service) recomputeSiblingAttributions(ctx context.Context, tx store.Exe
 // TerminateForAgent force-resolves every signal detected by one agent, in its own
 // transaction. Used when the agent is deleted.
 func (s *Service) TerminateForAgent(ctx context.Context, agentID string) error {
-	return s.terminate(ctx, ReasonAgentDeleted, func(ctx context.Context, tx *sql.Tx) error {
+	return s.terminate(ctx, ReasonAgentDeleted, func(ctx context.Context, tx store.Executor) error {
 		_, err := tx.ExecContext(ctx, `DELETE FROM detector_state WHERE agent_id=?`, agentID)
 		return err
 	}, `agent_id = ?`, agentID)
@@ -187,7 +186,7 @@ func (s *Service) ResolveOutOfScope(ctx context.Context, siteID string) error {
 // transaction, runs the optional extra cleanup in that same transaction, then
 // publishes post-commit. Callers must invoke it OUTSIDE any open write
 // transaction (SQLite has a single writer).
-func (s *Service) terminate(ctx context.Context, reason string, extra func(context.Context, *sql.Tx) error, whereSQL string, args ...any) error {
+func (s *Service) terminate(ctx context.Context, reason string, extra func(context.Context, store.Executor) error, whereSQL string, args ...any) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -276,7 +275,7 @@ func (s *Service) terminateTx(ctx context.Context, tx store.Executor, reason, wh
 // ClearDetectorStateTx drops the detector counters for the given targets inside
 // the caller's tx, without touching signals. Used by config paths that reset a
 // target's generation without having any firing signal to terminate.
-func (s *Service) ClearDetectorStateTx(ctx context.Context, tx *sql.Tx, targetIDs []string) error {
+func (s *Service) ClearDetectorStateTx(ctx context.Context, tx store.Executor, targetIDs []string) error {
 	if len(targetIDs) == 0 {
 		return nil
 	}

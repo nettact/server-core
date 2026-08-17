@@ -92,13 +92,13 @@ const (
 type FaultTerminator interface {
 	// TerminateForTargetsTx force-resolves, inside tx, the firing signals of the
 	// given targets with the given reason, and clears their detector counters.
-	TerminateForTargetsTx(ctx context.Context, tx *sql.Tx, targetIDs []string, reason string) ([]string, PostCommit, error)
+	TerminateForTargetsTx(ctx context.Context, tx store.Executor, targetIDs []string, reason string) ([]string, PostCommit, error)
 	// TerminateForGroupTx force-resolves, inside tx, the firing signals of every
 	// target in a monitor group (group deletion or merge-policy flip).
-	TerminateForGroupTx(ctx context.Context, tx *sql.Tx, groupID string) ([]string, PostCommit, error)
+	TerminateForGroupTx(ctx context.Context, tx store.Executor, groupID string) ([]string, PostCommit, error)
 	// ClearDetectorStateTx drops the detector counters of the given targets without
 	// touching signals, for a generation change that had nothing firing.
-	ClearDetectorStateTx(ctx context.Context, tx *sql.Tx, targetIDs []string) error
+	ClearDetectorStateTx(ctx context.Context, tx store.Executor, targetIDs []string) error
 }
 
 type Service struct {
@@ -258,28 +258,19 @@ func (s *Service) GetGroup(ctx context.Context, groupID string) (MonitorGroup, e
 // until targets are assigned to it.
 func (s *Service) CreateGroup(ctx context.Context, siteID, name string, mergeEnabled, allAgents bool, agentGroupIDs []string) (string, error) {
 	id := "mgrp_" + uuid.NewString()
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return "", err
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			_ = tx.Rollback()
-		}
-	}()
-	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO monitor_groups(id, site_id, name, is_default, merge_enabled, all_agents)
+	if err := s.db.WriteTx(ctx, store.Standalone(), func(wtx store.WriteTx) (func(), error) {
+		if _, err := wtx.ExecContext(ctx,
+			`INSERT INTO monitor_groups(id, site_id, name, is_default, merge_enabled, all_agents)
 		 VALUES(?,?,?,0,?,?)`, id, siteID, name, boolInt(mergeEnabled), boolInt(allAgents)); err != nil {
+			return nil, err
+		}
+		if err := reconcileGroupScope(ctx, wtx, id, siteID, allAgents, agentGroupIDs); err != nil {
+			return nil, err
+		}
+		return nil, nil
+	}); err != nil {
 		return "", err
 	}
-	if err := reconcileGroupScope(ctx, tx, id, siteID, allAgents, agentGroupIDs); err != nil {
-		return "", err
-	}
-	if err := tx.Commit(); err != nil {
-		return "", err
-	}
-	committed = true
 	return id, nil
 }
 
@@ -292,58 +283,54 @@ func (s *Service) CreateGroup(ctx context.Context, siteID, name string, mergeEna
 // The default group may be updated but not renamed to empty. Returns the group's
 // site id, or sql.ErrNoRows when the group is gone.
 func (s *Service) UpdateGroup(ctx context.Context, groupID, name string, mergeEnabled, allAgents bool, agentGroupIDs []string) (string, error) {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return "", err
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			_ = tx.Rollback()
-		}
-	}()
 	var siteID string
-	var oldMerge int
-	if err := tx.QueryRowContext(ctx,
-		`SELECT site_id, merge_enabled FROM monitor_groups WHERE id=?`, groupID).Scan(&siteID, &oldMerge); err != nil {
-		return "", err
-	}
-	// Terminate the group's firing alerts in-tx only on a merge-policy flip (a pure
-	// rename or agent-scope edit is not a grouping-identity change and must not
-	// terminate incidents).
-	var termPub PostCommit
-	var termAffected []string
-	if s.term != nil && (oldMerge == 1) != mergeEnabled {
-		termAffected, termPub, err = s.term.TerminateForGroupTx(ctx, tx, groupID)
-		if err != nil {
-			return "", err
+	if err := s.db.WriteTx(ctx, store.Standalone(), func(wtx store.WriteTx) (func(), error) {
+		var oldMerge int
+		if err := wtx.QueryRowContext(ctx,
+			`SELECT site_id, merge_enabled FROM monitor_groups WHERE id=?`, groupID).Scan(&siteID, &oldMerge); err != nil {
+			return nil, err
 		}
-	}
-	targetIDs, err := groupTargetIDs(ctx, tx, groupID)
-	if err != nil {
+		// Terminate the group's firing alerts in-tx only on a merge-policy flip (a pure
+		// rename or agent-scope edit is not a grouping-identity change and must not
+		// terminate incidents).
+		var termPub PostCommit
+		var termAffected []string
+		if s.term != nil && (oldMerge == 1) != mergeEnabled {
+			var err error
+			termAffected, termPub, err = s.term.TerminateForGroupTx(ctx, wtx, groupID)
+			if err != nil {
+				return nil, err
+			}
+		}
+		targetIDs, err := groupTargetIDs(ctx, wtx, groupID)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := wtx.ExecContext(ctx,
+			`UPDATE monitor_groups SET name=?, merge_enabled=?, all_agents=? WHERE id=?`,
+			name, boolInt(mergeEnabled), boolInt(allAgents), groupID); err != nil {
+			return nil, err
+		}
+		if err := reconcileGroupScope(ctx, wtx, groupID, siteID, allAgents, agentGroupIDs); err != nil {
+			return nil, err
+		}
+		if _, err := wtx.ExecContext(ctx,
+			`UPDATE sites SET config_serial=config_serial+1 WHERE id=?`, siteID); err != nil {
+			return nil, err
+		}
+		// The terminator's publisher, the DesiredState announce and the status
+		// event all have to happen after durability and not at all on rollback,
+		// which is precisely what the post closure guarantees.
+		return func() {
+			if termPub != nil {
+				termPub(ctx)
+			}
+			s.announce(siteID)
+			s.publishTargetStatus(siteID, append(targetIDs, termAffected...))
+		}, nil
+	}); err != nil {
 		return "", err
 	}
-	if _, err := tx.ExecContext(ctx,
-		`UPDATE monitor_groups SET name=?, merge_enabled=?, all_agents=? WHERE id=?`,
-		name, boolInt(mergeEnabled), boolInt(allAgents), groupID); err != nil {
-		return "", err
-	}
-	if err := reconcileGroupScope(ctx, tx, groupID, siteID, allAgents, agentGroupIDs); err != nil {
-		return "", err
-	}
-	if _, err := tx.ExecContext(ctx,
-		`UPDATE sites SET config_serial=config_serial+1 WHERE id=?`, siteID); err != nil {
-		return "", err
-	}
-	if err := tx.Commit(); err != nil {
-		return "", err
-	}
-	committed = true
-	if termPub != nil {
-		termPub(ctx)
-	}
-	s.announce(siteID)
-	s.publishTargetStatus(siteID, append(targetIDs, termAffected...))
 	return siteID, nil
 }
 

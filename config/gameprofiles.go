@@ -29,6 +29,8 @@ import (
 	"github.com/google/uuid"
 
 	pcfg "github.com/nettact/protocol/config"
+
+	"github.com/nettact/server-core/store"
 )
 
 // Game profile tiers. base is the always-affordable measurement every run gets;
@@ -130,7 +132,7 @@ func (s *Service) CreateGameProfile(ctx context.Context, siteID string, p GamePr
 	now := time.Now().UTC().Unix()
 	p.CreatedAt, p.UpdatedAt = now, now
 
-	if err := s.inGameTx(ctx, siteID, func(tx *sql.Tx) error {
+	if err := s.inGameTx(ctx, siteID, func(tx store.Executor) error {
 		_, err := tx.ExecContext(ctx,
 			`INSERT INTO game_profiles(id, site_id, name, exe_match, target_fps, tier, monitor_ids, created_at, updated_at)
 			 VALUES(?,?,?,?,?,?,?,?,?)`,
@@ -158,7 +160,7 @@ func (s *Service) UpdateGameProfile(ctx context.Context, id string, p GameProfil
 	if err != nil {
 		return GameProfileRec{}, err
 	}
-	if err := s.inGameTx(ctx, siteID, func(tx *sql.Tx) error {
+	if err := s.inGameTx(ctx, siteID, func(tx store.Executor) error {
 		now := time.Now().UTC().Unix()
 		res, err := tx.ExecContext(ctx,
 			`UPDATE game_profiles SET name=?, exe_match=?, target_fps=?, tier=?, monitor_ids=?, updated_at=?
@@ -193,7 +195,7 @@ func (s *Service) DeleteGameProfile(ctx context.Context, id string) (string, err
 	if err != nil {
 		return "", err
 	}
-	if err := s.inGameTx(ctx, siteID, func(tx *sql.Tx) error {
+	if err := s.inGameTx(ctx, siteID, func(tx store.Executor) error {
 		res, err := tx.ExecContext(ctx, `DELETE FROM game_profiles WHERE id=?`, id)
 		if err != nil {
 			return err
@@ -228,7 +230,7 @@ func (s *Service) GameCollection(ctx context.Context, siteID string) (bool, erro
 // serial and announces. It is the same axis as a profile edit because it is the
 // same decision for the sensor: both change which processes it captures.
 func (s *Service) SetGameCollection(ctx context.Context, siteID string, recordUnmatched bool) error {
-	return s.inGameTx(ctx, siteID, func(tx *sql.Tx) error {
+	return s.inGameTx(ctx, siteID, func(tx store.Executor) error {
 		res, err := tx.ExecContext(ctx,
 			`UPDATE sites SET game_record_unmatched=? WHERE id=?`, boolInt(recordUnmatched), siteID)
 		if err != nil {
@@ -249,7 +251,7 @@ func (s *Service) SetGameCollection(ctx context.Context, siteID string, recordUn
 // would be pushed to agents under a version they have already applied, and the
 // change would simply never take effect. The probe serial is deliberately
 // untouched.
-func (s *Service) inGameTx(ctx context.Context, siteID string, fn func(tx *sql.Tx) error) error {
+func (s *Service) inGameTx(ctx context.Context, siteID string, fn func(tx store.Executor) error) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
