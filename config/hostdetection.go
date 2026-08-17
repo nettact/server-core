@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/nettact/server-core/fault"
+
+	"github.com/nettact/server-core/store"
 )
 
 // System-status thresholds are server-side semantics in exactly the sense
@@ -222,54 +224,50 @@ func readHostSettings(ctx context.Context, q interface {
 // firing system-status signals as a configuration change and clears its detector
 // counters, all in one transaction.
 func (s *Service) UpdateHostDetection(ctx context.Context, targetID string, p HostDetectionPatch) (HostDetection, error) {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return HostDetection{}, err
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			_ = tx.Rollback()
-		}
-	}()
+	var (
+		siteID, kind string
+		set          fault.HostSettings
+		now          = time.Now().UTC()
+	)
+	if err := s.db.WriteTx(ctx, store.Standalone(), func(wtx store.WriteTx) (func(), error) {
+		tx := wtx
 
-	var siteID, kind string
-	if err := tx.QueryRowContext(ctx,
-		`SELECT site_id, kind FROM probe_tasks WHERE id=?`, targetID).Scan(&siteID, &kind); err != nil {
-		return HostDetection{}, err
-	}
-	if kind != "host" {
-		return HostDetection{}, fmt.Errorf("target %s is not a host monitor", targetID)
-	}
-	set, _, err := readHostSettings(ctx, tx, targetID)
-	if err != nil {
-		return HostDetection{}, err
-	}
-	if err := validateHostPatch(p); err != nil {
-		return HostDetection{}, err
-	}
-	applyHostPatch(&set, p)
-	if err := validateHostSettings(set); err != nil {
-		return HostDetection{}, err
-	}
+		if err := tx.QueryRowContext(ctx,
+			`SELECT site_id, kind FROM probe_tasks WHERE id=?`, targetID).Scan(&siteID, &kind); err != nil {
+			return nil, err
+		}
+		if kind != "host" {
+			return nil, fmt.Errorf("target %s is not a host monitor", targetID)
+		}
+		var err error
+		set, _, err = readHostSettings(ctx, tx, targetID)
+		if err != nil {
+			return nil, err
+		}
+		if err := validateHostPatch(p); err != nil {
+			return nil, err
+		}
+		applyHostPatch(&set, p)
+		if err := validateHostSettings(set); err != nil {
+			return nil, err
+		}
 
-	now := time.Now().UTC()
-	b := func(v bool) int {
-		if v {
-			return 1
+		b := func(v bool) int {
+			if v {
+				return 1
+			}
+			return 0
 		}
-		return 0
-	}
-	nullable := func(v float64) any {
-		if v > 0 {
-			return v
+		nullable := func(v float64) any {
+			if v > 0 {
+				return v
+			}
+			return nil
 		}
-		return nil
-	}
-	// The defaults are revision 1, so the first STORED edit has to be 2 or it would
-	// be indistinguishable from them — and a streak pinned to the defaults could
-	// then be continued under a threshold that replaced them.
-	if _, err := tx.ExecContext(ctx, `
+		// The defaults are revision 1, so the first STORED edit has to be 2 or it would
+		// be indistinguishable from them — and a streak pinned to the defaults could
+		// then be continued under a threshold that replaced them.
+		if _, err := tx.ExecContext(ctx, `
 		INSERT INTO host_detection_settings(target_id, cpu_enabled, cpu_pct, cpu_duration_s,
 		    mem_enabled, mem_pct, mem_duration_s, load_enabled, load_per_core, load_duration_s,
 		    net_enabled, net_rx_mbps, net_tx_mbps, net_duration_s, disk_enabled, disk_pct,
@@ -284,38 +282,39 @@ func (s *Service) UpdateHostDetection(ctx context.Context, targetID string, p Ho
 		  net_tx_mbps=excluded.net_tx_mbps, net_duration_s=excluded.net_duration_s,
 		  disk_enabled=excluded.disk_enabled, disk_pct=excluded.disk_pct,
 		  revision=host_detection_settings.revision+1, updated_at=excluded.updated_at`,
-		targetID, b(set.CPUEnabled), set.CPUPct, set.CPUDurationS,
-		b(set.MemEnabled), set.MemPct, set.MemDurationS,
-		b(set.LoadEnabled), set.LoadPerCore, set.LoadDurationS,
-		b(set.NetEnabled), nullable(set.NetRxMbps), nullable(set.NetTxMbps), set.NetDurationS,
-		b(set.DiskEnabled), set.DiskPct, now); err != nil {
-		return HostDetection{}, err
-	}
-
-	var termPub PostCommit
-	if s.term != nil {
-		_, pub, err := s.term.TerminateForTargetsTx(ctx, tx, []string{targetID}, ReasonConfigChanged)
-		if err != nil {
-			return HostDetection{}, err
+			targetID, b(set.CPUEnabled), set.CPUPct, set.CPUDurationS,
+			b(set.MemEnabled), set.MemPct, set.MemDurationS,
+			b(set.LoadEnabled), set.LoadPerCore, set.LoadDurationS,
+			b(set.NetEnabled), nullable(set.NetRxMbps), nullable(set.NetTxMbps), set.NetDurationS,
+			b(set.DiskEnabled), set.DiskPct, now); err != nil {
+			return nil, err
 		}
-		termPub = pub
-		if err := s.term.ClearDetectorStateTx(ctx, tx, []string{targetID}); err != nil {
-			return HostDetection{}, err
-		}
-	}
 
-	if err := tx.QueryRowContext(ctx,
-		`SELECT revision FROM host_detection_settings WHERE target_id=?`, targetID).Scan(&set.Revision); err != nil {
+		var termPub PostCommit
+		if s.term != nil {
+			_, pub, err := s.term.TerminateForTargetsTx(ctx, tx, []string{targetID}, ReasonConfigChanged)
+			if err != nil {
+				return nil, err
+			}
+			termPub = pub
+			if err := s.term.ClearDetectorStateTx(ctx, tx, []string{targetID}); err != nil {
+				return nil, err
+			}
+		}
+
+		if err := tx.QueryRowContext(ctx,
+			`SELECT revision FROM host_detection_settings WHERE target_id=?`, targetID).Scan(&set.Revision); err != nil {
+			return nil, err
+		}
+		return func() {
+			if termPub != nil {
+				termPub(ctx)
+			}
+			s.publishTargetStatus(siteID, []string{targetID})
+		}, nil
+	}); err != nil {
 		return HostDetection{}, err
 	}
-	if err := tx.Commit(); err != nil {
-		return HostDetection{}, err
-	}
-	committed = true
-	if termPub != nil {
-		termPub(ctx)
-	}
-	s.publishTargetStatus(siteID, []string{targetID})
 
 	out := hostDetectionFrom(targetID, siteID, set)
 	out.UpdatedAt = &now
