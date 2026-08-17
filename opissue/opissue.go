@@ -171,134 +171,124 @@ type SaveWarningAgent struct {
 // runtime target-policy transition, or a policy-changing restart with unchanged
 // DesiredState, is still recorded.
 func (s *Service) ApplyMonitorStatus(ctx context.Context, agentID, siteID string, ms wire.MonitorStatus) error {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			_ = tx.Rollback()
-		}
-	}()
+	return s.db.WriteTx(ctx, store.Standalone(), func(wtx store.WriteTx) (func(), error) {
+		tx := wtx
 
-	var lastAccepted, desired int
-	err = tx.QueryRowContext(ctx,
-		`SELECT a.last_status_config_version, COALESCE(st.config_serial,0)
-		 FROM agents a JOIN sites st ON st.id = a.site_id WHERE a.id=?`, agentID).
-		Scan(&lastAccepted, &desired)
-	if err != nil {
-		if err == sql.ErrNoRows {
-			return nil // agent gone; nothing to reconcile
-		}
-		return err
-	}
-	// Monotonic guard: reject stale frames (older than what we accepted or than
-	// the desired site config serial we last pushed). Equal is valid.
-	if ms.ConfigVersion < lastAccepted || ms.ConfigVersion < desired {
-		return nil
-	}
-
-	// Only monitors that are enabled and in this agent's scope are valid targets; a
-	// stale or misbehaving agent must not create status/issues for monitors it was
-	// never assigned. The map value is each monitor's current material generation.
-	valid, err := s.probeMonitorSerials(ctx, tx, siteID, agentID)
-	if err != nil {
-		return err
-	}
-
-	now := time.Now().UTC()
-	changed := false
-	var statusChanged []string // monitor ids whose monitor_status row changed
-	current := make([]string, 0, len(ms.Statuses))
-	blocked := map[string]bool{} // dedupe_keys reported blocked this frame
-	seen := map[string]bool{}    // monitor ids already handled this frame (reject dupes)
-
-	for _, e := range ms.Statuses {
-		serial, ok := valid[e.MonitorID]
-		if !ok || seen[e.MonitorID] || !validMonitorStatus(e.Status) {
-			// Unknown/out-of-scope monitor, a duplicate id, or a non-enum status: ignore
-			// rather than mutating status/issues on untrusted input.
-			continue
-		}
-		seen[e.MonitorID] = true
-		// The monitor is in scope and named in this frame, so its row is retained
-		// (not deleted as absent) regardless of the per-target generation check below.
-		current = append(current, e.MonitorID)
-		// Exact per-target generation echo: an entry attesting a generation other
-		// than the target's current one (stale — the agent has not applied the
-		// target's latest material change — or a forged future) is ignored, leaving
-		// the row's current state untouched, while the frame's other entries still
-		// apply and the whole-frame monotonic guard still governs frame ordering.
-		if e.TargetConfigSerial != serial {
-			continue
-		}
-		wrote, err := upsertMonitorStatus(ctx, tx, agentID, e.MonitorID, e.Status,
-			e.MissingPermissions, e.MatchedSelector, e.Reason, ms.PolicyHash, ms.ConfigVersion,
-			serial, nullPosInt(e.EffectiveIntervalSeconds), nullPosInt(e.CycleDeadlineMs),
-			nullPosInt(ms.UploadIntervalSeconds), now)
+		var lastAccepted, desired int
+		err := tx.QueryRowContext(ctx,
+			`SELECT a.last_status_config_version, COALESCE(st.config_serial,0)
+			 FROM agents a JOIN sites st ON st.id = a.site_id WHERE a.id=?`, agentID).
+			Scan(&lastAccepted, &desired)
 		if err != nil {
-			return err
+			if err == sql.ErrNoRows {
+				return nil, nil // agent gone; nothing to reconcile
+			}
+			return nil, err
 		}
-		if wrote {
-			statusChanged = append(statusChanged, e.MonitorID)
+		// Monotonic guard: reject stale frames (older than what we accepted or than
+		// the desired site config serial we last pushed). Equal is valid.
+		if ms.ConfigVersion < lastAccepted || ms.ConfigVersion < desired {
+			return nil, nil
 		}
-		if e.Status == wire.MonitorStatusActive {
-			continue
-		}
-		key := dedupeKey(agentID, categoryMonitor, e.MonitorID, e.Status, e.Reason)
-		blocked[key] = true
-		wasTransition, err := s.upsertIssue(ctx, tx, issueUpsert{
-			siteID: siteID, agentID: agentID, refID: e.MonitorID, reason: e.Status,
-			detailReason: e.Reason,
-			dedupeKey:    key, missing: e.MissingPermissions, matchedSelector: e.MatchedSelector,
-			policyHash: ms.PolicyHash, now: now,
-		})
+
+		// Only monitors that are enabled and in this agent's scope are valid targets; a
+		// stale or misbehaving agent must not create status/issues for monitors it was
+		// never assigned. The map value is each monitor's current material generation.
+		valid, err := s.probeMonitorSerials(ctx, tx, siteID, agentID)
 		if err != nil {
-			return err
+			return nil, err
 		}
-		changed = changed || wasTransition
-	}
 
-	// Delete this agent's PROBE monitor_status rows absent from the frame; host
-	// rows are owned by ReevaluateHostMonitors and never touched here.
-	deleted, err := deleteAbsentProbeStatus(ctx, tx, agentID, current)
-	if err != nil {
-		return err
-	}
-	statusChanged = append(statusChanged, deleted...)
+		now := time.Now().UTC()
+		changed := false
+		var statusChanged []string // monitor ids whose monitor_status row changed
+		current := make([]string, 0, len(ms.Statuses))
+		blocked := map[string]bool{} // dedupe_keys reported blocked this frame
+		seen := map[string]bool{}    // monitor ids already handled this frame (reject dupes)
 
-	// Resolve any active PROBE issue for this agent whose exact reason is no longer
-	// reported (recovered, or transitioned to a different block reason).
-	resolvedAny, err := s.resolveIssuesNotIn(ctx, tx,
-		`SELECT oi.id, oi.dedupe_key FROM operational_issues oi
-		   JOIN probe_tasks pt ON pt.id = oi.ref_id
-		  WHERE oi.agent_id=? AND oi.category=? AND oi.state='active' AND pt.kind<>'host'`,
-		[]any{agentID, categoryMonitor}, blocked, now)
-	if err != nil {
-		return err
-	}
-	changed = changed || resolvedAny
+		for _, e := range ms.Statuses {
+			serial, ok := valid[e.MonitorID]
+			if !ok || seen[e.MonitorID] || !validMonitorStatus(e.Status) {
+				// Unknown/out-of-scope monitor, a duplicate id, or a non-enum status: ignore
+				// rather than mutating status/issues on untrusted input.
+				continue
+			}
+			seen[e.MonitorID] = true
+			// The monitor is in scope and named in this frame, so its row is retained
+			// (not deleted as absent) regardless of the per-target generation check below.
+			current = append(current, e.MonitorID)
+			// Exact per-target generation echo: an entry attesting a generation other
+			// than the target's current one (stale — the agent has not applied the
+			// target's latest material change — or a forged future) is ignored, leaving
+			// the row's current state untouched, while the frame's other entries still
+			// apply and the whole-frame monotonic guard still governs frame ordering.
+			if e.TargetConfigSerial != serial {
+				continue
+			}
+			wrote, err := upsertMonitorStatus(ctx, tx, agentID, e.MonitorID, e.Status,
+				e.MissingPermissions, e.MatchedSelector, e.Reason, ms.PolicyHash, ms.ConfigVersion,
+				serial, nullPosInt(e.EffectiveIntervalSeconds), nullPosInt(e.CycleDeadlineMs),
+				nullPosInt(ms.UploadIntervalSeconds), now)
+			if err != nil {
+				return nil, err
+			}
+			if wrote {
+				statusChanged = append(statusChanged, e.MonitorID)
+			}
+			if e.Status == wire.MonitorStatusActive {
+				continue
+			}
+			key := dedupeKey(agentID, categoryMonitor, e.MonitorID, e.Status, e.Reason)
+			blocked[key] = true
+			wasTransition, err := s.upsertIssue(ctx, tx, issueUpsert{
+				siteID: siteID, agentID: agentID, refID: e.MonitorID, reason: e.Status,
+				detailReason: e.Reason,
+				dedupeKey:    key, missing: e.MissingPermissions, matchedSelector: e.MatchedSelector,
+				policyHash: ms.PolicyHash, now: now,
+			})
+			if err != nil {
+				return nil, err
+			}
+			changed = changed || wasTransition
+		}
 
-	// The upload cadence rides the same frame and is recorded here as well as on
-	// the per-monitor rows: it describes the whole outbox, and an agent whose only
-	// subject is a host anchor sends a frame with no entries, so the per-monitor
-	// rows would carry no cadence at all. A frame that omits it (0) leaves the
-	// last known value standing rather than resetting to the default.
-	if _, err := tx.ExecContext(ctx,
-		`UPDATE agents SET last_status_config_version=?,
-		        upload_interval_seconds=CASE WHEN ?>0 THEN ? ELSE upload_interval_seconds END
-		 WHERE id=?`,
-		ms.ConfigVersion, ms.UploadIntervalSeconds, ms.UploadIntervalSeconds, agentID); err != nil {
-		return err
-	}
-	if err := tx.Commit(); err != nil {
-		return err
-	}
-	committed = true
-	s.publish(changed, siteID)
-	s.publishStatus(siteID, statusChanged)
-	return nil
+		// Delete this agent's PROBE monitor_status rows absent from the frame; host
+		// rows are owned by ReevaluateHostMonitors and never touched here.
+		deleted, err := deleteAbsentProbeStatus(ctx, tx, agentID, current)
+		if err != nil {
+			return nil, err
+		}
+		statusChanged = append(statusChanged, deleted...)
+
+		// Resolve any active PROBE issue for this agent whose exact reason is no longer
+		// reported (recovered, or transitioned to a different block reason).
+		resolvedAny, err := s.resolveIssuesNotIn(ctx, tx,
+			`SELECT oi.id, oi.dedupe_key FROM operational_issues oi
+			   JOIN probe_tasks pt ON pt.id = oi.ref_id
+			  WHERE oi.agent_id=? AND oi.category=? AND oi.state='active' AND pt.kind<>'host'`,
+			[]any{agentID, categoryMonitor}, blocked, now)
+		if err != nil {
+			return nil, err
+		}
+		changed = changed || resolvedAny
+
+		// The upload cadence rides the same frame and is recorded here as well as on
+		// the per-monitor rows: it describes the whole outbox, and an agent whose only
+		// subject is a host anchor sends a frame with no entries, so the per-monitor
+		// rows would carry no cadence at all. A frame that omits it (0) leaves the
+		// last known value standing rather than resetting to the default.
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE agents SET last_status_config_version=?,
+			        upload_interval_seconds=CASE WHEN ?>0 THEN ? ELSE upload_interval_seconds END
+			 WHERE id=?`,
+			ms.ConfigVersion, ms.UploadIntervalSeconds, ms.UploadIntervalSeconds, agentID); err != nil {
+			return nil, err
+		}
+		return func() {
+			s.publish(changed, siteID)
+			s.publishStatus(siteID, statusChanged)
+		}, nil
+	})
 }
 
 // ---- server-side host monitor evaluation ----
@@ -351,96 +341,85 @@ func (s *Service) ReevaluateHostMonitors(ctx context.Context, agentID string) er
 		return err
 	}
 
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			_ = tx.Rollback()
-		}
-	}()
-
-	now := time.Now().UTC()
-	changed := false
-	var statusChanged []string
-	for _, hm := range hostMons {
-		monitorID := hm.id
-		required, err := hostRequired(ctx, tx, monitorID)
-		if err != nil {
-			return err
-		}
-		// Classify like the agent (monitoreval.evaluate): a required permission that
-		// is granted but not platform-supported is `unsupported`; one that is not
-		// granted (or otherwise not effective) is `permission_blocked`. A locally
-		// denied permission takes precedence over an unsupported one.
-		var missing, unsupported []string
-		for _, id := range diff(required, effective) {
-			if granted.Has(id) && !supported.Has(id) {
-				unsupported = append(unsupported, string(id))
-			} else {
-				missing = append(missing, string(id))
-			}
-		}
-
-		status := wire.MonitorStatusActive
-		var reasonList []string
-		switch {
-		case len(missing) > 0:
-			status = wire.MonitorStatusPermissionBlocked
-			reasonList = missing
-		case len(unsupported) > 0:
-			status = wire.MonitorStatusUnsupported
-			reasonList = unsupported
-		}
-
-		// Host rows are server-authoritative reports at the target's own generation;
-		// they carry no agent-reported effective schedule or upload cadence.
-		wrote, err := upsertMonitorStatus(ctx, tx, agentID, monitorID, status,
-			reasonList, "", "", policyHash, configVersion, hm.configSerial,
-			sql.NullInt64{}, sql.NullInt64{}, sql.NullInt64{}, now)
-		if err != nil {
-			return err
-		}
-		if wrote {
-			statusChanged = append(statusChanged, monitorID)
-		}
-		if status == wire.MonitorStatusActive {
-			// Resolve any active issue for this pair regardless of prior reason.
-			resolved, err := s.resolveMonitorIssuesExcept(ctx, tx, agentID, monitorID, "", now)
+	return s.db.WriteTx(ctx, store.Standalone(), func(wtx store.WriteTx) (func(), error) {
+		tx := wtx
+		now := time.Now().UTC()
+		changed := false
+		var statusChanged []string
+		for _, hm := range hostMons {
+			monitorID := hm.id
+			required, err := hostRequired(ctx, tx, monitorID)
 			if err != nil {
-				return err
+				return nil, err
+			}
+			// Classify like the agent (monitoreval.evaluate): a required permission that
+			// is granted but not platform-supported is `unsupported`; one that is not
+			// granted (or otherwise not effective) is `permission_blocked`. A locally
+			// denied permission takes precedence over an unsupported one.
+			var missing, unsupported []string
+			for _, id := range diff(required, effective) {
+				if granted.Has(id) && !supported.Has(id) {
+					unsupported = append(unsupported, string(id))
+				} else {
+					missing = append(missing, string(id))
+				}
+			}
+
+			status := wire.MonitorStatusActive
+			var reasonList []string
+			switch {
+			case len(missing) > 0:
+				status = wire.MonitorStatusPermissionBlocked
+				reasonList = missing
+			case len(unsupported) > 0:
+				status = wire.MonitorStatusUnsupported
+				reasonList = unsupported
+			}
+
+			// Host rows are server-authoritative reports at the target's own generation;
+			// they carry no agent-reported effective schedule or upload cadence.
+			wrote, err := upsertMonitorStatus(ctx, tx, agentID, monitorID, status,
+				reasonList, "", "", policyHash, configVersion, hm.configSerial,
+				sql.NullInt64{}, sql.NullInt64{}, sql.NullInt64{}, now)
+			if err != nil {
+				return nil, err
+			}
+			if wrote {
+				statusChanged = append(statusChanged, monitorID)
+			}
+			if status == wire.MonitorStatusActive {
+				// Resolve any active issue for this pair regardless of prior reason.
+				resolved, err := s.resolveMonitorIssuesExcept(ctx, tx, agentID, monitorID, "", now)
+				if err != nil {
+					return nil, err
+				}
+				changed = changed || resolved
+				continue
+			}
+			wasTransition, err := s.upsertIssue(ctx, tx, issueUpsert{
+				siteID: siteID, agentID: agentID, refID: monitorID, reason: status,
+				// A host monitor is evaluated server-side, so there is no agent-reported detail
+				// reason to carry — the status is the whole story.
+				dedupeKey: dedupeKey(agentID, categoryMonitor, monitorID, status, ""),
+				missing:   reasonList, policyHash: policyHash, now: now,
+			})
+			if err != nil {
+				return nil, err
+			}
+			changed = changed || wasTransition
+			// If the monitor flipped between block reasons (e.g. permission_blocked →
+			// unsupported), resolve the stale issue of the other reason.
+			resolved, err := s.resolveMonitorIssuesExcept(ctx, tx, agentID, monitorID, status, now)
+			if err != nil {
+				return nil, err
 			}
 			changed = changed || resolved
-			continue
 		}
-		wasTransition, err := s.upsertIssue(ctx, tx, issueUpsert{
-			siteID: siteID, agentID: agentID, refID: monitorID, reason: status,
-			// A host monitor is evaluated server-side, so there is no agent-reported detail
-			// reason to carry — the status is the whole story.
-			dedupeKey: dedupeKey(agentID, categoryMonitor, monitorID, status, ""),
-			missing:   reasonList, policyHash: policyHash, now: now,
-		})
-		if err != nil {
-			return err
-		}
-		changed = changed || wasTransition
-		// If the monitor flipped between block reasons (e.g. permission_blocked →
-		// unsupported), resolve the stale issue of the other reason.
-		resolved, err := s.resolveMonitorIssuesExcept(ctx, tx, agentID, monitorID, status, now)
-		if err != nil {
-			return err
-		}
-		changed = changed || resolved
-	}
-	if err := tx.Commit(); err != nil {
-		return err
-	}
-	committed = true
-	s.publish(changed, siteID)
-	s.publishStatus(siteID, statusChanged)
-	return nil
+		return func() {
+			s.publish(changed, siteID)
+			s.publishStatus(siteID, statusChanged)
+		}, nil
+	})
 }
 
 // ReevaluateHostMonitorsForSite reevaluates host monitors for every non-revoked
@@ -485,7 +464,7 @@ func (s *Service) ReevaluateHostMonitorsForSite(ctx context.Context, siteID stri
 // zero-config defaults, so the requirement is computed the same way whether or
 // not anyone ever opened the form. All families off requires nothing, which
 // leaves the anchor unconditionally active.
-func hostRequired(ctx context.Context, tx *sql.Tx, monitorID string) (permission.Set, error) {
+func hostRequired(ctx context.Context, tx store.Executor, monitorID string) (permission.Set, error) {
 	def := fault.DefaultHostSettings()
 	cpuOn, memOn, loadOn, netOn, diskOn := def.CPUEnabled, def.MemEnabled, def.LoadEnabled, def.NetEnabled, def.DiskEnabled
 	var cpu, mem, load, net, disk int
@@ -570,60 +549,50 @@ func (s *Service) ReconcileScope(ctx context.Context, siteID string) error {
 		return nil
 	}
 
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			_ = tx.Rollback()
+	return s.db.WriteTx(ctx, store.Standalone(), func(wtx store.WriteTx) (func(), error) {
+		tx := wtx
+		now := time.Now().UTC()
+		changed := false
+		statusChanged := make([]string, 0, len(stranded))
+		for _, r := range stranded {
+			res, err := tx.ExecContext(ctx,
+				`DELETE FROM monitor_status WHERE agent_id=? AND monitor_id=?`, r.agentID, r.monitorID)
+			if err != nil {
+				return nil, err
+			}
+			if n, _ := res.RowsAffected(); n > 0 {
+				statusChanged = append(statusChanged, r.monitorID)
+			}
+			// Clear this pair's detector counters as it leaves scope. The target stops
+			// being evaluated for the agent once out of scope, so a retained failing streak
+			// would resume counting if the pair later re-enters scope without a material
+			// target edit (the generation, and thus its samples/series, are unchanged).
+			// Recorded fault signals are immutable history and untouched; this is live
+			// detector state only.
+			res, err = tx.ExecContext(ctx,
+				`DELETE FROM detector_state WHERE agent_id=? AND target_id=?`, r.agentID, r.monitorID)
+			if err != nil {
+				return nil, err
+			}
+			if n, _ := res.RowsAffected(); n > 0 {
+				statusChanged = append(statusChanged, r.monitorID)
+			}
+			res, err = tx.ExecContext(ctx,
+				`UPDATE operational_issues SET state='resolved', resolved_at=?
+				  WHERE agent_id=? AND category=? AND ref_id=? AND state='active'`,
+				now, r.agentID, categoryMonitor, r.monitorID)
+			if err != nil {
+				return nil, err
+			}
+			if n, _ := res.RowsAffected(); n > 0 {
+				changed = true
+			}
 		}
-	}()
-	now := time.Now().UTC()
-	changed := false
-	statusChanged := make([]string, 0, len(stranded))
-	for _, r := range stranded {
-		res, err := tx.ExecContext(ctx,
-			`DELETE FROM monitor_status WHERE agent_id=? AND monitor_id=?`, r.agentID, r.monitorID)
-		if err != nil {
-			return err
-		}
-		if n, _ := res.RowsAffected(); n > 0 {
-			statusChanged = append(statusChanged, r.monitorID)
-		}
-		// Clear this pair's detector counters as it leaves scope. The target stops
-		// being evaluated for the agent once out of scope, so a retained failing streak
-		// would resume counting if the pair later re-enters scope without a material
-		// target edit (the generation, and thus its samples/series, are unchanged).
-		// Recorded fault signals are immutable history and untouched; this is live
-		// detector state only.
-		res, err = tx.ExecContext(ctx,
-			`DELETE FROM detector_state WHERE agent_id=? AND target_id=?`, r.agentID, r.monitorID)
-		if err != nil {
-			return err
-		}
-		if n, _ := res.RowsAffected(); n > 0 {
-			statusChanged = append(statusChanged, r.monitorID)
-		}
-		res, err = tx.ExecContext(ctx,
-			`UPDATE operational_issues SET state='resolved', resolved_at=?
-			  WHERE agent_id=? AND category=? AND ref_id=? AND state='active'`,
-			now, r.agentID, categoryMonitor, r.monitorID)
-		if err != nil {
-			return err
-		}
-		if n, _ := res.RowsAffected(); n > 0 {
-			changed = true
-		}
-	}
-	if err := tx.Commit(); err != nil {
-		return err
-	}
-	committed = true
-	s.publish(changed, siteID)
-	s.publishStatus(siteID, statusChanged)
-	return nil
+		return func() {
+			s.publish(changed, siteID)
+			s.publishStatus(siteID, statusChanged)
+		}, nil
+	})
 }
 
 // ---- monitor-save prediction ----
@@ -667,79 +636,71 @@ func (s *Service) PredictProbeMonitors(ctx context.Context, siteID string) ([]Sa
 		return nil, err
 	}
 
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return nil, err
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			_ = tx.Rollback()
-		}
-	}()
-
 	now := time.Now().UTC()
 	var warnings []SaveWarning
 	var statusChanged []string
-	for _, t := range targets {
-		required := permission.Closure(permission.NewSet(permission.RequiredForTarget(t.pt)...))
-		agents, err := scopedAgents(ctx, tx, siteID, t.id)
-		if err != nil {
-			return nil, err
-		}
-		capable, affected := 0, 0
-		worst := ""
-		missingUnion := permission.Set{}
-		var blockedAgents, capableAgents []SaveWarningAgent
-		for _, a := range agents {
-			status, reasonList := classifyMonitor(required, a.effective, a.granted, a.supported)
-			if status == wire.MonitorStatusActive {
-				capable++
-				capableAgents = append(capableAgents, SaveWarningAgent{
-					AgentID: a.id, AgentName: a.name, Status: status,
-				})
-			} else {
-				affected++
-				for _, id := range reasonList {
-					missingUnion.Add(id)
-				}
-				if worst == "" || status == wire.MonitorStatusUnsupported {
-					worst = status
-				}
-				blockedAgents = append(blockedAgents, SaveWarningAgent{
-					AgentID: a.id, AgentName: a.name, Status: status,
-					MissingPermissions: setStrings(reasonList),
-				})
-			}
-			// The predicted row attests the target's own generation (t.configSerial);
-			// the whole-site watermark advances via siteSerial.
-			wrote, err := upsertPredictedStatus(ctx, tx, a.id, t.id, status,
-				setStrings(reasonList), a.policyHash, siteSerial, t.configSerial, now)
+	if err := s.db.WriteTx(ctx, store.Standalone(), func(wtx store.WriteTx) (func(), error) {
+		tx := wtx
+		for _, t := range targets {
+			required := permission.Closure(permission.NewSet(permission.RequiredForTarget(t.pt)...))
+			agents, err := scopedAgents(ctx, tx, siteID, t.id)
 			if err != nil {
 				return nil, err
 			}
-			if wrote {
-				statusChanged = append(statusChanged, t.id)
+			capable, affected := 0, 0
+			worst := ""
+			missingUnion := permission.Set{}
+			var blockedAgents, capableAgents []SaveWarningAgent
+			for _, a := range agents {
+				status, reasonList := classifyMonitor(required, a.effective, a.granted, a.supported)
+				if status == wire.MonitorStatusActive {
+					capable++
+					capableAgents = append(capableAgents, SaveWarningAgent{
+						AgentID: a.id, AgentName: a.name, Status: status,
+					})
+				} else {
+					affected++
+					for _, id := range reasonList {
+						missingUnion.Add(id)
+					}
+					if worst == "" || status == wire.MonitorStatusUnsupported {
+						worst = status
+					}
+					blockedAgents = append(blockedAgents, SaveWarningAgent{
+						AgentID: a.id, AgentName: a.name, Status: status,
+						MissingPermissions: setStrings(reasonList),
+					})
+				}
+				// The predicted row attests the target's own generation (t.configSerial);
+				// the whole-site watermark advances via siteSerial.
+				wrote, err := upsertPredictedStatus(ctx, tx, a.id, t.id, status,
+					setStrings(reasonList), a.policyHash, siteSerial, t.configSerial, now)
+				if err != nil {
+					return nil, err
+				}
+				if wrote {
+					statusChanged = append(statusChanged, t.id)
+				}
+			}
+			if affected > 0 || len(agents) == 0 {
+				if worst == "" {
+					worst = wire.MonitorStatusPermissionBlocked
+				}
+				warnings = append(warnings, SaveWarning{
+					MonitorID: t.id, MonitorName: monitorLabel(t.pt.Name, t.pt.Target),
+					Status: worst, AffectedAgents: affected, CapableAgents: capable,
+					MissingPermissions: missingUnion.Strings(),
+					BlockedAgents:      blockedAgents,
+					CapableAgentList:   capableAgents,
+				})
 			}
 		}
-		if affected > 0 || len(agents) == 0 {
-			if worst == "" {
-				worst = wire.MonitorStatusPermissionBlocked
-			}
-			warnings = append(warnings, SaveWarning{
-				MonitorID: t.id, MonitorName: monitorLabel(t.pt.Name, t.pt.Target),
-				Status: worst, AffectedAgents: affected, CapableAgents: capable,
-				MissingPermissions: missingUnion.Strings(),
-				BlockedAgents:      blockedAgents,
-				CapableAgentList:   capableAgents,
-			})
-		}
-	}
-	if err := tx.Commit(); err != nil {
+		return func() {
+			s.publishStatus(siteID, statusChanged)
+		}, nil
+	}); err != nil {
 		return nil, err
 	}
-	committed = true
-	s.publishStatus(siteID, statusChanged)
 	return warnings, nil
 }
 
@@ -754,7 +715,7 @@ type scopedAgent struct {
 
 // scopedAgents returns the non-revoked agents in a monitor's scope, with their
 // stored permission policy, for prediction.
-func scopedAgents(ctx context.Context, tx *sql.Tx, siteID, monitorID string) ([]scopedAgent, error) {
+func scopedAgents(ctx context.Context, tx store.Executor, siteID, monitorID string) ([]scopedAgent, error) {
 	rows, err := tx.QueryContext(ctx, `
 		SELECT a.id, COALESCE(NULLIF(a.display_name,''), NULLIF(a.hostname,''), a.id),
 		       COALESCE(a.perm_effective,'[]'), COALESCE(a.perm_granted,'[]'), COALESCE(a.perm_supported,'[]'), COALESCE(a.policy_hash,'')
@@ -869,36 +830,26 @@ func (s *Service) PredictProbeMonitorsForAgent(ctx context.Context, agentID stri
 		return nil
 	}
 
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			_ = tx.Rollback()
+	return s.db.WriteTx(ctx, store.Standalone(), func(wtx store.WriteTx) (func(), error) {
+		tx := wtx
+		now := time.Now().UTC()
+		var statusChanged []string
+		for _, t := range targets {
+			required := permission.Closure(permission.NewSet(permission.RequiredForTarget(t.pt)...))
+			status, reasonList := classifyMonitor(required, effective, granted, supported)
+			wrote, err := upsertPredictedStatus(ctx, tx, agentID, t.id, status,
+				setStrings(reasonList), policyHash, siteSerial, t.configSerial, now)
+			if err != nil {
+				return nil, err
+			}
+			if wrote {
+				statusChanged = append(statusChanged, t.id)
+			}
 		}
-	}()
-	now := time.Now().UTC()
-	var statusChanged []string
-	for _, t := range targets {
-		required := permission.Closure(permission.NewSet(permission.RequiredForTarget(t.pt)...))
-		status, reasonList := classifyMonitor(required, effective, granted, supported)
-		wrote, err := upsertPredictedStatus(ctx, tx, agentID, t.id, status,
-			setStrings(reasonList), policyHash, siteSerial, t.configSerial, now)
-		if err != nil {
-			return err
-		}
-		if wrote {
-			statusChanged = append(statusChanged, t.id)
-		}
-	}
-	if err := tx.Commit(); err != nil {
-		return err
-	}
-	committed = true
-	s.publishStatus(siteID, statusChanged)
-	return nil
+		return func() {
+			s.publishStatus(siteID, statusChanged)
+		}, nil
+	})
 }
 
 // ---- read side ----
@@ -1064,7 +1015,7 @@ type issueUpsert struct {
 // real transition (a newly created issue, or a resolved→active reactivation) — a
 // pure repeat report of an already-active issue only bumps count/last_seen and is
 // not treated as a change.
-func (s *Service) upsertIssue(ctx context.Context, tx *sql.Tx, u issueUpsert) (bool, error) {
+func (s *Service) upsertIssue(ctx context.Context, tx store.Executor, u issueUpsert) (bool, error) {
 	var prevState string
 	err := tx.QueryRowContext(ctx,
 		`SELECT state FROM operational_issues WHERE dedupe_key=?`, u.dedupeKey).Scan(&prevState)
@@ -1095,7 +1046,7 @@ func (s *Service) upsertIssue(ctx context.Context, tx *sql.Tx, u issueUpsert) (b
 // resolveMonitorIssuesExcept resolves every active issue for (agent, monitor)
 // whose reason differs from keepReason (pass "" to resolve all reasons, e.g. when
 // the monitor is now active). Reports whether any row changed.
-func (s *Service) resolveMonitorIssuesExcept(ctx context.Context, tx *sql.Tx, agentID, monitorID, keepReason string, now time.Time) (bool, error) {
+func (s *Service) resolveMonitorIssuesExcept(ctx context.Context, tx store.Executor, agentID, monitorID, keepReason string, now time.Time) (bool, error) {
 	res, err := tx.ExecContext(ctx,
 		`UPDATE operational_issues SET state='resolved', resolved_at=?
 		  WHERE agent_id=? AND category=? AND ref_id=? AND state='active' AND reason<>?`,
@@ -1109,7 +1060,7 @@ func (s *Service) resolveMonitorIssuesExcept(ctx context.Context, tx *sql.Tx, ag
 
 // resolveIssuesNotIn resolves every active issue matched by selectSQL whose
 // dedupe_key is not in keep, reporting whether any row changed.
-func (s *Service) resolveIssuesNotIn(ctx context.Context, tx *sql.Tx, selectSQL string, args []any, keep map[string]bool, now time.Time) (bool, error) {
+func (s *Service) resolveIssuesNotIn(ctx context.Context, tx store.Executor, selectSQL string, args []any, keep map[string]bool, now time.Time) (bool, error) {
 	rows, err := tx.QueryContext(ctx, selectSQL, args...)
 	if err != nil {
 		return false, err
@@ -1151,7 +1102,7 @@ func (s *Service) resolveIssuesNotIn(ctx context.Context, tx *sql.Tx, selectSQL 
 // only when this report attests a newer target generation than the stored row;
 // otherwise it is preserved so the pending clock is not restarted. Reports whether
 // a row was written (always true for a matching call — a report is a change).
-func upsertMonitorStatus(ctx context.Context, tx *sql.Tx, agentID, monitorID, status string,
+func upsertMonitorStatus(ctx context.Context, tx store.Executor, agentID, monitorID, status string,
 	missing []string, matchedSelector, reason, policyHash string, configVersion, targetConfigSerial int,
 	effInterval, cycleDeadline, uploadInterval sql.NullInt64, now time.Time) (bool, error) {
 	res, err := tx.ExecContext(ctx, `
@@ -1186,7 +1137,7 @@ func upsertMonitorStatus(ctx context.Context, tx *sql.Tx, agentID, monitorID, st
 // never overwritten by a prediction). assigned_at is only reset when the target
 // generation advances, so repeated predictions for the same pending generation
 // preserve the grace clock while the whole-site watermark may advance.
-func upsertPredictedStatus(ctx context.Context, tx *sql.Tx, agentID, monitorID, status string,
+func upsertPredictedStatus(ctx context.Context, tx store.Executor, agentID, monitorID, status string,
 	missing []string, policyHash string, configVersion, targetConfigSerial int, now time.Time) (bool, error) {
 	res, err := tx.ExecContext(ctx, `
 		INSERT INTO monitor_status(agent_id, monitor_id, status, missing_permissions, matched_selector,
@@ -1223,7 +1174,7 @@ func nullPosInt(v int) sql.NullInt64 {
 	return sql.NullInt64{}
 }
 
-func deleteAbsentProbeStatus(ctx context.Context, tx *sql.Tx, agentID string, keep []string) ([]string, error) {
+func deleteAbsentProbeStatus(ctx context.Context, tx store.Executor, agentID string, keep []string) ([]string, error) {
 	sel := `SELECT monitor_id FROM monitor_status WHERE agent_id=?
 		AND monitor_id IN (SELECT id FROM probe_tasks WHERE kind<>'host')`
 	args := []any{agentID}
@@ -1265,7 +1216,7 @@ func deleteAbsentProbeStatus(ctx context.Context, tx *sql.Tx, agentID string, ke
 	return deleted, nil
 }
 
-func (s *Service) probeMonitorSerials(ctx context.Context, tx *sql.Tx, siteID, agentID string) (map[string]int, error) {
+func (s *Service) probeMonitorSerials(ctx context.Context, tx store.Executor, siteID, agentID string) (map[string]int, error) {
 	// Only enabled, non-host monitors currently in THIS agent's server-owned scope
 	// are valid targets for an agent-reported status. An agent must not be able to
 	// create status/issues for a monitor it was never assigned (or a disabled one).
