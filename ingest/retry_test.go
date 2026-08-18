@@ -24,6 +24,7 @@ package ingest
 
 import (
 	"context"
+	"errors"
 	"sync/atomic"
 	"testing"
 
@@ -47,38 +48,66 @@ func (c countingSeriesStore) AppendRaw(ctx context.Context, samples []tsstore.Ra
 }
 
 // applyRun is one scripted run of the pipeline over its own harness: a fresh
-// database, a fresh data plane whose appends are counted, and a subscription
-// to every topic the post-commit executor can publish on.
+// database, a fresh data plane whose appends are counted, a subscription to
+// every topic the post-commit executor can publish on, and a liveness hook
+// whose returned closure is counted.
+//
+// The liveness hook is not decoration. The executor's FIRST action is to call
+// a closure the transaction core handed back to it, and that call is INDIRECT
+// — a call through a function-typed field, which no source-level audit of
+// named call sites can recognise. Leaving the hook unset would leave that
+// closure unexecuted in every observation below, so a side effect moved into
+// it would keep all the counters at zero and every assertion green. The hook
+// is therefore what makes the closure path observable at all.
 type applyRun struct {
-	h       *charHarness
-	svc     *Service
-	pub     *busyCounter
-	appends *int64
+	h        *charHarness
+	svc      *Service
+	pub      *busyCounter
+	appends  *int64
+	liveness *int64 // executions of the closure the transaction core returned
 }
 
 func newApplyRun(t *testing.T) *applyRun {
 	t.Helper()
-	appends := new(int64)
+	return newApplyRunWith(t, nil)
+}
+
+// newApplyRunWith builds a run whose fault evaluator is ev; nil means the
+// ordinary one.
+func newApplyRunWith(t *testing.T, ev Evaluator) *applyRun {
+	t.Helper()
+	appends, liveness := new(int64), new(int64)
 	h := newCharHarness(t, countingSeriesStore{SeriesStore: tsstoretest.Open(t), appends: appends})
-	svc := New(h.db, h.bus, h.m, fault.New(h.db, h.bus, nil), nil, nil)
+	if ev == nil {
+		ev = fault.New(h.db, h.bus, nil)
+	}
+	svc := New(h.db, h.bus, h.m, ev, nil, nil)
+	// Runs inside the transaction and returns the closure the executor calls
+	// first, after the commit. The closure — not this function — is what the
+	// counter observes.
+	svc.TouchAgentTx = func(context.Context, store.WriteTx, string) (func(), error) {
+		return func() { atomic.AddInt64(liveness, 1) }, nil
+	}
 	pub := &busyCounter{}
 	subscribeAll(h, pub)
-	return &applyRun{h: h, svc: svc, pub: pub, appends: appends}
+	return &applyRun{h: h, svc: svc, pub: pub, appends: appends, liveness: liveness}
 }
 
 // applyObservations is what a run is compared on: the relational and
-// data-plane state it left, plus the two side-effect counters.
+// data-plane state it left, plus the three side-effect counters.
 type applyObservations struct {
-	state     stateSnapshot
-	appends   int64
-	publishes int
+	state         stateSnapshot
+	appends       int64
+	publishes     int
+	livenessPosts int64
 }
 
 func (r *applyRun) observe() applyObservations {
 	return applyObservations{
-		state:     r.h.snapshot(),
-		appends:   atomic.LoadInt64(r.appends),
-		publishes: r.pub.n,
+		state:         r.h.snapshot(),
+		appends:       atomic.LoadInt64(r.appends),
+		publishes:     r.pub.n,
+		livenessPosts: atomic.LoadInt64(r.liveness),
 	}
 }
 
@@ -97,9 +126,15 @@ func bumpTargetGeneration(r *applyRun) {
 // TestNoSideEffectIOInsideTheTransaction asserts the forward half of "side
 // effects happen only after the commit": sampled at the last instant the write
 // transaction is still open — inside the transaction function, after the
-// transaction core has run and produced its plan — the data-plane append count
-// and the publication count are both zero. They become non-zero only once the
-// owner runs the plan, after the transaction returned.
+// transaction core has run and produced its plan — the data-plane append
+// count, the publication count and the liveness-closure count are all zero.
+// They become non-zero only once the owner runs the plan, after the
+// transaction returned.
+//
+// All three counters matter, and the third for its own reason: the executor
+// reaches its first side effect through a closure the transaction core handed
+// back, an indirect call that a source-level audit of named call sites cannot
+// see. Only a runtime counter covers that path.
 //
 // The existing rollback tests assert the complementary negative (a transaction
 // that never commits leaves no append, no cache fold and no publication). This
@@ -117,16 +152,20 @@ func TestNoSideEffectIOInsideTheTransaction(t *testing.T) {
 
 	var plan PostCommitPlan
 	var res ApplyResult
-	var inTxAppends int64
-	var inTxPublishes int
+	var inTx applyObservations
 	err = r.h.db.WriteTx(r.h.ctx, store.Standalone(), func(wtx store.WriteTx) (func(), error) {
 		var aerr error
 		res, plan, aerr = r.svc.ApplyPacketTx(r.h.ctx, store.Standalone(), wtx, in)
 		// Sampled while the transaction is still open: the function has not
 		// returned, so the owner has not committed and cannot have run
-		// anything post-commit.
-		inTxAppends = atomic.LoadInt64(r.appends)
-		inTxPublishes = r.pub.n
+		// anything post-commit. Only the counters are read here — the
+		// relational snapshot would query the database from inside its own
+		// write transaction.
+		inTx = applyObservations{
+			appends:       atomic.LoadInt64(r.appends),
+			publishes:     r.pub.n,
+			livenessPosts: atomic.LoadInt64(r.liveness),
+		}
 		return nil, aerr
 	})
 	if err != nil {
@@ -135,19 +174,25 @@ func TestNoSideEffectIOInsideTheTransaction(t *testing.T) {
 	if !res.New {
 		t.Fatal("the batch was not admitted; the rest of this test would prove nothing")
 	}
-	if inTxAppends != 0 {
-		t.Fatalf("%d data-plane appends happened while the transaction was still open, want 0", inTxAppends)
+	if inTx.appends != 0 {
+		t.Fatalf("%d data-plane appends happened while the transaction was still open, want 0", inTx.appends)
 	}
-	if inTxPublishes != 0 {
-		t.Fatalf("%d publications happened while the transaction was still open, want 0", inTxPublishes)
+	if inTx.publishes != 0 {
+		t.Fatalf("%d publications happened while the transaction was still open, want 0", inTx.publishes)
+	}
+	if inTx.livenessPosts != 0 {
+		t.Fatalf("the liveness closure ran %d times while the transaction was still open, want 0",
+			inTx.livenessPosts)
 	}
 
 	if err := r.svc.Commit(r.h.ctx, &plan); err != nil {
 		t.Fatalf("post-commit executor: %v", err)
 	}
-	// Self-control: if this batch produced no side effects at all, the two
-	// zero assertions above would have held for a reason that has nothing to
-	// do with ordering.
+	// Self-control: if this batch produced no side effects at all, the zero
+	// assertions above would have held for a reason that has nothing to do
+	// with ordering. Each counter needs its own witness — a batch that
+	// publishes but never appends would still make an append-only assertion
+	// vacuous.
 	obs := r.observe()
 	if obs.appends == 0 {
 		t.Fatal("no data-plane append happened even after the plan ran — this batch exercises no append, " +
@@ -157,8 +202,60 @@ func TestNoSideEffectIOInsideTheTransaction(t *testing.T) {
 		t.Fatal("no publication happened even after the plan ran — this batch publishes nothing, " +
 			"so the in-transaction zero above was vacuous")
 	}
+	if obs.livenessPosts == 0 {
+		t.Fatal("the liveness closure never ran even after the plan ran — the closure path is not wired " +
+			"in this run, so the in-transaction zero above was vacuous")
+	}
 	if obs.state.rawSamples == 0 || obs.state.high != 2 {
 		t.Fatalf("post-commit state %+v, want the committed watermark 2 and raw samples present", obs.state)
+	}
+}
+
+// TestPostCommitNeverRunsWhenTheTransactionFails is the behavioral form of
+// "the plan runs only after a successful commit", asserted through the
+// ordinary entry point rather than over the source.
+//
+// It exists because a structural check can only say WHERE the executor is
+// called from, not WHEN. An executor call that sits outside the transaction
+// function but ahead of the error check would satisfy every lexical rule and
+// still run the plan of a transaction that rolled back — publishing, folding
+// the latest cache and firing the liveness closure for work that does not
+// exist. Here the transaction fails at its evaluation step, so the plan is
+// populated (the liveness closure is already captured in it) but the
+// transaction never commits; nothing the plan describes may be observable.
+func TestPostCommitNeverRunsWhenTheTransactionFails(t *testing.T) {
+	boom := errors.New("evaluation failed")
+	r := newApplyRunWith(t, errEvaluator{err: boom})
+
+	_, err := r.svc.Ingest(r.h.ctx, "agent_a", "site_default", 1, charPacket(3, icmpRounds(1, 0, 30)))
+	if !errors.Is(err, boom) {
+		t.Fatalf("ingest = %v, want the injected failure (the ack must be withheld)", err)
+	}
+
+	obs := r.observe()
+	if obs.livenessPosts != 0 {
+		t.Fatalf("the liveness closure ran %d times after a failed transaction, want 0 — the post-commit "+
+			"plan of a transaction that never committed must not run", obs.livenessPosts)
+	}
+	if obs.appends != 0 {
+		t.Fatalf("%d data-plane appends after a failed transaction, want 0", obs.appends)
+	}
+	if obs.publishes != 0 {
+		t.Fatalf("%d publications after a failed transaction, want 0", obs.publishes)
+	}
+	if obs.state.high != 0 {
+		t.Fatalf("high_sequence=%d after a failed transaction, want 0", obs.state.high)
+	}
+
+	// Self-control: the same packet on a healthy service must drive all three
+	// counters, or the zeros above would say nothing about ordering.
+	ok := newApplyRun(t)
+	if _, err := ok.svc.Ingest(ok.h.ctx, "agent_a", "site_default", 1, charPacket(3, icmpRounds(1, 0, 30))); err != nil {
+		t.Fatalf("control ingest: %v", err)
+	}
+	if c := ok.observe(); c.livenessPosts == 0 || c.appends == 0 || c.publishes == 0 {
+		t.Fatalf("the control run produced %+v; this packet does not exercise every counter, so the zeros "+
+			"asserted above were vacuous", c)
 	}
 }
 

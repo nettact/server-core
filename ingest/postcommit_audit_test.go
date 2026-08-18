@@ -12,11 +12,21 @@ package ingest
 // transaction function, or a second, unrelated caller that runs the executor
 // without owning the transaction that produced its plan.
 //
-// Honest limit of this audit: it constrains SOURCE STRUCTURE — how many call
-// sites exist and where they sit lexically — not runtime ordering. The
-// ordering half is TestNoSideEffectIOInsideTheTransaction (forward timing)
-// plus the existing rollback tests (the negative). Only the two together
-// mechanize the property.
+// Honest limits of this audit, both load-bearing:
+//
+//   - It constrains SOURCE STRUCTURE — how many call sites exist and which
+//     function owns them — not runtime ordering. "Outside the transaction
+//     function" does not mean "only after a successful commit".
+//   - It only sees calls made through a NAME. The executor's first action is a
+//     call through a function-typed field — an indirect call this scan cannot
+//     attribute to anything, so a side effect moved into that closure is
+//     invisible here.
+//
+// Both gaps are covered by runtime tests rather than by widening this one:
+// TestNoSideEffectIOInsideTheTransaction (forward timing, and it counts the
+// closure's executions specifically), TestPostCommitNeverRunsWhenTheTransactionFails
+// (the plan of a failed transaction runs nothing at all), and the existing
+// rollback tests. Only all of them together mechanize the property.
 //
 // Maintenance obligation: the audit names functions. A rename or a file move
 // must update it in the same change — that is intended, because a rename is
@@ -181,7 +191,14 @@ var publishSurface = []string{
 //	(b) the post-commit executor has exactly one non-test call site, and it
 //	    sits OUTSIDE every such literal — i.e. after the write transaction
 //	    returned;
-//	(c) every side-effecting publish/append/cache call in this package lives in
+//	(c) the executor's BODY — the function that actually performs the side
+//	    effects — has exactly one non-test caller, the executor entry point
+//	    itself. Without this, (b) is trivially bypassable: the body is an
+//	    ordinary method of this package, so any function here, a transaction
+//	    callback included, could call it directly and run every side effect
+//	    inside the transaction while (b) still saw a single, well-placed call
+//	    to the entry point;
+//	(d) every side-effecting publish/append/cache call in this package lives in
 //	    the executor's body and nowhere else.
 //
 // The subtests named "self-control" are not about the rule; they are about the
@@ -192,7 +209,7 @@ var publishSurface = []string{
 // recognised — so a parser, filter or matcher that silently stops seeing the
 // package fails here instead of turning the whole audit green by vacuity.
 func TestPostCommitCallSitesAreOwnedByTheEntryPoint(t *testing.T) {
-	watch := map[string]bool{"ApplyPacketTx": true, "Commit": true}
+	watch := map[string]bool{"ApplyPacketTx": true, "Commit": true, "commitOnce": true}
 	for _, n := range publishSurface {
 		watch[n] = true
 	}
@@ -255,6 +272,45 @@ func TestPostCommitCallSitesAreOwnedByTheEntryPoint(t *testing.T) {
 			t.Fatalf("Commit is called at %s:%d in %s from inside the transaction function — the post-commit "+
 				"plan must only run after the write transaction returned successfully",
 				sites[0].file, sites[0].line, sites[0].enclosing)
+		}
+		// Lexically outside the transaction function is necessary but not
+		// sufficient: it says nothing about whether the call is reached only
+		// when the transaction succeeded. This assertion pins the one further
+		// thing structure can honestly state — WHICH function owns the call —
+		// so the executor cannot drift to a caller that never held the
+		// transaction. Whether it runs only after success is a timing
+		// question, answered by TestPostCommitNeverRunsWhenTheTransactionFails
+		// and TestNoSideEffectIOInsideTheTransaction rather than here;
+		// modelling control flow in this audit would mean guessing at the
+		// error check, and an audit that guesses wrong stops seeing the very
+		// thing it exists to catch.
+		if sites[0].enclosing != "Ingest" {
+			t.Fatalf("Commit is called from %s at %s:%d; the transaction owner is the only function that may "+
+				"run the plan it produced", sites[0].enclosing, sites[0].file, sites[0].line)
+		}
+	})
+
+	t.Run("the executor body is reachable only through the executor entry point", func(t *testing.T) {
+		// (b) alone is not enough. The side effects are performed by the
+		// executor's BODY, which is an ordinary method of this package: any
+		// function here can call it directly, transaction callbacks included.
+		// Such a caller would run all seven side effects inside the
+		// transaction while (b) still saw one well-placed call to the entry
+		// point, and the runtime timing tests would not execute the new caller
+		// either. Confining the body to a single caller — the entry point,
+		// which carries the single-use guard — is what makes (b) load-bearing.
+		sites := scan.byCallee("commitOnce")
+		if len(sites) != 1 {
+			t.Fatalf("commitOnce has %d non-test call sites (%+v), want exactly 1 — the side effects must "+
+				"only be reachable through the executor entry point", len(sites), sites)
+		}
+		if sites[0].enclosing != "Commit" {
+			t.Fatalf("commitOnce is called from %s at %s:%d, bypassing the executor entry point and its "+
+				"single-use guard", sites[0].enclosing, sites[0].file, sites[0].line)
+		}
+		if sites[0].inTxFunc {
+			t.Fatalf("commitOnce is called at %s:%d from inside the transaction function — every side effect "+
+				"it performs would run before the commit", sites[0].file, sites[0].line)
 		}
 	})
 
