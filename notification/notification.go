@@ -511,10 +511,15 @@ func (s *Service) sendNative(ctx context.Context, lang string, p Payload) {
 	if lines := RenderLines(p, lang); len(lines) > 0 {
 		body = body + "\n" + lines[0] // keep the toast short — lead with the top fault
 	}
-	// The click URL is attached as the toast's click action (protocol activation)
-	// rather than printed into the body, so clicking the toast opens the incident
-	// page. See nativeClickURL for why this is not simply p.URL.
-	if err := nativeNotify(ctx, title, body, s.nativeClickURL(p)); err != nil {
+	// The click URL is attached as the toast's click action (protocol activation
+	// on Windows, a UN click handler on the desktop's macOS) rather than printed
+	// into the body, so clicking the toast opens the incident page. See
+	// nativeClickURL for why this is not simply p.URL.
+	//
+	// Native, not nativeNotify: a host that replaced the OS-notification path
+	// with SetNativeNotify (the desktop app on macOS) must see incident toasts on
+	// that path too, or they would land back on osascript's Script Editor.
+	if err := Native(ctx, title, body, s.nativeClickURL(p)); err != nil {
 		log.Printf("notify system: %v", err)
 	}
 }
