@@ -144,24 +144,40 @@ func (s *session) enqueue(f wire.Frame) bool {
 // frame enqueued just before the shutdown (the epoch-rotation result) must
 // precede the close on the wire, the same ordering the pipe transport's reader
 // already implements on the receiving side.
+// errDownlinkGuard is what writeGuarded returns when it refused a frame. The
+// caller needs to tell a guard refusal — which has already torn the session
+// down — apart from a plain write error, which the two paths handle
+// differently (the live path re-tears, the drain just ends).
+var errDownlinkGuard = errors.New("agentws: downlink guard refused a frame")
+
+// writeGuarded is the single path a frame takes to the peer, live or draining.
+// A frame the session's schema never negotiated must never go out: the session
+// logic already branches so such frames are never built, so a guard failure
+// here is a server bug, and it is torn down loudly rather than sent. Routing
+// both paths through one method is what keeps a future change from guarding
+// one and forgetting the other — the drift that a dedicated drain path had
+// introduced before.
+func (s *session) writeGuarded(f wire.Frame) error {
+	if err := s.adapter.GuardDownlink(f); err != nil {
+		log.Printf("agentws: downlink guard refused a %T for %s: %v", f, s.agentID, err)
+		s.shutdown(wire.CloseInternalError, "downlink guard refused a frame")
+		_ = s.conn.Close(wire.CloseInternalError, "downlink guard refused a frame")
+		return errDownlinkGuard
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), writeTimeout)
+	defer cancel()
+	return s.conn.WriteFrame(ctx, f)
+}
+
 func (s *session) writeLoop() {
 	for {
 		select {
 		case f := <-s.sendCh:
-			// The downlink guard: a frame the session's schema never negotiated
-			// must never go out. The session logic already branches so such
-			// frames are never built; a guard failure here is a server bug, and
-			// it is torn down loudly rather than sent.
-			if err := s.adapter.GuardDownlink(f); err != nil {
-				log.Printf("agentws: downlink guard refused a %T for %s: %v", f, s.agentID, err)
-				s.shutdown(wire.CloseInternalError, "downlink guard refused a frame")
-				_ = s.conn.Close(wire.CloseInternalError, "downlink guard refused a frame")
-				return
-			}
-			ctx, cancel := context.WithTimeout(context.Background(), writeTimeout)
-			err := s.conn.WriteFrame(ctx, f)
-			cancel()
-			if err != nil {
+			if err := s.writeGuarded(f); err != nil {
+				if errors.Is(err, errDownlinkGuard) {
+					// The guard already shut the session down; nothing left to do.
+					return
+				}
 				// A write error means the peer is gone (a clean agent close races the
 				// writer) or, far more rarely, a server-built frame failed to marshal.
 				// Either way the session cannot continue; the reader's teardown handles
@@ -181,10 +197,14 @@ func (s *session) writeLoop() {
 			for {
 				select {
 				case f := <-s.sendCh:
-					ctx, cancel := context.WithTimeout(context.Background(), writeTimeout)
-					err := s.conn.WriteFrame(ctx, f)
-					cancel()
-					if err != nil {
+					// The drained frames take the same guarded path as the live
+					// ones. A frame that sits in the queue is one the live path
+					// never got to, and shutdown is not an excuse to smuggle a
+					// frame past the schema boundary the session negotiated.
+					if err := s.writeGuarded(f); err != nil {
+						if errors.Is(err, errDownlinkGuard) {
+							return
+						}
 						break drain
 					}
 				default:

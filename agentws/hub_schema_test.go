@@ -420,3 +420,51 @@ func TestPacketSchemaMustMatchSession(t *testing.T) {
 		t.Fatalf("mismatched packet close = %v, want 4003", err)
 	}
 }
+
+// TestDownlinkGuardHoldsWhileDraining: the guard must apply to frames written
+// during shutdown's drain-before-close, not just the live path. A frame that
+// was queued and then caught a shutdown was previously written to the peer
+// with no guard at all — the one window where the live path's guard could not
+// reach it — so a schema 8 control frame could escape onto a schema 7 session
+// exactly when the session was ending, which is the worst time to learn about
+// it. Making the drain refuse the frame instead of sending it is what keeps
+// the guard total.
+//
+// MUTATION: write the drained frame without calling GuardDownlink → the queue
+// is never drained (the reader gets no close at all) and this times out.
+func TestDownlinkGuardHoldsWhileDraining(t *testing.T) {
+	e := newTestEnv(t)
+	e.seedAgent(t, "agent_a", "tok_a")
+	ctx := context.Background()
+
+	c, err := e.hub.DialLocal(ctx, "tok_a")
+	if err != nil {
+		t.Fatalf("DialLocal: %v", err)
+	}
+	if err := c.WriteFrame(ctx, testHello7()); err != nil {
+		t.Fatalf("write hello: %v", err)
+	}
+	if f, err := c.ReadFrame(ctx); err != nil || f.DesiredState == nil {
+		t.Fatalf("first push = %+v err=%v, want DesiredState", f, err)
+	}
+
+	e.hub.mu.Lock()
+	s := e.hub.conns["agent_a"]
+	e.hub.mu.Unlock()
+	if s == nil {
+		t.Fatal("session not registered")
+	}
+
+	// Enqueue a forbidden frame, then close the session so the writer enters the
+	// drain branch with that frame still queued. The guard is the only thing
+	// between it and the peer; the reader must see the 1011 close that refuses
+	// it, and must NOT see the frame itself.
+	if !s.enqueue(wire.Frame{SequenceFloor: &wire.SequenceFloor{EnrollmentEpoch: 1}}) {
+		t.Fatal("enqueue floor frame")
+	}
+	s.shutdown(wire.CloseNormalClosure, "test shutdown")
+
+	if _, err := c.ReadFrame(ctx); wire.CloseStatus(err) != wire.CloseInternalError {
+		t.Fatalf("close = %v, want 1011 (the drain refused the frame it was about to send)", err)
+	}
+}
