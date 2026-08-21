@@ -827,6 +827,49 @@ func TestHelloFloorGateRejects(t *testing.T) {
 	expectClose(t, conn, wire.CloseProtocolError)
 }
 
+// TestFloorLookupFailureClosesTheSession: when the committed sequence
+// watermark cannot be read on connect, the session closes with an internal
+// error and admits nothing. It must not degrade to a zero floor.
+//
+// Degrading is the tempting reading, because zero is exactly what an agent
+// with no committed history legitimately receives — so the failure mode looks
+// like a benign one. It is not. A floor is an instruction to the peer about
+// what it still owes: pushing zero on the strength of a query that failed
+// tells an agent to replay its whole current generation, and whichever of
+// those packets the store did commit before the read started failing come back
+// as duplicates that the very watermark we could not read is what would have
+// suppressed. The opposite shortcut — admitting packets with no barrier at all
+// — is worse in the same direction, since it renumbers in place against an
+// unverified watermark. Closing costs one reconnect and nothing else: the
+// outbox is durable, the agent retries, and the barrier is re-established the
+// next time the read succeeds.
+//
+// This branch sits in the connect path, not in ingest. The ingest-level read
+// has its own coverage, so a regression that swallowed the error here — the
+// one-character `floor, _ :=` — would leave every other test in the suite
+// green. The read is failed by dropping the column it selects; because
+// authentication and the config push read other columns, the session still
+// reaches the floor step, which is what reading DesiredState below pins. That
+// assertion is the point: it proves the close comes from the floor lookup and
+// not from an earlier step that the same injection happened to break.
+func TestFloorLookupFailureClosesTheSession(t *testing.T) {
+	e := newTestEnv(t)
+	e.seedAgent(t, "agent_a", "tok_a")
+
+	if _, err := e.db.ExecContext(context.Background(),
+		`ALTER TABLE agents DROP COLUMN high_sequence`); err != nil {
+		t.Fatalf("break the floor read: %v", err)
+	}
+
+	conn := e.dial(t, "tok_a", wire.SubprotocolJSON)
+	sendFrame(t, conn, testHello())
+	if f := readFrame(t, conn); f.DesiredState == nil {
+		t.Fatalf("first push = %+v, want DesiredState — the session must reach the floor step "+
+			"for this test to be about the floor lookup at all", f)
+	}
+	expectClose(t, conn, wire.CloseInternalError)
+}
+
 // TestPacketBeforeFloorAppliedCloses pins the barrier fail-closed: a packet
 // sent before the SequenceFloorApplied reply is a protocol error, even though
 // the floor was pushed and the session is otherwise healthy.
