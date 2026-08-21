@@ -24,12 +24,12 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"log"
 	"math"
 	"sync"
 	"time"
 
-	"github.com/nettact/protocol"
 	"github.com/nettact/protocol/telemetry"
 	"github.com/nettact/server-core/baseline"
 	"github.com/nettact/server-core/config"
@@ -48,6 +48,14 @@ type AgentPrincipal struct {
 	AgentID         string
 	SiteID          string
 	EnrollmentEpoch uint64
+	// WireSchema is the wire schema the admission layer negotiated for this
+	// session. The packet must declare exactly this schema; ingest compares the
+	// two and never interprets the value — which schemas exist and are served
+	// is the admission edge's decision, not this package's. Zero is refused
+	// (fail closed): an unfilled principal means the admission layer never
+	// spoke, and silently falling back to the native schema would admit
+	// packets whose session was never pinned down.
+	WireSchema int
 }
 
 // PreparedInputs carries everything the prepare phase resolved OUTSIDE the
@@ -190,8 +198,17 @@ type PostCommitPlan struct {
 // transaction was taken.
 func (s *Service) Prepare(ctx context.Context, p AgentPrincipal, pkt telemetry.Packet) (PreparedInputs, error) {
 	var in PreparedInputs
-	if err := protocol.ValidateSchema(pkt.SchemaVersion); err != nil {
-		return in, err
+	// The admission principal must name the session's negotiated wire schema,
+	// and the packet must declare exactly that schema. This is an equality
+	// check, not a membership check: ingest neither knows nor cares which
+	// schemas exist — an admission edge that serves several schemas has already
+	// pinned the session's one, and a packet that disagrees with its own
+	// session is confused state to refuse, not to second-guess.
+	if p.WireSchema == 0 {
+		return in, errors.New("ingest: no wire schema on the admission principal (the session must be admitted with its negotiated schema)")
+	}
+	if pkt.SchemaVersion != p.WireSchema {
+		return in, fmt.Errorf("packet wire schema %d does not match the session's negotiated wire schema %d", pkt.SchemaVersion, p.WireSchema)
 	}
 	in.principal = p
 	// Snapshot the packet BEFORE the fingerprint and the filters: the transaction

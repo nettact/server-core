@@ -18,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/nettact/protocol"
 	pcfg "github.com/nettact/protocol/config"
 	"github.com/nettact/protocol/telemetry"
 	"github.com/nettact/server-core/baseline"
@@ -186,8 +187,14 @@ func filterTimestamps(ms []telemetry.Metric, now time.Time) (kept []telemetry.Me
 // transaction core, and Commit executes the post-commit plan — only after
 // WriteTx returned nil, i.e. the commit succeeded. A rollback discards the
 // plan, so nothing post-commit ever observes a batch that did not commit.
-func (s *Service) Ingest(ctx context.Context, agentID, siteID string, epoch uint64, pkt telemetry.Packet) (Ack, error) {
-	p := AgentPrincipal{AgentID: agentID, SiteID: siteID, EnrollmentEpoch: epoch}
+//
+// IngestPrincipal is the schema-aware entry point: the principal carries the
+// wire schema the admission layer negotiated for the session, and Prepare
+// requires the packet to declare exactly that schema (zero is refused). The
+// older Ingest convenience method below keeps its signature for released
+// callers and fills the native schema — the semantics of that call have always
+// been "this module's single native schema".
+func (s *Service) IngestPrincipal(ctx context.Context, p AgentPrincipal, pkt telemetry.Packet) (Ack, error) {
 	in, err := s.Prepare(ctx, p, pkt)
 	if err != nil {
 		return Ack{}, err
@@ -215,6 +222,21 @@ func (s *Service) Ingest(ctx context.Context, agentID, siteID string, epoch uint
 		HighestSequence: s.ackSequence(p.AgentID, pkt.Sequence, in.cacheEpoch, res.New, res.AdoptHigh),
 		ServerTime:      in.now,
 	}, nil
+}
+
+// Ingest is the pre-admission-registry convenience form of IngestPrincipal,
+// kept for callers released before sessions carried a negotiated wire schema.
+// It serves the module's native schema — the only one a caller that has no
+// admission layer to ask can mean — and Prepare's equality check still refuses
+// a packet whose declared schema disagrees with it. New callers should pass a
+// principal whose WireSchema comes from the session's negotiated schema.
+func (s *Service) Ingest(ctx context.Context, agentID, siteID string, epoch uint64, pkt telemetry.Packet) (Ack, error) {
+	return s.IngestPrincipal(ctx, AgentPrincipal{
+		AgentID:         agentID,
+		SiteID:          siteID,
+		EnrollmentEpoch: epoch,
+		WireSchema:      protocol.SchemaVersion,
+	}, pkt)
 }
 
 // receiptFingerprint returns the stored content fingerprint for one (agent,

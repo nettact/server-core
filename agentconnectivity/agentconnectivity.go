@@ -300,12 +300,24 @@ func (e *Engine) loadAgents(ctx context.Context) ([]agentRow, error) {
 }
 
 // reasonFor maps an agent's last disconnect kind to a connectivity fault reason.
+//
+// The kind vocabulary (agents.last_disconnect_kind, a free-text column) is:
+// clean, error, superseded, revoked, server_shutdown, unsupported_schema,
+// epoch_ahead (a Hello reported a credential generation ahead of the
+// authority's — the agent is in a bad state and the alert must name it, not
+// the generic loss), and sequence_conflict (a pre-upgrade session hit a
+// fingerprint conflict it cannot rotate out of — terminal, and the reason says
+// an upgrade is the way out).
 func reasonFor(disconnectKind string) string {
 	switch disconnectKind {
 	case "clean":
 		return "clean_shutdown"
 	case "unsupported_schema":
 		return "version_incompatible"
+	case "epoch_ahead":
+		return "epoch_ahead_of_authority"
+	case "sequence_conflict":
+		return "sequence_conflict_requires_upgrade"
 	default:
 		return "unexpected"
 	}

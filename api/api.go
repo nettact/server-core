@@ -57,6 +57,7 @@ import (
 	"github.com/nettact/server-core/statuspage"
 	"github.com/nettact/server-core/targetstatus"
 	"github.com/nettact/server-core/updatecheck"
+	"github.com/nettact/server-core/wireadapt"
 
 	neturl "net/url"
 )
@@ -556,11 +557,36 @@ func (d Deps) handleEnroll(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "reinstall target agent no longer exists")
 		return
 	case err != nil:
+		// An unsupported schema lands here (it is not one of the sentinel
+		// classes above): 500, not 400. The peer's downgrade retry discriminates
+		// on "5xx AND the body names the mismatch", so a 400 here — however
+		// semantically tempting — would read as a terminal rejection and the
+		// retry would never fire.
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	d.Audit.Log(r.Context(), resp.AgentID, "agent.enroll", resp.SiteID, req.Hostname)
-	writeJSON(w, http.StatusOK, resp)
+	// Encode the response in the requesting schema's shape. The schema 8 shape
+	// is the canonical struct; the schema 7 shape drops the enrollment_epoch
+	// key the 7 peer cannot act on. This is the HTTP half of the same duty as
+	// never sending a control frame to a peer that did not declare the
+	// capability: the server speaks to each peer in the version that peer
+	// negotiated. The trailing newline matches the previous JSON encoder
+	// output, so the schema 8 response is byte-for-byte unchanged.
+	adapter, ok := wireadapt.Lookup(req.SchemaVersion)
+	if !ok {
+		writeError(w, http.StatusInternalServerError, wireadapt.UnsupportedSchema(req.SchemaVersion).Error())
+		return
+	}
+	body, err := adapter.EncodeEnrollResponse(resp)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	body = append(body, '\n')
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(body)
 }
 
 // ---- live host snapshot (ephemeral, never stored) ----

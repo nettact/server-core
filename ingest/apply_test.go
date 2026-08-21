@@ -19,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nettact/protocol"
 	"github.com/nettact/protocol/gamesense"
 	"github.com/nettact/protocol/telemetry"
 	"github.com/nettact/server-core/eventbus"
@@ -30,7 +31,12 @@ import (
 )
 
 func applyPrincipal() AgentPrincipal {
-	return AgentPrincipal{AgentID: "agent_a", SiteID: "site_default", EnrollmentEpoch: 1}
+	// The wire schema is the native one: this helper stands for the admission
+	// layer of a single-schema host, which pins every session to the native
+	// schema. The zero value is deliberately never used here — Prepare refuses
+	// an unfilled schema (fail closed), and the migration of the helper is the
+	// plan's documented surface for that change.
+	return AgentPrincipal{AgentID: "agent_a", SiteID: "site_default", EnrollmentEpoch: 1, WireSchema: protocol.SchemaVersion}
 }
 
 // applyDirect runs the full three-phase pipeline exactly the way Ingest does,

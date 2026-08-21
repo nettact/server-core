@@ -456,3 +456,46 @@ func TestFrozenDisplayName(t *testing.T) {
 		t.Fatalf("expected the display name frozen onto the fault, got %+v", in)
 	}
 }
+
+// TestNewDisconnectKindReasons (H6b): the two new disconnect kinds map to
+// their frozen alert reasons — the strings the wire contract fixes — so a
+// connectivity incident opened for one of them names the condition instead of
+// the generic loss.
+func TestNewDisconnectKindReasons(t *testing.T) {
+	for _, c := range []struct {
+		kind, want string
+	}{
+		{"epoch_ahead", "epoch_ahead_of_authority"},
+		{"sequence_conflict", "sequence_conflict_requires_upgrade"},
+	} {
+		if got := reasonFor(c.kind); got != c.want {
+			t.Errorf("reasonFor(%q) = %q, want %q", c.kind, got, c.want)
+		}
+	}
+}
+
+// TestEpochAheadReasonOpensConnectivityFault (H6d): the integration half of
+// the ahead-of-authority refusal. The hub test covers the 4003 close writing
+// the row this test starts from — kind 'epoch_ahead', a last_seen in the past.
+// Here the engine, with the peer still absent past grace, opens the
+// connectivity fault under reason epoch_ahead_of_authority (not the default
+// 'unexpected'), which is what the notification pipeline then names.
+func TestEpochAheadReasonOpensConnectivityFault(t *testing.T) {
+	h := newHarness(t)
+	base := h.clock
+	h.seedAgent("agent_ahead", ptr(base), ptr(base), false, "epoch_ahead")
+
+	h.tick("agent_ahead")     // baseline: connected
+	h.advance(1 * time.Second)
+	h.tick()                  // first absent tick: the absent clock starts
+	h.advance(30 * time.Second)
+	h.tick()                  // absent past grace: the fault opens
+
+	in, ok := h.lastOpenOf("agent_ahead")
+	if !ok {
+		t.Fatal("no fault opened for the epoch-ahead agent")
+	}
+	if in.Reason != "epoch_ahead_of_authority" {
+		t.Fatalf("reason = %q, want epoch_ahead_of_authority", in.Reason)
+	}
+}

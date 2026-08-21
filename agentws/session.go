@@ -10,6 +10,7 @@ import (
 	"github.com/nettact/protocol/wire"
 	"github.com/nettact/server-core/ingest"
 	"github.com/nettact/server-core/registry"
+	"github.com/nettact/server-core/wireadapt"
 )
 
 const (
@@ -38,6 +39,13 @@ type session struct {
 	conn    wire.Conn
 	agentID string
 	siteID  string
+
+	// wireSchema is the schema this session was admitted under, and adapter is
+	// its registry adapter. Every frame decision — what may arrive, what may
+	// leave — flows through the adapter, so a session of either schema behaves
+	// exactly as its adapter prescribes.
+	wireSchema int
+	adapter    *wireadapt.Adapter
 
 	// Schema-8 session state. epoch/floorSent/floorPushed are set
 	// by serve before readLoop starts; floorApplied is read and written only by
@@ -140,6 +148,16 @@ func (s *session) writeLoop() {
 	for {
 		select {
 		case f := <-s.sendCh:
+			// The downlink guard: a frame the session's schema never negotiated
+			// must never go out. The session logic already branches so such
+			// frames are never built; a guard failure here is a server bug, and
+			// it is torn down loudly rather than sent.
+			if err := s.adapter.GuardDownlink(f); err != nil {
+				log.Printf("agentws: downlink guard refused a %T for %s: %v", f, s.agentID, err)
+				s.shutdown(wire.CloseInternalError, "downlink guard refused a frame")
+				_ = s.conn.Close(wire.CloseInternalError, "downlink guard refused a frame")
+				return
+			}
 			ctx, cancel := context.WithTimeout(context.Background(), writeTimeout)
 			err := s.conn.WriteFrame(ctx, f)
 			cancel()
@@ -231,8 +249,26 @@ func (h *Hub) readLoop(ctx context.Context, s *session) error {
 			}
 			return err // closed, kicked, or broken — the deferred teardown handles it
 		}
+		// Frame-level admission: a session must not receive a frame its schema
+		// never negotiated. For a pre-boundary session this is what refuses the
+		// newer control frames with a protocol error instead of mis-processing
+		// them (a rotation frame on a session that cannot complete one would
+		// otherwise be acted on).
+		if err := s.adapter.AcceptUplink(frame); err != nil {
+			log.Printf("agentws: out-of-schema frame from %s: %v", s.agentID, err)
+			s.shutdown(wire.CloseProtocolError, "frame outside the negotiated schema")
+			return nil
+		}
 		switch {
 		case frame.Packet != nil:
+			// The packet must declare the session's negotiated schema exactly —
+			// the same equality ingest enforces on the principal. This is the
+			// pre-ingest check that turns a mixed-schema confusion into a
+			// retryable protocol error instead of an ingest failure.
+			if frame.Packet.SchemaVersion != s.wireSchema {
+				s.shutdown(wire.CloseProtocolError, "packet schema does not match the session")
+				return nil
+			}
 			// Fail closed: until the agent echoes the pushed floor back, no packet
 			// may be claimed — a packet admitted before the barrier would be
 			// renumberable in place, which is exactly what the epoch exists to
@@ -241,9 +277,26 @@ func (h *Hub) readLoop(ctx context.Context, s *session) error {
 				s.shutdown(wire.CloseProtocolError, "packet before floor applied")
 				return nil
 			}
-			ack, err := h.deps.Ingest.Ingest(ctx, s.agentID, s.siteID, s.epoch, *frame.Packet)
+			ack, err := h.deps.Ingest.IngestPrincipal(ctx, ingest.AgentPrincipal{
+				AgentID:         s.agentID,
+				SiteID:          s.siteID,
+				EnrollmentEpoch: s.epoch,
+				WireSchema:      s.wireSchema,
+			}, *frame.Packet)
 			if err != nil {
 				if errors.Is(err, ingest.ErrSequenceConflict) {
+					if !s.adapter.RunsFloorBarrier {
+						// A pre-boundary session has no rotation to drive: refuse
+						// with no ack and the unsupported-schema close so a
+						// confused peer quiesces instead of retrying forever. A
+						// newer peer probes the newer schema, where rotation
+						// exists and self-heals.
+						log.Printf("agentws: sequence conflict from %s (epoch %d, seq %d): no rotation on a pre-boundary session, closing",
+							s.agentID, s.epoch, frame.Packet.Sequence)
+						_ = h.deps.Registry.RecordDisconnect(ctx, s.agentID, "sequence_conflict")
+						s.shutdown(wire.CloseUnsupportedSchema, "sequence_conflict_requires_upgrade")
+						return nil
+					}
 					// The batch collides with the durable receipt ledger under its
 					// (epoch, sequence): it was either never admitted at this
 					// watermark or admitted with different content. Renumbering in

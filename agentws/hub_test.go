@@ -919,9 +919,17 @@ func TestStaleHelloEpochChallenges(t *testing.T) {
 	}
 	agentID := resp.AgentID
 
+	// The row advances to generation 3 (two prior credential replacements the
+	// agent missed); the agent still believes it is on 2. That is a genuinely
+	// STALE report — behind the authority. (An ahead-of-authority report is a
+	// different case, refused with 4003; see TestHelloEpochAheadRefused.)
+	if _, err := e.db.ExecContext(ctx, `UPDATE agents SET enrollment_epoch=3 WHERE id=?`, agentID); err != nil {
+		t.Fatalf("advance epoch: %v", err)
+	}
+
 	staleHello := func() wire.Frame {
 		h := testHello()
-		h.Hello.EnrollmentEpoch = 5 // the row is at generation 1
+		h.Hello.EnrollmentEpoch = 2 // the row is at generation 3
 		return h
 	}
 
@@ -944,8 +952,8 @@ func TestStaleHelloEpochChallenges(t *testing.T) {
 	expectClose(t, conn, wire.CloseProtocolError)
 
 	// A second stale session drives the rotation through: the agent signs the
-	// challenge with the HELLO epoch it believes in (5), and the row derives
-	// the new generation (1+1=2).
+	// challenge with the HELLO epoch it believes in (2), and the row derives
+	// the new generation (3+1=4).
 	conn2 := e.dial(t, resp.AgentToken, wire.SubprotocolJSON)
 	sendFrame(t, conn2, staleHello())
 	_ = readFrame(t, conn2) // DesiredState
@@ -956,13 +964,13 @@ func TestStaleHelloEpochChallenges(t *testing.T) {
 	challenge := f.EpochRotationChallenge.Challenge
 	sendFrame(t, conn2, wire.Frame{EpochRotationRequest: &wire.EpochRotationRequest{
 		Challenge: challenge,
-		OldEpoch:  5,
+		OldEpoch:  2,
 		Signature: ed25519.Sign(priv, []byte(challenge)),
 	}})
 	f = readFrame(t, conn2)
 	if f.EpochRotationResult == nil || f.EpochRotationResult.Status != wire.RotationOK ||
-		f.EpochRotationResult.NewEpoch != 2 || f.EpochRotationResult.AgentToken == "" {
-		t.Fatalf("result = %+v, want RotationOK epoch 2 with a token — a stale agent must jump to row+1, never be denied", f.EpochRotationResult)
+		f.EpochRotationResult.NewEpoch != 4 || f.EpochRotationResult.AgentToken == "" {
+		t.Fatalf("result = %+v, want RotationOK epoch 4 with a token — a stale agent must jump to row+1, never be denied", f.EpochRotationResult)
 	}
 	rotatedToken := f.EpochRotationResult.AgentToken
 	expectClose(t, conn2, wire.CloseGoingAway)
@@ -971,14 +979,14 @@ func TestStaleHelloEpochChallenges(t *testing.T) {
 	// session serves the floor at the converged generation.
 	conn3 := e.dial(t, rotatedToken, wire.SubprotocolJSON)
 	hello3 := testHello()
-	hello3.Hello.EnrollmentEpoch = 2
+	hello3.Hello.EnrollmentEpoch = 4
 	sendFrame(t, conn3, hello3)
 	if f := readFrame(t, conn3); f.DesiredState == nil {
 		t.Fatalf("push = %+v, want DesiredState", f)
 	}
 	f = readFrame(t, conn3)
-	if f.SequenceFloor == nil || f.SequenceFloor.EnrollmentEpoch != 2 {
-		t.Fatalf("push = %+v, want SequenceFloor at the converged epoch 2", f)
+	if f.SequenceFloor == nil || f.SequenceFloor.EnrollmentEpoch != 4 {
+		t.Fatalf("push = %+v, want SequenceFloor at the converged epoch 4", f)
 	}
 	if f.SequenceFloor.SequenceFloor != 0 {
 		t.Errorf("post-rotation floor = %d, want 0 (the switch zeroes the watermark)", f.SequenceFloor.SequenceFloor)
@@ -988,8 +996,8 @@ func TestStaleHelloEpochChallenges(t *testing.T) {
 		SequenceFloor:   f.SequenceFloor.SequenceFloor,
 	}})
 	auth, err := e.reg.AuthenticateAgent(ctx, rotatedToken)
-	if err != nil || auth.AgentID != agentID || auth.Epoch != 2 {
-		t.Fatalf("rotated token auth = %+v, %v; want %q at epoch 2", auth, err, agentID)
+	if err != nil || auth.AgentID != agentID || auth.Epoch != 4 {
+		t.Fatalf("rotated token auth = %+v, %v; want %q at epoch 4", auth, err, agentID)
 	}
 }
 

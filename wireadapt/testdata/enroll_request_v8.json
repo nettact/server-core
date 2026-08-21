@@ -1,0 +1,17 @@
+{
+  "schema_version": 8,
+  "enrollment_token": "fixture-token",
+  "public_key": "PRSz22+HBJG3lirIqaHqTzgcFguRfMGKcHGN9t7ItEw=",
+  "nonce": "fixture-nonce",
+  "signature": "SGMPaVw93DVd5beypI6OzVPF+ilGDULmonMCqgfAOmfd7SDwWzDMogsaZli9bwl0FaAJNchJewu1IO/3H8N7CQ==",
+  "hostname": "fixture-enroll-host",
+  "platform": "linux",
+  "agent_version": "fixture-version",
+  "permissions": {
+    "supported": ["probe.icmp"],
+    "granted": ["probe.icmp"],
+    "effective": ["probe.icmp"],
+    "source": "environment",
+    "policy_hash": "fixture-hash"
+  }
+}

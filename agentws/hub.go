@@ -21,7 +21,6 @@ import (
 	"github.com/coder/websocket"
 	"github.com/google/uuid"
 
-	"github.com/nettact/protocol"
 	pcfg "github.com/nettact/protocol/config"
 	"github.com/nettact/protocol/wire"
 	"github.com/nettact/server-core/config"
@@ -30,6 +29,7 @@ import (
 	"github.com/nettact/server-core/ingest"
 	"github.com/nettact/server-core/opissue"
 	"github.com/nettact/server-core/registry"
+	"github.com/nettact/server-core/wireadapt"
 )
 
 // maxFrameBytes bounds a single inbound frame. It matches the old POST body
@@ -182,7 +182,12 @@ func (h *Hub) serve(ctx context.Context, auth registry.AuthResult, c wire.Conn, 
 		return
 	}
 	hello := frame.Hello
-	if err := protocol.ValidateSchema(hello.SchemaVersion); err != nil {
+	// Membership first: the registry's explicit per-schema list decides which
+	// Hellos this build serves — never a range. A schema the registry does not
+	// serve gets the unsupported-schema close (4001) with no explanation frame;
+	// the peer's only recourse is a different wire schema or an upgrade.
+	adapter, ok := wireadapt.Lookup(hello.SchemaVersion)
+	if !ok {
 		// Record the reason at a point where the agent identity is already known
 		// (auth happened before the upgrade), so a firing connectivity alert can
 		// map it to "version incompatible" rather than a generic loss.
@@ -190,15 +195,33 @@ func (h *Hub) serve(ctx context.Context, auth registry.AuthResult, c wire.Conn, 
 		_ = c.Close(wire.CloseUnsupportedSchema, "unsupported schema")
 		return
 	}
-	// Schema-8 gates, evaluated BEFORE registration and before any Hello side
-	// effect: a peer that cannot speak the floor barrier must not get a session
-	// at all — without the barrier its packets would be renumbered in place the
-	// first time its WAL restarts, which the receipt ledger exists to forbid.
-	// A schema-8 agent always declares the capability regardless of epoch, so
-	// the zero-epoch bootstrap path (below) is still gated here.
-	if !wire.HasCapability(hello.Capabilities, wire.CapSequenceFloorV1) {
+	// The adapter's Hello check, evaluated BEFORE registration and before any
+	// Hello side effect. For the current schema this enforces the capability
+	// that gates the floor barrier: a peer that cannot echo a floor must not
+	// get a session whose packets could be renumbered in place. For a
+	// pre-boundary schema it tolerates and ignores the newer fields.
+	if err := adapter.ValidateHello(*hello); err != nil {
 		_ = h.deps.Registry.RecordDisconnect(ctx, agentID, "unsupported_schema")
-		_ = c.Close(wire.CloseProtocolError, "missing sequence_floor_v1 capability")
+		_ = c.Close(wire.CloseProtocolError, err.Error())
+		return
+	}
+	// The credential-generation gate, evaluated EARLY — before any Hello side
+	// effect (permissions refresh, last-seen, first-connected). A peer whose
+	// reported generation is AHEAD of the authority's is refused here with a
+	// retryable 4003: it reconnects on backoff, and had it stamped last_seen on
+	// every reconnect the connectivity detector would wait out the entire
+	// backoff before declaring it offline — the alert would be late or never.
+	// Not touching last_seen here lets the sweeper declare the peer offline on
+	// its own cadence, and the incident carries this reason. The gate is
+	// skipped while a rotation is staged: the recovery path re-issues the same
+	// result first, whatever the Hello reports, and everything converges when
+	// the peer reconnects under the new credential. The verdict function is the
+	// single source of the four-way decision — the reported value is compared
+	// against the authority, never adopted.
+	if adapter.RunsEpochGate && auth.PendingRotation == nil &&
+		wireadapt.EpochVerdict(hello.EnrollmentEpoch, auth.Epoch) == wireadapt.VerdictRefuseAhead {
+		_ = h.deps.Registry.RecordDisconnect(ctx, agentID, "epoch_ahead")
+		_ = c.Close(wire.CloseProtocolError, "epoch_ahead_of_authority")
 		return
 	}
 
@@ -226,13 +249,15 @@ func (h *Hub) serve(ctx context.Context, auth registry.AuthResult, c wire.Conn, 
 	}
 
 	s := &session{
-		conn:      c,
-		agentID:   agentID,
-		siteID:    siteID,
-		sendCh:    make(chan wire.Frame, sendQueueCap),
-		done:      make(chan struct{}),
-		closed:    make(chan struct{}),
-		sessionID: uuid.NewString(),
+		conn:       c,
+		agentID:    agentID,
+		siteID:     siteID,
+		wireSchema: hello.SchemaVersion,
+		adapter:    adapter,
+		sendCh:     make(chan wire.Frame, sendQueueCap),
+		done:       make(chan struct{}),
+		closed:     make(chan struct{}),
+		sessionID:  uuid.NewString(),
 	}
 	// Registered first so it runs LAST (after the teardown defer below): closing
 	// `closed` signals Disconnect/CloseAll that the reader has returned and the
@@ -348,11 +373,30 @@ func (h *Hub) serve(ctx context.Context, auth registry.AuthResult, c wire.Conn, 
 		}
 	}
 
-	// Schema 8: the credential-generation gate and the sequence-floor barrier.
 	// The session serves exactly one epoch — the one its bearer authenticated
-	// to at registration above.
+	// to at registration above, derived from the credential row, never from
+	// the Hello.
 	s.epoch = revAuth.Epoch
 	s.helloEpoch = hello.EnrollmentEpoch
+
+	if !adapter.RunsFloorBarrier {
+		// A pre-boundary session: no floor barrier, no epoch gate. There is no
+		// barrier to apply, so the session opens immediately; the generation is
+		// still pinned from the row for the ingest principal.
+		s.floorApplied = true
+		if revAuth.PendingRotation != nil {
+			// A rotation staged for this credential cannot be re-issued to this
+			// peer — the result frame is a control frame it never negotiated.
+			// Serve normally instead: the old token is still the live
+			// credential, the staged window lapses harmlessly, and when the
+			// peer next probes a schema that can carry the result the rotation
+			// completes then.
+			log.Printf("agentws: staged rotation for %s not re-issued on a pre-boundary session", agentID)
+		}
+		readErr = h.readLoop(ctx, s)
+		return
+	}
+
 	switch {
 	case revAuth.PendingRotation != nil:
 		// The presented token is the current (old) token while a phase-1
@@ -366,13 +410,22 @@ func (h *Hub) serve(ctx context.Context, auth registry.AuthResult, c wire.Conn, 
 		s.rotated = true
 		s.shutdown(wire.CloseGoingAway, "epoch rotated; reconnect")
 		return
-	case hello.EnrollmentEpoch == 0:
-		// A pre-schema-8 credential: the agent knows no generation and skips
-		// the floor barrier on its side too (zero means "unknown"). No floor is
-		// pushed and the barrier is opened immediately — gating a zero-epoch
-		// session would stall every install upgraded from before schema 8.
+	case wireadapt.EpochVerdict(hello.EnrollmentEpoch, revAuth.Epoch) == wireadapt.VerdictBootstrap:
+		// A credential the peer knows no generation for (it reports zero): no
+		// floor is pushed and the barrier opens immediately — gating a
+		// zero-epoch session would stall every install upgraded from before the
+		// generation era.
 		s.floorApplied = true
-	case hello.EnrollmentEpoch != revAuth.Epoch:
+	case wireadapt.EpochVerdict(hello.EnrollmentEpoch, revAuth.Epoch) == wireadapt.VerdictRefuseAhead:
+		// The narrow window between the upgrade-time auth and this re-check: a
+		// rotation committed in between, so the peer's report is now ahead of
+		// the newer authority. Same handling as the early gate — retryable
+		// 4003, no side effects beyond the recorded kind. A mis-fired close is
+		// retried on the peer's next reconnect, which lands on the current row.
+		_ = h.deps.Registry.RecordDisconnect(ctx, agentID, "epoch_ahead")
+		s.shutdown(wire.CloseProtocolError, "epoch_ahead_of_authority")
+		return
+	case wireadapt.EpochVerdict(hello.EnrollmentEpoch, revAuth.Epoch) == wireadapt.VerdictRotate:
 		// The Hello presents a stale credential generation. Challenge the agent
 		// to rotate out of it and HOLD the session for the rotation flow — the
 		// agent answers with EpochRotationRequest, and the read loop completes
@@ -387,9 +440,10 @@ func (h *Hub) serve(ctx context.Context, auth registry.AuthResult, c wire.Conn, 
 			return
 		}
 	default:
-		// The barrier: push the current epoch's committed sequence floor before
-		// any packet may be claimed. Until the agent's SequenceFloorApplied
-		// echoes both values back, readLoop refuses packets outright.
+		// VerdictOpen. The barrier: push the current epoch's committed sequence
+		// floor before any packet may be claimed. Until the agent's
+		// SequenceFloorApplied echoes both values back, readLoop refuses
+		// packets outright.
 		floor, err := h.deps.Ingest.AcceptedFloor(ctx, agentID)
 		if err != nil {
 			log.Printf("agentws: accepted floor for %s: %v", agentID, err)
@@ -423,7 +477,19 @@ func classifyDisconnect(readErr error, s *session) string {
 	if s.rotated {
 		return "clean"
 	}
-	if code, set := s.closeInfo(); set {
+	if code, reason, set := s.closeInfoReason(); set {
+		// Two server-initiated closes carry their semantics in the close reason
+		// (the frozen wire string), not in the code — 4003 is also the generic
+		// protocol error and 4001 the generic unsupported-schema close — so the
+		// reason discriminates the specific kind: a credential generation ahead
+		// of the authority's, and a pre-upgrade session whose fingerprint
+		// conflict it cannot rotate out of.
+		switch {
+		case code == wire.CloseProtocolError && reason == "epoch_ahead_of_authority":
+			return "epoch_ahead"
+		case code == wire.CloseUnsupportedSchema && reason == "sequence_conflict_requires_upgrade":
+			return "sequence_conflict"
+		}
 		switch code {
 		case wire.CloseSuperseded:
 			return "superseded"

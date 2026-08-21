@@ -14,10 +14,10 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/nettact/protocol"
 	"github.com/nettact/protocol/enroll"
 
 	"github.com/nettact/server-core/store"
+	"github.com/nettact/server-core/wireadapt"
 )
 
 var (
@@ -164,7 +164,18 @@ func (s *Service) RevokeEnrollmentToken(ctx context.Context, tokenHash string) e
 // enrollment inherits the token's note as its display name (see
 // CreateEnrollmentToken); a reinstall token keeps the existing agent's name.
 func (s *Service) Enroll(ctx context.Context, req enroll.EnrollRequest) (enroll.EnrollResponse, error) {
-	if err := protocol.ValidateSchema(req.SchemaVersion); err != nil {
+	// The wire schema is the FIRST gate, before the possession proof and before
+	// the one-time token is touched. An unknown schema must not consume the
+	// token: the agent's downgrade retry depends on a refused first attempt
+	// leaving the token spendable. Membership is the registry's explicit list,
+	// not a range, and the acceptance adapter re-checks the version fail-closed
+	// (a missing one decodes to 0 and is refused, never silently the native
+	// schema).
+	adapter, ok := wireadapt.Lookup(req.SchemaVersion)
+	if !ok {
+		return enroll.EnrollResponse{}, wireadapt.UnsupportedSchema(req.SchemaVersion)
+	}
+	if _, err := adapter.AcceptEnrollRequest(req); err != nil {
 		return enroll.EnrollResponse{}, err
 	}
 	if len(req.PublicKey) != ed25519.PublicKeySize ||

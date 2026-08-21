@@ -1,0 +1,15 @@
+{
+  "hello": {
+    "schema_version": 7,
+    "hostname": "fixture-v7-host",
+    "platform": "linux",
+    "agent_version": "v0.4.4",
+    "permissions": {
+      "supported": ["probe.icmp"],
+      "granted": ["probe.icmp"],
+      "effective": ["probe.icmp"],
+      "source": "environment",
+      "policy_hash": "fixture-hash"
+    }
+  }
+}

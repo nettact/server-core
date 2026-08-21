@@ -284,7 +284,7 @@ func TestPostCommitCallSitesAreOwnedByTheEntryPoint(t *testing.T) {
 		// modelling control flow in this audit would mean guessing at the
 		// error check, and an audit that guesses wrong stops seeing the very
 		// thing it exists to catch.
-		if sites[0].enclosing != "Ingest" {
+		if sites[0].enclosing != "IngestPrincipal" {
 			t.Fatalf("Commit is called from %s at %s:%d; the transaction owner is the only function that may "+
 				"run the plan it produced", sites[0].enclosing, sites[0].file, sites[0].line)
 		}

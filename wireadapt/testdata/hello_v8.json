@@ -1,0 +1,17 @@
+{
+  "hello": {
+    "schema_version": 8,
+    "hostname": "fixture-v8-host",
+    "platform": "linux",
+    "agent_version": "v0.4.5",
+    "permissions": {
+      "supported": ["probe.icmp"],
+      "granted": ["probe.icmp"],
+      "effective": ["probe.icmp"],
+      "source": "environment",
+      "policy_hash": "fixture-hash"
+    },
+    "capabilities": ["sequence_floor_v1"],
+    "enrollment_epoch": 3
+  }
+}

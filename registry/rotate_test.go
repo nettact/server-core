@@ -599,3 +599,157 @@ func TestRotationPurgesOldEpochReceipts(t *testing.T) {
 		t.Errorf("old token after rotation = %v, want ErrAuth", err)
 	}
 }
+
+// The three independent anti-stranding regressions. The two-phase rotation
+// already structurally satisfies them (completeRotation is the only place the
+// old credential is revoked, and it is reached only by the NEW token's first
+// authentication), but the existing flow test (TestRotateEpochTwoPhase) rolls
+// all three into one sequence, so a refactor that breaks one strand cannot be
+// pointed at. Each test below stands alone, and the third exists precisely to
+// catch a "revoke-on-commit" family that the first two would both pass: an
+// implementation that swapped token_hash at phase-1 commit fails R2 and R3,
+// while one that revoked the old credential after the first delivery or at
+// window expiry passes R1 and R2 — only R3's "delivered many times + window
+// expired + old token still live, revoked only by the new token's first use"
+// sequence stops it.
+
+// TestRotationResultReissueIsIdempotent (R1): a result lost in transit is
+// re-served as the SAME result — same new epoch, same token, byte for byte —
+// however many times the old token reconnects, and identically after a
+// process restart. Re-issuing a NEW round on every reconnect would strand a
+// peer that just missed the first delivery.
+func TestRotationResultReissueIsIdempotent(t *testing.T) {
+	db := storetest.Open(t)
+	ctx := context.Background()
+	mustExec(t, db, `INSERT INTO sites(id,name,created_at) VALUES('site_default','def',?)`, time.Now().UTC())
+	reg := New(db, 0, nil)
+
+	priv, oldToken, agentID := enrollTestAgent(t, reg, "site_default")
+	ch := reg.IssueRotationChallenge(agentID, 1, "test")
+	newEpoch, newToken, err := reg.RotateEpoch(ctx, agentID, wire.EpochRotationRequest{
+		Challenge: ch.Challenge, OldEpoch: 1, Signature: ed25519.Sign(priv, []byte(ch.Challenge)),
+	})
+	if err != nil || newEpoch != 2 {
+		t.Fatalf("phase 1 = epoch %d, %v; want 2", newEpoch, err)
+	}
+
+	var prev *wire.EpochRotationResult
+	for i := 0; i < 3; i++ {
+		res, err := reg.AuthenticateAgent(ctx, oldToken)
+		if err != nil {
+			t.Fatalf("auth %d: %v", i, err)
+		}
+		if res.PendingRotation == nil {
+			t.Fatalf("auth %d: no pending rotation", i)
+		}
+		if prev != nil && (res.PendingRotation.NewEpoch != prev.NewEpoch || res.PendingRotation.AgentToken != prev.AgentToken) {
+			t.Fatalf("re-issue %d changed: %+v vs %+v", i, res.PendingRotation, prev)
+		}
+		prev = res.PendingRotation
+	}
+
+	// "Restart": a fresh Service over the same database re-issues the identical
+	// result.
+	reg2 := New(db, 0, nil)
+	res, err := reg2.AuthenticateAgent(ctx, oldToken)
+	if err != nil {
+		t.Fatalf("auth after restart: %v", err)
+	}
+	if res.PendingRotation == nil || res.PendingRotation.NewEpoch != prev.NewEpoch ||
+		res.PendingRotation.AgentToken != prev.AgentToken || res.PendingRotation.AgentToken != newToken {
+		t.Fatalf("post-restart result = %+v, want the SAME result %+v (token %q)", res.PendingRotation, prev, newToken)
+	}
+}
+
+// TestOldTokenServesWhileRotationStaged (R2): staging a rotation must not
+// touch the old credential's present usability — it still authenticates to the
+// same identity at the OLD generation, and the token_hash column is unchanged.
+func TestOldTokenServesWhileRotationStaged(t *testing.T) {
+	db := storetest.Open(t)
+	ctx := context.Background()
+	mustExec(t, db, `INSERT INTO sites(id,name,created_at) VALUES('site_default','def',?)`, time.Now().UTC())
+	reg := New(db, 0, nil)
+
+	priv, oldToken, agentID := enrollTestAgent(t, reg, "site_default")
+	ch := reg.IssueRotationChallenge(agentID, 1, "test")
+	if _, _, err := reg.RotateEpoch(ctx, agentID, wire.EpochRotationRequest{
+		Challenge: ch.Challenge, OldEpoch: 1, Signature: ed25519.Sign(priv, []byte(ch.Challenge)),
+	}); err != nil {
+		t.Fatalf("phase 1: %v", err)
+	}
+
+	res, err := reg.AuthenticateAgent(ctx, oldToken)
+	if err != nil {
+		t.Fatalf("old token while staged: %v", err)
+	}
+	if res.AgentID != agentID || res.Epoch != 1 {
+		t.Fatalf("auth = %+v, want %q at epoch 1", res, agentID)
+	}
+	var hash string
+	if err := db.QueryRowContext(ctx, `SELECT token_hash FROM agents WHERE id=?`, agentID).Scan(&hash); err != nil {
+		t.Fatalf("read hash: %v", err)
+	}
+	if hash != sha256hex(oldToken) {
+		t.Fatalf("token_hash changed during staging")
+	}
+}
+
+// TestOldCredentialOutlivesUnusedNewCredential (R3): the ONLY trigger that
+// revokes the old credential is the new credential's first use. Staging the
+// rotation, delivering the result, and letting the staging window lapse each
+// leave the old credential live — so a peer that received the result but never
+// used it is never locked out. This is the test that a "revoke on commit"
+// implementation (phase 1 swaps token_hash) AND a "revoke after first
+// delivery / at window expiry" implementation both fail, while R1 and R2 alone
+// would pass the latter.
+func TestOldCredentialOutlivesUnusedNewCredential(t *testing.T) {
+	db := storetest.Open(t)
+	ctx := context.Background()
+	mustExec(t, db, `INSERT INTO sites(id,name,created_at) VALUES('site_default','def',?)`, time.Now().UTC())
+	reg := New(db, 0, nil)
+
+	priv, oldToken, agentID := enrollTestAgent(t, reg, "site_default")
+	ch := reg.IssueRotationChallenge(agentID, 1, "test")
+	newEpoch, newToken, err := reg.RotateEpoch(ctx, agentID, wire.EpochRotationRequest{
+		Challenge: ch.Challenge, OldEpoch: 1, Signature: ed25519.Sign(priv, []byte(ch.Challenge)),
+	})
+	if err != nil || newEpoch != 2 {
+		t.Fatalf("phase 1 = epoch %d, %v; want 2", newEpoch, err)
+	}
+
+	// The result is delivered (fetched) several times: delivery is not the
+	// revocation trigger.
+	for i := 0; i < 3; i++ {
+		res, err := reg.AuthenticateAgent(ctx, oldToken)
+		if err != nil || res.PendingRotation == nil {
+			t.Fatalf("delivery %d = %+v, %v; want a pending rotation", i, res, err)
+		}
+	}
+
+	// The staging window lapses: by the window's own semantics the staging is
+	// now absent, and the old token is the ONLY live credential.
+	mustExec(t, db, `UPDATE agents SET pending_next_until=? WHERE id=?`, 1, agentID)
+
+	// The old credential still authenticates — revocation happens only on the
+	// NEW credential's first use, never on staging, never on delivery, never on
+	// window expiry.
+	res, err := reg.AuthenticateAgent(ctx, oldToken)
+	if err != nil {
+		t.Fatalf("old token after window expiry, before first new-token use: %v", err)
+	}
+	if res.AgentID != agentID || res.Epoch != 1 {
+		t.Fatalf("auth = %+v, want %q at epoch 1", res, agentID)
+	}
+	if res.PendingRotation != nil {
+		t.Fatalf("expired window still re-issues: %+v", res.PendingRotation)
+	}
+
+	// The first use of the new credential completes phase 2...
+	if _, err := reg.AuthenticateAgent(ctx, newToken); err != nil {
+		t.Fatalf("first use of new token: %v", err)
+	}
+	// ...and only now is the old credential revoked.
+	if _, err := reg.AuthenticateAgent(ctx, oldToken); !errors.Is(err, ErrAuth) {
+		t.Fatalf("old token after first new-token use = %v, want ErrAuth", err)
+	}
+}
