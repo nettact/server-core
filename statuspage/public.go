@@ -496,12 +496,22 @@ func (s *Service) PublicIncidentHistory(ctx context.Context, slug string) (Publi
 	now := s.now().UTC()
 	windowStart := now.AddDate(0, 0, -PublicIncidentWindowDays)
 
-	// Everything — page, subjects, the incident query, and the cache write — runs
-	// inside one read snapshot (WAL isolation, so selection and labels come from one
-	// committed page version), and the incidentMu cache check sits between the
-	// cheap reads and the expensive query. The closure's end is the function's
-	// decision point, so deferring the mutex unlock in the closure releases it at
-	// the same moment the old code's function-level defer did.
+	// The cache lock is taken BEFORE the read transaction is opened. ReadTx
+	// checks a connection out of the read pool before its closure ever runs, so
+	// locking inside the closure — the previous shape — meant every caller
+	// queued on incidentMu while sitting on a pooled connection with an open
+	// read transaction: a burst of anonymous viewers behind one slow rebuild
+	// could pin the whole read pool, and each pinned transaction also pins a
+	// WAL read mark, stalling checkpoints. Locking first matches
+	// targetSnapshot/agentSnapshot/availabilitySnapshot — only the lock holder
+	// ever owns a transaction. Everything else is unchanged: page, subjects,
+	// the incident query, and the cache write still run inside one read
+	// snapshot (WAL isolation, so selection and labels come from one committed
+	// page version), with the cache check between the cheap reads and the
+	// expensive query.
+	s.incidentMu.Lock()
+	defer s.incidentMu.Unlock()
+
 	var (
 		p       pageRow
 		targets []publicSubjectRef
@@ -520,8 +530,6 @@ func (s *Service) PublicIncidentHistory(ctx context.Context, slug string) (Publi
 			return err
 		}
 		selection := incidentSelectionKey(p, targets, agents)
-		s.incidentMu.Lock()
-		defer s.incidentMu.Unlock()
 		if c, ok := s.incidentCache[p.id]; ok && c.selection == selection && now.Sub(c.at) < s.ttl {
 			cached = c.data
 			return nil
