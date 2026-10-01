@@ -210,6 +210,25 @@ func (e *Engine) Tick(ctx context.Context, connectedIDs []string) error {
 		}
 	}
 
+	// End faults whose agent no longer exists. Deleting an agent terminates its
+	// signals and then removes the row in a second transaction, and a tick that
+	// read the agent list before the row went but the firing set after the
+	// termination sees an absent agent with no fault — and confirms a fresh one.
+	// Nothing would ever resolve it after that: every other path here iterates the
+	// agent list, which no longer names it, so its incident would stay open
+	// forever. Closing it here, with the deletion's own reason (silent, not a
+	// recovery), makes the sweep self-healing for that race and for any such
+	// orphan already stored. No connectivity refresh is due: the deletion already
+	// refreshed its site's agents, and the resolve publishes its own incident event.
+	for agentID := range firing {
+		if seen[agentID] {
+			continue
+		}
+		if err := e.faults.ResolveAgentSignal(ctx, agentID, fault.ReasonAgentDeleted, at); err != nil {
+			return err
+		}
+	}
+
 	// Prune clocks for agents that no longer exist (deleted).
 	for id := range e.absentSince {
 		if !seen[id] {

@@ -499,3 +499,29 @@ func TestEpochAheadReasonOpensConnectivityFault(t *testing.T) {
 		t.Fatalf("reason = %q, want epoch_ahead_of_authority", in.Reason)
 	}
 }
+
+// A fault whose agent row is gone must still end. Deleting an agent terminates
+// its signals and removes the row in two transactions, so a tick interleaved
+// between them can confirm a fresh fault for the agent being deleted; after the
+// row goes, no agent-list-driven path would ever reach it again and its incident
+// would stay open forever. The next tick ends it, silently, as a deletion.
+func TestFaultOfDeletedAgentEnds(t *testing.T) {
+	h := newHarness(t)
+	base := h.clock
+	h.seedAgent("agent_a", ptr(base), ptr(base), false, "error")
+	h.takeAgentOffline("agent_a")
+
+	mustExec(t, h.db, `DELETE FROM agents WHERE id='agent_a'`)
+	h.advance(5 * time.Second)
+	h.tick()
+
+	if h.firing("agent_a") {
+		t.Fatal("fault of a deleted agent is still firing")
+	}
+	if got := h.faults.lastResolve("agent_a"); got != fault.ReasonAgentDeleted {
+		t.Fatalf("resolve reason = %q, want %q", got, fault.ReasonAgentDeleted)
+	}
+	if n := h.openCount("agent_a"); n != 1 {
+		t.Fatalf("expected no reopen after the deletion, opens = %d", n)
+	}
+}

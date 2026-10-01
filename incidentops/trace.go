@@ -284,6 +284,9 @@ func nullTimeOf(t time.Time) any {
 // trace to nothing while three monitors sharing one dead host each waited for a
 // trace of their own.
 func attachTrace(ctx context.Context, tx store.Executor, agentID string, res telemetry.TraceResult, now time.Time) ([]string, error) {
+	if res.TriggerReason == telemetry.TraceTriggerServerDisconnect {
+		return attachDisconnectTrace(ctx, tx, agentID, res, now)
+	}
 	if res.DestKey == "" {
 		return nil, nil
 	}
@@ -347,15 +350,41 @@ func attachTrace(ctx context.Context, tx store.Executor, agentID string, res tel
 	if len(matched) == 0 {
 		return nil, nil
 	}
+	owners := make([]sceneRef, len(matched))
+	for i, r := range matched {
+		owners[i] = sceneRef{signalID: r.signalID, incidentID: r.incidentID}
+	}
+	return insertTraceRefs(ctx, tx, res.ReportID, owners, now)
+}
 
+// attachDisconnectTrace files a report the Agent ran because its session to
+// this server was lost. Such a report walks toward the server's own address and
+// diagnoses the Agent-connectivity fault, so it is matched by the agent and the
+// edge's timing — never by destination, which would hand it to any monitor that
+// happens to watch the server's host. The owner rule is the disconnect scene's
+// (ownerOfDisconnect), including its admission of recently resolved outages: the
+// report can only arrive once the Agent has reconnected, by which time its
+// outage has usually closed. An edge that no outage owns (the session dropped
+// for less than the detector's grace) leaves the report unattached.
+func attachDisconnectTrace(ctx context.Context, tx store.Executor, agentID string, res telemetry.TraceResult, now time.Time) ([]string, error) {
+	r, ok, err := ownerOfDisconnect(ctx, tx, agentID, res.FirstFailedAt, now)
+	if err != nil || !ok {
+		return nil, err
+	}
+	return insertTraceRefs(ctx, tx, res.ReportID, []sceneRef{r}, now)
+}
+
+// insertTraceRefs references one report from each owning signal and appends a
+// timeline entry to each distinct incident, returning those incidents.
+func insertTraceRefs(ctx context.Context, tx store.Executor, reportID string, owners []sceneRef, now time.Time) ([]string, error) {
 	seen := map[string]bool{}
 	var incidents []string
-	for _, r := range matched {
+	for _, r := range owners {
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO trace_report_refs(report_id, incident_id, signal_id, active, created_at)
 			VALUES(?,?,?,1,?)
 			ON CONFLICT(report_id, incident_id, signal_id) DO UPDATE SET active=1`,
-			res.ReportID, r.incidentID, r.signalID, now); err != nil {
+			reportID, r.incidentID, r.signalID, now); err != nil {
 			return nil, err
 		}
 		if seen[r.incidentID] {
@@ -365,7 +394,7 @@ func attachTrace(ctx context.Context, tx store.Executor, agentID string, res tel
 		incidents = append(incidents, r.incidentID)
 		if _, err := tx.ExecContext(ctx,
 			`INSERT INTO incident_timeline(id, incident_id, ts, kind, message, ref) VALUES(?,?,?,?,?,?)`,
-			"tl_"+uuid.NewString(), r.incidentID, now, "diag.completed", "", res.ReportID); err != nil {
+			"tl_"+uuid.NewString(), r.incidentID, now, "diag.completed", "", reportID); err != nil {
 			return nil, err
 		}
 	}
@@ -488,7 +517,9 @@ func (s *Service) claimTraces(ctx context.Context, ev fault.SignalEvent, destKey
 		SELECT id FROM trace_reports
 		WHERE agent_id=? AND dest_key=? AND received_at >= ?
 		  AND (first_failed_at IS NULL OR first_failed_at >= ?)
-		ORDER BY received_at`, ev.AgentID, destKey, cutoff, observedAt.Add(-attachSlack).UTC())
+		  AND trigger_reason <> ?
+		ORDER BY received_at`, ev.AgentID, destKey, cutoff, observedAt.Add(-attachSlack).UTC(),
+		telemetry.TraceTriggerServerDisconnect)
 	if err != nil {
 		return err
 	}
