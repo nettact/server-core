@@ -132,10 +132,10 @@ func TestReopeningAnExistingDatabaseChangesNothing(t *testing.T) {
 	if err := db2.QueryRow(`SELECT COUNT(*) FROM schema_migrations`).Scan(&versions); err != nil {
 		t.Fatalf("count migrations: %v", err)
 	}
-	// One squashed baseline plus the schema-8 epoch/receipt migration — each
-	// recorded exactly once, never re-applied.
-	if versions != 2 {
-		t.Errorf("schema_migrations has %d rows, want 2 (0001 baseline + 0002 schema 8)", versions)
+	// One squashed baseline, the schema-8 epoch/receipt migration and the
+	// baseline-drift repair — each recorded exactly once, never re-applied.
+	if versions != 3 {
+		t.Errorf("schema_migrations has %d rows, want 3 (0001 baseline + 0002 schema 8 + 0003 repair)", versions)
 	}
 }
 
