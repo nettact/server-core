@@ -120,6 +120,10 @@ type Deps struct {
 	// self-hosted server has no embedded agent to configure and leaves it nil,
 	// which makes the /local-agent routes answer 404 — see localagent.go.
 	LocalAgent LocalAgentAPI
+
+	// ASNTable is the host's IP→ASN table used to attribute route-monitor hops
+	// (nil when the host has none to report). See asntable.go.
+	ASNTable ASNTableAPI
 }
 
 // ListenStatus describes the server's actual listen binding for server-info.
@@ -338,6 +342,10 @@ func Router(d Deps) http.Handler {
 			// Global server settings (e.g. console_base_url for notification links).
 			r.Get("/settings", d.handleGetSettings)
 			r.Put("/settings", d.handleUpdateSettings)
+			// The host's IP→ASN table: status and an on-demand refresh. Absent
+			// (404) when the host supplies none; server-info's asn_table bit says so.
+			r.Get("/asn-table", d.handleGetASNTable)
+			r.Post("/asn-table/check", d.handleCheckASNTable)
 			// Desktop only: the external servers this machine's embedded agent
 			// connects to besides this one. Absent (404) on a self-hosted server;
 			// server-info's local_agent bit is how the console knows.
@@ -530,6 +538,9 @@ func (d Deps) handleServerInfo(w http.ResponseWriter, r *http.Request) {
 	}
 	if d.LocalAgent != nil {
 		out["local_agent"] = true
+	}
+	if d.ASNTable != nil {
+		out["asn_table"] = true
 	}
 	writeJSON(w, http.StatusOK, out)
 }
