@@ -159,6 +159,9 @@ type SaveWarningAgent struct {
 	AgentName          string   `json:"agent_name"`
 	Status             string   `json:"status"` // active | permission_blocked | unsupported
 	MissingPermissions []string `json:"missing_permissions"`
+	// Reason is a stable code for a block no permission explains — today only
+	// config.ReasonAgentUpgradeRequired (the agent's build cannot run the kind).
+	Reason string `json:"reason,omitempty"`
 }
 
 // ---- ingestion: agent-reported probe monitor status ----
@@ -197,6 +200,17 @@ func (s *Service) ApplyMonitorStatus(ctx context.Context, agentID, siteID string
 		valid, err := s.probeMonitorSerials(ctx, tx, siteID, agentID)
 		if err != nil {
 			return nil, err
+		}
+		// Monitors withheld from this agent for want of a capability are the
+		// server's to describe (upsertUpgradeRequired), not the agent's: it was
+		// never sent them, so an entry naming one is ignored, and the frame's
+		// silence about them must not delete the server's verdict either.
+		withheld, err := withheldMonitors(ctx, tx, agentID, valid)
+		if err != nil {
+			return nil, err
+		}
+		for id := range withheld {
+			delete(valid, id)
 		}
 
 		now := time.Now().UTC()
@@ -254,6 +268,9 @@ func (s *Service) ApplyMonitorStatus(ctx context.Context, agentID, siteID string
 
 		// Delete this agent's PROBE monitor_status rows absent from the frame; host
 		// rows are owned by ReevaluateHostMonitors and never touched here.
+		for id := range withheld {
+			current = append(current, id)
+		}
 		deleted, err := deleteAbsentProbeStatus(ctx, tx, agentID, current)
 		if err != nil {
 			return nil, err
@@ -652,6 +669,25 @@ func (s *Service) PredictProbeMonitors(ctx context.Context, siteID string) ([]Sa
 			missingUnion := permission.Set{}
 			var blockedAgents, capableAgents []SaveWarningAgent
 			for _, a := range agents {
+				if !config.KindSupportedBy(t.pt.Kind, a.caps) {
+					// Withheld from this agent's DesiredState (see
+					// config.RequiredCapability), so the verdict is the server's
+					// own and final until the agent upgrades.
+					affected++
+					worst = wire.MonitorStatusUnsupported
+					blockedAgents = append(blockedAgents, SaveWarningAgent{
+						AgentID: a.id, AgentName: a.name, Status: wire.MonitorStatusUnsupported,
+						MissingPermissions: []string{}, Reason: config.ReasonAgentUpgradeRequired,
+					})
+					wrote, err := upsertUpgradeRequired(ctx, tx, a.id, t.id, a.policyHash, siteSerial, t.configSerial, now)
+					if err != nil {
+						return nil, err
+					}
+					if wrote {
+						statusChanged = append(statusChanged, t.id)
+					}
+					continue
+				}
 				status, reasonList := classifyMonitor(required, a.effective, a.granted, a.supported)
 				if status == wire.MonitorStatusActive {
 					capable++
@@ -711,6 +747,7 @@ type scopedAgent struct {
 	granted    permission.Set
 	supported  permission.Set
 	policyHash string
+	caps       []string
 }
 
 // scopedAgents returns the non-revoked agents in a monitor's scope, with their
@@ -718,7 +755,8 @@ type scopedAgent struct {
 func scopedAgents(ctx context.Context, tx store.Executor, siteID, monitorID string) ([]scopedAgent, error) {
 	rows, err := tx.QueryContext(ctx, `
 		SELECT a.id, COALESCE(NULLIF(a.display_name,''), NULLIF(a.hostname,''), a.id),
-		       COALESCE(a.perm_effective,'[]'), COALESCE(a.perm_granted,'[]'), COALESCE(a.perm_supported,'[]'), COALESCE(a.policy_hash,'')
+		       COALESCE(a.perm_effective,'[]'), COALESCE(a.perm_granted,'[]'), COALESCE(a.perm_supported,'[]'), COALESCE(a.policy_hash,''),
+		       COALESCE(a.capabilities,'[]')
 		FROM agents a, probe_tasks pt
 		WHERE pt.id=? AND a.site_id=? AND a.revoked=0 AND EXISTS(
 		    SELECT 1 FROM monitor_groups mg
@@ -733,10 +771,11 @@ func scopedAgents(ctx context.Context, tx store.Executor, siteID, monitorID stri
 	var out []scopedAgent
 	for rows.Next() {
 		var a scopedAgent
-		var eff, grant, sup string
-		if err := rows.Scan(&a.id, &a.name, &eff, &grant, &sup, &a.policyHash); err != nil {
+		var eff, grant, sup, caps string
+		if err := rows.Scan(&a.id, &a.name, &eff, &grant, &sup, &a.policyHash, &caps); err != nil {
 			return nil, err
 		}
+		a.caps = config.DecodeCapabilities(caps)
 		a.effective = permission.FromStrings(decodeStrings(eff))
 		a.granted = permission.FromStrings(decodeStrings(grant))
 		a.supported = permission.FromStrings(decodeStrings(sup))
@@ -779,13 +818,14 @@ func classifyMonitor(required, effective, granted, supported permission.Set) (st
 // it on every hello never resets a confirmed pair. Silent no-op when the agent is
 // gone.
 func (s *Service) PredictProbeMonitorsForAgent(ctx context.Context, agentID string) error {
-	var siteID, effStr, supStr, grantStr, policyHash string
+	var siteID, effStr, supStr, grantStr, policyHash, capStr string
 	var siteSerial int
 	err := s.db.QueryRowContext(ctx, `
 		SELECT a.site_id, COALESCE(st.config_serial,0), COALESCE(a.perm_effective,'[]'),
-		       COALESCE(a.perm_supported,'[]'), COALESCE(a.perm_granted,'[]'), COALESCE(a.policy_hash,'')
+		       COALESCE(a.perm_supported,'[]'), COALESCE(a.perm_granted,'[]'), COALESCE(a.policy_hash,''),
+		       COALESCE(a.capabilities,'[]')
 		FROM agents a JOIN sites st ON st.id = a.site_id WHERE a.id=?`, agentID).
-		Scan(&siteID, &siteSerial, &effStr, &supStr, &grantStr, &policyHash)
+		Scan(&siteID, &siteSerial, &effStr, &supStr, &grantStr, &policyHash, &capStr)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return nil
@@ -795,6 +835,7 @@ func (s *Service) PredictProbeMonitorsForAgent(ctx context.Context, agentID stri
 	effective := permission.FromStrings(decodeStrings(effStr))
 	supported := permission.FromStrings(decodeStrings(supStr))
 	granted := permission.FromStrings(decodeStrings(grantStr))
+	caps := config.DecodeCapabilities(capStr)
 
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT pt.id, pt.kind, COALESCE(pt.name,''), COALESCE(pt.target,''), COALESCE(pt.params,''), pt.config_serial
@@ -835,6 +876,16 @@ func (s *Service) PredictProbeMonitorsForAgent(ctx context.Context, agentID stri
 		now := time.Now().UTC()
 		var statusChanged []string
 		for _, t := range targets {
+			if !config.KindSupportedBy(t.pt.Kind, caps) {
+				wrote, err := upsertUpgradeRequired(ctx, tx, agentID, t.id, policyHash, siteSerial, t.configSerial, now)
+				if err != nil {
+					return nil, err
+				}
+				if wrote {
+					statusChanged = append(statusChanged, t.id)
+				}
+				continue
+			}
 			required := permission.Closure(permission.NewSet(permission.RequiredForTarget(t.pt)...))
 			status, reasonList := classifyMonitor(required, effective, granted, supported)
 			wrote, err := upsertPredictedStatus(ctx, tx, agentID, t.id, status,
@@ -1165,6 +1216,45 @@ func upsertPredictedStatus(ctx context.Context, tx store.Executor, agentID, moni
 	return n > 0, nil
 }
 
+// upsertUpgradeRequired records that an agent's build cannot run a
+// capability-gated monitor: status unsupported, reason
+// config.ReasonAgentUpgradeRequired, source predicted.
+//
+// Unlike upsertPredictedStatus it overwrites a same-generation REPORTED row.
+// The ordinary prediction defers to a report because the agent knows its own
+// policy better than the server; here the server knows better — it is the one
+// withholding the monitor (config.DesiredStateFor), so an earlier report (from
+// a newer build the agent has since been downgraded from) describes a monitor
+// the agent no longer has, and no new report will ever come to replace it.
+// Writes only when something changed, so the per-Hello re-run is free.
+func upsertUpgradeRequired(ctx context.Context, tx store.Executor, agentID, monitorID, policyHash string,
+	configVersion, targetConfigSerial int, now time.Time) (bool, error) {
+	res, err := tx.ExecContext(ctx, `
+		INSERT INTO monitor_status(agent_id, monitor_id, status, missing_permissions, matched_selector,
+		    reason, policy_hash, config_version, target_config_serial, source, assigned_at,
+		    effective_interval_seconds, cycle_deadline_ms, upload_interval_seconds, updated_at)
+		VALUES(?,?,?,'[]','',?,?,?,?,'predicted',?,NULL,NULL,NULL,?)
+		ON CONFLICT(agent_id, monitor_id) DO UPDATE SET
+		  status=excluded.status, missing_permissions='[]', matched_selector='',
+		  reason=excluded.reason, policy_hash=excluded.policy_hash,
+		  config_version=excluded.config_version,
+		  target_config_serial=excluded.target_config_serial, source='predicted',
+		  assigned_at=CASE WHEN excluded.target_config_serial > monitor_status.target_config_serial
+		                   THEN excluded.assigned_at ELSE monitor_status.assigned_at END,
+		  effective_interval_seconds=NULL, cycle_deadline_ms=NULL, upload_interval_seconds=NULL,
+		  updated_at=excluded.updated_at
+		WHERE monitor_status.status<>excluded.status OR monitor_status.reason<>excluded.reason
+		   OR monitor_status.source<>'predicted'
+		   OR monitor_status.target_config_serial<>excluded.target_config_serial`,
+		agentID, monitorID, wire.MonitorStatusUnsupported, config.ReasonAgentUpgradeRequired,
+		policyHash, configVersion, targetConfigSerial, now, now)
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
+}
+
 // nullPosInt maps a non-positive int (unset) to SQL NULL and a positive value to
 // a valid integer — used for the agent's reported effective schedule fields.
 func nullPosInt(v int) sql.NullInt64 {
@@ -1214,6 +1304,34 @@ func deleteAbsentProbeStatus(ctx context.Context, tx store.Executor, agentID str
 		return nil, err
 	}
 	return deleted, nil
+}
+
+// withheldMonitors returns which of the given in-scope monitor ids the agent
+// is not sent because its declared capabilities lack what their kind needs.
+func withheldMonitors(ctx context.Context, tx store.Executor, agentID string, inScope map[string]int) (map[string]bool, error) {
+	out := map[string]bool{}
+	if len(inScope) == 0 {
+		return out, nil
+	}
+	caps, err := config.AgentCapabilities(ctx, tx, agentID)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT id, kind FROM probe_tasks WHERE kind=?`, config.KindTrace)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id, kind string
+		if err := rows.Scan(&id, &kind); err != nil {
+			return nil, err
+		}
+		if _, ok := inScope[id]; ok && !config.KindSupportedBy(kind, caps) {
+			out[id] = true
+		}
+	}
+	return out, rows.Err()
 }
 
 func (s *Service) probeMonitorSerials(ctx context.Context, tx store.Executor, siteID, agentID string) (map[string]int, error) {

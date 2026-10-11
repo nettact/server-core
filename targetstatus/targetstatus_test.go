@@ -232,3 +232,30 @@ func TestFluctuationTotalTracksTheAvailabilityPopulation(t *testing.T) {
 			got.Fluctuations)
 	}
 }
+
+// A route monitor withheld from an agent whose build lacks the capability is
+// decided by the server alone, so its predicted verdict reads as confirmed —
+// unsupported with the upgrade reason — rather than "awaiting status" forever.
+// A route monitor has no availability verdict, so its probe dimension is
+// not applicable.
+func TestServerDecidedUpgradeVerdictCountsAsConfirmed(t *testing.T) {
+	now := time.Unix(100_000, 0).UTC()
+	target := &targetRow{id: "target", kind: "trace", enabled: true, configSerial: 2}
+	pair := applicablePair{agentID: "agent", online: true}
+	svc := &Service{}
+	ms := &msRow{status: wire.MonitorStatusUnsupported, source: "predicted", targetConfigSerial: 2,
+		reason: "agent_upgrade_required"}
+	as, _ := svc.deriveAgent(target, pair, now, map[string]*msRow{"target\x00agent": ms}, nil, nil, nil)
+	if as.ExecutionState != execUnsupported || as.BlockReason != "agent_upgrade_required" {
+		t.Errorf("execution = %s / %q, want unsupported / agent_upgrade_required", as.ExecutionState, as.BlockReason)
+	}
+	if as.ProbeState != probeNotApplicable {
+		t.Errorf("probe state = %s, want not applicable for a route monitor", as.ProbeState)
+	}
+	// An ordinary predicted verdict is still only a prediction.
+	ms2 := &msRow{status: wire.MonitorStatusUnsupported, source: "predicted", targetConfigSerial: 2}
+	as2, _ := svc.deriveAgent(target, pair, now, map[string]*msRow{"target\x00agent": ms2}, nil, nil, nil)
+	if as2.ExecutionState != execPending {
+		t.Errorf("plain prediction = %s, want pending", as2.ExecutionState)
+	}
+}

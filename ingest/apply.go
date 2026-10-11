@@ -595,11 +595,21 @@ func (s *Service) ApplyPacketTx(ctx context.Context, scope store.Scope, wtx stor
 		// same transaction, after the fault evaluation, so a report and the rounds
 		// that explain it commit together and a report can attach to a fault the
 		// very batch it arrived in has just confirmed.
-		if s.tracer != nil && len(pkt.TraceResults) > 0 {
-			if tr, terr := s.tracer.IngestTracesTx(ctx, wtx, p.AgentID, p.SiteID, pkt.TraceResults); terr != nil {
+		diagTraces, routeTraces := splitTraces(pkt.TraceResults)
+		if s.tracer != nil && len(diagTraces) > 0 {
+			if tr, terr := s.tracer.IngestTracesTx(ctx, wtx, p.AgentID, p.SiteID, diagTraces); terr != nil {
 				return res, plan, terr
 			} else {
 				plan.Traces = tr
+			}
+		}
+		// Scheduled sweeps of route monitors are history, not evidence: they never
+		// enter the trace-report store or the claim flow, and go to route history
+		// in this same transaction (so a replay of the packet is a no-op there
+		// too — the receipt gate above already refused it).
+		if len(routeTraces) > 0 {
+			if err := s.applyRouteTraces(ctx, scope, wtx, p, routeTraces, in.now); err != nil {
+				return res, plan, err
 			}
 		}
 		// Incident scenes the agent collected on its own fault edges, on the same

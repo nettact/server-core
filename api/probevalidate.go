@@ -2,15 +2,18 @@ package api
 
 import (
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/netip"
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	pcfg "github.com/nettact/protocol/config"
+	"github.com/nettact/server-core/config"
 )
 
 // Address validation for monitoring targets.
@@ -27,6 +30,7 @@ import (
 //   - icmp, tcp           → a host to dial                   (bare host, port is separate)
 //   - nat, stun_server2   → a STUN endpoint                  (bare host, optional :port)
 //   - dns resolver_server → a resolver endpoint              (bare host, or a URL for DoH)
+//   - trace               → a host to trace towards          (bare host or IPv4, no port)
 //   - gateway, host       → server-side anchors, not addresses (exempt)
 
 // hostRule tunes what a bare-host field accepts beyond the common syntax.
@@ -386,6 +390,57 @@ func validateHostname(field, host string) error {
 				return errors.New(field + " contains an invalid character " + strconv.Quote(string(c)) + ": " + strconv.Quote(host))
 			}
 		}
+	}
+	return nil
+}
+
+// Route-monitor bounds. The sweep's TTL ceiling and per-TTL attempts are what
+// one run costs the agent's shared traceroute budget, so they are capped well
+// below anything a diagnosis would need; the interval floor is the agent's own
+// (pcfg.MinTraceInterval) so the console never saves a cadence the agent would
+// silently stretch.
+const (
+	maxTraceHops     = 64
+	maxTraceAttempts = 5
+)
+
+// validateTraceTarget checks a route monitor ("trace"). Its target is a host to
+// trace towards: a hostname or an IPv4 literal — the traceroute engine is
+// IPv4-only, so an IPv6 literal could only ever fail. It never runs through a
+// proxy: a hop list measured from behind a relay describes the relay's path,
+// not this vantage point's, and the agent refuses such a target anyway.
+func validateTraceTarget(t *config.ProbeTarget) error {
+	if err := validateBareHost("trace monitor target", t.Target, hostRule{}); err != nil {
+		return err
+	}
+	if addr, err := netip.ParseAddr(strings.Trim(t.Target, "[]")); err == nil && !addr.Unmap().Is4() {
+		return errors.New("trace monitor target must be a hostname or an IPv4 address")
+	}
+	if t.ProxyID != "" {
+		return errors.New("trace monitors cannot run through a proxy")
+	}
+	p := &t.Params
+	minSecs := int(pcfg.MinTraceInterval / time.Second)
+	if p.IntervalSeconds != 0 && p.IntervalSeconds < minSecs {
+		return fmt.Errorf("trace monitor interval_seconds must be 0 (default) or at least %d", minSecs)
+	}
+	p.TraceMode = strings.ToLower(strings.TrimSpace(p.TraceMode))
+	switch p.TraceMode {
+	case "", pcfg.TraceModeICMP, pcfg.TraceModeTCP:
+	default:
+		return errors.New("invalid trace_mode: " + p.TraceMode)
+	}
+	if p.MaxHops < 0 || p.MaxHops > maxTraceHops {
+		return fmt.Errorf("max_hops out of range (0 = default, 1-%d)", maxTraceHops)
+	}
+	if p.AttemptsPerHop < 0 || p.AttemptsPerHop > maxTraceAttempts {
+		return fmt.Errorf("attempts_per_hop out of range (0 = default, 1-%d)", maxTraceAttempts)
+	}
+	if p.Port < 0 || p.Port > 65535 {
+		return errors.New("trace monitor port out of range (0 = default, 1-65535)")
+	}
+	if p.GlobalTimeoutMs < 0 || p.GlobalTimeoutMs > maxTimeoutMs {
+		return errors.New("global_timeout_ms out of range (0-" + strconv.Itoa(maxTimeoutMs) + ")")
 	}
 	return nil
 }

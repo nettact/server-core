@@ -134,7 +134,7 @@ type MonitorGroup struct {
 type ProbeTarget struct {
 	ID      string           `json:"id"`
 	GroupID string           `json:"group_id"` // owning monitor group (required)
-	Kind    string           `json:"kind"`     // "icmp" | "dns" | "http" | "tcp" | "nat" | "gateway" | "host"
+	Kind    string           `json:"kind"`     // "icmp" | "dns" | "http" | "tcp" | "nat" | "gateway" | "trace" | "host"
 	Name    string           `json:"name,omitempty"`
 	Target  string           `json:"target"`
 	Params  pcfg.ProbeParams `json:"params"`
@@ -954,8 +954,18 @@ func validateTargetProxies(ctx context.Context, q scopeQueryer, siteID string, t
 // agent when its monitor group broadcasts to the whole site or this agent belongs
 // to one of the group's referenced agent groups. "host" targets are server-side
 // alerting anchors and are never pushed down; disabled targets are skipped.
+//
+// A target whose kind needs a Hello capability the agent did not declare (see
+// RequiredCapability) is withheld too: a build that predates the kind would
+// report it running and never run it. Withholding it here is what lets the
+// status prediction mark such pairs agent_upgrade_required with no agent report
+// ever arriving to overwrite the verdict.
 func (s *Service) DesiredStateFor(ctx context.Context, agentID string) (pcfg.DesiredState, error) {
 	st, err := s.reg.ConfigStatus(ctx, agentID)
+	if err != nil {
+		return pcfg.DesiredState{}, err
+	}
+	caps, err := AgentCapabilities(ctx, s.db, agentID)
 	if err != nil {
 		return pcfg.DesiredState{}, err
 	}
@@ -980,6 +990,9 @@ func (s *Service) DesiredStateFor(ctx context.Context, agentID string) (pcfg.Des
 		var params string
 		if err := rows.Scan(&t.MonitorID, &t.Kind, &t.Name, &t.Target, &params, &t.ConfigSerial, &t.ProxyID); err != nil {
 			return pcfg.DesiredState{}, err
+		}
+		if !KindSupportedBy(t.Kind, caps) {
+			continue
 		}
 		if params != "" {
 			_ = json.Unmarshal([]byte(params), &t.Params)

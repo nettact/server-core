@@ -8,6 +8,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"sort"
 	"sync"
 	"time"
 
@@ -283,6 +284,48 @@ func (s *Service) UpdatePermissions(ctx context.Context, id string, report permi
 		sup, gr, eff, reasons, report.Source, report.PolicyHash,
 		id, sup, gr, eff, reasons, report.Source, report.PolicyHash)
 	return err
+}
+
+// UpdateCapabilities persists the protocol capability names the agent declared
+// in its Hello, so decisions taken without a live session — the DesiredState
+// built for an agent, the status predicted for an offline one — can tell
+// whether it understands a capability-gated probe kind. Names are stored as a
+// sorted, de-duplicated JSON array: the Hello's order carries no meaning, and a
+// canonical encoding keeps the conditional UPDATE a true no-op on an ordinary
+// reconnect. The input is agent-controlled, so it is bounded (count and name
+// length) rather than trusted; an over-long name cannot be a capability this
+// server knows, and dropping it loses nothing.
+//
+// It must run before the Hello's prediction and its first DesiredState push,
+// which read it back.
+func (s *Service) UpdateCapabilities(ctx context.Context, id string, caps []string) error {
+	enc := marshalStrings(normalizeCapabilities(caps))
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE agents SET capabilities=? WHERE id=? AND capabilities<>?`, enc, id, enc)
+	return err
+}
+
+// Bounds on a declared capability list (see UpdateCapabilities).
+const (
+	maxCapabilities   = 64
+	maxCapabilityName = 64
+)
+
+func normalizeCapabilities(caps []string) []string {
+	seen := make(map[string]bool, len(caps))
+	out := make([]string, 0, len(caps))
+	for _, c := range caps {
+		if c == "" || len(c) > maxCapabilityName || seen[c] {
+			continue
+		}
+		seen[c] = true
+		out = append(out, c)
+	}
+	sort.Strings(out)
+	if len(out) > maxCapabilities {
+		out = out[:maxCapabilities]
+	}
+	return out
 }
 
 // marshalStrings encodes a string slice as a JSON array, normalizing nil to "[]"

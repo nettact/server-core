@@ -3,6 +3,7 @@ package api
 import (
 	"testing"
 
+	pcfg "github.com/nettact/protocol/config"
 	"github.com/nettact/server-core/config"
 )
 
@@ -87,5 +88,50 @@ func TestValidateTargetLeavesNonHTTPKindsAlone(t *testing.T) {
 		if tgt.Target != "www.yahoo.co.jp" {
 			t.Fatalf("kind=%s target rewritten to %q", kind, tgt.Target)
 		}
+	}
+}
+
+// A route monitor traces towards a host (hostname or IPv4 — the engine is
+// IPv4-only), never through a proxy, at a cadence no faster than the agent's
+// own floor, with bounded sweep shape.
+func TestValidateTargetTrace(t *testing.T) {
+	type p = pcfg.ProbeParams
+	cases := []struct {
+		name    string
+		target  string
+		proxy   string
+		params  p
+		wantErr bool
+	}{
+		{name: "hostname with defaults", target: "example.com"},
+		{name: "ipv4 literal", target: "1.1.1.1"},
+		{name: "full custom shape", target: "example.com", params: p{IntervalSeconds: 1800, TraceMode: "tcp", Port: 8443, MaxHops: 64, AttemptsPerHop: 5}},
+		{name: "mode is case-normalized", target: "example.com", params: p{TraceMode: " ICMP "}},
+		{name: "five-minute floor", target: "example.com", params: p{IntervalSeconds: 300}},
+		{name: "ipv6 literal rejected", target: "2001:db8::1", wantErr: true},
+		{name: "bracketed ipv6 rejected", target: "[2001:db8::1]", wantErr: true},
+		{name: "url rejected", target: "https://example.com", wantErr: true},
+		{name: "host:port rejected", target: "example.com:443", wantErr: true},
+		{name: "empty target", target: "", wantErr: true},
+		{name: "proxy rejected", target: "example.com", proxy: "px1", wantErr: true},
+		{name: "interval below floor", target: "example.com", params: p{IntervalSeconds: 299}, wantErr: true},
+		{name: "interval above a day", target: "example.com", params: p{IntervalSeconds: 86401}, wantErr: true},
+		{name: "unknown mode", target: "example.com", params: p{TraceMode: "udp"}, wantErr: true},
+		{name: "too many hops", target: "example.com", params: p{MaxHops: 65}, wantErr: true},
+		{name: "negative hops", target: "example.com", params: p{MaxHops: -1}, wantErr: true},
+		{name: "too many attempts", target: "example.com", params: p{AttemptsPerHop: 6}, wantErr: true},
+		{name: "port out of range", target: "example.com", params: p{Port: 70000}, wantErr: true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			tgt := config.ProbeTarget{Kind: "trace", Target: c.target, ProxyID: c.proxy, Params: c.params}
+			err := validateTarget(&tgt)
+			if (err != nil) != c.wantErr {
+				t.Fatalf("err = %v, wantErr %v", err, c.wantErr)
+			}
+			if err == nil && c.params.TraceMode != "" && tgt.Params.TraceMode != "icmp" && tgt.Params.TraceMode != "tcp" {
+				t.Errorf("trace_mode stored as %q", tgt.Params.TraceMode)
+			}
+		})
 	}
 }

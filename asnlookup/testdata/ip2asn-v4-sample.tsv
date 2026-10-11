@@ -1,0 +1,11 @@
+1.0.0.0	1.0.0.255	13335	US	CLOUDFLARENET
+1.0.1.0	1.0.3.255	0	None	Not routed
+1.0.4.0	1.0.7.255	38803	AU	WPL-AS-AP Wirefreebroadband Pty Ltd
+8.8.8.0	8.8.8.255	15169	US	GOOGLE
+10.0.0.0	10.255.255.255	64512	ZZ	Should never answer (private)
+100.64.0.0	100.127.255.255	64513	US	Should never answer (CGNAT)
+202.97.0.0	202.97.127.255	4134	CN	CHINANET-BACKBONE No.31,Jin-rong Street
+202.97.16.0	202.97.16.255	4809	CN	CHINANET-CN2 nested more-specific
+not-an-ip	1.2.3.4	1	US	broken line
+2001:db8::	2001:db8::ffff	64500	US	IPv6 skipped
+59.43.0.0	59.43.255.255	AS4809	cn	CHINATELECOM CN2

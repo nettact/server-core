@@ -51,6 +51,7 @@ import (
 	"github.com/nettact/server-core/notifypolicy"
 	"github.com/nettact/server-core/opissue"
 	"github.com/nettact/server-core/registry"
+	"github.com/nettact/server-core/routehist"
 	"github.com/nettact/server-core/settings"
 	"github.com/nettact/server-core/site"
 	"github.com/nettact/server-core/sse"
@@ -84,6 +85,7 @@ type Deps struct {
 	GameData          *gamedata.Service         // game presentation runs + per-second buckets (not metrics)
 	HostLive          *hostlive.Store           // in-memory live process/connection snapshots (never persisted)
 	OpIssue           *opissue.Service          // operational-issue engine (monitor status + issues)
+	Routes            *routehist.Service        // route-monitor history reads (epochs, changes, run detail)
 	TargetStatus      *targetstatus.Service     // authoritative current target-status aggregation (read-time)
 	AgentStatus       *agentstatus.Service      // per-agent health/resource rollup for the Agent status list (read-time)
 	StatusPage        *statuspage.Service       // public status pages: admin CRUD + the anonymous sanitized reads
@@ -311,6 +313,14 @@ func Router(d Deps) http.Handler {
 			r.Get("/targets/{id}/host-detection", d.handleGetHostDetection)
 			r.Patch("/targets/{id}/host-detection", d.handleUpdateHostDetection)
 			r.Get("/targets/{id}/baseline", d.handleGetTargetBaseline)
+			// Route monitors: the current route per agent, its history of AS-path
+			// eras, the confirmed route changes, and one change in full — plus a
+			// site-wide batch of compact per-agent summaries for the status page.
+			r.Get("/sites/{id}/route-summaries", d.handleRouteSummaries)
+			r.Get("/targets/{id}/route", d.handleTargetRoute)
+			r.Get("/targets/{id}/route/epochs", d.handleRouteEpochs)
+			r.Get("/targets/{id}/route/changes", d.handleRouteChanges)
+			r.Get("/route-changes/{id}", d.handleRouteChange)
 			// Notification policies decide whether/when/where a recorded fault is
 			// announced. Exactly one applies per incident: group > site for a probe
 			// fault, agent > site for an Agent-offline one.
@@ -1361,7 +1371,7 @@ func (d Deps) handleDeleteAgentGroup(w http.ResponseWriter, r *http.Request) {
 }
 
 // validKinds is the whitelist of monitoring-target kinds the server accepts.
-var validKinds = map[string]bool{"icmp": true, "dns": true, "http": true, "tcp": true, "nat": true, "gateway": true, "host": true}
+var validKinds = map[string]bool{"icmp": true, "dns": true, "http": true, "tcp": true, "nat": true, "gateway": true, "trace": true, "host": true}
 
 // leadingSchemeRE matches a URL that OPENS with a scheme (RFC 3986 §3.1). It is
 // deliberately anchored: a "://" anywhere else belongs to the path or query
@@ -1488,6 +1498,11 @@ func validateTarget(t *config.ProbeTarget) error {
 	if t.Kind == "tcp" {
 		if t.Params.Port < 1 || t.Params.Port > 65535 {
 			return errors.New("tcp monitor requires a port in 1-65535")
+		}
+	}
+	if t.Kind == config.KindTrace {
+		if err := validateTraceTarget(t); err != nil {
+			return err
 		}
 	}
 	if t.Kind == "nat" {

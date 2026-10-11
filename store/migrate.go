@@ -60,6 +60,14 @@ var ErrPreBaselineDatabase = errors.New("store: database predates the release ba
 // thing that runs before the steps, and it changes nothing on a database it
 // refuses.
 func (db *DB) migrate() error {
+	return db.migrateTo(int(^uint(0) >> 1))
+}
+
+// migrateTo is migrate stopped after the step numbered limit. Production
+// always runs the whole chain; tests use the limit to reproduce the exact
+// shape an intermediate step runs against (the baseline repair, for one, only
+// ever sees the database as it stands before the later steps).
+func (db *DB) migrateTo(limit int) error {
 	ctx := context.Background()
 	migs, err := loadMigrations()
 	if err != nil {
@@ -77,6 +85,9 @@ func (db *DB) migrate() error {
 	}
 
 	for _, m := range migs {
+		if m.version > limit {
+			break
+		}
 		var applied int
 		if err := db.QueryRow(`SELECT COUNT(*) FROM schema_migrations WHERE version=?`, m.version).Scan(&applied); err != nil {
 			return err

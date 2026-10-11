@@ -445,7 +445,7 @@ func assertLedger(t *testing.T, db *sql.DB) {
 		rows.Scan(&v, &n)
 		got = append(got, fmt.Sprintf("%d=%s", v, n))
 	}
-	want := "1=0001_init.sql 2=0002_schema8_epoch.sql 3=" + repairBaselineName
+	want := "1=0001_init.sql 2=0002_schema8_epoch.sql 3=" + repairBaselineName + " 4=0004_route_monitor.sql"
 	if strings.Join(got, " ") != want {
 		t.Errorf("ledger = %v, want %s", got, want)
 	}
@@ -455,7 +455,7 @@ func assertLedger(t *testing.T, db *sql.DB) {
 // install's objects must be a known leftover table or an index on one.
 func assertLeftoversOnly(t *testing.T, db *sql.DB) {
 	t.Helper()
-	ref, err := referenceSchema(context.Background())
+	ref, err := fullChainSchema(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -483,7 +483,7 @@ func assertLeftoversOnly(t *testing.T, db *sql.DB) {
 func schemaFingerprint(t *testing.T, db *sql.DB) string {
 	t.Helper()
 	ctx := context.Background()
-	ref, err := referenceSchema(ctx)
+	ref, err := fullChainSchema(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -606,9 +606,13 @@ func TestRepairIsANoOpOnTheCurrentShapeAndIdempotent(t *testing.T) {
 	for name, mk := range cases {
 		t.Run(name, func(t *testing.T) {
 			path := mk(t)
-			db, err := Open(path)
-			if err != nil {
-				t.Fatalf("Open: %v", err)
+			// The repair only ever runs against the database as it stands
+			// before the later steps (it is step 3; 0004 onward come after), so
+			// that is the shape it must leave untouched.
+			raw := openRaw(t, path)
+			db := &DB{DB: raw, path: path}
+			if err := db.migrateTo(repairBaselineVersion); err != nil {
+				t.Fatalf("migrate to the repair: %v", err)
 			}
 			before := rawSchemaDump(t, db.DB)
 			tx, err := db.BeginTx(ctx, nil)
@@ -625,14 +629,21 @@ func TestRepairIsANoOpOnTheCurrentShapeAndIdempotent(t *testing.T) {
 			tx.Rollback()
 			db.Close()
 
-			// Reopening re-runs nothing and changes nothing.
+			// The normal open path then runs only the later steps, and a
+			// second open re-runs nothing and changes nothing.
+			db1, err := Open(path)
+			if err != nil {
+				t.Fatalf("Open: %v", err)
+			}
+			full := rawSchemaDump(t, db1.DB)
+			db1.Close()
 			db2, err := Open(path)
 			if err != nil {
 				t.Fatalf("reopen: %v", err)
 			}
 			defer db2.Close()
-			if after := rawSchemaDump(t, db2.DB); after != before {
-				t.Errorf("reopen changed the schema:\n%s", diffLines(before, after))
+			if after := rawSchemaDump(t, db2.DB); after != full {
+				t.Errorf("reopen changed the schema:\n%s", diffLines(full, after))
 			}
 			assertLedger(t, db2.DB)
 		})
@@ -645,7 +656,7 @@ func TestRepairIsANoOpOnTheCurrentShapeAndIdempotent(t *testing.T) {
 func TestFreshInstallRecordsNamedStepsAndMatchesTheReference(t *testing.T) {
 	db := openFreshForCompare(t)
 	assertLedger(t, db.DB)
-	ref, err := referenceSchema(context.Background())
+	ref, err := fullChainSchema(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -776,7 +787,7 @@ func TestLoadMigrationsMergesGoStepsWithoutCollisions(t *testing.T) {
 		}
 		got = append(got, m.name)
 	}
-	if want := "0001_init.sql 0002_schema8_epoch.sql " + repairBaselineName; strings.Join(got, " ") != want {
+	if want := "0001_init.sql 0002_schema8_epoch.sql " + repairBaselineName + " 0004_route_monitor.sql"; strings.Join(got, " ") != want {
 		t.Errorf("chain = %v, want %s", got, want)
 	}
 }
@@ -795,4 +806,41 @@ func TestNormalizeDDL(t *testing.T) {
 	if normalizeDDL("CREATE TABLE t(a TEXT NOT NULL)") == normalizeDDL("CREATE TABLE t(a TEXT)") {
 		t.Error("a constraint difference normalized away")
 	}
+}
+
+// fullChainSchema is the shape every database must end in: the repair's
+// reference (baselineFiles) with every later .sql step applied on top, in
+// version order. The later steps are deliberately outside the repair's
+// reference — they run after it, against the shape it leaves, on fresh and
+// upgraded databases alike — so the comparisons that used to be against the
+// reference alone are against this.
+func fullChainSchema(ctx context.Context) ([]schemaObject, error) {
+	mem, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		return nil, err
+	}
+	defer mem.Close()
+	mem.SetMaxOpenConns(1)
+	for _, f := range baselineFiles {
+		body, err := migrationsFS.ReadFile(f)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := mem.ExecContext(ctx, string(body)); err != nil {
+			return nil, fmt.Errorf("%s: %w", f, err)
+		}
+	}
+	migs, err := loadMigrations()
+	if err != nil {
+		return nil, err
+	}
+	for _, m := range migs {
+		if m.version <= repairBaselineVersion || m.sql == "" {
+			continue
+		}
+		if _, err := mem.ExecContext(ctx, m.sql); err != nil {
+			return nil, fmt.Errorf("%s: %w", m.name, err)
+		}
+	}
+	return readSchema(ctx, mem)
 }

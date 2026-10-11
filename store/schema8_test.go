@@ -91,14 +91,14 @@ func TestSchema8UpgradeFromV1(t *testing.T) {
 	if receipts != 0 {
 		t.Errorf("packet_receipts has %d rows on upgrade, want 0", receipts)
 	}
-	// Exactly the three steps are recorded: 0002 and the baseline repair (a
-	// no-op on this shape) on top of the hand-recorded 0001.
+	// Every later step is recorded: 0002, the baseline repair (a no-op on this
+	// shape) and 0004 on top of the hand-recorded 0001.
 	var versions int
 	if err := db.QueryRow(`SELECT COUNT(*) FROM schema_migrations`).Scan(&versions); err != nil {
 		t.Fatalf("count migrations: %v", err)
 	}
-	if versions != 3 {
-		t.Errorf("schema_migrations has %d rows, want 3 (0001 + 0002 + 0003 repair)", versions)
+	if versions != 4 {
+		t.Errorf("schema_migrations has %d rows, want 4 (0001 + 0002 + 0003 repair + 0004)", versions)
 	}
 }
 

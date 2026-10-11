@@ -229,6 +229,13 @@ func (h *Hub) serve(ctx context.Context, auth registry.AuthResult, c wire.Conn, 
 	// transport: refresh the agent-owned fields it carries, then mark the agent
 	// online immediately — a connected link IS liveness, no packet needed.
 	_ = h.deps.Registry.UpdatePermissions(ctx, agentID, hello.Permissions)
+	// The declared capabilities are persisted BEFORE the prediction below and
+	// the first DesiredState push, both of which read them back: a
+	// capability-gated probe kind is pushed (and predicted runnable) only for
+	// an agent whose stored list declares it.
+	if err := h.deps.Registry.UpdateCapabilities(ctx, agentID, hello.Capabilities); err != nil {
+		log.Printf("agentws: record capabilities for %s: %v", agentID, err)
+	}
 	_ = h.deps.Registry.UpdateReportedInfo(ctx, agentID, hello.Hostname, hello.Platform, hello.AgentVersion)
 	_ = h.deps.Registry.TouchLastSeen(ctx, agentID)
 	// Stamp the first-ever connection (no-op after the first): until this is set

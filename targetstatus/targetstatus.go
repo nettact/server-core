@@ -36,6 +36,7 @@ import (
 	pcfg "github.com/nettact/protocol/config"
 	"github.com/nettact/protocol/telemetry"
 	"github.com/nettact/protocol/wire"
+	"github.com/nettact/server-core/config"
 	"github.com/nettact/server-core/fault"
 	"github.com/nettact/server-core/metrics"
 	"github.com/nettact/server-core/store"
@@ -507,6 +508,14 @@ func (s *Service) deriveAgent(t *targetRow, p applicablePair, now time.Time,
 	pairKey := t.id + "\x00" + p.agentID
 	ms := msByKey[pairKey]
 	confirmed := ms != nil && ms.source == "reported" && ms.targetConfigSerial == t.configSerial
+	// A server-decided verdict counts as confirmed: a capability-gated monitor is
+	// never pushed to an agent whose build lacks the capability, so no report will
+	// ever arrive, and leaving the pair "awaiting status" would be a wait with no
+	// end. The verdict is authoritative for exactly that reason.
+	if ms != nil && ms.source == "predicted" && ms.reason == config.ReasonAgentUpgradeRequired &&
+		ms.targetConfigSerial == t.configSerial {
+		confirmed = true
+	}
 
 	// Assignment cutoff for current-state reads (SRV-007): the later of the target's
 	// material-generation time and this pair's assigned_at. A pair that left a

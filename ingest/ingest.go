@@ -21,6 +21,7 @@ import (
 	"github.com/nettact/protocol"
 	pcfg "github.com/nettact/protocol/config"
 	"github.com/nettact/protocol/telemetry"
+	"github.com/nettact/server-core/asnlookup"
 	"github.com/nettact/server-core/baseline"
 	"github.com/nettact/server-core/config"
 	"github.com/nettact/server-core/eventbus"
@@ -112,6 +113,16 @@ type Service struct {
 	// inside the packet transaction and must not reach a raw handle back out
 	// of it.
 	TouchAgentTx func(ctx context.Context, tx store.WriteTx, agentID string) (post func(), err error)
+
+	// ASN resolves route-monitor hops to their origin AS while route history
+	// is recorded (routehist.ApplyTx, inside the packet transaction — the
+	// lookup is an in-memory binary search, so it costs the single writer
+	// nothing measurable). nil is supported: hops are recorded without an AS
+	// and no AS-level route change is ever confirmed. A host that refreshes
+	// its table at runtime assigns an *asnlookup.Holder once at composition
+	// and swaps the table inside it; the field itself is not reassigned while
+	// packets flow.
+	ASN asnlookup.Resolver
 
 	// Per-agent highest-committed-sequence watermark, mirroring
 	// agents.high_sequence: cached so the hot ingest path does not re-read the
